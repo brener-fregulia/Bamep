@@ -2,230 +2,144 @@
 
 Status: **Approved**
 
-## Context
+This Specification defines the normative trusted-bootstrap contract between the boot boundary,
+Agent, and Server. ADR-0010 owns the Secure Boot baseline rationale; ADR-0011 owns first-site
+trust rationale; Agent Protocol owns the `BootstrapEvidence` wire shape; Endpoint identity owns
+the authoritative current-boot lifecycle and destructive-operation precondition 7.
 
-This Specification defines the explicit M0 contract that turns ADR-0010's `trusted bootstrap established` security property into an independently implementable Server / boot-boundary / Agent contract, executing Issue #13 (`[WP] Define trusted bootstrap and Server fingerprint delivery contract`). It closes the gap ADR-0010 deliberately left open: Secure Boot authenticates *executable* boot-chain integrity, but does not by itself authenticate the *site-specific bootstrap data* (the expected Server TLS fingerprint, and enrollment context where applicable) that Agent Protocol v1 requires before authentication.
+## Trusted-bootstrap model
 
-This Specification defines the **contract** only. No production implementation is part of this Work Package.
+`trusted bootstrap established` is a boot-scoped security fact, not a firmware-specific
+`SecureBootEnabled` value.
 
-It consumes, without redefining:
+Local establishment requires both:
 
-- `docs/decisions/0010-trusted-bootstrap-and-secure-boot-baseline.md` — the `trusted bootstrap established` property and the Secure Boot V1 baseline this contract builds on.
-- `docs/specifications/m0-agent-protocol-contract.md` — the WSS/pinned-TLS handshake, and the `BootstrapEvidence` message this round adds to carry sub-problem (D)'s evidence; **this Work Package's second round amended that Specification directly**, adding `BootstrapEvidence` without changing WSS, pinned TLS, `AuthRequest`, `SessionEstablished`, or ADR-0005.
-- `docs/specifications/m0-endpoint-identity-lifecycle.md` — destructive-operation precondition 7, whose authoritative fact this contract defines the origin of.
-- `docs/specifications/m0-job-lifecycle-and-scheduling.md` — the revalidation ordering precondition 7 already participates in; unchanged.
-- `docs/specifications/m0-simulator-contract-and-validation-strategy.md` — the Simulator fidelity boundary and fixture-ownership split this contract fills in.
-- `docs/specifications/m0-stack-and-boundaries-baseline.md` — the Boot Port/Adapter boundary this contract's mechanics remain behind.
-- `docs/reference/secure-boot-hardened-chain-spike.md` — the empirical evidence this contract's design is grounded in (see "Four distinct sub-problems").
-- `docs/reference/site-trust-anchor-provisioning-spike.md` — the empirical evidence (Issue #14) sub-problem (B)'s accepted mechanism is grounded in.
-- `docs/decisions/0011-site-trust-anchor-operator-verified-pairing.md` — the accepted decision for sub-problem (B), consumed and cross-referenced, not redefined, by this round.
+1. executable boot-chain integrity under the production mechanism accepted by ADR-0010; and
+2. an authenticated, fresh Bamep bootstrap assertion whose expected Server TLS fingerprint is
+   verified under a legitimately established site trust anchor.
 
-## Owner-review status
+The Agent establishes this fact locally before WSS. The Server establishes its authoritative
+current-boot fact only after an authenticated Agent reports `BootstrapEvidence` and the Server
+independently validates the evidence and current-boot correlation.
 
-All four sub-problems are now **accepted**:
+These facts are independent from credential validity. `CredentialActive` neither establishes
+nor implies trusted bootstrap, and trusted bootstrap does not authenticate an Agent credential.
 
-- **(C) Authenticated/fresh bootstrap material — ACCEPTED**: the nonce-bound signed bootstrap assertion (previously "Candidate B") is the M0 mechanism. The static signed manifest is **not** the M0 baseline.
-- **(D) Server-side bootstrap evidence — ACCEPTED**: an authenticated Agent bootstrap report (`BootstrapEvidence`, now added to `docs/specifications/m0-agent-protocol-contract.md`), explicitly **not** hardware-backed remote attestation.
-- **(B) Site trust-anchor provisioning — ACCEPTED (ADR-0011)**: operator-verified first-site-key pairing is the V1 default mechanism, informed by Issue #14's empirical evidence for MOK and direct UEFI `db`/PK enrollment (both validated, neither selected as the V1 default). No remaining architectural fork blocks this Specification.
+Trusted bootstrap is valid for one genuine boot context. Same-boot reconnect does not require a
+new assertion or a new local establishment; a genuine reboot requires a fresh `BootNonce`,
+assertion, and Server-side establishment. There is no in-boot TTL.
 
-**Status: Approved.**
+The mechanism-independent current-boot state consumed by Domain is defined by
+`m0-endpoint-identity-lifecycle.md`.
 
-## Goal
+## Site trust-anchor establishment
 
-Define enough of the trusted-bootstrap and Server-fingerprint-delivery contract that it is independently implementable, without inventing a general-purpose PKI or secrets platform, and without hiding a required architectural decision inside a future implementation Work Package.
+The V1 default for a previously unprepared Endpoint is the operator-verified first-site-key
+pairing contract selected by ADR-0011.
 
-## Scope
+Before a site key becomes trusted:
 
-- the semantic meaning, ownership, and scoping of `trusted bootstrap established`, distinguishing local (Agent-side) establishment from Server-side authoritative knowledge of it;
-- the minimum authenticated bootstrap-material contract;
-- **(A)** restating, not redeciding, boot executable trust (ADR-0010);
-- **(B)** site trust-anchor provisioning — **accepted**: operator-verified first-site-key pairing (ADR-0011), restated, not redecided, here;
-- **(C)** the accepted nonce-bound signed bootstrap assertion mechanism;
-- **(D)** the accepted authenticated Agent bootstrap report mechanism, and its explicit assurance limitations;
-- the M0 threat-model boundary this design is, and is not, intended to defend against;
-- the Agent-integrity requirement that makes (D) meaningful;
-- rotation, revocation, recovery, and fail-closed behavior;
-- the Agent bootstrap sequence up to and including Agent Protocol authentication and evidence reporting;
-- failure semantics for every unsafe case;
-- Simulator fixture semantics;
-- validation expectations across all layers, including Integration Environment.
+1. the Endpoint is running inside the trusted maintenance/bootstrap executable path;
+2. it obtains a candidate Bamep site public key through a transport that is not assumed trusted;
+3. it derives a human-verifiable representation from that exact candidate key;
+4. the legitimate Bamep installation independently derives/displays the representation of its
+   own site public key through an operator-trusted management context;
+5. the operator explicitly compares the two representations;
+6. only successful explicit verification may persist the candidate as the site trust anchor;
+7. mismatch, cancellation, ambiguity, or absent approval persists no candidate key and fails
+   closed;
+8. successful pairing survives ordinary reboot/reconnect until explicit reset, revocation,
+   rotation, or recovery requires otherwise.
 
-## Out of scope
+The human-verifiable representation is implementation-time, but it must provide meaningful
+collision resistance against an active-network attacker. A bare unauthenticated "accept this
+key?" prompt is insufficient.
 
-- production implementation code;
-- selecting the final PXE/network bootloader mechanism (Issue #8's network-delivered boot mechanism remains separately unresolved and is not selected here);
-- resolving Issue #8's physical network-delivery uncertainty;
-- real Secure Boot deployment/configuration, or firmware key-enrollment tooling;
-- a broad enterprise PKI;
-- Administrative API/Web authentication, multi-user support, or RBAC;
-- data-plane transfer authentication;
-- driver-provider behavior;
-- any change to Agent Protocol v1 transport, WSS, pinned TLS, `AuthRequest`/`SessionEstablished` semantics, or ADR-0005 — the `BootstrapEvidence` addition to `docs/specifications/m0-agent-protocol-contract.md` is strictly additive;
-- any change to Job/JobStep/Attempt lifecycle or states;
-- production provisioning;
-- selecting a concrete network transport (HTTP/TFTP/PXE/etc.) for bootstrap-assertion delivery;
-- concrete library/crate choice and version for the V1 signature implementation; the
-  algorithm and signed representation themselves are defined normatively below;
-- the concrete human-verifiable representation/encoding, transport, and UX for the (B) operator-verified pairing ceremony — accepted at the contract level (ADR-0011), not designed to implementation detail here; see "(B) Site trust-anchor provisioning";
-- hardware-backed remote attestation (e.g., measured boot / TPM-class functionality) — explicitly not introduced as an M0 requirement (see "M0 threat-model boundary").
+Site-key approval and Endpoint enrollment approval are independent security decisions even when
+one operator workflow presents both.
 
-## Four distinct sub-problems (do not collapse)
+A changed candidate key never silently replaces an already-paired key. Rotation uses an
+authenticated path under the existing trusted key where possible. If the prior key is
+unavailable or compromised, recovery returns to explicit operator verification rather than
+TOFU.
 
-- **(A) Boot executable trust** — ADR-0010 / the Secure Boot baseline. Already accepted, not reopened here.
-- **(B) Site trust-anchor provisioning** — how an arbitrary Endpoint learns a public key that legitimately belongs to *this* Bamep installation. **Accepted**: operator-verified first-site-key pairing (see "(B) Site trust-anchor provisioning" and ADR-0011).
-- **(C) Authenticated/fresh bootstrap material** — **Accepted**: the nonce-bound signed bootstrap assertion (see "(C) Authenticated and fresh bootstrap material").
-- **(D) Server-side bootstrap evidence** — **Accepted**: the authenticated Agent bootstrap report, explicitly not remote attestation (see "(D) Server-side bootstrap evidence").
+Bamep V1 does not claim cryptographically strong zero-touch first-site trust for an arbitrary
+previously unprepared OEM Endpoint. MOK and direct UEFI `db`/PK enrollment remain validated
+possible future pre-provisioned trust modes, not V1 default requirements.
 
-### Evidence characterization
+## Bootstrap assertion V1
 
-`docs/reference/secure-boot-hardened-chain-spike.md` Scenario 3 empirically demonstrated exactly: **firmware Secure Boot → Microsoft-trusted shim → Canonical-signed GRUB**, reaching a genuine interactive `grub>` prompt — the evidentiary basis for (A). `docs/reference/site-trust-anchor-provisioning-spike.md` (Issue #14) subsequently validated MOK enrollment and direct UEFI `db`/PK enrollment end-to-end (enrollment, functional trust verification, revocation), the evidentiary basis for (B)'s accepted default and for recording both mechanisms as validated optional future pre-provisioned modes (ADR-0011) — neither Endpoint-firmware-modification mechanism was selected as the V1 default because neither was shown to support unattended first-trust establishment from an arbitrary previously-unprepared OEM Endpoint.
+The V1 authenticated/fresh bootstrap material is a nonce-bound signed bootstrap assertion.
 
-## 1. Trusted-bootstrap semantic model
+A static signed manifest is insufficient because it does not structurally bind valid material
+to the current boot.
 
-`trusted bootstrap established` is a fact about **the current Agent boot/session context**, produced by the Boot Adapter boundary and exposed upward through Application-level Boot Orchestration — never as `SecureBootEnabled`, and never inspected directly by Domain code (`docs/specifications/m0-stack-and-boundaries-baseline.md`).
+For each genuine new boot:
 
-**The fact requires two things to both hold, not Secure Boot (A) alone** (ADR-0010 point 7):
+1. the trusted bootstrap stage generates a fresh `BootNonce`;
+2. it obtains an assertion through a transport that need not itself be trusted;
+3. the signer signs exactly the fixed V1 transcript below and must not act as an
+   arbitrary-byte signing oracle;
+4. the bootstrap stage strictly parses and verifies the assertion against an already-trusted
+   site key and the exact current nonce;
+5. only successful verification makes the assertion's Server fingerprint available for WSS
+   pinning.
 
-1. **(A) Executable boot-chain integrity** — Secure Boot, already accepted, not reopened here.
-2. **(B)+(C) Authenticated site-specific bootstrap material** — the expected Server TLS fingerprint has been cryptographically authenticated using a legitimately-provisioned trust anchor. Both are now accepted: (C) the nonce-bound signed bootstrap assertion mechanism, and (B) how that trust anchor is legitimately provisioned to the Endpoint in the first place — by default, the operator-verified first-site-key pairing ceremony (ADR-0011).
+Replay under a different `BootNonce`, an unknown signer, a malformed/non-canonical assertion,
+or a bad signature fails closed.
 
-**Local establishment vs. Server-side authority are distinct.** The Agent locally determines, at boot time, whether (1) and (2) hold for itself — **local establishment**, sufficient to gate the Agent's own willingness to proceed (see "Failure semantics"). Making the fact **Server-observable** is (D), now accepted via `BootstrapEvidence` (see "(D) Server-side bootstrap evidence") — but note (D)'s explicit assurance limitations before treating it as equivalent to (A) actually having held.
+### Server certificate fingerprint
 
-**Ownership:** the Boot Adapter observes/produces the raw evidence; Application-level Boot Orchestration composes it into the exposed fact `trusted_bootstrap: Established | NotEstablished`, consumed by Endpoint identity precondition 7 (Server-side, now possible via accepted (D)) and the Agent's own pre-connection gate (Agent-side, local establishment only).
+`ServerCertFingerprint` is exactly the SHA-256 digest of the exact DER bytes of the
+leaf/end-entity certificate presented by the Server for the WSS connection: 32 bytes.
 
-**Scope: boot-session-scoped.** Established once per boot cycle, valid for the entire boot session. Agent Protocol reconnect within the same boot session does not require re-establishment; a genuine reboot does. No in-session expiry timer — boot-scoped, not TTL-scoped.
+It is:
 
-**Independence from credential validity is preserved exactly as ADR-0010/precondition 7 require**: `CredentialActive` proves the Agent authenticated successfully; it does not prove the boot path was trusted, locally or to the Server — this is precisely why (D) is needed as a distinct mechanism rather than an inference from authentication success.
+- not an SPKI/public-key pin;
+- not a CA certificate fingerprint;
+- not a certificate-chain fingerprint;
+- not hostname-derived identity.
 
-## 2. Bootstrap material
+A different leaf certificate therefore has a different fingerprint even if it reuses the same
+key pair.
 
-- **Expected Server TLS certificate fingerprint** — always required. **Accepted (Agent Protocol v1 owner decision): SHA-256 over the exact DER bytes of the leaf/end-entity certificate the Server presents during the TLS handshake — a 32-byte digest.** This is exact-certificate pinning: not an SPKI/public-key pin, not a CA certificate fingerprint, not a certificate-chain fingerprint, and not a hostname-derived identity. A new Server leaf certificate therefore has a different fingerprint even when it reuses the same key pair. Certificate-rotation mechanics themselves are not designed here — see `docs/specifications/m0-agent-protocol-contract.md` "Transport and handshake" for the resulting TLS-authentication policy, and "Rotation, revocation, and recovery" below for the rotation consequence at contract level.
-- **Enrollment/bootstrap context** — required only if the future pre-authorized enrollment capability is in use; **not required for M0's default operator-approval-gated enrollment path**. See "Confidentiality boundary" below for why this field's future semantics are explicitly not decided here.
-- **Explicit domain/contract discriminator and schema/contract version** — so the signer and verifier agree the signed structure is a Bamep bootstrap assertion of a known shape, not an arbitrary signed byte string (see "(C)" for why this matters).
-- **`boot_nonce`** — the freshness primitive; see "(C)."
-- **Signing-key identifier / verification metadata** — the 32-byte `SiteKeyId`
-  defined below, which identifies which already-accepted trust-anchor key the
-  assertion claims to be signed by, distinct from *whether* that key is actually
-  trusted (sub-problem (B)).
-
-No other configuration is added merely because a bootstrap object exists. **This SHA-256 choice is scoped only to the Agent Protocol v1 Server TLS certificate fingerprint above** — it does not select ADR-0008 point 3's already-deferred `digest_algorithm` for Artifact/data-plane digests, or any other project-wide digest convention; that decision remains separately deferred, unaffected by this one. Inside assertion schema V1, the fingerprint is represented as its exact raw 32-byte digest at the fixed offset defined below.
-
-## (B) Site trust-anchor provisioning
-
-**Accepted (ADR-0011): operator-verified first-site-key pairing** is the V1 default
-mechanism by which a previously unprepared, arbitrary Endpoint legitimately learns the
-public key belonging to a specific Bamep installation. This is restated from
-ADR-0011, not redecided here; ADR-0011 remains the authoritative decision record.
-
-**This is explicitly not automatic trust-on-first-use.** A candidate site public key
-must not become trusted merely because it was the first key observed on the
-provisioning network.
-
-**Required security semantics:**
-
-1. The Endpoint reaches the trusted maintenance/bootstrap environment whose
-   executable integrity is covered by ADR-0010's Secure Boot baseline.
-2. Before it has a site trust anchor, the Endpoint obtains a *candidate* Bamep site
-   public key through a transport that is not itself assumed trusted.
-3. The Endpoint derives a human-verifiable representation from that exact candidate
-   public key.
-4. The legitimate Bamep installation independently derives/displays the
-   corresponding representation from its own site public key, through an
-   operator-trusted management context (e.g. Bamep Web/Admin).
-5. The operator explicitly compares/verifies the two representations.
-6. Only an explicit, successful verification/approval allows the Endpoint to persist
-   that site public key as its trust anchor.
-7. Mismatch, cancellation, ambiguity, or absent approval fails closed — no candidate
-   key is persisted, and `trusted bootstrap established` remains `NotEstablished`
-   (see "Failure semantics").
-8. After successful pairing, subsequent boots do not repeat this ceremony unless
-   trust has been explicitly reset, revoked, or requires recovery.
-
-The exact human-verifiable representation (full fingerprint, shorter
-collision-resistant code, word-based encoding, QR-assisted comparison, or an
-equivalent mechanism) is **not selected here** — implementation-time, bound by
-ADR-0011's requirement that it provide enough collision resistance to be meaningful
-against an active-network-attacker threat model. A short unauthenticated "Yes/No
-accept key?" prompt does not satisfy this contract.
-
-**Composition with Endpoint enrollment (ADR-0004):** where practical, this ceremony
-composes with the already-accepted operator-approval-gated first Endpoint enrollment
-workflow (`docs/specifications/m0-endpoint-identity-lifecycle.md`) in a single
-operator workflow, but remains a **distinct security check** — "I approve this
-Endpoint identity" and "this public key really represents my Bamep site" are never
-inferred from one another.
-
-**No-TOFU clarification:** ADR-0010's no-TOFU invariant is not reopened. First key
-observed → **not** trusted → operator performs an independent, out-of-band
-comparison → explicit verified approval → trust established. The network alone never
-establishes trust.
-
-**Persistence and reset (contract-level):** a successfully paired site public key
-becomes durable Endpoint-local bootstrap trust state; normal reboot/reconnect does
-not remove it; explicit reset/revocation does; a changed candidate key never silently
-replaces an already-paired key; rotation requires an authenticated path under the
-existing paired key where possible; recovery from an unavailable/compromised paired
-key returns to an explicit operator verification ceremony. Concrete local storage
-format, rotation protocol, and recovery UX remain implementation-time (see "Open
-questions").
-
-**MOK and direct UEFI `db`/PK enrollment** were both empirically validated end-to-end
-by Issue #14 (`docs/reference/site-trust-anchor-provisioning-spike.md`) and are
-recorded as **validated, technically viable optional future pre-provisioned trust
-modes** for environments that can pre-provision Endpoint firmware trust (e.g. a
-managed fleet with imaging/BMC infrastructure). Neither is required for the V1
-baseline, neither is the default onboarding path, and neither is implemented or
-further specified by this Specification. See ADR-0011 "Alternatives considered" for
-the full evidence-driven rationale for not selecting either as the V1 default.
-
-**Product limitation, stated explicitly:** Bamep V1 does not claim cryptographically
-strong zero-touch first-site trust establishment on an arbitrary previously-unprepared
-OEM Endpoint. First trust establishment requires operator verification unless the
-Endpoint has been pre-provisioned through a future supported trust mechanism. After
-first trust establishment, subsequent normal Bamep boots may be unattended. This is an
-explicit product/security boundary, not an implementation defect.
-
-## (C) Authenticated and fresh bootstrap material — ACCEPTED: nonce-bound signed bootstrap assertion
-
-**The static signed manifest is not the M0 baseline.** Its unresolved replay/freshness gap (a validly-signed static artifact remains validly-signed indefinitely, with no structural way to distinguish "current" from "superseded" without an additional, separately-trusted mechanism) is why it was not accepted.
-
-**Accepted contract:**
-
-1. At each new boot context, the trusted bootstrap stage generates a cryptographically random `boot_nonce` according to the exact `BootNonce` contract below.
-2. It obtains a signed bootstrap assertion through a transport that need not itself be trusted — authenticity/integrity comes from the signature and nonce binding, not from transport security. No concrete transport is selected here (see "Out of scope"; Issue #8 remains independently unresolved).
-3. The signer signs exactly the fixed assertion-schema-V1 transcript defined below. It covers the domain discriminator, schema version, exact `boot_nonce`, expected Server TLS certificate fingerprint, and `SiteKeyId` as one signed unit. Assertion schema V1 contains no enrollment/bootstrap-context extension; any future mechanism needing such a field must define a new complete assertion schema rather than append or omit bytes in V1.
-4. **The signer signs this fixed, structured assertion — it must not act as a generic arbitrary-byte signing oracle.** Signing an attacker-chosen arbitrary payload under the site key would defeat the discriminator/schema protections above; the signer's role is scoped to producing exactly this structure.
-5. The bootstrap stage verifies: the strict Ed25519 signature; the signer against the already-provisioned site trust anchor (B); the domain/schema version; the exact nonce match; canonical representation; and required-field validity.
-6. Only successful verification makes the authenticated Server fingerprint locally usable for WSS pinning.
-7. A replayed assertion bound to a different `boot_nonce` fails closed.
-8. The assertion is **boot-context-scoped**: a WSS reconnect during the same boot does not require a new assertion merely because the socket changed; a genuine reboot generates a new nonce and requires a new assertion.
+This SHA-256 definition is scoped only to the Agent Protocol V1 Server certificate fingerprint;
+it does not select a digest algorithm for Artifact/data-plane integrity.
 
 ### BootNonce V1
 
-`BootNonce` is exactly 32 random bytes. It is generated fresh for every genuine new
-boot context from the operating system CSPRNG. Failure to obtain secure randomness
-aborts creation of that boot context; there is no insecure PRNG fallback. Same-boot
-reconnect retains the same value, while every genuine reboot requires a new value.
-`BootNonce` is not a UUID.
+`BootNonce` is exactly 32 random bytes generated fresh for every genuine boot context from the
+operating-system CSPRNG.
 
-Where Agent Protocol carries `boot_nonce` as text, its only valid representation is
-RFC 4648 base64url without padding over the exact 32 bytes: exactly 43 ASCII
-characters. Parsing is strict: padding (`=`), the standard-base64 `+`/`/` alphabet,
-whitespace, invalid length, non-canonical trailing bits, or any input that does not
-round-trip byte-for-byte through the canonical encoder is rejected.
+- CSPRNG failure aborts creation of that boot context; there is no insecure fallback.
+- Same-boot reconnect retains the same nonce.
+- Genuine reboot requires a new nonce.
+- `BootNonce` is not a UUID.
 
-### Site bootstrap signing key and SiteKeyId
+When carried as Agent Protocol text, the only valid representation is RFC 4648 base64url without
+padding over the exact 32 bytes: exactly 43 ASCII characters.
 
-Assertion schema V1 uses ordinary Ed25519 signing and verification: no prehash mode,
-no optional Ed25519 context mode, and no alternate-algorithm negotiation inside V1.
-Verification must use a strict Ed25519 mode that rejects non-canonical/problematic
-representations and weak-key cases where the implementation exposes such a mode
-(`verify_strict` is the intended semantic requirement for the current Rust
-implementation). Concrete library and library-version selection remains an
-implementation detail.
+Parsing is strict. Reject padding (`=`), the standard-base64 `+`/`/` alphabet, whitespace,
+wrong length, non-canonical trailing bits, or any value that does not round-trip byte-for-byte
+through the canonical encoder.
 
-The site bootstrap signing key is distinct from the Agent Protocol TLS Server key,
-UEFI/Secure Boot `db`/PK keys, and enrollment/runtime credential secrets.
+### Site signing key and SiteKeyId
+
+Assertion V1 uses ordinary Ed25519:
+
+- no prehash mode;
+- no optional Ed25519 context mode;
+- no algorithm negotiation inside V1;
+- verification must use strict Ed25519 semantics rejecting non-canonical/problematic
+  representations and weak-key cases where supported.
+
+The concrete cryptographic library/version is implementation-time.
+
+The site bootstrap signing key is distinct from:
+
+- the Agent Protocol TLS Server key;
+- UEFI/Secure Boot `db`/PK keys;
+- enrollment/runtime credential secrets.
 
 `SiteKeyId` is exactly:
 
@@ -233,18 +147,16 @@ UEFI/Secure Boot `db`/PK keys, and enrollment/runtime credential secrets.
 SHA-256(exact raw 32-byte Ed25519 public-key value)
 ```
 
-SPKI, PEM, DER wrappers, and human-readable key text are not hashed. `SiteKeyId` is
-exactly 32 bytes and is itself covered by the V1 signature. Verification parses the
-ID, finds a previously accepted/persisted/configured site trust anchor with that ID,
-recomputes the ID from that accepted key's raw bytes, requires exact equality, and
-only then verifies the signature with that accepted key. An assertion never causes an
-unknown public key to become trusted. WP1 may configure a set containing one accepted
-site key while retaining this identifier shape for future rotation; rotation UX and
-protocol remain out of scope.
+SPKI, PEM, DER wrappers, and human-readable text are not hashed. `SiteKeyId` is exactly 32
+bytes and is included in the signed transcript.
 
-### Exact assertion-schema-V1 signed representation
+Verification must use `SiteKeyId` only to select a previously accepted site public key, recompute
+the ID from that accepted key's raw bytes, require exact equality, and then verify the signature.
+An assertion can never introduce or automatically trust a new site key.
 
-The exact signed payload is:
+### Exact signed representation
+
+The V1 signed payload is exactly:
 
 ```text
 u16be(33)
@@ -256,362 +168,254 @@ u16be(33)
 ```
 
 | Offset | Exact content |
-|---|---|
-| `0..2` | domain length, unsigned 16-bit big-endian, value 33 |
+| --- | --- |
+| `0..2` | domain length, unsigned 16-bit big-endian, value `33` |
 | `2..35` | exact 33-byte ASCII `bamep.trusted-bootstrap.assertion` |
-| `35..37` | schema version, unsigned 16-bit big-endian, value 1 |
+| `35..37` | schema version, unsigned 16-bit big-endian, value `1` |
 | `37..69` | `BootNonce` raw 32 bytes |
 | `69..101` | expected Server TLS leaf-certificate fingerprint raw 32 bytes |
 | `101..133` | `SiteKeyId` raw 32 bytes |
 
-The signed payload is exactly 133 bytes. The complete binary assertion is:
+The signed payload is exactly 133 bytes. The complete assertion is exactly:
 
 ```text
 signed_payload_v1[133] || ed25519_signature[64]
 ```
 
-It is exactly 197 bytes. V1 has no optional or omitted/default fields, JSON, CBOR,
-Unicode beyond the fixed ASCII discriminator, variable-width numbers, structural
-padding, algorithm field, or trailing bytes. Unknown schema versions are rejected
-explicitly. A future V2 may define another complete transcript and/or algorithm; V1
-is never best-effort parsed as another version.
+Total length: **197 bytes**.
 
-### Agent Protocol assertion carrier
+V1 has no optional/default fields, JSON, CBOR, variable-width numbers, structural padding,
+algorithm field, trailing bytes, or Unicode other than the fixed ASCII discriminator. Unknown
+schema versions are rejected. A future version defines a separate complete transcript; V1 is
+never best-effort parsed as another version.
 
-`BootstrapEvidence.bootstrap_assertion` remains opaque to Agent Protocol. For
-assertion schema V1 its String value is the canonical RFC 4648 base64url-without-
-padding encoding of the exact 197 assertion bytes, exactly 263 ASCII characters.
-Parsing rejects `=` padding, `+`/`/`, whitespace, invalid length, non-canonical
-trailing bits, and every representation that does not round-trip byte-for-byte
-through the canonical encoder. Assertion-internal fields are not exposed as Agent
-Protocol JSON fields.
+### Agent Protocol carrier
 
-### Shared contract implementation boundary
+`BootstrapEvidence.bootstrap_assertion` is opaque to Agent Protocol.
 
-The expected responsibility-specific implementation boundary is
-`crates/trusted-bootstrap`, package `bamep-trusted-bootstrap`. It owns representations
-and operations corresponding to this contract, including `BootNonce`,
-`ServerCertFingerprint`, `SiteKeyId`, the site public-key representation, and
-assertion parsing/transcript/verification. The existing `ServerCertFingerprint`
-implementation currently located in the Simulator is expected to move into this
-boundary.
+Assertion V1 is carried as canonical RFC 4648 base64url without padding over the exact 197
+assertion bytes: exactly **263 ASCII characters**.
 
-This shared boundary does not depend on Domain, Server, Simulator, Agent Protocol, or
-WebSocket/TLS transport. Domain may depend on it for the mechanism-neutral
-`BootNonce` value without importing signing-key/signature-library types into the
-Endpoint aggregate. This ownership does not create a generic `common`, `utils`, or
-`shared` package, and does not make Rust implementation structure the normative
-source of truth.
+Parsing rejects padding, `+`/`/`, whitespace, wrong length, non-canonical trailing bits, and
+every representation that does not round-trip byte-for-byte through the canonical encoder.
+Assertion-internal fields are not duplicated as Agent Protocol JSON fields.
+
+### Local verification result
+
+Successful local cryptographic verification must produce a trusted result that carries, at
+minimum:
+
+- the verified `BootNonce`;
+- the authenticated `ServerCertFingerprint`;
+- the original signed assertion material needed for Server-side evidence.
+
+The normal Agent path must consume this verified result to obtain the WSS pin and subsequent
+evidence. An unchecked boolean such as `trusted = true`, an unchecked constructor, or equivalent
+bypass must not substitute for cryptographic verification.
 
 ### Confidentiality boundary
 
-**A digital signature supplies authenticity/integrity, not confidentiality.** M0's required Server TLS fingerprint is not treated as secret — it is authenticated data, not protected data, and this contract's guarantees are about *tampering*, not *disclosure*.
+The assertion provides authenticity/integrity, not confidentiality. The Server certificate
+fingerprint is not treated as secret.
 
-The future *optional* enrollment/bootstrap context (Section 2) must **not** be assumed safe to expose over an unauthenticated plaintext transport if that future mechanism gives it bearer-secret or confidential semantics (e.g., a pre-authorization token that grants trust merely by possession). **This Specification does not design that future enrollment mechanism, and does not resolve its confidentiality/binding question** — that mechanism, when and if it is specified, owns deciding whether its own bootstrap context requires confidentiality in addition to the authenticity this contract already provides.
+Assertion V1 contains no enrollment/pre-authorization secret. A future extension carrying
+bearer-secret or otherwise confidential bootstrap context must define its own confidentiality
+and binding requirements in a new complete contract/version.
 
-## (D) Server-side bootstrap evidence — ACCEPTED: authenticated Agent bootstrap report (not remote attestation)
+## Server-side BootstrapEvidence
 
-**Accepted M0 model:**
+`BootstrapEvidence` is an authenticated Agent report, not hardware-backed remote attestation.
 
-```text
-local trusted boot evaluation (A)
-        +
-locally verified nonce-bound signed assertion (B)+(C)
-        ↓
-Agent establishes local trusted-bootstrap result
-        ↓
-WSS pinned TLS succeeds using the assertion fingerprint
-        ↓
-Agent Protocol credential authentication succeeds
-        ↓
-authenticated Agent sends bootstrap evidence/report
-        (`BootstrapEvidence`, `docs/specifications/m0-agent-protocol-contract.md`)
-        ↓
-Server validates assertion + correlates boot context
-        ↓
-Server records trusted bootstrap = Established
-        for that current boot context
-        ↓
-destructive precondition 7 may now be satisfied
-```
+The Server MUST NOT infer trusted bootstrap merely from:
 
-**The Server MUST NOT infer this fact merely from:** a TCP/WSS connection; a fingerprint match alone; `CredentialActive`; or mere possession of a valid assertion without performing independent verification. Only the explicit sequence above — ending in independently-verified `BootstrapEvidence` — establishes the Server-side fact.
+- TCP/WSS connectivity;
+- TLS fingerprint match alone;
+- successful Agent credential authentication;
+- possession of a syntactically valid assertion.
 
-### Authoritative current boot and durable Server state
+After `SessionEstablished`, Server-side establishment requires all of the following:
 
-Historical resolved `BootContext` records are not proof that any one of them is the
-Endpoint's current boot. The Endpoint therefore owns an authoritative current-boot
-projection containing the current `boot_context_id`, current `BootNonce`, and
-`TrustedBootstrapState` (`NotEstablished | Established`). Absence of that projection
-means no trusted current boot is known and fails closed.
-
-First contact selects the redeemed `BootContext` as current and initializes
-`NotEstablished`. A genuine reboot replaces the projection with the new
-`BootContext`/nonce and resets it to `NotEstablished`. Same-boot runtime reconnect or
-credential rotation preserves it exactly. Valid independently verified evidence for
-the current boot promotes `NotEstablished` to `Established`; repeated valid evidence
-for that same boot is idempotent. Rejected evidence and evidence for a historical or
-otherwise non-current boot make no state mutation.
-
-This current-boot fact is durable PostgreSQL domain state, not WebSocket-session
-state, in-memory Agent presence, or an inference from an open connection. It survives
-a Server restart and same-boot reconnect, allowing later destructive-operation
-precondition 7 to consume an authoritative fact. A reconnect in the same boot is not
-required to re-present evidence; it may re-present the same nonce/assertion, which the
-Server re-verifies idempotently.
-
-Old-boot replay is rejected against the current projection even when the historical
-assertion remains cryptographically valid. If boot A/nonce A reached `Established`
-and genuine reboot B/nonce B is now current and `NotEstablished`, replaying a correctly
-signed assertion A cannot establish B. Only evidence matching the authoritative
-current boot B may do so.
-
-### Independent Server verification
-
-After `SessionEstablished`, logical verification includes, before establishment:
-
-1. the Agent Protocol message is valid for the authenticated-session phase and uses a
-   supported `protocol_version`;
+1. `BootstrapEvidence` is valid for the authenticated-session phase and uses a supported
+   `protocol_version`;
 2. `local_boot_trust` is exactly `Established`;
 3. `boot_nonce` and `bootstrap_assertion` decode in their strict canonical forms;
-4. the assertion has the exact V1 length/layout, domain discriminator, and schema
-   version;
+4. the assertion has the exact V1 length, layout, discriminator, and schema version;
 5. the wire `BootNonce` exactly equals the signed assertion `BootNonce`;
-6. `SiteKeyId` selects an already accepted site public key and recomputation from that
-   key exactly matches;
+6. `SiteKeyId` selects an already accepted site public key and its recomputed ID exactly
+   matches;
 7. the strict Ed25519 signature verifies;
-8. the assertion's expected Server fingerprint exactly equals the fingerprint of the
-   leaf certificate used to establish **this WSS connection**;
-9. under the Endpoint/current-boot persistence lock, the Endpoint is still on that
-   exact current `BootContext` and `BootNonce` immediately before mutation.
+8. the assertion's expected Server fingerprint exactly equals the fingerprint of the leaf
+   certificate used to establish **this WSS connection**;
+9. immediately before mutation, the Server atomically revalidates that the Endpoint's
+   authoritative current boot is still the exact `BootContext`/`BootNonce` represented by the
+   evidence.
 
-The TLS comparison authority is the immutable connection-bound leaf-certificate
-identity, not an independently mutable "currently configured certificate" value read
-later. An implementation may derive and retain this typed fingerprint through its TLS
-acceptor/session context; this Specification does not prescribe its API shape.
+The TLS comparison authority is the immutable connection-bound leaf-certificate identity, not a
+later read of mutable Server certificate configuration.
 
-Cryptographic parsing/signature verification may occur before acquiring the Endpoint
-lock, but current-boot authorization is checked or rechecked under that lock. Evidence
-persistence must not acquire a `BootContext` lock after acquiring the Endpoint lock:
-credential redemption already orders locks from `BootContext` through correlation to
-Endpoint, so the authoritative Endpoint projection carries enough immutable current-
-boot correlation data to avoid the reverse `Endpoint -> BootContext` dependency.
+Only successful verification for the exact authoritative current boot may establish the
+Server-side trusted-bootstrap state. Repeated valid evidence for that same current boot is
+idempotent. Rejected, stale, or historical-boot evidence makes no trust-state mutation.
 
-The race outcome is deterministic and fail-closed: if evidence A establishes first,
-a later genuine reboot B replaces the current boot and resets trust; if reboot B
-commits first, later evidence A observes B as current and makes no mutation. No
-ordering can restore A as current.
+Evidence for an old boot can never establish a newer boot even if its assertion remains
+cryptographically valid. Current-boot lifecycle and persistence ordering are authoritative in
+`m0-endpoint-identity-lifecycle.md` and
+`m0-persistence-observability-and-domain-events.md`.
 
-For WP1, the Server verifier receives an immutable configured set of accepted site
-public keys, while the Simulated Agent receives its accepted/paired public keys
-independently. No asynchronous repository/Port for dynamic site-key rotation is
-required in WP1.
+Same-boot reconnect does not require evidence to be re-presented, but re-presentation is allowed
+and must reverify idempotently.
 
-### Atomic current-boot transitions
+## Assurance boundary and Agent integrity
 
-Before first-contact `SessionEstablished`, one transaction commits the Endpoint's
-`PendingEnrollment` state, credential chain, credential lookup projection,
-`BootContext` resolution, current-boot selection/current nonce,
-`TrustedBootstrapState::NotEstablished`, and existing required
-`EndpointPendingEnrollment` event.
+Server verification proves that:
 
-Before genuine-reboot `SessionEstablished`, one transaction preserves Endpoint
-identity while replacing the credential chain/lookup projection, resolving and
-selecting the new `BootContext`/nonce, and resetting trusted bootstrap to
-`NotEstablished`. Same-boot credential reconnect/rotation preserves all current-boot
-state. A rejected credential mutates none of it.
+- the assertion was signed by an accepted site key;
+- its authenticated fields are intact;
+- it is bound to the reported/current boot nonce;
+- its fingerprint matches the certificate of the current WSS connection.
 
-Persistence may use a new migration with an optional historical `boot_nonce` for
-pre-migration `BootContext` rows and an Endpoint current projection sufficient for
-the state above. Every new `BootContext` created by the new flow has a 32-byte nonce.
-Existing development rows for which no authenticated current boot can be reconstructed
-remain current-boot-absent plus `NotEstablished`; implementations do not fabricate
-historical nonces or introduce a compatibility trust model for them.
+It does **not independently prove** that firmware Secure Boot actually ran, that the intended
+executable chain executed, or that a fully compromised Endpoint did not run a counterfeit Agent
+capable of fabricating a report.
 
-### What this proves, and what it does not (corrected from the prior round)
+M0 protects against an untrusted provisioning network, Server/fingerprint substitution,
+bootstrap-material tampering/replay, and stale/accidental bootstrap context. It does not claim
+cryptographic remote attestation against a malicious fully compromised Endpoint. TPM/measured
+boot or equivalent hardware-backed attestation is not an M0 requirement.
 
-**Forwarding the signed assertion to the Server, and the Server independently verifying it, does not by itself prove the Endpoint booted through Secure Boot / trusted bootstrap.** Server-side verification of the assertion proves only:
+This assurance limitation does not permit bypassing ADR-0010. Production still requires the
+trusted executable-bootstrap chain.
 
-- the assertion was produced by the accepted site signer;
-- its authenticated material (the fingerprint, nonce, etc.) is intact;
-- it is bound to the declared `boot_nonce`/boot context.
+For `BootstrapEvidence` to be meaningful, the production trust chain must extend through the
+Agent code and logic that generates the report. The exact Agent-integrity packaging mechanism
+(GRUB/UKI/WinPE/initramfs or another validated design) is implementation/integration work.
 
-It does **not** independently prove:
+## Rotation, revocation, and recovery
 
-- that firmware Secure Boot was actually enabled for this boot;
-- that the expected executable chain actually executed;
-- that the current Agent process itself is genuine, as opposed to a substitute able to replay or fabricate a report.
+- Routine Server TLS certificate rotation does not require site trust-anchor rotation. New
+  assertions carry the new authenticated leaf fingerprint under the still-valid site key.
+- A boot context already established under valid material may finish under that material; a
+  genuine new boot uses current material. Exact overlap duration is implementation-time.
+- Site signing/trust-anchor rotation uses an authenticated path under the existing trusted key
+  where possible. Compromised/unavailable-key recovery returns to explicit operator
+  verification.
+- Revoked/compromised bootstrap material or key fails closed.
+- Rotation never introduces TOFU or silent replacement by an unverified fingerprint/key.
+- Production Server certificate/key identity must not be regenerated merely because the Server
+  process restarts; changing the leaf certificate is an explicit rotation event.
 
-**(A) local boot-chain establishment and (B)+(C) assertion authentication remain distinct facts.** `BootstrapEvidence` is Server-observable evidence of (B)+(C) having been locally verified by *something* claiming to be the Agent; it is not independent proof of (A). This distinction is exactly why the model is an **authenticated Agent report**, not remote attestation — see "M0 threat-model boundary" for what assurance this does and does not provide, and "Agent-integrity requirement" for what production must additionally guarantee to make this report meaningful.
+Fixture-driven tests may use ephemeral certificates only when their trusted-bootstrap material
+authenticates the matching test certificate.
 
-## M0 threat-model boundary
-
-This M0 mechanism is designed to protect against the already-accepted threat boundary, including:
-
-- an untrusted provisioning network;
-- Server/fingerprint substitution;
-- tampering with or replay of bootstrap material;
-- accidental or stale bootstrap context.
-
-**It does not claim cryptographic remote attestation against a malicious/fully-compromised Endpoint capable of executing a counterfeit authenticated Agent or falsifying local platform state.** Providing that stronger property would require a separately justified hardware-backed attestation design (for example, measured boot or TPM-class functionality), which is **not** introduced as an M0 requirement — no such requirement is evidenced anywhere in the accepted M0 architecture.
-
-**This is a limitation of assurance, not permission to bypass Secure Boot.** Production Bamep still requires the trusted executable-bootstrap baseline from ADR-0010 in full; this mechanism supplements it with site-specific data authentication, it does not substitute for it.
-
-## Agent-integrity requirement
-
-**An authenticated Agent bootstrap report is meaningful only if the Agent code and the logic producing that report are themselves covered by the trusted maintenance-boot integrity boundary.** This is persisted as a production requirement: "Secure Boot enabled" does not automatically verify an arbitrary Bamep user-space Agent binary — the executable chain of trust (A) must extend to the specific code that generates and sends `BootstrapEvidence`, not stop short of it.
-
-The final Boot Adapter / maintenance-environment implementation must provide an authenticated path from the accepted boot chain to the Agent code/configuration that produces the bootstrap report. **The exact packaging mechanism is not selected here** — GRUB, a Unified Kernel Image (UKI), WinPE-specific packaging, an initramfs layout, or another mechanism all remain candidates, dependent on the eventual production boot implementation (Issue #8's still-unresolved network-delivered mechanism) and future Integration Environment validation. This requirement constrains that future work; it does not design it.
-
-## 5. Rotation, revocation, and recovery
-
-- **Legitimate Server TLS certificate/fingerprint rotation does not require site-trust-anchor rotation.** Once the Server begins using a new certificate, newly issued valid assertions contain the corresponding authenticated fingerprint, signed by the same still-valid trust-anchor key — no boot-media refresh or trust-anchor change is required for routine rotation.
-- **Operational overlap.** Currently-running boot contexts may finish under their already-established assertion; a new boot receives a new nonce and a new assertion reflecting current material. **No arbitrary time window is defined here without evidence** — exact overlap/transition duration is implementation-time.
-- **Signing/trust-anchor key rotation** follows the contract-level semantics accepted in "(B) Site trust-anchor provisioning" (ADR-0011): an authenticated rotation path under the existing paired key where possible; recovery from an unavailable/compromised key returns to an explicit operator verification ceremony. Concrete rotation protocol/UX remains implementation-time.
-- **Compromised/revoked bootstrap material or key** fails closed (see "Failure semantics"); revocation mechanics follow the same (B) contract-level semantics.
-- **No silent TOFU or multiple simultaneously-accepted unverified fingerprints** are introduced by rotation — exactly one authenticated fingerprint is accepted per successful bootstrap sequence.
-- **Server certificate identity is stable across ordinary Server restarts.** The production Server certificate/key identity must not be regenerated merely because the Server process restarted — doing so would change the leaf-certificate fingerprint (see "Bootstrap material" above) and invalidate every already-authenticated expected fingerprint, which is a rotation event, not routine operation. Exact certificate/key storage, configuration, and rotation mechanics remain implementation/deployment detail, not designed here. Test/Simulator environments may use ephemeral generated certificates precisely because their trusted-bootstrap fixture supplies the matching expected fingerprint for that test boot context (`docs/specifications/m0-simulator-contract-and-validation-strategy.md` "Simulator fidelity boundary") — this is not an exception to the production stability requirement, since production and fixture-driven trust are already distinct paths.
-
-## 6. Agent bootstrap sequence
+## Bootstrap sequence
 
 ```text
-1. Firmware Secure Boot verifies the executable boot chain (A, ADR-0010) up
-   through the trusted bootstrap stage and the Agent process launch
-   (subject to the Agent-integrity requirement above).
-2. The trusted bootstrap stage generates a `boot_nonce` and obtains a
-   signed bootstrap assertion through a transport that need not itself be
-   trusted (see "(C)").
-3. The assertion's signature and exact nonce binding are verified against
-   the site trust-anchor public key provisioned via the operator-verified
-   first-site-key pairing ceremony (ADR-0011), or, where a future optional
-   pre-provisioned mode is adopted, via MOK or direct UEFI db/PK enrollment.
-     - Verification failure → trusted bootstrap is NOT established locally
-       → go to "Failure semantics"; the sequence does not proceed to step 4.
-4. On successful local verification: the trusted-bootstrap fact becomes
-   `Established` for this boot session, locally, at the Agent.
-5. The Agent opens a WSS connection to the Server.
-6. The Agent verifies the Server's presented TLS certificate fingerprint
-   against the authenticated expected fingerprint from step 4 — unchanged
-   from `m0-agent-protocol-contract.md`.
-7. On fingerprint match: Agent Protocol authentication begins
-   (`AuthRequest`/`SessionEstablished`/`AuthError`), unchanged.
-8. On `SessionEstablished`: the authenticated Agent sends `BootstrapEvidence`
-   (`boot_nonce`, the assertion, `local_boot_trust: Established`).
-9. The Server independently verifies the assertion and correlates it to the
-   current boot context via `boot_nonce`; on success, the Server records
-   `trusted bootstrap = Established` for that boot context, making
-   destructive-operation precondition 7 satisfiable.
+1. The production executable trust chain reaches the trusted bootstrap stage and Agent.
+2. The bootstrap stage creates the current BootNonce and obtains the signed assertion.
+3. The Agent verifies assertion structure, accepted site key, signature, and exact nonce.
+4. Local trusted bootstrap becomes Established; the verified assertion supplies the WSS pin.
+5. The Agent opens WSS and verifies the presented leaf certificate against that pin.
+6. Agent Protocol credential authentication completes.
+7. After SessionEstablished, the Agent sends BootstrapEvidence.
+8. The Server independently verifies the evidence and exact current-boot correlation.
+9. Only then may Server-side trusted bootstrap become Established for that current boot.
 ```
 
-Steps 1–4 and 8–9 are defined by this Specification, with (B) accepted (ADR-0011) as the mechanism steps 2–4 and 9 depend on for how the verifying trust anchor was itself legitimately established. Steps 5–7 restate the already-accepted Agent Protocol handshake unchanged.
+Steps 5–7 use Agent Protocol semantics owned by `m0-agent-protocol-contract.md`.
 
-## 7. Failure semantics
+## Failure semantics
 
-- **Trusted bootstrap cannot be established locally** (Section 6 step 3): the Agent must not proceed to step 5, must not treat any received Server certificate as verified if it connects anyway, and must not proceed to Agent Protocol authentication. Fail-closed, no retry under a different trust assumption, no fallback, no TOFU.
-- **`BootstrapEvidence` is missing or its syntactically valid assertion is invalid-signature, nonce-mismatched, fingerprint-mismatched, or non-current** (Server-side, step 9): the Server-side fact remains `NotEstablished` for that boot context; destructive-operation precondition 7 cannot be satisfied. `SessionEstablished` is final credential authentication, not provisional pending evidence, so this does not affect the already-authenticated session or non-destructive operation. `NotEstablished` already exists before `SessionEstablished`; missing evidence therefore causes no timeout-driven mutation. A malformed post-handshake Agent Protocol frame/message is instead a protocol-shape/phase violation handled with the existing generic `ProtocolError`; assertion rejection produces no `AuthError`, acknowledgement, or evidence-specific rejection response and must not expose verification detail as an oracle.
-- **TLS fingerprint mismatch at the Agent Protocol layer** (step 6) remains exactly as already defined in `docs/specifications/m0-agent-protocol-contract.md`.
+- If local trusted-bootstrap verification fails, the Agent must not proceed to normal WSS/Agent
+  Protocol authentication under another trust assumption. No fallback and no TOFU.
+- A TLS fingerprint mismatch follows the Agent Protocol fail-closed contract.
+- Missing valid `BootstrapEvidence` leaves Server-side trusted bootstrap `NotEstablished`.
+  It does not undo already successful credential authentication and does not by itself block
+  permitted non-destructive activity.
+- `SessionEstablished` is final credential authentication, not a provisional state waiting for
+  trusted-bootstrap evidence.
+- Missing evidence causes no timeout-driven transition to `Established` or another inferred
+  trust state.
+- A malformed post-auth Agent Protocol message follows the generic protocol violation behavior
+  owned by the Agent Protocol Specification.
+- A syntactically valid but rejected assertion/evidence produces no `AuthError`, evidence-
+  specific acknowledgement, or detailed verification oracle; trusted bootstrap simply remains
+  `NotEstablished`.
+- Wrong signer, invalid signature, nonce mismatch/replay, fingerprint mismatch, revoked trust,
+  stale/historical boot, or failed current-boot revalidation all fail closed.
 
-## 8. Simulator contract
+Destructive execution remains governed by the complete gate in
+`m0-endpoint-identity-lifecycle.md`; this Specification does not duplicate that list.
 
-Consistent with the already-accepted Simulator fidelity boundary: the Simulated Agent uses the real Agent Protocol v1 WSS transport end-to-end, including the real `BootstrapEvidence` message; only the production boot chain (including this contract's boot-stage mechanics) is faked.
+## Simulator contract
 
-**Fixture semantics owned by this Specification** (the concrete fixture file/configuration technique remains implementation-time; assertion format is normative above):
+The Simulator uses real WSS, leaf-certificate pinning, Agent Protocol authentication, and
+`BootstrapEvidence`. It may fake only the physical production boot/pairing mechanism.
 
-- **Positive fixture:** a valid nonce-bound signed assertion (matching the Simulator's real test-Server TLS certificate, since the real WSS fingerprint check must genuinely succeed) **plus** an authenticated `BootstrapEvidence` report with `local_boot_trust: Established`, correctly bound to the fixture's `boot_nonce`.
-- **Negative variants**, each required: signature failure (assertion signed by an untrusted/wrong key); nonce mismatch/replay (assertion bound to a different `boot_nonce` than the one presented); absent evidence (`SessionEstablished` succeeds but no `BootstrapEvidence` is ever sent); and — consistent with the already-specified "Required trusted-bootstrap independence scenario" (`docs/specifications/m0-simulator-contract-and-validation-strategy.md`) — the case where all other six preconditions hold but this Server-side fact is never established.
-- **Structural local gate:** successful local cryptographic verification produces a
-  typed established result containing the `BootNonce`, authenticated
-  `ServerCertFingerprint`, and original signed assertion material. Only this result
-  naturally supplies the fingerprint used to invoke pinned WSS and the later evidence
-  material. Wrong signer, corrupted signature, and an assertion for an old/nonmatching
-  nonce fail before WSS. No ordinary Simulator path may substitute a boolean
-  `trusted = true`, unchecked constructor, or equivalent bypass.
-- **Key separation:** the fixture issuer owns the private Ed25519 signing key. The
-  Simulated Agent and its paired-trust state receive independently only accepted site
-  public key(s); neither they nor the established result contain or receive the
-  private key. WP1 assertion signing is fixture/test support, not a production Server
-  assertion-signing service or the real ADR-0011 pairing ceremony.
-- The Simulator does **not** claim to validate real firmware Secure Boot, real trust-anchor provisioning, or real Agent-integrity packaging — those remain Integration Environment concerns.
-- **The Simulator fixture necessarily represents only (A)+(B)+(C) local establishment plus the (D) reporting mechanism** — it cannot, and does not claim to, validate that a real production boot chain, or a real operator-verified pairing ceremony, would have genuinely produced that state; that gap is inherent to the assurance limitation already recorded in "M0 threat-model boundary," not introduced by the Simulator contract itself. (B) being accepted at the architecture level (ADR-0011) does not change this — the Simulator still fakes the mechanism, exactly as it already fakes real firmware Secure Boot.
+Required fixture semantics:
 
-`docs/specifications/m0-simulator-contract-and-validation-strategy.md` itself is not modified by this Work Package — no direct contradiction with it was found requiring amendment; the fixture semantics above are owned here and referenced from there via the already-existing required scenario.
+- **Positive:** valid nonce-bound assertion signed by the fixture site key, matching the real
+  test Server leaf certificate, plus authenticated `BootstrapEvidence` with
+  `local_boot_trust: Established` and the matching nonce.
+- **Wrong signer/signature:** rejected before normal WSS when local verification fails.
+- **Nonce mismatch/replay:** rejected; an assertion for another boot cannot establish this one.
+- **Absent evidence:** `SessionEstablished` may succeed, but Server-side trusted bootstrap stays
+  `NotEstablished`.
+- **Independent safety gate:** the scenario where all other six destructive preconditions hold
+  but trusted current bootstrap does not must remain denied.
+- **Structural gate:** the ordinary Simulator path obtains the WSS pin/evidence only from the
+  successful typed cryptographic-verification result; no unchecked trusted flag/bypass.
+- **Key separation:** fixture signing owns the Ed25519 private key; the Simulated Agent receives
+  only accepted site public key(s), never the signing key.
 
-## 9. Validation expectations
+The Simulator does not prove real Secure Boot, real operator pairing, firmware behavior, or real
+Agent-integrity packaging.
 
-Per `docs/development/testing.md` "Unit and domain tests": bootstrap-assertion parsing/schema validation as pure domain/contract logic; precondition-7 consumption tests already specified in `m0-job-lifecycle-and-scheduling.md` and `m0-endpoint-identity-lifecycle.md` are confirmed aligned, not redefined here.
+## Validation
 
-Per `docs/development/testing.md` "Contract tests": assertion signature verification — valid accepted; invalid/corrupted/wrong-signer rejected; nonce mismatch (replay) rejected; missing material handled explicitly. `BootstrapEvidence` contract tests are now specified directly in `docs/specifications/m0-agent-protocol-contract.md` "Validation expectations (contract tests)."
+Contract-specific validation must cover at least:
 
-Per general negative-case practice: Agent-side fail-closed verification (local, step 3) and Server-side fail-closed verification (step 9) are tested independently — a failure at either layer must not be masked by success at the other.
+- exact V1 transcript offsets, lengths, discriminator, schema version, and canonical carrier;
+- strict `BootNonce` parsing/canonicalization and fresh-boot semantics;
+- valid accepted-site-key assertion verification;
+- unknown/wrong signer and corrupted signature rejection;
+- nonce mismatch/replay rejection;
+- Server leaf-fingerprint mismatch rejection;
+- missing evidence preserving `NotEstablished`;
+- stale/historical boot evidence unable to establish the current boot;
+- repeated valid current-boot evidence remaining idempotent;
+- independent failure of local verification and Server-side verification;
+- Simulator positive/negative cases above.
 
-Per `docs/development/testing.md` "Simulator": the required trusted-bootstrap independence scenario plus the positive/negative fixture variants in Section 8.
+Real production Secure Boot, operator pairing, physical firmware behavior, and Agent-integrity
+packaging require Integration Environment validation according to
+`docs/development/testing.md`.
 
-Per `docs/development/testing.md` "Integration Environment": the real operator-verified site-key pairing ceremony (ADR-0011) — including whether an arbitrary previously-unprepared OEM Endpoint can complete it, and the physical-firmware behavior of any future optional MOK/db-PK pre-provisioned mode adopted — real Agent-integrity packaging, and real end-to-end Secure-Boot-backed production chain validation remain explicitly deferred.
+## Out of scope
 
-Per "Local development environments," domain/contract tests are expected to run in the Linux reference environment (WSL2 or containers from Windows).
+- concrete PXE/network bootstrap-delivery transport or bootloader selection;
+- production Secure Boot deployment/configuration and firmware enrollment tooling;
+- human-verifiable pairing representation/encoding/UX beyond its security requirement;
+- paired-key local storage format and concrete rotation/recovery UX/protocol;
+- cryptographic library/version;
+- exact material/key rotation overlap duration;
+- concrete Simulator fixture file/configuration technique;
+- concrete Agent-integrity packaging mechanism;
+- future confidential/pre-authorized enrollment-bootstrap extension;
+- hardware-backed remote attestation;
+- adopting MOK or direct UEFI `db`/PK as a supported optional mode.
 
-Manual: owner approval of this Specification — **given**; all four sub-problems ((A) restated, (B), (C), (D)) are accepted, per Issue #14's empirical evidence and ADR-0011.
+## Related
 
-## Architectural constraints (restated, unchanged)
-
-- ADR-0010 remains authoritative; not reopened.
-- ADR-0011 remains authoritative for site trust-anchor provisioning (B); not reopened.
-- ADR-0005 remains authoritative; WSS + pinned Server TLS authentication remains the Agent control-plane architecture; not reopened.
-- No TOFU; no acceptance of an unverified Server certificate, or an unverified site trust-anchor key, under any circumstance.
-- `CredentialActive` does not imply trusted bootstrap, locally or to the Server; trusted bootstrap does not imply `CredentialActive`.
-- Secure Boot mechanics stay behind the Boot Adapter boundary; Domain code does not inspect firmware state.
-- The network-delivered WinPE mechanism (Issue #8) remains separately unresolved and is not selected by this Work Package.
-- The seven destructive-operation preconditions are unchanged.
-- This contract does not become a general secrets, identity, or PKI platform.
-- No hardware-backed remote attestation (TPM/measured boot) is introduced as an M0 requirement.
-
-## Acceptance criteria
-
-An owner-approved Specification defines:
-
-1. the exact semantic meaning and scope of `trusted bootstrap established` — satisfied.
-2. the minimum authenticated bootstrap-material contract — satisfied.
-3. the mechanism by which the expected Server TLS fingerprint is cryptographically bound to trusted bootstrap — **satisfied and accepted**: nonce-bound signed bootstrap assertion.
-4. trust-anchor/key ownership sufficient for independent implementation — **satisfied and accepted**: operator-verified first-site-key pairing (ADR-0011), with MOK and direct UEFI `db`/PK enrollment recorded as validated optional future modes.
-5. rotation/revocation/recovery and fail-closed behavior — satisfied for (B), (C), and (D); the V1 assertion encoding is defined above, while delivery transport, paired-key local storage, and rotation/recovery mechanics remain implementation-time (see "Open questions").
-6. Agent bootstrap ordering before WSS/Agent Protocol authentication, and evidence reporting after — satisfied.
-7. how destructive-operation precondition 7 obtains its authoritative fact — **satisfied and accepted**: the authenticated Agent bootstrap report (`BootstrapEvidence`), with its assurance limitations explicit.
-8. Simulator fixture semantics and negative cases — satisfied.
-9. contract-test and Integration Environment validation expectations — satisfied.
-10. no remaining architectural decision required to implement this boundary is hidden inside a future implementation Work Package — **satisfied; no genuine architectural fork remains open in this Specification.**
-
-## Related ADRs
-
-- ADR-0010 remains authoritative for the Secure Boot/trusted-bootstrap baseline (A); not reopened.
-- **ADR-0011 — V1 site trust-anchor establishment and operator-verified first-key pairing (`Accepted`)** — the decision record for sub-problem (B), created alongside this amendment; restated, not redefined, here.
-- The accepted (C) nonce-assertion and (D) Server-evidence decisions remain recorded directly in this Specification, as scoped extensions of the already-Accepted ADR-0010 rather than new durable boundaries independent of it, per `docs/development/documentation-policy.md`'s ADR criteria.
-
-## Related work
-
-- Issue #13 — `[WP] Define trusted bootstrap and Server fingerprint delivery contract` — this Specification's approval blocker is now resolved.
-- Issue #14 / ADR-0011 — `[Spike] Validate site trust-anchor provisioning` (complete) and `docs/reference/site-trust-anchor-provisioning-spike.md` — empirical evidence for (B)'s accepted mechanism and the recorded optional future modes.
-- Issue #10 / ADR-0010 — `[Spike] Validate Secure Boot and hardened boot chain` (complete; origin of `trusted bootstrap established` and the Scenario 3 evidence (A) and (B) candidates were evaluated against).
-- Issue #3 / ADR-0005 / `m0-agent-protocol-contract.md` — WSS/pinned-TLS handshake; amended in an earlier round to add `BootstrapEvidence`, without reopening WSS, pinned TLS, `AuthRequest`, `SessionEstablished`, or ADR-0005.
-- Issue #2 / ADR-0004 / `m0-endpoint-identity-lifecycle.md` — destructive-operation precondition 7, and the operator-approval-gated Endpoint enrollment workflow the (B) pairing ceremony composes with as a distinct check.
-- Issue #4 / ADR-0006 / `m0-job-lifecycle-and-scheduling.md` — precondition-7 revalidation ordering; unchanged.
-- Issue #7 / `m0-simulator-contract-and-validation-strategy.md` — Simulator fidelity boundary and fixture-ownership split; not modified by this round.
-- Issue #1 / `m0-stack-and-boundaries-baseline.md` — Boot Port/Adapter boundary this contract's mechanics remain behind.
-
-## Open questions
-
-No genuine architectural fork remains open in this Specification. Remaining questions
-are implementation-time details, not architectural blockers:
-
-1. The concrete human-verifiable representation/encoding for the (B) pairing ceremony (fingerprint, short code, word-based, QR-assisted, or equivalent) — bound by ADR-0011's collision-resistance requirement, not selected here.
-2. The concrete transport used to deliver the candidate site public key to the Endpoint before a trust anchor exists (ADR-0011 step 2) — not selected here; follows the same "transport need not itself be trusted" framing already established for (C).
-3. Whether any new Agent Protocol message is genuinely required to support the pairing ceremony, versus the ceremony completing entirely before Agent Protocol authentication begins — not decided here; `BootstrapEvidence` (D) is unchanged. Any genuine need discovered during implementation must go through its own Specification/ADR treatment, not be introduced silently.
-4. Concrete local storage format, rotation protocol, and recovery UX for the paired site key — implementation-time, not decided here.
-5. Exact overlap/transition duration for material or key rotation; concrete Simulator
-   fixture file/configuration technique; concrete cryptographic library/version; and
-   the exact Agent-integrity packaging mechanism
-   (GRUB/UKI/WinPE-specific/initramfs), dependent on Issue #8's still-unresolved
-   network-delivery mechanism. The V1 assertion algorithm, transcript, and carriers
-   are no longer open.
-6. Whether MOK or direct UEFI `db`/PK enrollment is ever adopted as a supported optional pre-provisioned mode for managed fleets — a future decision, not made here (ADR-0011).
-
-Status: Approved.
+- ADR-0010 — Secure Boot and mechanism-independent trusted-bootstrap rationale.
+- ADR-0011 — operator-verified first-site-key pairing rationale.
+- `docs/specifications/m0-agent-protocol-contract.md` — WSS, TLS pinning, authentication, and
+  `BootstrapEvidence` wire contract.
+- `docs/specifications/m0-endpoint-identity-lifecycle.md` — authoritative current boot and
+  destructive-operation gate.
+- `docs/specifications/m0-persistence-observability-and-domain-events.md` — durable current-boot
+  and atomic mutation ordering.
+- `docs/specifications/m0-simulator-contract-and-validation-strategy.md` — generic Simulator
+  fidelity boundary.
+- `docs/specifications/m0-stack-and-boundaries-baseline.md` — Boot Port/Adapter boundary.
+- `docs/reference/secure-boot-hardened-chain-spike.md` — executable-chain evidence.
+- `docs/reference/site-trust-anchor-provisioning-spike.md` — site-trust provisioning evidence.
