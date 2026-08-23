@@ -150,3 +150,49 @@ CREATE TABLE endpoint_credential_lookups (
     PRIMARY KEY (endpoint_id, slot),
     UNIQUE (lookup_id)
 );
+
+CREATE TYPE job_state AS ENUM (
+    'Pending',
+    'Running',
+    'Cancelling',
+    'Succeeded',
+    'Failed',
+    'Cancelled'
+);
+
+CREATE TYPE job_step_state AS ENUM (
+    'Pending',
+    'PreconditionsSatisfied',
+    'Dispatching',
+    'Succeeded',
+    'Failed',
+    'Cancelled'
+);
+
+-- Durable Job: one workflow targeting one Endpoint
+-- (m0-job-lifecycle-and-scheduling.md "Domain model"). Issue #24 durably
+-- creates only rows in `Pending`; later Work Packages (#25-#28) own the
+-- remaining lifecycle transitions and whatever additional durable
+-- state/events/audit they require.
+CREATE TABLE jobs (
+    id UUID PRIMARY KEY,
+    endpoint_id UUID NOT NULL REFERENCES endpoints (id),
+    state job_state NOT NULL
+);
+
+CREATE INDEX idx_jobs_endpoint_id ON jobs (endpoint_id);
+
+-- Durable JobStep: one ordered linear stage of its owning Job. step_order is
+-- the explicit stable linear position the accepted linear-workflow baseline
+-- requires; the UNIQUE constraint protects that ordering durably.
+-- Branching/parallel/skip ordering is out of scope
+-- (m0-job-lifecycle-and-scheduling.md "Out of scope").
+CREATE TABLE job_steps (
+    id UUID PRIMARY KEY,
+    job_id UUID NOT NULL REFERENCES jobs (id),
+    step_order INTEGER NOT NULL CHECK (step_order >= 0),
+    state job_step_state NOT NULL,
+    UNIQUE (job_id, step_order)
+);
+
+CREATE INDEX idx_job_steps_job_id ON job_steps (job_id);

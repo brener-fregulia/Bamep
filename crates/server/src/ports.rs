@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use bamep_domain::presented_credential::{CredentialKind, CredentialLookupId};
 use bamep_domain::{
     BootContext, BootContextResolveError, EndpointAggregate, EndpointId, InvalidIdentityTransition,
-    InventoryRevision, InventorySnapshot, RedeemOutcome, TransitionOutcome,
+    InventoryRevision, InventorySnapshot, Job, JobId, RedeemOutcome, TransitionOutcome,
     TrustedBootstrapOutcome,
 };
 
@@ -99,6 +99,40 @@ pub trait InventoryRepository: Send + Sync {
         &self,
         endpoint_id: EndpointId,
     ) -> Result<Option<InventoryRevision>, EndpointUpdateError>;
+}
+
+/// Errors from [`JobRepository::create_workflow`]. Distinct from
+/// [`EndpointUpdateError`]: workflow creation never invokes a Domain
+/// transition decision closure on the Endpoint, it only verifies the target
+/// Endpoint's existence/state before persisting the already-constructed
+/// [`Job`].
+#[derive(Debug, thiserror::Error)]
+pub enum CreateWorkflowError {
+    #[error("endpoint {0:?} not found")]
+    EndpointNotFound(EndpointId),
+    #[error("endpoint {0:?} is not enrolled")]
+    EndpointNotEnrolled(EndpointId),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
+/// Durable Job/JobStep workflow persistence
+/// (`m0-job-lifecycle-and-scheduling.md` "Domain model"). Issue #24 stops at
+/// durable workflow creation; later Work Packages (#25-#28) extend this Port
+/// as they add scheduling/dispatch/reconciliation persistence.
+#[async_trait]
+pub trait JobRepository: Send + Sync {
+    /// Verifies `job.endpoint_id` is an existing `Enrolled` Endpoint, then
+    /// atomically persists `job` and every one of its `JobStep`s
+    /// (`m0-persistence-observability-and-domain-events.md` "Atomic
+    /// persistence"). Rejects and persists nothing — no partial Job or
+    /// JobStep row — when the target Endpoint does not exist or is not
+    /// `Enrolled`, or when persistence itself fails partway through.
+    async fn create_workflow(&self, job: &Job) -> Result<(), CreateWorkflowError>;
+
+    /// Read-only lookup of a persisted workflow and its ordered `JobStep`s,
+    /// for verification/reporting only.
+    async fn find_job(&self, id: JobId) -> Result<Option<Job>, RepositoryError>;
 }
 
 /// Persistence for newly issued `BootContext`s (ADR-0014 point 11

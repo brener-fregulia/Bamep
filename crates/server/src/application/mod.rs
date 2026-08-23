@@ -1,10 +1,11 @@
-//! Application layer: orchestrates Domain transitions against the
-//! `EndpointRepository`/`CredentialRedemptionRepository` Ports. Owns no
-//! business rules of its own — every decision about whether a transition is
-//! legal, and what it produces, comes from `bamep_domain`. This layer's job
-//! is sequencing (fetch, decide, one atomic commit) and translating Domain
-//! outcomes into results the Runtime Services (Agent Control Gateway,
-//! operator-approval harness) can act on.
+//! Application layer: orchestrates Domain transitions/constructions against
+//! the `EndpointRepository`/`CredentialRedemptionRepository`/`JobRepository`
+//! Ports. Owns no business rules of its own — every decision about whether a
+//! transition or construction is legal, and what it produces, comes from
+//! `bamep_domain`. This layer's job is sequencing (fetch, decide, one atomic
+//! commit) and translating Domain outcomes into results the Runtime Services
+//! (Agent Control Gateway, operator-approval harness, workflow-creation
+//! harness) can act on.
 
 use std::sync::Arc;
 
@@ -12,23 +13,28 @@ use bamep_agent_protocol::{BootstrapEvidenceMessage, InventoryReportMessage};
 use bamep_domain::credential::CredentialHash;
 use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_domain::{
-    transitions, Actor, BootContext, BootNonce, EndpointId, InvalidIdentityTransition,
-    InventoryRevision, InventorySnapshot, DEFAULT_CREDENTIAL_TTL,
+    transitions, Actor, BootContext, BootNonce, EmptyWorkflow, EndpointId,
+    InvalidIdentityTransition, InventoryRevision, InventorySnapshot, Job, DEFAULT_CREDENTIAL_TTL,
 };
 use bamep_trusted_bootstrap::{AcceptedSiteKeys, BootstrapAssertion, ServerCertFingerprint};
 use chrono::{DateTime, Duration, Utc};
 
 use crate::ports::{
-    BootContextRepository, CredentialRedemptionRepository, EndpointRepository, EndpointUpdateError,
-    InventoryRepository, RedemptionDecision, RedemptionTarget, RepositoryError,
+    BootContextRepository, CreateWorkflowError, CredentialRedemptionRepository, EndpointRepository,
+    EndpointUpdateError, InventoryRepository, JobRepository, RedemptionDecision, RedemptionTarget,
+    RepositoryError,
 };
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplicationError {
     #[error("endpoint {0:?} not found")]
     EndpointNotFound(EndpointId),
+    #[error("endpoint {0:?} is not enrolled")]
+    EndpointNotEnrolled(EndpointId),
     #[error(transparent)]
     InvalidTransition(#[from] InvalidIdentityTransition),
+    #[error(transparent)]
+    EmptyWorkflow(#[from] EmptyWorkflow),
     #[error(transparent)]
     Repository(#[from] RepositoryError),
 }
@@ -39,6 +45,18 @@ impl From<EndpointUpdateError> for ApplicationError {
             EndpointUpdateError::NotFound(id) => ApplicationError::EndpointNotFound(id),
             EndpointUpdateError::InvalidTransition(e) => ApplicationError::InvalidTransition(e),
             EndpointUpdateError::Repository(e) => ApplicationError::Repository(e),
+        }
+    }
+}
+
+impl From<CreateWorkflowError> for ApplicationError {
+    fn from(err: CreateWorkflowError) -> Self {
+        match err {
+            CreateWorkflowError::EndpointNotFound(id) => ApplicationError::EndpointNotFound(id),
+            CreateWorkflowError::EndpointNotEnrolled(id) => {
+                ApplicationError::EndpointNotEnrolled(id)
+            }
+            CreateWorkflowError::Repository(e) => ApplicationError::Repository(e),
         }
     }
 }
@@ -118,6 +136,42 @@ impl InventoryService {
             )
             .await
             .map_err(ApplicationError::from)
+    }
+}
+
+/// The internal Simulator/harness workflow-creation control path
+/// (`m1-simulated-vertical-slice-and-baseline-validation.md` RF-004; Issue
+/// #24 "durable workflow creation" boundary). Callers of
+/// [`create_workflow`](Self::create_workflow) must be structurally separate
+/// from Agent Protocol message handling — an in-process test/development
+/// harness, a future Simulator control path, or a CLI — mirroring
+/// [`EnrollmentService::approve_enrollment`]'s separation requirement. This
+/// is the only path through which Issue #24 creates a workflow; callers never
+/// insert `jobs`/`job_steps` rows directly.
+pub struct JobService<J: JobRepository> {
+    repo: Arc<J>,
+}
+
+impl<J: JobRepository> JobService<J> {
+    pub fn new(repo: Arc<J>) -> Self {
+        Self { repo }
+    }
+
+    /// Constructs one linear workflow of `step_count` ordered `JobStep`s
+    /// targeting `endpoint_id` (`bamep_domain::create_workflow`) and
+    /// atomically persists it. Rejects an empty workflow before any I/O, and
+    /// rejects a nonexistent or not-`Enrolled` target Endpoint without
+    /// persisting partial state (`crate::ports::JobRepository::create_workflow`).
+    /// Does not admit the Job into `Running`, evaluate JobStep preconditions,
+    /// acquire leases, or create an Attempt — those belong to #25.
+    pub async fn create_workflow(
+        &self,
+        endpoint_id: EndpointId,
+        step_count: usize,
+    ) -> Result<Job, ApplicationError> {
+        let job = bamep_domain::create_workflow(endpoint_id, step_count)?;
+        self.repo.create_workflow(&job).await?;
+        Ok(job)
     }
 }
 

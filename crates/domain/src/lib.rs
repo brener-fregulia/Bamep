@@ -15,6 +15,7 @@ pub mod endpoint;
 pub mod events;
 pub mod identity;
 pub mod inventory;
+pub mod job;
 pub mod presented_credential;
 pub mod transitions;
 
@@ -28,5 +29,8 @@ pub use identity::{IdentityState, InvalidIdentityTransition};
 pub use inventory::{
     record_inventory_on_change, InventoryRevision, InventoryRevisionChange, InventoryRevisionId,
     InventorySnapshot,
+};
+pub use job::{
+    create_workflow, EmptyWorkflow, Job, JobId, JobState, JobStep, JobStepId, JobStepState,
 };
 pub use transitions::{RedeemOutcome, TrustedBootstrapOutcome};

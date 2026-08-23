@@ -12,7 +12,7 @@ Bamep currently has five Rust crates:
 | --- | --- |
 | `bamep-trusted-bootstrap` | Trusted-bootstrap primitives, assertion parsing/transcript, and verification |
 | `bamep-agent-protocol` | Rust wire model/codec for the implemented Agent Protocol v1 slice |
-| `bamep-domain` | Pure Endpoint identity, boot-context, trusted-bootstrap, and runtime-credential business logic |
+| `bamep-domain` | Pure Endpoint identity, boot-context, trusted-bootstrap, runtime-credential, and Job/JobStep workflow business logic |
 | `bamep-server` | Application services, Ports, PostgreSQL/transport Adapters, and Agent session handling |
 | `bamep-simulator` | Simulated Agent participant using real trusted-bootstrap and WSS/Agent Protocol boundaries |
 
@@ -56,6 +56,16 @@ The current Simulator/Server slice:
 Production boot-chain inputs are still represented by Simulator fixtures where the physical
 Integration Environment is not implemented. The WSS and Agent Protocol boundary itself is
 not replaced by an in-process fake.
+
+## Implemented internal workflow-creation path
+
+A structurally separate internal Application control path
+(`bamep_server::application::JobService::create_workflow`, exercised directly by tests today)
+creates one durable `Pending` Job with one or more ordered `Pending` JobSteps for an existing
+`Enrolled` Endpoint, atomically, through the `JobRepository` Port and its PostgreSQL Adapter.
+This path never runs through Agent Protocol message handling. It stops at durable creation:
+admission into `Running`, scheduling, resource leases, dispatch authorization, and Attempt
+creation are not yet implemented.
 
 ## Maintenance rule
 
