@@ -4,387 +4,206 @@ Status: Accepted
 
 ## Context
 
-During M0, Bamep required an architectural model for durable workflow execution and
-resource-aware scheduling before implementation could begin.
+Bamep needs a durable workflow model that can survive disconnect/restart, represent repeated
+execution safely, and schedule constrained resources without reducing capacity to one global
+concurrency number.
 
-Issue #4 (`[WP] Define Job lifecycle and scheduling model`) had to resolve several related
-questions:
+ADR-0005 defines the Agent Protocol retry mechanism; this ADR defines the workflow model and
+the conditions under which another execution attempt may exist.
 
-- how an overall provisioning/recovery workflow is represented;
-- how repeated execution of one workflow stage is represented;
-- how uncertain execution after disconnect or restart is represented;
-- how endpoint exclusivity and other constrained resources are arbitrated;
-- how retry policy composes with Agent Protocol retry mechanics;
-- what workflow/scheduler authorization means for destructive dispatch.
-
-Earlier decisions had deliberately left parts of this open:
-
-- ADR-0004 required an authorized Job/action as one destructive-operation precondition but
-  did not define that authorization;
-- ADR-0005 defined the Agent Protocol retry **mechanism** using a fresh `action_id`, but did
-  not define when a retry is safe or permitted.
-
-The owner review of the original model also identified important corrections:
-
-- endpoint exclusivity must be Job-scoped rather than Attempt-scoped;
-- time-sensitive dispatch preconditions must be revalidated immediately before durable
-  dispatch commitment;
-- uncertain execution needs an explicit terminal `Indeterminate` outcome;
-- cancellation needs a non-terminal `Cancelling` state rather than assuming that a
-  cancellation request proves execution stopped;
-- Agent Protocol action states and Server workflow states must remain distinct models.
-
-The original ADR contained detailed state tables and destructive-precondition enumeration.
-Those normative details are now owned by
-`docs/specifications/m0-job-lifecycle-and-scheduling.md` and related Specifications.
-
-This ADR preserves **why the model was selected**.
+Normative lifecycle states, transitions, destructive preconditions, reconciliation details,
+and cancellation semantics belong to
+`docs/specifications/m0-job-lifecycle-and-scheduling.md`.
 
 ## Decision
 
 ### Three-tier workflow model
 
-Bamep models durable workflow execution using three distinct concepts:
+Bamep models:
 
-- **Job** — the overall workflow targeting one Endpoint;
+- **Job** — one overall workflow targeting an Endpoint;
 - **JobStep** — one ordered stage of that workflow;
-- **Attempt** — one concrete execution attempt of a JobStep.
+- **Attempt** — one concrete execution of a JobStep.
 
-An Attempt corresponds to one Agent Protocol `action_id` lifecycle.
+One Attempt corresponds to one Agent Protocol `action_id` lifecycle. A retry creates a new
+Attempt with a fresh action identity and explicit lineage to the prior execution.
 
-A retry is therefore not mutation or reuse of an earlier Attempt. It creates a new Attempt
-with a fresh action identity while retaining explicit correlation to the previous
-execution.
+This keeps retry/reconciliation history durable and separates workflow-stage state from
+individual execution outcomes.
 
-This separation is required because JobStep lifecycle and execution-attempt lifecycle have
-different semantics:
+### Linear baseline workflow
 
-- one JobStep may require more than one execution attempt;
-- an individual Attempt may be rejected, fail, be cancelled, or become uncertain without
-  necessarily defining the final JobStep outcome;
-- retry and reconciliation history must remain durable and auditable.
+The baseline Job is an ordered linear sequence of JobSteps.
 
-The exact state machines and transitions are normative in
-`docs/specifications/m0-job-lifecycle-and-scheduling.md`.
+Branching, parallel JobSteps, partial-success, and skip semantics require explicit future
+design.
 
-### Linear JobStep sequence for the baseline
+### Job-scoped Endpoint exclusivity
 
-The baseline uses an ordered linear sequence of JobSteps.
+Endpoint exclusivity belongs to the Job, not an individual JobStep or Attempt.
 
-A DAG or branching workflow model is not part of this decision because no M0 requirement
-required parallel or branching JobSteps within one Job.
+Once a Job is active, another Job must not interleave work against the same Endpoint.
 
-A future requirement for branching, parallel JobSteps, partial completion, or skip
-semantics must be introduced explicitly rather than inferred from this model.
+The lease remains held across JobStep boundaries, retries, cancellation handling, and
+reconciliation uncertainty until the Job is genuinely terminal.
 
-### Job-scoped endpoint exclusivity
+### Attempt-scoped technical resource leases
 
-Endpoint exclusivity is owned by the **Job**, not by an individual JobStep or Attempt.
-
-Once a Job is admitted to active execution, another active Job must not interleave work
-against the same Endpoint.
-
-This scope was selected because:
-
-- the baseline does not require two active Jobs to interleave against one Endpoint;
-- Job-scoped ownership is simpler than repeatedly releasing and reacquiring exclusivity
-  between JobSteps or Attempts;
-- retaining exclusivity across retries and reconciliation provides the safer boundary while
-  execution outcome may still be uncertain.
-
-Scheduler admission therefore arbitrates the endpoint-exclusivity lease.
-
-The exact Job states, acquisition/release transitions, and queuing behavior belong to the
-Job lifecycle Specification.
-
-### Attempt-scoped constrained-resource leases
-
-Resources other than endpoint exclusivity may be scoped to individual Attempts.
-
-Examples include:
+Other constrained resources may be acquired per Attempt, including:
 
 - network capacity;
 - storage read/write capacity;
 - CPU/Worker capacity;
 - future constrained technical resources.
 
-This separates long-lived endpoint ownership from resources that only need to be consumed
-while a concrete execution attempt requires them.
+This keeps long-lived Endpoint ownership separate from resources needed only for one
+execution.
 
-The resource model is extensible. This ADR does not select a fairness algorithm, lease
-ordering algorithm, priority model, or fixed global concurrency limit.
+Fairness, priority, lease ordering, and exact capacity numbers are not selected here.
 
-### Resource-aware scheduling instead of one global concurrency number
+### Resource-aware scheduling
 
-Bamep does not model scheduling as one fixed global number of concurrent endpoints.
+Bamep does not use one fixed global concurrency limit as its scheduling model.
 
-Different operations consume different constrained resources. A JobStep/Attempt therefore
-competes for the technical leases required by that operation rather than only for a single
-repository-wide concurrency slot.
+Different work consumes different resources, so admission/dispatch competes for the leases
+required by that operation.
 
-A later capacity policy may constrain admission through this resource model without
-changing the core decision recorded here.
+Capacity policy may evolve without changing the Job/JobStep/Attempt model.
 
-### Workflow/scheduler authorization is one independent gate
+### Workflow authorization is one independent gate
 
-Workflow/scheduler authorization is a distinct decision produced by Job lifecycle and
-resource arbitration.
+Workflow/scheduler authorization answers whether the current Job/JobStep is allowed to
+create and dispatch an Attempt at that point in time.
 
-It answers whether the current workflow is allowed to create and dispatch an Attempt at
-that point in time.
+It is one independent dispatch condition, not a synonym for the complete destructive-safety
+gate.
 
-It is **not** a synonym for the entire destructive-operation safety gate and must not be
-defined recursively in terms of that full gate.
+The exact normative conditions belong to the Job lifecycle Specification.
 
-The precise workflow/scheduler authorization conditions are normative in
-`docs/specifications/m0-job-lifecycle-and-scheduling.md`.
+### Revalidate immediately before durable dispatch commitment
 
-### Destructive dispatch consumes the complete normative safety gate
+Earlier eligibility is not sufficient.
 
-This ADR does not own the list of destructive-operation preconditions.
+Time-sensitive preconditions and workflow authorization are revalidated at the final
+pre-dispatch boundary before the durable dispatch commitment is created.
 
-A destructive Attempt may be committed for dispatch only when the **complete current
-normative precondition set** defined by the applicable Specifications holds.
+If revalidation fails, no Attempt/dispatch commitment is created and no action is sent.
 
-The current Job lifecycle Specification composes the seven independent destructive
-preconditions defined by the Endpoint identity/trust baseline, including trusted current
-bootstrap context.
+Persist-before-send ordering is owned by
+`m0-persistence-observability-and-domain-events.md`.
 
-The original ADR text enumerated an older six-item set. That enumeration is intentionally
-removed here so the ADR cannot compete with the normative Specification as the safety
-contract evolves.
+### Destructive dispatch uses the complete current safety contract
 
-No destructive precondition may be inferred from another.
+This ADR does not enumerate destructive-operation preconditions.
 
-### Revalidation immediately before durable dispatch commitment
+A destructive Attempt may be committed only when the complete current normative gate in the
+Endpoint/Job Specifications holds.
 
-Preliminary JobStep eligibility is not sufficient authorization to dispatch.
+No precondition may be inferred from another.
 
-Time-sensitive conditions and workflow/scheduler authorization must be evaluated at the
-final pre-dispatch boundary required by the Job lifecycle Specification.
+### Attempt is Server-side execution interpretation
 
-This revalidation gates creation of the durable dispatch commitment.
+Attempt state is a durable Server Domain concept, not a copy of Agent Protocol local action
+states.
 
-The ordering is important because:
-
-- leases or authoritative state may change after an earlier eligibility check;
-- a stale eligibility result must never authorize destructive work;
-- persistence and network transmission cannot be one atomic operation.
-
-The current persistence baseline requires the dispatch commitment to be durably persisted
-before the Server attempts delivery to the Agent. Current authority for those persistence
-invariants is ADR-0013 and the persistence Specification.
-
-### Attempt is the Server-side interpretation of execution
-
-Attempt state is a Server-side durable workflow model.
-
-It is not a 1:1 copy of the Agent Protocol's local action-state vocabulary.
-
-The Agent Protocol communicates execution evidence; the Job lifecycle translates that
-evidence into durable workflow state according to its normative Specification.
-
-This separation allows the protocol and Domain model to evolve at their appropriate
-boundaries without requiring identical state machines.
+Agent Protocol supplies execution evidence; the Job lifecycle maps that evidence into
+durable Attempt state.
 
 ### Uncertain execution is first-class
 
-Loss of acknowledgement, connection loss, Agent restart, or Server restart can make the
-actual outcome of an Attempt uncertain.
+Disconnect, timeout, Agent restart, or Server restart may leave execution outcome unknown.
 
 The model therefore distinguishes:
 
-- an Attempt that is still awaiting reconciliation;
-- a terminal `Indeterminate` Attempt whose real execution outcome cannot be established.
+- execution still awaiting reconciliation;
+- terminal `Indeterminate`, meaning the real outcome cannot be established.
 
-`Indeterminate` must never mean:
+`Indeterminate` means neither success, failure, cancellation, nor proof that execution never
+occurred.
 
-- success;
-- failure;
-- cancellation;
-- proof that the action never executed.
-
-Closing uncertainty as `Indeterminate` requires the explicit reconciliation semantics
-defined by the Job lifecycle Specification.
-
-This distinction is especially important for destructive work, where assuming
-"not executed" could lead to unsafe duplicate execution.
+This prevents uncertainty from being converted into unsafe duplicate execution.
 
 ### Destructive work is never blindly retried
 
-ADR-0005 provides the protocol mechanism for a retry: a new action identity correlated to
-the previous one.
+A fresh `action_id` is a protocol mechanism, not authorization to retry.
 
-This ADR establishes that the existence of that mechanism does not authorize its use.
+Destructive JobSteps have no generic automatic-retry path. Another destructive Attempt
+requires the explicit workflow/operator authorization defined by the Job lifecycle
+Specification.
 
-Destructive JobSteps have no generic automatic-retry path.
+Timeout, reconnect, restart, `Unknown`, or `Indeterminate` never imply permission to
+redispatch destructive work.
 
-A subsequent destructive Attempt after failure or indeterminate execution requires the
-explicit authorization semantics defined by the Job lifecycle Specification.
+### Cancellation intent is not execution outcome
 
-Reconnect, timeout, Server restart, Agent restart, `Unknown`, or `Indeterminate` must never
-be treated as implicit permission to redispatch destructive work.
+Requesting cancellation does not prove that execution stopped.
 
-### Cancellation represents intent separately from outcome
+The Job therefore has a non-terminal `Cancelling` condition while active or uncertain work
+is resolved.
 
-Requesting cancellation does not prove execution stopped.
-
-The Job model therefore includes a non-terminal `Cancelling` state while active or
-uncertain execution is resolved.
-
-This prevents Bamep from:
-
-- reporting cancellation prematurely;
-- releasing endpoint exclusivity while execution may still exist;
-- starting another Job or Attempt based on an unproven stopped state.
-
-The detailed `CancelAction` / `CancelAck` / reconciliation transitions belong to the Job
-lifecycle and Agent Protocol Specifications.
+Endpoint exclusivity is not released and replacement work is not started merely because a
+cancel request was issued.
 
 ## Alternatives considered
 
-### Two-tier model without Attempt
+### Two-tier Job/JobStep model
 
-Rejected.
+Rejected. Repeated executions would require mutable/ad-hoc history instead of one durable
+record per concrete Attempt.
 
-Representing repeated execution directly on JobStep would require ad hoc fields or mutable
-history to distinguish multiple dispatches.
+### DAG/branching baseline
 
-A first-class Attempt provides:
+Rejected because no accepted baseline requirement needs branching or parallel JobSteps.
 
-- one durable record per concrete execution;
-- direct correlation to one `action_id`;
-- explicit retry lineage;
-- independent reconciliation and terminal outcome.
+### Fixed global concurrency limit
 
-### DAG or branching workflow baseline
+Rejected because Endpoint exclusivity, network, storage, and Worker/CPU capacity are
+independent constraints.
 
-Rejected for M0.
+### Attempt- or JobStep-scoped Endpoint exclusivity
 
-No accepted requirement required branching or parallel JobSteps inside one Job.
+Rejected after owner review. It would allow two Jobs to interleave against one Endpoint
+between steps/retries despite no requirement for that behavior.
 
-A linear sequence was the smallest model that satisfied the workflow requirements.
+### Treat protocol `Unknown` as a final workflow result
 
-### One fixed global concurrency limit
+Rejected. Protocol uncertainty needs workflow-level reconciliation and cannot safely imply
+"not executed", failure, or retryability.
 
-Rejected.
+### Immediate `Cancelled` on cancel request
 
-A single number cannot represent endpoint exclusivity, network, storage, Worker/CPU, and
-other independently constrained resources.
+Rejected because the request expresses intent, not proof that execution stopped.
 
-Resource leases provide a model that can express those constraints without prematurely
-choosing a complex scheduling algorithm.
+### Generic destructive retry
 
-### Attempt- or JobStep-scoped endpoint exclusivity
-
-Rejected after owner review.
-
-Releasing endpoint ownership between Attempts or JobSteps would allow interleaving of two
-Jobs against one Endpoint even though the baseline had no requirement for that behavior.
-
-Job-scoped exclusivity is both simpler and safer for the accepted workflow model.
-
-### Treat protocol `Unknown` as an automatic final interpretation
-
-Rejected.
-
-Protocol uncertainty requires workflow-level judgment.
-
-Automatically mapping one unknown report to "not executed", retryable failure, or even
-immediate `Indeterminate` would collapse distinct safety-relevant states.
-
-### Immediate Job `Cancelled` on cancellation request
-
-Rejected.
-
-A cancellation request is intent, not execution evidence.
-
-The explicit `Cancelling` state preserves this distinction until active or uncertain work
-has been resolved.
-
-### Generic automatic retry for destructive JobSteps
-
-Rejected.
-
-Even a nominally gated generic retry path creates an unsafe default for operations whose
-previous execution may have partially or fully occurred.
-
-Destructive retry must remain an explicit workflow decision rather than a generic transport
-or scheduler policy.
+Rejected because the previous execution may have partially or fully occurred.
 
 ## Consequences
 
 - Job, JobStep, and Attempt are durable Domain concepts.
-- Attempt history must survive Server restart sufficiently to support reconciliation.
-- Endpoint exclusivity is arbitrated at Job admission and remains held while the Job is
-  active or cancellation/reconciliation uncertainty still exists.
-- Attempt-scoped resource leases are separate from Job-scoped endpoint exclusivity.
-- Scheduler/resource policy can evolve without collapsing the lifecycle model into a fixed
-  global concurrency number.
-- Dispatch commitment must respect the current persistence contract and persist-before-send
+- Attempt/retry history survives restart sufficiently for reconciliation.
+- Endpoint exclusivity is Job-scoped.
+- Technical resource leases are independently Attempt-scoped.
+- Scheduling remains resource-aware rather than one global concurrency value.
+- Dispatch requires final revalidation and the persistence contract's persist-before-send
   ordering.
-- Uncertain execution must remain explicit rather than being silently mapped to failure,
-  success, or non-execution.
-- Destructive work cannot inherit a generic automatic-retry policy.
-- Data-plane JobSteps must fit the same JobStep/Attempt and reconciliation model; their
-  transfer-specific contract remains separate.
-- Simulator validation must be able to exercise reconciliation, `Indeterminate`,
-  cancellation, and endpoint-exclusivity contention through the normative contract.
-- Future branching workflows, partial-failure/skip semantics, or materially different
-  scheduling semantics require explicit approved design work.
+- Execution uncertainty remains explicit through reconciliation/`Indeterminate`.
+- Destructive work cannot inherit a generic retry policy.
+- Cancellation cannot release exclusivity or start replacement work before execution state
+  is resolved.
+- Data-plane work uses the same JobStep/Attempt model; transfer semantics remain in the
+  data-plane Specification.
 
-## Authority boundary
+## Related
 
-This ADR owns the **decision rationale** for:
-
-- the Job/JobStep/Attempt split;
-- linear baseline workflow shape;
-- Job-scoped endpoint exclusivity;
-- Attempt-scoped technical resource leases;
-- resource-aware scheduling;
-- explicit uncertainty and `Indeterminate`;
-- non-terminal cancellation;
-- prohibition on generic destructive retry.
-
-It does **not** own:
-
-- the exact lifecycle state tables or transitions;
-- the current destructive-precondition list;
-- Agent Protocol wire messages;
-- persistence transaction details;
-- data-plane transfer semantics;
-- Simulator scenario requirements.
-
-Those are owned by their Specifications.
-
-## Current implementation relationship
-
-Issue #18 (`[WP] Execute durable Job lifecycle, scheduling, and safe action dispatch`) is
-the current M1 implementation Work Package for this model.
-
-The current repository does not yet make completion of that Work Package implicit merely
-because this ADR is Accepted.
-
-`docs/architecture/README.md` remains authoritative for what is actually implemented.
-
-## Related specifications and decisions
-
-- `docs/specifications/m0-job-lifecycle-and-scheduling.md` — normative Job/JobStep/Attempt
-  lifecycle, scheduling, reconciliation, and destructive-dispatch composition.
-- `docs/specifications/m0-endpoint-identity-lifecycle.md` — normative Endpoint/trust safety
-  preconditions consumed by destructive dispatch.
-- `docs/specifications/m0-agent-protocol-contract.md` — action identity, status,
-  acknowledgement, cancellation, and retry/reconciliation wire contract.
-- `docs/specifications/m0-persistence-observability-and-domain-events.md` — durable workflow,
-  event, audit, and persistence semantics.
-- ADR-0004 — Endpoint identity/enrollment decision history.
-- ADR-0005 — Agent control-plane and typed-action decision history.
-- ADR-0013 — current PostgreSQL persistence baseline and carried-forward persistence
-  invariants.
-
-## Related work
-
-- Issue #4 — historical M0 Work Package that produced this decision and the normative Job
-  lifecycle Specification.
-- Issue #18 — current M1 Work Package implementing and validating the durable Job lifecycle,
-  scheduling, reconciliation, and complete destructive-dispatch gate.
+- `docs/specifications/m0-job-lifecycle-and-scheduling.md` — normative lifecycle,
+  scheduling, reconciliation, cancellation, and dispatch contract.
+- `docs/specifications/m0-endpoint-identity-lifecycle.md` — Endpoint/trust safety
+  preconditions.
+- `docs/specifications/m0-agent-protocol-contract.md` — action/status/cancellation wire
+  contract.
+- `docs/specifications/m0-persistence-observability-and-domain-events.md` — durability and
+  persist-before-send.
+- ADR-0004 — Endpoint identity decision.
+- ADR-0005 — Agent Protocol/action decision.
+- Issue #18 — current M1 implementation Work Package.
