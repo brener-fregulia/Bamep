@@ -4,80 +4,355 @@ Status: Accepted
 
 ## Context
 
-M0 requires resolving Endpoint identity and the enrollment/trust bootstrap (`docs/discovery/adr-triage.md` candidate 2; `docs/specifications/m0-architecture-baseline.md` scope item "Endpoint identity"; `docs/discovery/architecture-redesign.md` "Endpoint identity", "Security invariants"; `AGENTS.md` Safety section). Issue #2 executes this Work Package.
+During M0, Bamep needed a durable Endpoint identity model before destructive workflow,
+Agent authentication, persistence, and data-plane contracts could safely depend on
+Endpoint trust.
 
-Endpoint identity must survive NIC or MAC replacement (architecture-redesign.md "Endpoint identity"). Architecture-redesign.md proposes a direction "to evaluate through ADR": a Boot Orchestrator issues a short-lived enrollment context/credential, the Agent authenticates the Server, the Agent redeems the short-lived credential, a runtime Agent identity/session credential is established, and MAC addresses/hardware fingerprints remain inventory signals rather than trust anchors.
+Issue #2 (`[WP] Define endpoint identity and trust model`) established the decision
+requirements:
 
-The provisioning LAN is controlled but not inherently trustworthy (architecture-redesign.md "Security invariants"). MAC addresses are explicitly not authentication or permanent identity — this is a mandatory repository-wide rule (`AGENTS.md`), not something this ADR can weaken.
+- Endpoint identity must survive NIC or MAC replacement;
+- MAC addresses and other hardware fingerprints must remain evidence, never authentication
+  or permanent identity;
+- first enrollment must establish trust explicitly rather than treating provisioning-LAN
+  reachability as proof of identity;
+- reconnect must not blindly restore trust from a matching MAC or hardware signal;
+- later destructive-operation contracts need an explicit identity/trust precondition they
+  can consume.
+
+The provisioning LAN is controlled operationally but is not itself a trust anchor.
+
+The original ADR referenced M0 Discovery documents that have since been reduced or retired
+after their durable conclusions were promoted. Issue #2 and Git history preserve that
+planning history.
+
+This ADR preserves **why the identity and first-enrollment model was selected**.
+
+The normative lifecycle, credential, hardware-confidence, current-boot, and destructive-
+authorization semantics are owned by
+`docs/specifications/m0-endpoint-identity-lifecycle.md`.
 
 ## Decision
 
-Durable Endpoint identity is a Server-assigned identifier, independent of any hardware attribute. Inventory signals (MAC, disk fingerprint, hardware serials/DMI data when available) are evidence attached to an Endpoint identity record; they are never the identity itself.
+### Durable Endpoint identity is Server-assigned
 
-Evaluating the proposed enrollment/trust bootstrap direction:
+A Bamep Endpoint has a durable Server-assigned identifier.
 
-1. A booting endpoint reaches the Boot Orchestrator over the provisioning network — a position of some trust, since it received a lease and a boot artifact from Bamep's own controlled boot chain, but not proof of identity.
-2. The Boot Orchestrator issues a short-lived enrollment credential scoped to that specific boot attempt, not to a MAC address.
-3. The Agent authenticates the Server before presenting any credential. This ADR states the requirement only; the concrete mutual-authentication mechanism belongs to the Agent control-protocol Work Package (Issue #3) and is not decided here.
-4. The Agent redeems the short-lived enrollment credential with the Server.
-5. Redemption resolves to one of two outcomes depending on whether the endpoint's inventory signals match a known, previously enrolled Endpoint record:
-   - **First-seen endpoint**: no existing match. The Endpoint enters `PendingEnrollment` and requires explicit operator approval before it is trusted (see "Decision: operator-approval-gated first enrollment" below).
-   - **Reconnecting known (`Enrolled`) endpoint**: inventory signals match a known Endpoint, but the match alone must never authorize reuse of a previous runtime credential; a fresh runtime credential is issued through the same redemption flow (see "Reconnect handling"), without re-running operator approval, since the Endpoint's trusted identity already persists.
-6. On successful redemption, the Server issues a runtime Agent identity/session credential scoped to the Endpoint's durable identity, with an expiry/renewal policy (exact TTL is an implementation-time detail, not an M0 architectural question).
+That identifier is independent from:
 
-No concrete architectural blocker was identified in this direction for Bamep's V1 threat model and installation profiles (3–24 endpoints, single Server, controlled LAN).
+- MAC address;
+- NIC identity;
+- disk fingerprint;
+- DMI/SMBIOS data;
+- hardware serial numbers;
+- IP address;
+- current network connection.
 
-## Decision: operator-approval-gated first enrollment
+Hardware and network observations may support continuity/confidence decisions, but none is
+the Endpoint identity itself.
 
-First-time Endpoint enrollment requires explicit operator approval by default. A newly observed device on the provisioning network must not automatically become a trusted Endpoint merely because it can reach the Bamep Server — auto-trust is rejected as the M0 default. The provisioning LAN is explicitly "controlled but not inherently trustworthy," and destructive operations later depend on Endpoint identity as a trust anchor; auto-trusting any device that can reach the network for PXE boot would extend trust further than the stated threat model supports.
+This separation is required because legitimate lifecycle changes can replace individual
+hardware components without turning the machine into a new logical Endpoint.
 
-MAC addresses and hardware fingerprints remain inventory/confidence signals, not trust anchors, at every stage of this decision (unchanged from the original evaluation).
+### Hardware signals are evidence, not trust anchors
 
-Once an Endpoint has been explicitly enrolled, normal reconnects, reboots, and credential renewal must not require repeated operator approval when continuity of the trusted identity can be established (see "Reconnect handling" below and the continuity rule in `docs/specifications/m0-endpoint-identity-lifecycle.md`). Operator approval is a first-enrollment gate, not a recurring tax on legitimate, already-trusted Endpoints.
+Observed hardware attributes are attached to the Endpoint as evidence.
 
-Significant hardware changes on an already-enrolled Endpoint may lower identity confidence and require operator review, without necessarily un-enrolling the Endpoint or blocking reconnect/renewal outright — but destructive execution against that Endpoint is blocked until the confidence issue is resolved. The exact confidence model (a graduated `LoweredConfidence`/`Conflict` distinction, not a binary stale flag) and the precise blocking rules are defined in `docs/specifications/m0-endpoint-identity-lifecycle.md`, since they are state-model concerns rather than an enrollment-mechanism decision.
+They may contribute to:
 
-**Future, not required in M0**: pre-authorized enrollment, where an operator explicitly authorizes an enrollment context/token before an endpoint's first connection, may be supported later. This is an enrollment-authorization mechanism, not an Endpoint identity state — it must not be modeled as part of the Endpoint identity lifecycle (see `docs/specifications/m0-endpoint-identity-lifecycle.md`). It must not be treated as, or implemented as, unrestricted automatic enrollment — the explicit operator action is simply performed before rather than after first contact. Its mechanism is not designed by this ADR.
+- inventory;
+- continuity assessment;
+- hardware-confidence evaluation;
+- target-disk revalidation.
 
-## Destructive-operation authorization preconditions
+They must not be used as a substitute for authenticated Endpoint/session state.
 
-Once an Endpoint identity exists, any destructive operation targeting it must validate, immediately before execution, all of the following **independent** preconditions — trusted persistent Endpoint identity, an authenticated current Agent session, an authorized Job/action, sufficiently fresh inventory, target disk identity/fingerprint revalidation, and hardware confidence being sufficiently trusted (`Consistent` — both a `LoweredConfidence` and a `Conflict` state block destructive execution until resolved). None of these may be inferred from another, and in particular an `Enrolled` identity alone is never sufficient authorization on its own.
+In particular:
 
-The full precondition list, the state dimensions it depends on, and which Work Package owns each dimension are defined in `docs/specifications/m0-endpoint-identity-lifecycle.md` (this ADR does not duplicate that detail). It is available now for the Job lifecycle (Issue #4) and data-plane (Issue #6) Work Packages to reference directly rather than re-derive.
+- a matching MAC does not authenticate an Agent;
+- a matching disk fingerprint does not establish Endpoint identity by itself;
+- a changed MAC/NIC does not automatically create a new Endpoint;
+- hardware divergence must not be silently accepted by rewriting stored identity evidence.
 
-## Hardware-change handling
+The exact hardware-confidence states, transitions, and destructive-use rules belong to the
+Endpoint identity Specification.
 
-When an Endpoint's observed inventory signals (MAC, disk fingerprint, etc.) no longer match its previously recorded signals, the Server must not silently update the Endpoint's identity record to match the new hardware, and must not silently resolve the discrepancy in either direction. Divergence is surfaced as a hardware-confidence condition requiring explicit operator review; the graduated confidence model and its resolution rules are defined in `docs/specifications/m0-endpoint-identity-lifecycle.md`.
+### Boot-scoped enrollment bootstrap
 
-## Reconnect handling
+A new Agent boot begins with a short-lived enrollment credential/context provided through
+the boot-orchestration boundary.
 
-Reconnect must not blindly re-establish trust merely because a MAC address or other hardware signal matches previous inventory (Issue #2 safety constraint). A reconnecting Agent re-authenticates and redeems a fresh runtime credential through the same flow as an initial connection; a previous runtime credential does not carry implicit trust across a disconnect.
+The purpose of that credential is to bootstrap an authenticated relationship without
+requiring a permanent secret to be manually preinstalled per endpoint.
+
+The credential is scoped to the boot/enrollment context rather than to a MAC address.
+
+The detailed credential representation, lookup mechanism, BootContext correlation,
+rotation, recovery, and expiry semantics were refined later by ADR-0012 and ADR-0014 and
+are normative through the Endpoint identity and Agent Protocol Specifications.
+
+This ADR does not duplicate those later mechanics.
+
+### The Agent must authenticate the Server before presenting credentials
+
+An Agent must establish the expected Server identity before sending its enrollment/runtime
+credential.
+
+The provisioning network alone is insufficient evidence of Server identity.
+
+The concrete trust mechanism was resolved later by the trusted-bootstrap/site-trust and
+Agent Protocol decisions. This ADR establishes the requirement, not their wire or
+cryptographic details.
+
+### First enrollment is operator-approval gated
+
+A first-seen device does not become trusted solely because it:
+
+- PXE-boots from Bamep;
+- receives a Bamep boot artifact;
+- reaches the Server;
+- presents plausible inventory;
+- possesses a valid boot-scoped enrollment credential.
+
+The default V1/M0 trust transition requires explicit operator approval.
+
+A successfully authenticated first-seen endpoint therefore enters the untrusted/pending
+enrollment path defined by the Endpoint identity Specification, and only an explicit
+operator decision establishes durable `Enrolled` identity.
+
+This choice keeps the provisioning network and boot reachability from becoming implicit
+authorization to participate in destructive workflows.
+
+### Enrollment approval is a one-time trust establishment, not a reconnect tax
+
+Once an Endpoint has been explicitly enrolled, normal reconnect/reboot/credential-rotation
+flows must not require the operator to approve the same Endpoint again when the current
+identity-continuity rules permit continuity.
+
+The identity lifecycle is durable.
+
+Reconnect therefore separates two questions:
+
+1. is this still the same trusted Endpoint according to the current continuity/confidence
+   contract?
+2. can the current Agent authenticate with valid current credential/bootstrap state?
+
+A previous approval answers only the durable identity question. It does not bypass current
+authentication, credential, hardware-confidence, or trusted-bootstrap checks.
+
+The exact continuity rules and credential behavior belong to the Endpoint identity
+Specification and later credential ADRs.
+
+### Hardware change lowers or breaks confidence rather than rewriting identity silently
+
+When current hardware evidence differs from recorded evidence, Bamep must not silently
+update its trust record and continue as if nothing changed.
+
+The discrepancy is represented through the hardware-confidence model.
+
+A legitimate hardware replacement can preserve durable Endpoint identity while still
+requiring review/revalidation before destructive use.
+
+This is especially important for:
+
+- NIC replacement;
+- disk replacement;
+- multiple-disk endpoints;
+- migration/restore workflows.
+
+The exact distinction between `LoweredConfidence` and `Conflict`, their transitions, and
+their operational consequences belong to the Endpoint identity Specification.
+
+### Pre-authorized enrollment is a future authorization mechanism, not automatic enrollment
+
+A future workflow may allow an operator to authorize an enrollment context **before** the
+Endpoint's first connection.
+
+That would move the explicit operator decision earlier in time.
+
+It must not be interpreted as unrestricted automatic enrollment.
+
+Pre-authorization is therefore modeled as a separate enrollment-authorization mechanism,
+not as another Endpoint identity state and not as permission for arbitrary devices on the
+provisioning LAN to self-enroll.
+
+Its concrete design is outside this ADR.
+
+### Destructive-operation safety remains independently composed
+
+Trusted Endpoint identity is one required fact for destructive execution.
+
+It is not sufficient authorization by itself.
+
+This ADR does not own the complete destructive-operation precondition set.
+
+The current normative set is defined by
+`docs/specifications/m0-endpoint-identity-lifecycle.md` and composed at dispatch by
+`docs/specifications/m0-job-lifecycle-and-scheduling.md`.
+
+The original ADR text enumerated an earlier six-item set. That enumeration is intentionally
+removed here because the current contract contains seven independent preconditions,
+including trusted current bootstrap context.
+
+No destructive precondition may be inferred from `Enrolled` identity.
 
 ## Alternatives considered
 
-- **Pre-shared per-device secret, provisioned out-of-band** (e.g., injected via USB before first boot): rejected as the V1 default — reintroduces the manual per-device step the credential-bootstrap flow is meant to avoid. Remains an option for higher-security deployments beyond V1's stated scope.
-- **PKI/mTLS with a deployment-specific CA issuing per-Agent certificates**: technically stronger, but requires certificate lifecycle management (issuance, rotation, revocation) beyond what M0's small/medium/high-density install profiles require. The short-lived-credential bootstrap achieves an equivalent boot-time/runtime trust separation with less operational machinery. Not rejected outright — may be revisited if a later requirement (e.g., HA, multi-site) demands stronger cryptographic identity.
-- **TPM-based attestation**: rejected for V1 — depends on hardware capability not guaranteed across Bamep's target endpoint population; no current requirement demands hardware-rooted attestation.
-- **Automatic re-trust purely from MAC/hardware-fingerprint match on reconnect**: rejected — directly conflicts with the invariant that MAC/hardware fingerprints are inventory signals, not trust anchors, and with the explicit safety constraint against blindly re-establishing trust on reconnect.
+### MAC address as Endpoint identity
+
+Rejected.
+
+MAC addresses can change legitimately, can be duplicated/spoofed, and are network-interface
+attributes rather than durable machine identity.
+
+Using MAC as permanent identity would also make NIC replacement unnecessarily destructive
+to the Endpoint lifecycle.
+
+### Hardware fingerprint as the permanent identity
+
+Rejected.
+
+A compound hardware fingerprint can be useful continuity evidence, but hardware evolves.
+
+Treating the fingerprint as the identity itself would make legitimate component replacement
+either impossible or dependent on silently redefining identity when hardware changed.
+
+The selected model instead keeps stable Server identity and evaluates hardware evidence
+separately.
+
+### Automatic trust for any device that reaches the provisioning network
+
+Rejected.
+
+The provisioning LAN is not a trust anchor.
+
+Boot reachability and possession of a lease/boot artifact are insufficient reasons to
+grant durable identity trusted enough for destructive operations.
+
+### Automatic re-trust from matching hardware on reconnect
+
+Rejected.
+
+Matching evidence supports continuity assessment but is not authentication.
+
+Reconnect still requires the currently approved authentication/credential/bootstrap
+contract.
+
+### Pre-shared per-device secret installed manually out of band
+
+Rejected as the V1 default.
+
+It can provide a strong bootstrap, but it reintroduces a manual provisioning step for
+every endpoint and undermines the operational goal of network bootstrap.
+
+It may still be appropriate for a future higher-assurance deployment profile.
+
+### Per-Agent client-certificate PKI / mTLS as the V1 identity baseline
+
+Rejected as the baseline.
+
+A deployment-specific client-certificate lifecycle would require additional issuance,
+storage, rotation, revocation, recovery, and operator machinery.
+
+The selected boot-scoped credential + runtime-credential model satisfies the V1 trust
+requirements without making client PKI a prerequisite.
+
+This does not prohibit a future requirement from reconsidering the decision.
+
+### TPM/hardware-rooted endpoint attestation as a V1 requirement
+
+Rejected.
+
+Bamep targets hardware where suitable TPM/attestation capability cannot be assumed
+uniformly, and no V1 requirement justified making that hardware dependency mandatory.
+
+Trusted bootstrap and Endpoint identity remain separate properties.
 
 ## Consequences
 
-- Web Administration must support an operator approval action for `PendingEnrollment` Endpoints before implementation of the enrollment flow is complete; this is a durable requirement on the Presentation/Application layers, not an optional convenience.
-- The Boot Orchestrator becomes a component with real security responsibility (issuing enrollment credentials), constraining its design within the boot-orchestration boundary (`docs/specifications/m0-stack-and-boundaries-baseline.md`).
-- The destructive-operation authorization preconditions are available now and should be referenced, not re-derived or narrowed to a single check, by Issues #4 and #6.
-- Agent/Server mutual authentication is a requirement here but its concrete design belongs to Issue #3; this ADR must not be read as having decided that mechanism.
-- Pre-authorized enrollment remains a possible future extension and must not be implemented as a bypass of the operator-approval requirement established here.
+- Endpoint identity survives legitimate NIC/MAC replacement.
+- Inventory/hardware fingerprints remain useful evidence without becoming authentication.
+- First enrollment requires a durable explicit operator decision.
+- Presentation/Application surfaces that expose enrollment must preserve the operator
+  approval boundary; an Agent must never approve its own enrollment.
+- The boot-orchestration boundary has security responsibility because it participates in
+  creating the boot-scoped enrollment context.
+- Existing enrollment approval does not waive future authentication or safety checks.
+- Hardware discrepancies must be surfaced through confidence/revalidation semantics rather
+  than silently rewriting trusted evidence.
+- Future pre-authorized enrollment must preserve explicit operator intent.
+- Destructive workflows consume Endpoint identity as one independent safety fact and must
+  use the complete current safety contract rather than a copied list from this ADR.
+- Later credential, BootContext, trusted-bootstrap, and protocol decisions refine how this
+  identity model is realized without replacing the durable identity decision itself.
 
-## Related architecture
+## Authority boundary
 
-- `docs/discovery/architecture-redesign.md` — "Endpoint identity", "Security invariants".
-- `docs/discovery/adr-triage.md` — candidate 2; candidate 12 (identity-dependent portion only).
-- `AGENTS.md` — Safety section.
-- `docs/specifications/m0-endpoint-identity-lifecycle.md` — the identity lifecycle state model this decision governs.
+This ADR owns the rationale for:
+
+- Server-assigned durable Endpoint identity;
+- hardware/network attributes as evidence rather than identity/authentication;
+- boot-scoped enrollment bootstrap;
+- authenticating the Server before credential presentation;
+- operator-gated first enrollment;
+- avoiding repeated operator approval when trusted identity continuity remains valid;
+- rejecting silent hardware-trust rewriting;
+- treating future pre-authorization as explicit operator authorization rather than
+  unrestricted automatic enrollment.
+
+It does **not** own:
+
+- identity lifecycle state tables/transitions;
+- credential lifecycle/rotation/revocation;
+- credential lookup or BootContext schema/correlation;
+- current-boot trusted-bootstrap state;
+- hardware-confidence state transitions;
+- the complete destructive-operation precondition list;
+- Agent Protocol wire messages;
+- TLS/trusted-bootstrap cryptographic details;
+- operator-facing enrollment API/UX.
+
+Those belong to the applicable Specifications and later ADRs.
+
+## Current implementation relationship
+
+Issue #17 (`[WP] Establish simulated Endpoint trust, enrollment, and Agent session`) is
+completed.
+
+It established the M1 simulated vertical slice for:
+
+- real Agent Protocol v1 WSS session establishment;
+- durable `PendingEnrollment`;
+- explicit operator-driven transition to `Enrolled`;
+- identity continuity across reconnect without repeated approval;
+- runtime credential behavior required by the current credential contract;
+- trusted-bootstrap evidence semantics required by that Work Package.
+
+That completed Work Package does not mean every Endpoint identity capability or future
+operator UX described by the broader Specification is implemented.
+
+`docs/architecture/README.md` remains authoritative for current repository structure.
+
+## Related specifications and decisions
+
+- `docs/specifications/m0-endpoint-identity-lifecycle.md` — normative Endpoint identity,
+  credential, hardware-confidence, current-boot, and destructive-precondition contract.
+- `docs/specifications/m0-agent-protocol-contract.md` — normative Agent authentication and
+  session wire contract.
+- `docs/specifications/m0-trusted-bootstrap-and-server-fingerprint-contract.md` — normative
+  trusted-bootstrap and Server-identity contract.
+- `docs/specifications/m0-job-lifecycle-and-scheduling.md` — complete destructive-dispatch
+  composition.
+- `docs/specifications/m0-data-plane-and-storage-contracts.md` — Artifact-specific safety
+  gates and source/target-disk distinction.
+- ADR-0010 — trusted-bootstrap / Secure Boot architectural decision.
+- ADR-0011 — site trust-anchor establishment decision.
+- ADR-0012 — runtime Agent credential issuance/rotation/reconnect-recovery decision.
+- ADR-0014 — credential lookup and BootContext correlation decision.
 
 ## Related work
 
-- Issue #2 — `[WP] Define endpoint identity and trust model`.
-- Issue #3 — `[WP] Define Agent control and action contracts` (owns the mutual-authentication mechanism this ADR requires but does not design).
-- Issue #4 — `[WP] Define Job lifecycle and scheduling model` (consumes the destructive-operation authorization preconditions).
-- Issue #6 — `[WP] Define data-plane and storage contracts` (consumes the destructive-operation authorization preconditions for artifact/transfer safety).
+- Issue #2 — historical M0 Work Package that produced this identity/enrollment decision and
+  normative lifecycle baseline.
+- Issue #17 — completed M1 Work Package implementing and validating the simulated Endpoint
+  trust/enrollment/session slice.
