@@ -4,228 +4,156 @@ Status: Accepted
 
 ## Context
 
-ADR-0004 (Endpoint identity and enrollment/trust bootstrap model, `Accepted`) establishes that
-the Boot Orchestrator issues a short-lived enrollment credential scoped to a boot attempt, that
-the Agent redeems it, and that "the Server issues a runtime Agent identity/session credential
-scoped to the Endpoint's durable identity, with an expiry/renewal policy (exact TTL is an
-implementation-time detail, not an M0 architectural question)" (ADR-0004 point 6), and that
-reconnect "redeems a fresh runtime credential through the same flow as an initial connection"
-(ADR-0004, "Reconnect handling"). ADR-0005 (Agent control-plane protocol and typed-action model,
-`Accepted`) establishes that "successful completion of this handshake is the mechanism that
-establishes `CredentialActive`" and that the handshake ends in
-`SessionEstablished{protocol_version, session_id}` (`docs/specifications/m0-agent-protocol-contract.md`).
+ADR-0004 required successful Agent authentication/reconnect to issue a **fresh** runtime
+credential, but the original Agent Protocol handshake had no field or message that delivered
+that credential to the Agent.
 
-Neither ADR-0004 nor ADR-0005 defines the concrete mechanism by which the runtime credential the
-Server "issues" on each successful redemption is delivered to the Agent, nor how a fresh runtime
-credential safely replaces its predecessor across reconnects without leaving the Agent unable to
-authenticate if a message is lost between commit and delivery. This gap was found while defining
-Work Package WP1 of the M1 Milestone (Issue #17, `[WP] Establish simulated Endpoint trust,
-enrollment, and Agent session`): `m0-agent-protocol-contract.md`'s
-`SessionEstablished{protocol_version, session_id}` carries no credential field, and no other
-approved Agent Protocol v1 message conveys the issued runtime credential back to the Agent.
-Issue #17 had provisionally recorded an unapproved working interpretation ("Reading A") that
-avoided the gap by treating the Server's internal `CredentialActive` state as itself constituting
-"the issued/renewed runtime credential," so the Agent would reuse its original credential value
-indefinitely. That interpretation conflicts with ADR-0004's own language ("issues a runtime
-credential," a reconnect "redeems a **fresh** runtime credential") and is rejected by this ADR.
+This created a crash/delivery problem: if the Server durably replaced the credential and the
+connection dropped before the Agent received the successor, immediate predecessor
+invalidation could strand the Agent.
 
-This ADR resolves how the runtime credential is issued, delivered, safely replaced across
-reconnects without stranding the Agent, and how it composes with revocation — without reopening
-ADR-0004's enrollment/bootstrap model or ADR-0005's transport/handshake/typed-message decisions.
+Issue #17 surfaced an alternative interpretation where `CredentialActive` itself would
+represent issuance and the Agent would reuse its original credential indefinitely. That was
+rejected because it contradicted the accepted fresh-credential model.
+
+Normative credential-chain lifecycle belongs to
+`docs/specifications/m0-endpoint-identity-lifecycle.md`; Agent wire behavior belongs to
+`docs/specifications/m0-agent-protocol-contract.md`. Credential lookup and BootContext
+correlation are separate decisions in ADR-0014.
 
 ## Decision
 
-1. **Boot-scoped chain.** A single, uniform mechanism governs every credential exchange:
-   presenting a still-valid predecessor credential in `AuthRequest` and receiving a freshly
-   issued successor. The predecessor may be the boot-scoped enrollment credential issued by the
-   Boot Orchestrator (ADR-0004 point 2) on the first `AuthRequest` of a boot, or a previously
-   issued runtime credential on any later reconnect:
+### One boot-scoped credential chain
 
-   ```text
-   same boot:      E1 → R1 → R2 → R3 → ...
-   genuine reboot:  E2 (new enrollment credential) → fresh runtime credential → ...
-   ```
+The same rotation model applies from first contact through reconnects:
 
-   A runtime credential does not need to survive a genuine Agent reboot. A new boot always
-   re-engages the Boot Orchestrator for a new enrollment credential and restarts the redemption
-   flow (ADR-0004 point 1); Endpoint identity continuity across reboot is carried by the identity
-   dimension (`Enrolled`, matched by inventory signals — ADR-0004, "Reconnect handling"), never
-   by credential persistence across boots. Operator approval is not repeated when Endpoint
-   continuity holds, unchanged from ADR-0004.
-2. **Persist-before-send ordering.** On a successful `AuthRequest`, durable Endpoint
-   identity/credential changes (predecessor grace bookkeeping, the newly minted successor, and —
-   on first contact only — `PendingEnrollment` creation and the `NoActiveCredential →
-   CredentialActive` transition) commit in one atomic persistence transaction, consistent with the
-   atomic state+event+audit model already required by ADR-0013 (carrying forward ADR-0007) /
-   `m0-persistence-observability-and-domain-events.md`. Only after that commit does the Server
-   attempt to deliver `SessionEstablished` (carrying the new credential) over WSS. A database
-   transaction and a WebSocket send cannot be atomic with each other — the same constraint
-   ADR-0013 carries forward (point 16), originally established in ADR-0007's "Crash-safe dispatch
-   persistence ordering" for `ActionDispatch`, applied here to credential issuance. A crash or
-   dropped connection between commit and delivery
-   is therefore an expected, not exceptional, case, recovered by point 3.
-3. **Replacement, not redelivery, of an unconfirmed successor.** If a predecessor `P` is
-   presented again in a fresh `AuthRequest` while its previously issued successor `S` has never
-   itself successfully authenticated, and `P` is still within its grace/expiry bound, the Server
-   does not attempt to reconstruct or redeliver `S`. It atomically supersedes `S`, mints a fresh
-   successor `S'`, and `SessionEstablished` carries `S'`. The Server is never required to
-   reconstruct a previously emitted secret.
-4. **Bounded valid set.** For one credential chain, the durable valid set never exceeds: one
-   predecessor in grace, plus at most one current unconfirmed successor. Replacing an unconfirmed
-   successor invalidates it atomically within the same transaction that mints its replacement; no
-   unbounded accumulation of valid credentials is permitted.
-5. **Confirmation semantics.** Receiving `SessionEstablished` does not by itself confirm delivery
-   of the successor. A successor becomes confirmed only when it is later presented in an
-   `AuthRequest` and successfully authenticates. On that confirmation: its predecessor is retired,
-   the confirmed successor becomes the predecessor for the next rotation, and a fresh successor is
-   issued.
-6. **Agent-side retention.** The Agent retains its predecessor `P` until the successor `S`
-   delivered to it has itself successfully authenticated on a later connection. If `S` is
-   rejected while `P` is still within its valid grace/expiry bound, the Agent may retry using `P`.
-   `AuthError` is not required to reveal whether the presented credential was a superseded
-   successor as opposed to any other rejection cause — a generic authentication rejection is
-   sufficient, consistent with the already-accepted minimal-disclosure precedent in
-   `TransferAuthorizationDenied.reason` (`m0-agent-protocol-contract.md`).
-7. **Concurrent redemption.** Multiple connections may authenticate concurrently while presenting
-   the same still-valid predecessor. Credential issuance is conceptually serialized by the
-   durable transaction each successful redemption commits in: the last committed successor is the
-   only current one. An already-established WSS session is not retroactively invalidated merely
-   because the credential issued to it for a future reconnect was later superseded by a
-   concurrent redemption. The exact locking/isolation mechanism is implementation-time.
-8. **Revocation.** Explicit `CredentialRevoked` invalidates every credential still valid in the
-   Endpoint's chain at that instant — the current predecessor in grace and any unconfirmed
-   successor alike — never only the most recently issued value. This invalidation is durable
-   across disconnects, reconnects, and genuine Agent reboots: it is a fact about the Endpoint's
-   credential dimension, not scoped to a single boot/runtime-credential chain instance. A fresh,
-   independently valid boot-scoped enrollment credential (point 1's `E2`) does not itself clear
-   `CredentialRevoked`, and presenting it does not establish a new runtime credential chain while
-   the dimension remains `CredentialRevoked` — the genuine-reboot fallback in point 1 applies only
-   when the credential dimension is not `CredentialRevoked`. Restoring `CredentialActive` requires
-   a separate, explicit, authorized credential-reactivation/recovery operation; that operation's
-   concrete mechanism (invoking actor, preconditions, event/audit shape) is deferred and is not
-   decided by this ADR or required by WP1. This does not weaken point 1's identity-continuity
-   guarantee: durable Endpoint identity (`Enrolled`) is unaffected by `CredentialRevoked` and is
-   never itself reverted by revocation — identity continuity may remain fully established while
-   credential re-establishment is independently blocked.
-9. **Rotation is not a new lifecycle transition.** Routine rotation while the credential
-   dimension remains `CredentialActive` (points 3, 5, 7) is durable bookkeeping required to
-   validate a future `AuthRequest`; it does not change the credential dimension's value and does
-   not, by itself, introduce a new domain event. The illustrative domain-event catalog
-   (`m0-persistence-observability-and-domain-events.md`) remains transition-oriented, not
-   rotation-oriented.
-10. **No recoverable-secret requirement.** This model never requires the Server to store or
-    reconstruct a previously issued plaintext runtime credential. The concrete durable
-    representation (e.g., a salted hash verified against a presented value, or a self-verifying
-    signed capability in the style of `TransferAuthorizationGrant`'s `token`) remains
-    implementation-time, provided it satisfies points 1–9.
-11. **Wire mechanism.** `SessionEstablished` is extended —
-    `SessionEstablished{protocol_version, session_id, runtime_credential, credential_expires_at}`
-    — rather than introducing a separate message type: there is no second Agent Protocol message
-    or phase that delivers the runtime credential. Issuance of the runtime credential is 1:1 with,
-    and decided in the same instant as, successful credential validation and session establishment
-    (ADR-0004 point 6); a dedicated second message would introduce an additional protocol-level
-    credential-delivery phase, and with it a new partial-delivery failure state ("session
-    established but credential never arrived via that separate message") that bundling into one
-    message avoids by construction. This is a wire-shape choice only: it does not, and cannot,
-    eliminate the possibility that `SessionEstablished` itself — credential included — is lost in
-    its entirety after the durable commit (point 2, "Persist-before-send ordering"); that failure
-    window exists regardless of wire shape and is exactly what the predecessor/replacement recovery
-    mechanism (points 3, 6) is designed to handle. `runtime_credential` is opaque from Agent
-    Protocol's own
-    perspective, matching how `bootstrap_assertion` and the `TransferAuthorizationGrant` `token`
-    are already treated; `credential_expires_at` follows the timestamp convention
-    `m0-agent-protocol-contract.md` "Wire encoding" already defines (RFC 3339 / ISO 8601 UTC).
+```text
+same boot:       E1 -> R1 -> R2 -> R3 -> ...
+genuine reboot:  E2 -> fresh runtime chain -> ...
+```
+
+`E` is the boot-scoped enrollment credential; `R` values are runtime credentials.
+
+Runtime credentials need not survive a genuine Agent reboot. Endpoint identity continuity is
+independent from credential-chain continuity.
+
+### Persist before delivery
+
+Successful authentication commits the required durable credential/identity state before the
+Server attempts `SessionEstablished`.
+
+Database commit and WebSocket delivery are not atomic, so loss after commit is an expected
+failure window that the credential model must tolerate.
+
+### Retain a predecessor until successor confirmation
+
+Issuing a successor does not immediately make the predecessor unusable.
+
+A successor is confirmed only when it is later presented in an `AuthRequest` and
+successfully authenticates. Until then, the predecessor remains usable within its bounded
+grace/expiry rules.
+
+This avoids stranding the Agent when `SessionEstablished` is lost after persistence.
+
+### Replace, do not reconstruct, an unconfirmed successor
+
+If the still-valid predecessor is presented again while its previous successor remains
+unconfirmed, the Server supersedes that successor and mints a new one.
+
+It does not reconstruct or redeliver the old secret.
+
+The valid set is therefore bounded to one predecessor plus at most one current unconfirmed
+successor.
+
+### Concurrent redemption is serialized durably
+
+Concurrent use of the same valid predecessor may race, but successor updates are serialized
+by durable persistence; only the last committed successor remains current.
+
+An already-established session is not retroactively invalidated merely because a later
+concurrent redemption superseded the credential issued for its next reconnect.
+
+Exact locking/isolation mechanics are implementation details.
+
+### Revocation is Endpoint-level durable state
+
+`CredentialRevoked` invalidates all currently valid credentials in the chain, not only the
+latest value, and survives disconnect, reconnect, and genuine reboot.
+
+A new boot-scoped enrollment credential does not itself clear revocation.
+
+Restoring `CredentialActive` requires a separate explicit authorized recovery/reactivation
+operation; its concrete mechanism is outside this ADR.
+
+### Rotation does not require recoverable plaintext secrets
+
+The Server never needs to store or reconstruct a previously issued plaintext runtime
+credential.
+
+The durable representation may use one-way verification or another suitable opaque
+mechanism, provided the normative lifecycle contract is satisfied.
+
+### Deliver the successor in `SessionEstablished`
+
+Successful authentication returns:
+
+`SessionEstablished{protocol_version, session_id, runtime_credential, credential_expires_at}`
+
+A separate credential-delivery message is not introduced.
+
+Bundling avoids creating an additional protocol phase such as "session established but
+credential-delivery message pending." It does **not** make persistence and WebSocket
+delivery atomic; predecessor/replacement recovery still handles loss of the complete
+`SessionEstablished` message.
+
+The exact wire contract is normative only in the Agent Protocol Specification.
 
 ## Alternatives considered
 
-- **Immediate predecessor invalidation**: rejected — directly causes the stranding failure this
-  ADR must prevent: a crash or dropped connection between commit (point 2) and delivery would
-  leave the Agent holding no usable credential.
-- **Same-successor redelivery requiring recoverable secret material**: reapresenting the
-  predecessor while the successor is unconfirmed always returns the identical successor value.
-  Rejected as the M0 default — it requires the Server to reconstruct a previously issued secret,
-  via either a new encrypted-secret-recovery capability or a deterministic-derivation scheme
-  keyed by a long-lived Server secret. Both introduce a durable-secrets-management responsibility
-  no M0 ADR or Specification currently owns, a strictly larger at-rest exposure surface than
-  hash-only verification, and their own protection/rotation/recovery treatment.
-- **Replacement of an unconfirmed successor** (adopted): satisfies the same anti-stranding
-  requirement without ever reconstructing a secret; keeps durable representation hash-only (or
-  self-verifying-opaque), homogeneous with every other credential in this model.
-- **Explicit delivery acknowledgement**: rejected for M0 — the marginal reduction in the
-  predecessor's replay window is small relative to Bamep's V1 threat model (controlled LAN,
-  pinned-TLS-authenticated channel, 3–24 endpoints, infrequent reconnects), and adds a protocol
-  round trip and a new message type for a property the "confirmed by next successful use" rule
-  already provides implicitly.
-- **Dedicated `RuntimeCredentialIssued` message**: rejected — `BootstrapEvidence`/
-  `TransferAuthorizationGrant` carry facts that are N:1 or asynchronous relative to
-  `SessionEstablished`. Runtime credential issuance is 1:1 and decided in the same instant as
-  session establishment; splitting it into a second message would introduce an additional
-  protocol-level delivery phase, and with it a new ambiguous partial-delivery failure state that
-  bundling into one message avoids by construction, with no corresponding benefit. This is not a
-  claim that bundling makes `SessionEstablished` itself immune to being lost after the durable
-  commit — that failure window exists regardless of wire shape and remains covered by the
-  predecessor/replacement recovery mechanism (points 3, 6), not by this wire-shape choice. Not
-  preferred merely for syntactic consistency with the additive-message precedent.
-- **Collapsing the runtime credential into the Server-side `CredentialActive` state** (the
-  rejected Issue #17 "Reading A"): the Agent would reuse its original fixture/enrollment-issued
-  value indefinitely and no message ever conveys a distinct credential back to it. Rejected —
-  contradicts ADR-0004's own language ("issues a runtime credential," redeem a "**fresh** runtime
-  credential" on every reconnect) and `m0-endpoint-identity-lifecycle.md`'s existing treatment of
-  the runtime credential as an artifact distinct from the `CredentialActive` state fact.
+### Immediate predecessor invalidation
+
+Rejected because a crash or disconnect after durable successor creation but before delivery
+could leave the Agent with no usable credential.
+
+### Redeliver the identical successor
+
+Rejected as the baseline because it requires recoverable secret storage or deterministic
+secret derivation, introducing a larger secrets-management responsibility and at-rest
+exposure surface.
+
+### Explicit credential-delivery acknowledgement
+
+Rejected for the baseline because the next successful use of the successor already provides
+confirmation without another protocol round trip/message type.
+
+### Separate `RuntimeCredentialIssued` message
+
+Rejected because issuance is 1:1 with successful session establishment and a second message
+would add another partial-delivery phase without eliminating the underlying post-commit
+delivery-loss window.
+
+### Reuse the original credential indefinitely
+
+Rejected because it collapses credential issuance into the `CredentialActive` state fact and
+contradicts the accepted fresh-runtime-credential model.
 
 ## Consequences
 
-- `m0-endpoint-identity-lifecycle.md` is amended to define the credential-chain/grace/
-  replacement/confirmation/revocation model in the "Credential/session lifecycle" dimension it
-  already owns — this ADR records the decision and its reasoning; that Specification remains the
-  normative lifecycle definition.
-- `m0-agent-protocol-contract.md` is amended to extend `SessionEstablished` with
-  `runtime_credential` and `credential_expires_at`, and to define Agent-side retention/fallback
-  behavior and the generic-rejection requirement for a superseded successor — this ADR does not
-  restate that wire-level detail as the normative source.
-- Issue #17's now-invalid "Reading A" working interpretation is removed and replaced by a
-  reference to this ADR and the amended Specifications.
-- Neither ADR-0004 nor ADR-0005 is reopened or rewritten; both remain historically accurate as
-  written. This ADR consumes them and resolves the specific sub-problem both explicitly left to a
-  later Work Package.
-- No new durable-secrets-management component is introduced; concrete credential representation
-  remains implementation-time, bounded by point 10.
-- The exact numeric grace/expiry duration remains implementation-time, unchanged from ADR-0004
-  point 6's existing delegation.
-- **Owner decision (post-acceptance amendment):** whether an explicit `CredentialRevoked` state
-  survives a genuine reboot — previously left open (recorded in Issue #17 session notes and in
-  `redeem_known`/`genuine_reboot`'s own doc comments) — is resolved by point 8 above:
-  `CredentialRevoked` is durable Endpoint-level state, not scoped to a single boot/runtime-credential
-  chain instance, and a fresh `E2` cannot itself re-establish a chain while it holds. The concrete
-  credential-reactivation/recovery operation that restores `CredentialActive` remains out of scope
-  for this ADR and for WP1; no functional behavior changes as a result of this amendment, since the
-  implementation already failed closed for this case.
+- The Endpoint identity Specification owns the normative chain, grace, replacement,
+  confirmation, concurrency, and revocation rules.
+- The Agent Protocol Specification owns `SessionEstablished` wire fields and Agent-side
+  retention/fallback behavior.
+- Persistence follows the repository-wide persist-before-send contract.
+- No recoverable-runtime-secret subsystem is required.
+- Numeric credential TTL/grace values remain implementation-time policy.
+- Revocation remains durable until an explicit recovery/reactivation operation clears it.
 
-## Related architecture
+## Related
 
-- `docs/specifications/m0-endpoint-identity-lifecycle.md` — the Credential/session lifecycle
-  dimension this ADR's model extends.
-- `docs/specifications/m0-agent-protocol-contract.md` — the `SessionEstablished` wire contract
-  this ADR's model extends.
-- `docs/specifications/m0-persistence-observability-and-domain-events.md` — the atomic
-  state+event+audit transaction model (originally ADR-0007, carried forward by ADR-0013) this
-  ADR's persist-before-send ordering and rotation/event distinction rely on.
-
-## Related work
-
-- ADR-0004 — Endpoint identity and enrollment/trust bootstrap model (`Accepted`) — the
-  enrollment/runtime-credential model and reconnect redemption flow this ADR consumes without
-  reopening.
-- ADR-0005 — Agent control-plane protocol and typed-action model (`Accepted`) — the
-  WSS/typed-envelope/handshake decisions this ADR consumes without reopening; `SessionEstablished`'s
-  existence and its role in establishing `CredentialActive`.
-- ADR-0013 — PostgreSQL persistence backend baseline (`Accepted`) — the current persistence
-  backend; carries forward the crash-safe persist-before-send ordering pattern this ADR applies to
-  credential issuance.
-- ADR-0007 — Persistence backend and durable/transient boundary (`Superseded by ADR-0013`) —
-  originally established the crash-safe persist-before-send ordering pattern this ADR applies to
-  credential issuance; the backend-independent pattern itself is unchanged and is carried forward
-  by ADR-0013.
-- Issue #17 — `[WP] Establish simulated Endpoint trust, enrollment, and Agent session` — the Work
-  Package whose Discovery surfaced this gap, and which implements this ADR's model; its
-  previously recorded "Reading A" is superseded by this ADR.
+- ADR-0004 — Endpoint identity and enrollment bootstrap.
+- ADR-0005 — Agent control-plane protocol.
+- ADR-0014 — credential lookup and BootContext correlation.
+- `docs/specifications/m0-endpoint-identity-lifecycle.md` — normative credential lifecycle.
+- `docs/specifications/m0-agent-protocol-contract.md` — normative wire contract.
+- `docs/specifications/m0-persistence-observability-and-domain-events.md` — persist-before-send.
+- Issue #17 — M1 trust/enrollment/session implementation history.
