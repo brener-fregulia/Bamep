@@ -4,47 +4,49 @@
 
 This document defines the Bamep testing and validation strategy.
 
-It describes:
+It owns:
 
-* testing principles;
-* test layers;
-* isolation requirements;
-* simulator usage;
-* Integration Environment boundaries;
-* safety-sensitive validation;
-* test selection;
-* coverage policy;
-* failure handling;
-* result reporting.
+- test layers and their intended responsibilities;
+- validation selection according to behavior and risk;
+- test isolation requirements;
+- use of fakes, Simulator, and the Integration Environment;
+- safety-sensitive validation principles;
+- regression and failure-handling policy;
+- coverage policy.
 
-Current commands and test tooling must be verified from the repository once they exist.
+It does not define project workflow states, owner handoff, or work completion.
 
-Related responsibilities:
+Related authorities:
 
-* `AGENTS.md`: mandatory safety and validation rules;
-* `docs/development/sdd.md`: validation as part of approved work;
-* `docs/development/workflow.md`: operational execution and handoff to owner validation.
+- `docs/development/sdd.md` — validation obligations required by approved work;
+- `docs/development/workflow.md` — execution of validation, recording actual results, and
+  owner acceptance;
+- `docs/development/documentation-policy.md` — placement of reusable evidence;
+- `AGENTS.md` — mandatory repository and destructive-operation guardrails;
+- `docs/specifications/m0-simulator-contract-and-validation-strategy.md` — normative
+  Simulator fidelity, required scenarios, and M0 validation obligations.
+
+Concrete test commands and tooling must be derived from the current repository rather than
+invented or duplicated here.
 
 ## Principles
 
-* Test observable Bamep behavior, not dependency internals.
-* Relevant automated tests are part of implementation completeness.
-* Run the narrowest meaningful validation first.
-* Expand validation according to scope and risk.
-* Prefer deterministic and isolated tests.
-* Use simulators and fakes at hardware, network, storage, and destructive boundaries.
-* Add regression tests for reproducible defects.
-* Test failure behavior as deliberately as success behavior.
-* Never use destructive real-world operations when a safe automated representation is sufficient.
-* Use the Integration Environment when behavior cannot be represented reliably in local automation.
-* Treat coverage as a diagnostic signal, not proof of correctness.
-* Owner manual validation remains the acceptance gate before `Done`.
+- Test observable Bamep behavior rather than dependency internals.
+- Use the smallest test layer that can validate the intended behavior reliably.
+- Prefer deterministic, isolated, repeatable tests.
+- Test rejected, interrupted, stale, duplicate, and unsafe behavior deliberately.
+- Use fakes and simulation at external or destructive boundaries when they faithfully
+  preserve the contract under test.
+- Use real integration only when the integration itself is the behavior under test.
+- Add regression tests for reproducible defects when an active test layer can represent
+  them reliably.
+- Never weaken a safety invariant to make a test easier to reach.
+- Treat coverage as a diagnostic signal, not proof of correctness.
+- Do not describe intended validation as evidence that validation occurred.
 
 ## Test layers
 
-Bamep should use the smallest layer capable of validating the intended behavior.
-
-The expected strategy contains:
+Bamep uses layered validation:
 
 ```text
 Unit / Domain
@@ -56,476 +58,457 @@ Component / Integration
 Simulator
       ↓
 Integration Environment
-      ↓
-Owner manual validation
 ```
 
-Not every change requires every layer.
+These are validation responsibilities, not mandatory stages for every change.
 
-## Unit and domain tests
+Select only the layers needed to establish the approved behavior with sufficient
+confidence.
 
-Use unit and domain tests for deterministic behavior that does not require external infrastructure.
+Owner acceptance is part of the execution workflow, not a test layer defined by this
+document.
 
-Important candidates include:
+## Unit and Domain tests
 
-* state transitions;
-* validation rules;
-* identity matching logic;
-* inventory reconciliation;
-* Job and JobStep behavior;
-* retry and cancellation rules;
-* idempotency;
-* scheduler decisions;
-* resource lease acquisition and release;
-* storage capability selection;
-* safety invariants;
-* protocol message validation;
-* artifact metadata and integrity logic.
+Use Unit and Domain tests for deterministic logic that does not require infrastructure.
 
-State machines should test both valid and rejected transitions.
+Typical responsibilities include:
 
-Safety-sensitive domain behavior should include negative cases that demonstrate prohibited operations remain prohibited.
+- state transitions and rejected transitions;
+- validation rules;
+- Endpoint identity and reconciliation logic;
+- Job, JobStep, and Attempt state behavior;
+- retry, cancellation, and idempotency rules;
+- scheduler and resource-lease decisions;
+- storage-capability selection;
+- safety preconditions and invariants;
+- protocol-message validation helpers;
+- Artifact metadata and integrity logic.
+
+Domain tests should exercise invalid and unsafe cases as deliberately as successful ones.
+
+Pure Domain tests should not require network, database, filesystem, clock, process, or
+hardware I/O when those dependencies can be represented explicitly.
 
 ## Contract tests
 
-Use contract tests at boundaries shared between independently evolving components.
+Use contract tests at boundaries shared by independently evolving components or
+implementations.
 
-Relevant contracts may include:
+Relevant examples include:
 
-* Administrative API;
-* Agent Protocol;
-* Extension Protocol;
-* Server ↔ Web interactions;
-* Server ↔ Agent messages;
-* storage adapter interfaces;
-* infrastructure adapter interfaces;
-* artifact metadata;
-* domain events.
+- Agent Protocol;
+- Administrative API;
+- future extension/plugin protocols;
+- Server ↔ Agent messages;
+- Server ↔ Web contracts;
+- storage and infrastructure ports;
+- Artifact metadata;
+- domain-event representations.
 
-Contract tests should verify externally relevant behavior such as:
+Contract tests should focus on externally relevant behavior such as:
 
-* serialization;
-* required and optional fields;
-* version handling;
-* validation;
-* error representation;
-* duplicate messages;
-* unknown actions;
-* incompatible requests.
+- serialization and deserialization;
+- required and optional fields;
+- version handling;
+- validation and rejection;
+- error representation;
+- duplicate or unknown messages;
+- incompatible requests.
 
-Do not couple contract tests to private implementation details.
+The authoritative contract remains its Specification. Tests demonstrate that an
+implementation conforms to that contract; they do not redefine it.
 
 ## Component and integration tests
 
-Use component or integration tests when correctness depends on multiple real internal responsibilities working together.
+Use component or integration tests when correctness depends on multiple real internal
+responsibilities or a controlled real dependency working together.
 
 Examples include:
 
-* persistence and domain state;
-* scheduler and resource leases;
-* Agent session management;
-* API and application services;
-* artifact lifecycle;
-* transfer metadata and integrity;
-* adapter behavior against controlled local dependencies.
+- Application + Domain + persistence;
+- scheduler + resource leases;
+- Agent session handling;
+- API + application services;
+- Artifact lifecycle across persistence boundaries;
+- transport adapters;
+- controlled database behavior.
 
-Prefer local disposable dependencies when practical.
+Prefer disposable local dependencies and deterministic setup.
 
-Integration tests must remain deterministic enough to run repeatedly without requiring the physical Bamep laboratory.
+A component/integration test must not require the physical Bamep laboratory unless it is
+explicitly an Integration Environment test.
 
 ## Simulator
 
-Bamep Simulator is a first-class validation tool.
+Bamep Simulator is a first-class validation layer for orchestration behavior that requires
+a realistic Agent-side participant without physical endpoint hardware.
 
-It should eventually support many concurrent simulated endpoints with configurable characteristics such as:
+The Simulator should exercise the real external contracts required by its normative
+Specification rather than bypassing them through in-process access to Server business
+logic.
 
-* connection and reconnection;
-* latency;
-* throughput;
-* CPU constraints;
-* storage characteristics;
-* operation duration;
-* failures;
-* retries;
-* interruptions;
-* inventory changes;
-* storage pressure;
-* concurrent Jobs.
+Use the Simulator for behaviors such as:
 
-Use the Simulator for behaviors that require realistic orchestration without physical hardware.
+- Endpoint/Agent lifecycle;
+- reconnect and interruption;
+- protocol sequencing;
+- concurrent orchestration;
+- scheduling contention;
+- retries and cancellation;
+- transfer behavior;
+- restart/recovery scenarios;
+- failure and stale-state handling.
 
-Important scenarios include:
+Do not duplicate the authoritative list of required Simulator scenarios here.
 
-* 20–24 or more concurrent endpoints;
-* reconnect during active work;
-* duplicate or delayed messages;
-* stale inventory;
-* endpoint disappearance;
-* Agent restart;
-* Server restart where supported by the scenario;
-* scheduler contention;
-* resource exhaustion;
-* partial failure;
-* cancellation;
-* recovery after interruption.
+Normative fidelity, required scenarios, concurrency obligations, and boundaries between
+simulated and physical behavior belong to
+`docs/specifications/m0-simulator-contract-and-validation-strategy.md` and the active
+milestone Specification when applicable.
 
-Simulator tests must remain reproducible. Randomized scenarios should use reproducible seeds when failures need to be diagnosed.
+Simulator tests must remain reproducible. Randomized scenarios should expose or preserve a
+seed when reproducibility is required for diagnosis.
 
-The Simulator does not replace physical integration testing for hardware-specific behavior.
+The Simulator does not prove physical firmware, PXE, NIC, storage-controller, Secure Boot,
+or WinPE behavior.
 
-## Fakes and test boundaries
+## Fakes and controlled test boundaries
 
-Use fakes where the external system is not the behavior under test.
+Use a fake when the external system is not the behavior under test and the fake can
+preserve the relevant contract.
 
-Appropriate fake boundaries may include:
+Possible fake boundaries include:
 
-* Agent connections;
-* storage devices;
-* network infrastructure;
-* DHCP/PXE infrastructure;
-* switch integrations;
-* filesystem operations;
-* process execution;
-* clocks and timers;
-* artifact stores;
-* external download sources.
+- network or Agent peers;
+- storage devices;
+- boot/discovery infrastructure;
+- switch integrations;
+- filesystem operations;
+- process execution;
+- clocks and timers;
+- Artifact stores;
+- external download sources.
 
-A fake must preserve the contract relevant to the test.
+A fake should model the contract relevant to the scenario, including meaningful failure
+behavior where needed.
 
-Do not create mocks that merely reproduce the internal implementation line by line.
+Do not build mocks that reproduce private implementation steps line by line.
 
-When the external integration itself is being validated, use the appropriate integration layer instead of mocking it.
+When correctness depends on the real integration, move to the appropriate integration
+layer instead of increasing fake complexity until it merely imitates the real system.
 
 ## Destructive-operation safety
 
 Automated tests must not operate on real user or production data.
 
-Tests involving disk or storage mutation must use appropriate safe targets such as:
+Storage- or disk-mutating tests should use safe targets such as:
 
-* temporary files;
-* virtual disk images;
-* disposable loop devices when explicitly appropriate;
-* temporary filesystems;
-* isolated containers or virtual machines;
-* controlled Integration Environment devices.
+- temporary files and directories;
+- virtual disk images;
+- disposable loop devices when explicitly appropriate and isolated;
+- temporary filesystems;
+- isolated virtual machines;
+- controlled Integration Environment devices when real hardware behavior is required.
 
-Destructive workflows should test, when applicable:
+Safety-sensitive tests should cover the authoritative contract, including negative cases
+such as, when applicable:
 
-* identity validation;
-* stale inventory rejection;
-* target mismatch;
-* missing authorization;
-* invalid preconditions;
-* interruption;
-* safe retry behavior;
-* non-replayable destructive steps;
-* recovery-required states;
-* verification before destructive execution.
+- identity mismatch;
+- stale authoritative state;
+- target/disk mismatch;
+- missing authorization or trust;
+- failed destructive preconditions;
+- interrupted execution;
+- invalid retry/reconciliation;
+- required recovery states;
+- failed integrity or verification gates.
 
-A test must never weaken a safety invariant merely to reach later workflow stages.
+Do not hardcode a duplicate list of normative destructive preconditions here. Their
+authoritative definition belongs to the applicable Specification.
 
-## Data transfer and artifact tests
+A test must never bypass or weaken one safety condition merely to exercise a later stage.
 
-Backup and recovery behavior requires explicit failure testing.
+## Data-plane and Artifact validation
 
-Depending on the chosen implementation, relevant scenarios include:
+Data-plane validation should deliberately exercise interruption and integrity behavior
+defined by the authoritative data-plane Specification.
 
-* interrupted transfer;
-* incomplete `.part` artifact;
-* digest mismatch;
-* size mismatch;
-* duplicate transfer request;
-* storage exhaustion;
-* producer or consumer disconnect;
-* restart behavior;
-* atomic commit;
-* verified artifact promotion;
-* failed verification before destructive provisioning.
+Depending on the behavior under test, relevant scenarios may include:
 
-Resumability must only be tested according to capabilities actually supported by the selected transfer and artifact design.
+- interrupted transfer;
+- incomplete Artifact state;
+- digest or size mismatch;
+- duplicate transfer request;
+- storage exhaustion;
+- producer or consumer disconnect;
+- restart;
+- atomic completion;
+- verified Artifact promotion;
+- invalid transfer authorization or binding;
+- failed verification before destructive use.
 
-Do not simulate resume semantics that the real producer cannot provide.
+Resumability tests must represent only capabilities supported by the real transfer model.
 
-## Persistence and recovery tests
+Do not simulate arbitrary byte-offset resume if the producer cannot reproduce data with
+the semantics required by the approved contract.
 
-Durable workflow state must be tested independently from ephemeral runtime connections.
+## Persistence and recovery validation
 
-Relevant scenarios include:
+Durable workflow state must be validated independently from transient runtime presence.
 
-* process restart;
-* Agent reconnect;
-* incomplete JobStep;
-* persisted state with no active connection;
-* duplicate result delivery;
-* stale inventory revision;
-* interrupted destructive workflow;
-* recovery reconciliation;
-* invalid state recovery.
+Relevant scenarios may include:
 
-Tests should demonstrate that restart or reconnect does not blindly replay destructive work.
+- process restart;
+- Agent reconnect;
+- incomplete JobStep or Attempt;
+- durable state with no active connection;
+- duplicate result delivery;
+- stale revisions;
+- interrupted workflows;
+- recovery reconciliation;
+- invalid or inconsistent persisted state.
 
-## Frontend tests
+Tests must demonstrate the crash/reconnect semantics defined by the authoritative
+Specifications.
 
-Use frontend tests for behavior owned by Bamep Web.
+In particular, restart or reconnect must not be treated as evidence that destructive work
+is automatically safe to replay.
 
-Relevant areas include:
+Use a real disposable database when persistence semantics themselves are under test.
 
-* components;
-* state and stores;
-* forms and validation;
-* loading and error states;
-* localization boundaries;
-* API interaction through controlled boundaries;
-* Job and endpoint presentation;
-* destructive-action confirmations;
-* accessibility-relevant behavior.
+## Frontend validation
+
+When Bamep Web behavior is implemented, validate behavior owned by the frontend at the
+appropriate layer.
+
+Relevant areas may include:
+
+- components and user-visible state;
+- forms and validation;
+- loading and error states;
+- localization boundaries;
+- controlled API interaction;
+- Endpoint and Job presentation;
+- destructive-action confirmations;
+- accessibility-relevant behavior.
 
 Prefer observable assertions over private component structure.
 
-Frontend tests must not depend on a live production Bamep Server unless explicitly running as an integration scenario.
+Frontend unit/component tests should not require a production Bamep Server.
 
 ## Regression tests
 
-A reproducible defect should receive a regression test when an active test layer can represent it reliably.
+A reproducible defect should receive a regression test when an active test layer can
+represent it reliably and the test provides durable protection against recurrence.
 
-A regression test should:
+A useful regression test:
 
-1. reproduce the relevant failure condition;
-2. assert the expected behavior;
-3. avoid unrelated implementation details;
-4. fail against the defective behavior when practical.
+1. represents the failure condition;
+2. asserts the intended behavior from an authoritative requirement or established behavior;
+3. avoids unrelated private implementation detail;
+4. would detect the defective behavior when practical.
 
-If no automated layer can represent the defect reliably, document why and define the required manual or Integration Environment validation.
+If no automated layer can represent the defect faithfully, the required Integration
+Environment or manual validation belongs in the work item's validation obligations rather
+than in a misleading automated test.
 
-Do not introduce an inappropriate test layer solely to cover one unrelated defect.
+Do not create a new inappropriate testing abstraction solely to cover one isolated defect.
 
 ## Test isolation
 
 Automated tests must not depend on:
 
-* personal files;
-* real endpoint data;
-* production storage;
-* mutable external infrastructure;
-* developer-specific configuration;
-* real credentials;
-* public Internet availability;
-* physical Bamep hardware unless the test is explicitly an Integration Environment test.
+- personal files or developer-specific mutable state;
+- real endpoint/customer data;
+- production storage;
+- production credentials;
+- mutable external infrastructure;
+- public Internet availability;
+- physical Bamep hardware unless the test is explicitly an Integration Environment test.
 
-Use:
+Prefer:
 
-* temporary directories;
-* deterministic fixtures;
-* isolated databases;
-* fake adapters;
-* local test servers;
-* disposable artifacts;
-* explicit setup and teardown.
+- temporary directories;
+- deterministic fixtures;
+- isolated databases;
+- fake adapters;
+- local test servers;
+- disposable Artifacts;
+- explicit setup and teardown.
 
-Created resources should be cleaned up after success and failure when practical.
+Resources created by tests should be cleaned up after success and failure when practical.
 
-## Local development environments
+## Development environments
 
 Linux is the reference environment for Bamep Server, Agent, Worker, Simulator, and
 Linux-specific integration behavior.
 
-When development or validation is performed from Windows 11:
+When validation is performed from Windows:
 
-- prefer WSL2 for Linux-targeted builds, tests, scripts, process behavior, filesystem
-  behavior, and local simulation when WSL2 can represent the responsibility faithfully;
-- do not treat successful native-Windows execution as proof that Linux-specific
-  behavior is correct;
-- use native Windows tooling for responsibilities that are intentionally portable,
-  such as appropriate Web/frontend development and platform-independent tests.
+- WSL2 may be used for Linux-targeted builds, tests, scripts, process behavior, filesystem
+  behavior, and local simulation when it represents the responsibility faithfully;
+- successful native-Windows execution does not prove Linux-specific behavior;
+- native Windows tooling is appropriate for responsibilities that are intentionally
+  portable.
 
-Containers may be used when they improve isolation, reproducibility, or disposable
-test setup.
+Containers may be used when they improve isolation and reproducibility, for example for:
 
-Appropriate containerized scenarios may include:
-
+- disposable databases;
 - local service dependencies;
 - controlled protocol peers;
-- disposable databases;
-- isolated adapter dependencies;
-- Simulator scenarios;
 - repeatable integration fixtures.
 
-Containerization is a development and testing technique, not an assumed Bamep
-production deployment model.
+Containers and WSL2 are development/testing techniques, not assumed production
+architecture.
 
-Do not introduce Docker or another container runtime as a product dependency merely
-to simplify local testing.
-
-Containers and WSL2 must not be treated as faithful substitutes for behavior that
-depends on:
-
-- PXE or DHCP interaction with the physical network;
-- firmware or UEFI behavior;
-- Secure Boot;
-- physical NIC behavior;
-- real block devices or hardware-specific disk tooling;
-- WinPE;
-- hardware-specific compatibility.
-
-Use the Integration Environment for those cases when local virtualization or
-simulation cannot provide sufficient evidence.
+They must not be treated as faithful substitutes for behavior that materially depends on
+physical PXE/DHCP networks, firmware/UEFI, Secure Boot, physical NICs, real storage
+hardware, WinPE, or hardware-specific compatibility.
 
 ## Integration Environment
 
-The physical Bamep laboratory exists for behavior that cannot be validated faithfully through local tests or simulation.
+The Bamep Integration Environment exists for behavior that cannot be established
+faithfully through local automation or simulation.
 
 Examples include:
 
-* PXE;
-* DHCP behavior;
-* UEFI firmware;
-* GRUB;
-* Alpine boot;
-* physical NIC behavior;
-* MikroTik integration;
-* real disk tooling;
-* Windows deployment;
-* WinPE;
-* hardware-specific compatibility;
-* destructive end-to-end provisioning.
+- PXE and DHCP behavior on the provisioning network;
+- physical UEFI firmware;
+- bootloader/network-boot behavior;
+- Secure Boot and the physical trusted-boot chain;
+- physical NIC behavior;
+- real storage tooling where hardware behavior matters;
+- Windows or WinPE deployment;
+- hardware-specific compatibility;
+- destructive end-to-end provisioning.
 
-Integration Environment tests must identify:
+An Integration Environment procedure should identify, as applicable:
 
-* required hardware or topology;
-* preparation;
-* exact target;
-* safety precautions;
-* expected result;
-* cleanup or recovery procedure.
+- required hardware/topology;
+- environment preparation;
+- exact target;
+- safety precautions;
+- steps or stimulus;
+- expected observable result;
+- cleanup or recovery procedure.
 
-Destructive execution requires explicit owner authorization as defined in `AGENTS.md`.
+Real destructive execution requires the explicit authorization defined in `AGENTS.md`.
 
-Results that establish reusable hardware or compatibility facts should be persisted in `docs/reference/`.
+Reusable empirical findings from Integration Environment work belong in
+`docs/reference/` according to the documentation policy.
 
 ## Selecting validation
 
-Choose validation according to affected responsibility.
+Choose validation according to the responsibility and risk being changed.
 
-| Change                          | Minimum expected validation                                         |
-| ------------------------------- | ------------------------------------------------------------------- |
-| Pure domain rule                | Focused unit/domain tests                                           |
-| State machine                   | Transition and rejection tests                                      |
-| Shared protocol or API contract | Relevant contract tests                                             |
-| Persistence behavior            | Domain + persistence integration                                    |
-| Adapter                         | Adapter contract + controlled integration when relevant             |
-| Scheduler/resource model        | Domain tests + concurrent simulator scenarios                       |
-| Agent lifecycle                 | Contract + reconnect/failure scenarios                              |
-| Transfer behavior               | Integration + interruption/integrity scenarios                      |
-| Frontend behavior               | Relevant frontend tests                                             |
-| Hardware-specific behavior      | Automated layers where useful + Integration Environment             |
-| Destructive workflow            | Safety tests + explicit Integration Environment/manual validation   |
-| Documentation only              | Verify terminology, links, paths, examples, and referenced behavior |
+| Change | Typical validation |
+| --- | --- |
+| Pure Domain rule | Focused Unit/Domain tests |
+| State machine | Valid and rejected transition tests |
+| Shared protocol/API contract | Contract tests |
+| Persistence behavior | Domain + real disposable persistence integration |
+| Infrastructure adapter | Adapter/contract tests + controlled integration when relevant |
+| Scheduler/resource model | Domain tests + Simulator concurrency when required |
+| Agent lifecycle | Contract + component/Simulator reconnect and failure scenarios |
+| Data-plane transfer | Integration + interruption/integrity scenarios |
+| Frontend behavior | Relevant frontend tests |
+| Hardware-specific behavior | Automated layers where useful + Integration Environment |
+| Destructive workflow | Safety tests + required Integration Environment evidence |
+| Documentation only | Terminology, links, paths, examples, and factual consistency |
 
-Shared or cross-cutting changes require broader validation than isolated changes.
+Shared or cross-cutting changes normally require broader validation than an isolated pure
+function or document.
+
+The approved Specification or Work Package may require stronger validation than this table;
+when it does, the approved requirement wins.
 
 ## Coverage
 
-Coverage is useful for discovering weakly tested:
+Coverage helps identify weakly exercised:
 
-* branches;
-* state transitions;
-* failure paths;
-* safety logic;
-* shared domain behavior;
-* protocol handling.
+- branches;
+- state transitions;
+- error paths;
+- safety logic;
+- shared Domain behavior;
+- protocol handling.
 
-Coverage percentage alone is not a quality target.
+Coverage percentage is not proof of correctness.
 
-Do not introduce arbitrary thresholds during bootstrap.
+Do not introduce arbitrary repository-wide thresholds without an established baseline and
+a reasoned policy.
 
-Before enforcing thresholds:
+Before enforcing a threshold:
 
-1. establish stable test tooling;
+1. establish stable coverage tooling;
 2. establish a meaningful baseline;
-3. verify which files and generated code are included;
+3. verify what files/generated code are included;
 4. inspect important uncovered behavior;
-5. choose conservative values that prevent meaningful regression.
+5. choose a value that protects useful regression detection.
 
 Do not lower an established threshold merely to make a change pass.
 
-Safety-critical behavior may require strong targeted coverage even when repository-wide coverage remains lower.
+Safety-critical behavior may require strong targeted coverage even when repository-wide
+coverage remains lower.
 
-## Handling failures
+## Handling validation failures
 
-When validation fails:
+When a test or validation scenario fails:
 
-1. reproduce the failure with the narrowest useful test or scenario;
-2. determine whether the cause is the current change, environment, missing prerequisite, flaky behavior, or pre-existing state;
-3. fix failures caused by the current work;
-4. report unrelated or unresolved failures explicitly.
+1. reproduce with the narrowest useful test or scenario;
+2. determine whether the cause is the current change, the environment, a missing
+   prerequisite, flaky behavior, or pre-existing state;
+3. correct failures caused by the current work;
+4. preserve and report unrelated or unresolved failures accurately.
 
-Do not:
+Do not, without understanding and justifying the cause:
 
-* delete a failing test;
-* skip it;
-* weaken its assertion;
-* increase timeouts;
-* add retries;
-* disable safety checks;
+- delete the failing test;
+- skip or disable it;
+- weaken the assertion;
+- increase timeouts;
+- add retries;
+- disable safety checks.
 
-without understanding and documenting the underlying reason.
+A changed test is acceptable when the authoritative expected behavior changed; the reason
+must be the changed contract, not the desire to obtain a passing suite.
 
-## Manual validation
+## Validation evidence
 
-Owner manual validation follows relevant automated validation.
+Only executed validation produces validation evidence.
 
-It is especially important for:
+When recording results, distinguish:
 
-* complete provisioning workflows;
-* hardware behavior;
-* destructive operations;
-* operator-facing behavior that automation cannot represent reliably;
-* real Windows deployment and recovery.
+- the layer or scenario exercised;
+- the environment used;
+- actual pass/fail outcome;
+- relevant limitations;
+- missing prerequisites;
+- reusable empirical findings.
 
-Before handing work to `Validation`, report:
+The execution workflow owns where work-item results and owner handoff are recorded.
 
-* automated checks actually performed;
-* actual results;
-* environment limitations;
-* exact manual scenarios remaining.
+Reusable technical evidence that survives the work item belongs in `docs/reference/`.
 
-Agents must not claim owner validation has been completed.
+## Current repository state
 
-A problem discovered during manual validation returns the affected work to `In Progress`.
+Bamep currently has a Rust Cargo workspace containing the implemented Domain, Server,
+Agent Protocol, Simulator, and trusted-bootstrap crates.
 
-## Reporting results
+Do not hardcode a permanent repository-wide command here unless the repository explicitly
+defines one as authoritative.
 
-Report only validation that actually occurred.
+Derive concrete commands from the current workspace, package, build, CI, or test
+configuration for the scope being validated.
 
-Include, when relevant:
-
-* scenarios covered;
-* commands or test targets executed;
-* actual pass/fail results;
-* relevant coverage results;
-* missing prerequisites;
-* environment limitations;
-* Integration Environment work performed;
-* owner manual validation still required.
-
-Do not describe intended tests as executed tests.
-
-## Current bootstrap state
-
-Bamep does not yet have an established production test stack or authoritative repository-wide test commands.
-
-Do not invent them.
-
-As Server, Web, Agent, Simulator, and supporting tooling are implemented, this document should record only stable testing responsibilities and policies.
-
-Concrete commands should remain authoritative in the build, package, workspace, or test configuration that defines them.
+As additional components such as Bamep Web are implemented, extend this policy only when a
+new stable testing responsibility is required.
 
 ## Guiding rule
 
-Bamep testing should make unsafe, invalid, interrupted, and unexpected behavior as deliberate to validate as the successful path.
+Choose the smallest trustworthy layer that can prove the behavior under test.
 
-Simulation should cover what can be represented deterministically.
-
-The Integration Environment should validate what depends on real hardware.
-
-Owner manual validation should accept what automation cannot prove.
+Use deterministic automation for what can be represented faithfully, Simulator validation
+for orchestration through its real contract boundary, and the Integration Environment for
+physical behavior that simulation cannot establish.
