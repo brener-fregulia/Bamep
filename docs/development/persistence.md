@@ -1,228 +1,147 @@
 # Persistence
 
-## Purpose
+This document defines current Bamep Server persistence implementation and schema-evolution
+conventions. Backend rationale belongs to ADR-0013; normative durability/event semantics belong
+to `docs/specifications/m0-persistence-observability-and-domain-events.md`.
 
-This document defines the current Bamep Server persistence and schema-evolution
-conventions: PostgreSQL/SQLx usage, ORM policy, the Domain/persistence boundary,
-query style, and migration rules.
+## Current implementation
 
-It records ordinary implementation conventions, not a new architectural decision.
-The backend choice itself is decided by
-`docs/decisions/0013-postgresql-persistence-backend-baseline.md` (ADR-0013).
+- PostgreSQL is the selected backend (ADR-0013).
+- SQLx is the current Rust PostgreSQL toolkit.
+- Persistence-specific APIs and types stay inside `crates/server/src/adapters/postgres/`.
+- Domain and Application must not depend on `sqlx`, `PgPool`, PostgreSQL row types, or
+  persistence annotations.
+- Do not add another backend, persistence framework, or portability abstraction without a
+  concrete approved requirement.
 
-Related responsibilities:
+Current repository structure and code are final evidence for implementation details.
 
-* `AGENTS.md`: mandatory repository-wide agent rules;
-* ADR-0013: PostgreSQL as the only persistence backend, driver/migration tooling
-  left as an implementation-time choice;
-* `docs/development/testing.md`: general testing and validation policy;
-* `docs/development/workflow.md`: execution workflow.
+## SQL and model mapping
 
-## PostgreSQL and SQLx
-
-* PostgreSQL is the only supported persistence backend in the current baseline,
-  per ADR-0013.
-* SQLx is the current Rust PostgreSQL toolkit used by Bamep Server
-  (`crates/server/Cargo.toml`).
-* Do not add another persistence framework or toolkit without a concrete
-  requirement.
-* Do not add SQLite/MySQL support or a database-abstraction layer for
-  hypothetical portability. ADR-0013 explicitly rejects dual-backend support.
-* SQLx/PostgreSQL-specific types (`sqlx::PgPool`, `sqlx::Row`,
-  `sqlx::Transaction`, etc.) must remain inside the PostgreSQL Adapter
-  (`crates/server/src/adapters/postgres/`) and must not leak into Domain or
-  Application code, consistent with the repository Port/Adapter boundary.
-
-## ORM policy
-
-Bamep currently does **not** use an ORM.
-
-Explicit SQL behind the Repository Port / PostgreSQL Adapter boundary is the
-baseline.
-
-Do not introduce an ORM merely to reduce SQL boilerplate.
-
-An ORM may be reconsidered later only if a concrete requirement demonstrates a
-clear benefit worth the additional abstraction and dependency. This is a current
-baseline choice, not a permanent prohibition.
-
-## Domain versus persistence model
-
-Preserve:
+Bamep currently uses explicit SQL rather than an ORM.
 
 ```text
 database row/model != Domain entity
 ```
 
-Persistence DTO/row structs may exist inside the PostgreSQL Adapter when useful
-for mapping query results.
+Adapter-local row/DTO types may map between SQL results and Domain values. Domain types must not
+gain SQLx/ORM derives merely for persistence convenience.
 
-Domain types must not gain SQLx/ORM derives or PostgreSQL-specific annotations
-merely to make persistence easier.
+Queryable lifecycle, correlation, scheduling, reconciliation, audit, and safety state should use
+relational columns, constraints, and indexes. `JSONB` is for genuinely variable/opaque payloads,
+not whole-aggregate serialization. ADR-0013 owns the relational-first rationale.
 
-Queryable lifecycle, correlation, and safety state is relational first-class
-data (real columns, constraints, indexes) — see ADR-0013 "Modeling:
-relational-first, JSONB selective".
+### Closed categorical values
 
-`JSONB` is reserved for genuinely variable payloads (for example an event's
-type-specific `payload`), not a shortcut for serializing whole aggregates.
+For durable closed low-cardinality vocabularies:
 
-## Closed categorical values
-
-A durable column that holds a closed, low-cardinality vocabulary — a fixed
-set of state/type/kind labels that is part of the persistence/Domain
-contract (e.g. an identity-lifecycle state, a domain-event type, an actor
-kind) — should not default to repeated free-form `TEXT`.
-
-* Prefer a native PostgreSQL `ENUM` type when the vocabulary is
-  intentionally closed. It gives a compact fixed-size internal
-  representation (avoiding repeated textual labels in large tables/indexes),
-  keeps SQL human-readable, and lets PostgreSQL itself enforce the closed
-  set.
-* `TEXT` remains appropriate for open-ended values (free-form labels,
-  descriptive/error detail, arbitrary identifiers).
-* A numeric code (e.g. `SMALLINT`) requires a demonstrated storage/
-  performance need before use — it saves little over `ENUM` while losing
-  SQL readability and semantic clarity.
-* PostgreSQL `ENUM` evolution (adding/renaming/removing a label) is itself
-  schema evolution. During pre-baseline development, changes may be folded
-  into the current baseline migration; after baseline freeze, they require a
-  new versioned migration like any other schema change. They are never an
-  implicit/ad-hoc value.
-* SQLx/PostgreSQL enum representations (`#[derive(sqlx::Type)]`) stay
-  inside the PostgreSQL Adapter, mapped explicitly to/from the Domain type;
-  they must not leak into Domain, consistent with "Domain versus
-  persistence model" above.
+- prefer PostgreSQL `ENUM` when the vocabulary is intentionally closed;
+- use `TEXT` for open-ended/descriptive values;
+- use numeric codes only when a demonstrated storage/performance need justifies the readability
+  cost;
+- PostgreSQL enum representations remain Adapter-local and map explicitly to/from Domain types;
+- enum-label changes follow the migration-history rules below.
 
 ## Query style
 
-The current baseline uses runtime-checked SQL:
+The current baseline uses runtime-checked SQL such as:
 
-* `sqlx::query`;
-* `sqlx::query_scalar`;
-* binds and `Row` mapping where appropriate.
+- `sqlx::query`;
+- `sqlx::query_scalar`;
+- parameter binding and explicit `Row` mapping.
 
-Do not require the `query!` / `query_as!` compile-time macros as the project
-baseline today.
+`query!` / `query_as!` compile-time macros are not required as a project baseline. Compilation
+must not require a live database or generated `.sqlx` metadata solely for query checking.
 
-Reason: Bamep should remain buildable without requiring a live database or
-generated `.sqlx` metadata merely to compile.
-
-Compile-time SQL checking may be reconsidered later if its maintenance/build
-trade-off becomes worthwhile.
-
-Do not remove the `macros` SQLx feature: `sqlx::migrate!` (used in
-`crates/server/src/adapters/postgres/mod.rs` to embed migrations at build time)
-currently requires it.
+The SQLx `macros` feature remains required while the Adapter uses `sqlx::migrate!`.
 
 ## Migrations
 
-1. Schema changes use versioned SQL migrations.
-2. Migrations live under `crates/server/migrations/`.
-3. Do not hide schema evolution in Rust startup strings or ad-hoc `ALTER` logic.
-4. Use readable monotonic names, e.g. `0001_initial_schema.sql` and, after the
-   baseline is frozen, `0002_add_boot_context.sql`.
-5. Migrations should be transactional by default when PostgreSQL supports the
-   operation.
-6. A deliberately non-transactional migration requires explicit justification
-   and appropriate validation.
-7. Server startup applies pending embedded migrations
-   (`sqlx::migrate::Migrator`) before the Server becomes operational.
-8. Migration failure must fail startup clearly rather than allowing operation
-    on an incompatible partial schema.
-9. No external SQLx CLI should be required at Server runtime; migrations are
-    compiled in and applied by the Server itself.
-10. Constraints that protect durable invariants should exist in PostgreSQL when
-    appropriate (`NOT NULL`, `UNIQUE`, foreign keys, `CHECK`, indexes), not only
-    as Rust-side assumptions.
-11. Destructive or compatibility-sensitive migrations (`DROP`, incompatible
-    type changes, large data rewrites, etc.) require explicit
-    upgrade/backup/recovery consideration before implementation.
+Schema changes use versioned SQL migrations under:
 
-Bamep does not yet have a specified production backup/version-retention policy;
-do not assume or invent one when writing a migration.
+`crates/server/migrations/`
 
-### Pre-baseline development (current status)
+Conventions:
 
-Bamep is currently constructing its initial migration baseline. There is no
-persistent pilot deployment, customer database, released Server schema, or
-supported schema-upgrade path that must be preserved.
+1. use readable monotonic names such as `0001_initial_schema.sql`;
+2. do not hide schema evolution in startup-time Rust strings or ad-hoc `ALTER` logic;
+3. migrations are transactional by default when PostgreSQL supports the operation;
+4. non-transactional migrations require explicit justification and validation;
+5. Server startup applies pending embedded migrations before becoming operational;
+6. migration failure must fail startup rather than run against a partially compatible schema;
+7. runtime must not require the external SQLx CLI or an on-disk migrations directory;
+8. use database constraints (`NOT NULL`, `UNIQUE`, foreign keys, `CHECK`, indexes) where
+   appropriate to protect durable invariants;
+9. destructive/compatibility-sensitive changes require explicit upgrade, backup, and recovery
+   consideration.
 
-Until the baseline-freeze point defined below:
+Do not invent a production backup/version-retention policy that the project has not specified.
 
-* development and test databases are disposable;
-* existing development migrations may be edited, renamed, reordered,
-  consolidated, or removed;
-* schema corrections should normally be folded into the baseline instead of
-  creating artificial forward migrations;
-* compatibility with disposable local databases must not be preserved;
-* do not add backfills, dual-schema compatibility, or transitional security
-  behavior solely to preserve pre-baseline development data;
-* after the baseline migration changes, stale local development databases
-  should be dropped and recreated;
-* creating the complete schema in a fresh PostgreSQL database is the
-  authoritative validation target;
-* Git history preserves the development evolution; SQL migration history does
-  not need to duplicate that archaeology.
+## Migration-history phases
 
-Prefer a small, clean migration set that represents the schema Bamep actually
-intends to deploy. While the complete schema still belongs to the initial
-baseline, keep it in `0001_initial_schema.sql` rather than adding migrations
-merely because implementation happened incrementally.
+### Pre-baseline development — current phase
 
-### Frozen migration history (future)
+Until Bamep has either:
 
-The pre-baseline exception ends at the earliest of:
+1. a persistent non-disposable pilot database intended for in-place upgrade; or
+2. a released Server version establishing a supported persistent schema,
 
-1. the first persistent pilot or other non-disposable Bamep Server database
-   that Bamep intends to upgrade in place; or
-2. the first released Bamep version that establishes a supported persistent
-   database schema.
+development/test databases are disposable and the initial migration history may be rebased.
 
-At that explicit baseline-freeze point, every migration that may have been
-applied to a persistent supported database becomes immutable and migration
-history becomes append-only. Every later schema change receives a new
-monotonic migration. Released or applied migrations must not be edited,
-renamed, deleted, squashed, or otherwise changed in a way that alters their
-checksums. Forward upgrade compatibility becomes a product requirement; an
-applied migration is repaired through a new forward migration, and upgrade
-paths from supported prior states must be tested as those states begin to
-exist.
+During this phase:
 
-This phase distinction does not weaken production migration discipline. It
-defines when that discipline begins: a clean rebased baseline during
-pre-baseline development, then immutable, append-only, forward-only migration
-history after the baseline is frozen.
+- existing development migrations may be edited, renamed, reordered, consolidated, or removed;
+- schema corrections should normally be folded into the baseline instead of creating artificial
+  forward migrations;
+- do not add backfills, dual-schema compatibility, or transitional behavior solely to preserve
+  disposable development data;
+- after baseline changes, recreate stale local development databases;
+- validate that the complete schema can be created in a fresh PostgreSQL database;
+- prefer a small clean baseline, keeping the still-initial schema in `0001_initial_schema.sql`
+  when appropriate.
 
-## Migration testing
+Git history preserves pre-baseline implementation evolution; migration history does not need to.
 
-* Component/integration persistence tests use real PostgreSQL, per
-  `docs/development/testing.md`.
-* Migrations must apply cleanly to a fresh disposable test database.
-* Test databases must be isolated and safely disposable.
-* Do not use SQLite or in-memory behavior as proof of PostgreSQL behavior.
-* After the baseline is frozen and supported prior states exist, migrations
-  must also be validated from those supported schema/release states to the
-  current state.
-* Do not claim that upgrade-path testing already exists if it does not.
+### Frozen migration history
 
-## SQL file line endings
+At the first condition above, any migration that may have reached a supported persistent
+database becomes immutable and migration history becomes append-only.
 
-Because development occurs on both Windows and Linux, SQL migration files must
-use LF consistently so migration checksums do not vary because of checkout line
-endings.
+After freeze:
 
-`.gitattributes` enforces this narrowly for migration files:
+- every schema change gets a new monotonic migration;
+- applied/released migrations must not be edited, renamed, deleted, reordered, or squashed;
+- checksum-changing corrections use a new forward migration;
+- supported prior schema/release states become explicit upgrade-test inputs.
+
+## Migration validation
+
+Follow `docs/development/testing.md`.
+
+Persistence/migration validation must use real PostgreSQL. At minimum:
+
+- migrations apply cleanly to a fresh isolated disposable database;
+- SQLite/in-memory behavior is not evidence of PostgreSQL behavior;
+- after freeze, supported prior schema states are also tested through the forward upgrade path;
+- never claim an upgrade path was tested unless it actually ran.
+
+## SQL line endings
+
+Migration SQL files use LF to keep embedded migration checksums stable across Windows/Linux
+development.
+
+`.gitattributes` owns the repository rule:
 
 ```text
 crates/server/migrations/*.sql text eol=lf
 ```
 
-Do not broadly change unrelated line-ending policy when working in this area.
+Do not broaden unrelated line-ending policy while changing persistence migrations.
 
-## Guiding rule
+## Related
 
-Keep the persistence layer boring: explicit SQL, relational-first modeling, a
-clean rebased migration baseline while pre-baseline, append-only forward
-migrations after baseline freeze, and a strict Adapter boundary that keeps SQLx
-and PostgreSQL specifics out of Domain and Application code.
+- ADR-0013 — PostgreSQL backend decision and relational-first rationale.
+- `docs/specifications/m0-persistence-observability-and-domain-events.md` — normative persistence,
+  event, audit, correlation, and crash-ordering contract.
+- `docs/architecture/README.md` — current implemented boundaries.
+- `docs/development/testing.md` — persistence/migration validation policy.
