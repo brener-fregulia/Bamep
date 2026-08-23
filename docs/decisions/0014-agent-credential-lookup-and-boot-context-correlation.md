@@ -1,443 +1,243 @@
-# ADR-0014: Agent credential lookup and boot-context correlation
+# ADR-0014: Agent credential lookup and BootContext correlation
 
 Status: Accepted
 
 ## Context
 
-ADR-0012 (Runtime Agent credential issuance, rotation, and reconnect recovery,
-`Accepted`) defines how a credential chain rotates, confirms, and is revoked
-once the Server already knows which Endpoint's chain a presented credential
-must be validated against. It does not decide *how* the Server determines
-that Endpoint from an `AuthRequest{credential}` alone, nor how a boot-scoped
-enrollment credential (E1/E2) is correlated to a candidate Endpoint before any
-durable Endpoint record exists. Both gaps must be resolved before the real
-Agent Protocol v1/WSS transport path (`m0-agent-protocol-contract.md`) is
-implemented, since `AuthRequest` carries only an opaque `credential` — no
-endpoint identifier, inventory signal, or lookup field.
+ADR-0012 defines credential rotation once the Server knows which Endpoint credential chain
+must validate a presented `AuthRequest{credential}`. It did not define how that opaque
+credential locates the chain, or how a boot-scoped enrollment credential locates
+Server-owned correlation state before an Endpoint record exists.
 
-Inspection of the current WP1 checkpoint (Issue #17,
-`[WP] Establish simulated Endpoint trust, enrollment, and Agent session`)
-confirms this gap is real, not hypothetical: `EndpointRepository::redeem`
-(`crates/server/src/ports.rs`) and `EnrollmentService::redeem`
-(`crates/server/src/application/mod.rs`) currently take `inventory_signal` as
-an explicit out-of-band parameter supplied by the caller, used directly as the
-row-locking/lookup key. This is a Simulator-fixture stand-in for the real
-MAC/disk-fingerprint matching algorithm (`m0-endpoint-identity-lifecycle.md`
-"Identity model"), not a value the real `AuthRequest{credential}` message will
-ever carry. The remaining, not-yet-implemented part of WP1 — wiring a real
-`AuthRequest{credential}`-only redemption path — cannot reuse today's
-`inventory_signal` parameter unchanged; something derived from `credential`
-itself must resolve which Endpoint's persisted state to evaluate against.
+The accepted Agent Protocol wire shape carries no Endpoint identifier, MAC, inventory signal,
+or separate lookup field. Lookup therefore has to be derivable from the opaque credential
+without turning hardware/network evidence into authentication.
 
-This ADR resolves that lookup/correlation problem without reopening:
+This ADR originally described a self-verifying HMAC-signed enrollment token backed by an
+installation-global signing key. A later owner-approved amendment replaced that design:
+because every unresolved enrollment credential already has durable pre-redemption
+`BootContext` state, the credential can instead be stateful and verified against a one-way
+verifier in that record. The final accepted decision below reflects that amendment.
 
-- ADR-0004's enrollment/bootstrap model or operator-approval-gated first
-  enrollment;
-- ADR-0012's credential-chain rotation, grace, replacement, confirmation, or
-  revocation semantics;
-- ADR-0013's PostgreSQL persistence baseline;
-- Agent Protocol v1's wire shape (`AuthRequest{credential}`,
-  `SessionEstablished`);
-- the trusted-bootstrap `boot_nonce` contract
-  (`m0-trusted-bootstrap-and-server-fingerprint-contract.md`).
+Normative credential/BootContext lifecycle behavior belongs to
+`docs/specifications/m0-endpoint-identity-lifecycle.md`.
 
 ## Decision
 
-### 1. Agent Protocol wire shape is unchanged
+### Keep `AuthRequest{credential}` unchanged
 
-`AuthRequest{credential}` remains exactly as defined in
-`m0-agent-protocol-contract.md`. No `endpoint_id`, `inventory_signal`,
-`boot_context_id`, lookup identifier, MAC address, or other correlation field
-is added to it. The credential remains opaque from Agent Protocol's own
-perspective, as ADR-0012 already established.
+Agent Protocol does not gain `endpoint_id`, `inventory_signal`, `boot_context_id`, MAC, or
+another correlation field.
 
-### 2. Runtime credentials are self-locating
+The credential remains opaque at the protocol boundary.
 
-A runtime credential internally carries two logically distinct parts:
+### Runtime credentials are self-locating
 
-- a non-secret **lookup identifier**;
+A runtime credential contains logically distinct:
+
+- a non-secret lookup identifier;
 - secret credential material.
 
-The lookup identifier is not authentication by itself — it only narrows which
-persisted Endpoint credential chain a presented value must then be verified
-against, via the one-way credential verifier/hash the chain already stores
-(ADR-0012 point 10). It is indexed by PostgreSQL so this narrowing is a direct
-lookup, never a database-wide scan over every persisted credential hash. No
-plaintext credential is ever persisted; this is additive to ADR-0012 point 10,
-not a change to it. The concrete serialization (e.g., a structured token
-combining a public identifier and a secret component) is implementation-time,
-provided the credential kind and lookup identifier can always be determined
-unambiguously from the presented value.
+The lookup identifier narrows the presented credential to one persisted Endpoint credential
+chain through an indexed lookup. It never authenticates the Agent by itself; the secret must
+still verify against that chain's stored one-way verifier.
 
-### 3. Boot-scoped enrollment credentials resolve through a separate BootContext
+Database-wide scanning of credential hashes is not part of the design.
 
-A boot-scoped enrollment credential (E1/E2) is not yet bound to any persisted
-Endpoint credential chain — none exists until first successful redemption. Its
-pre-redemption lookup identifier is a distinct, Server-side concept:
+Exact credential serialization remains implementation-time.
 
-```text
-boot_context_id
-```
+### Enrollment credentials use durable `BootContext`
 
-`boot_context_id` is **not** the trusted-bootstrap `boot_nonce`
-(`m0-trusted-bootstrap-and-server-fingerprint-contract.md` "(C) Authenticated
-and fresh bootstrap material"). They are distinct values with distinct security
-responsibilities, but they compose in the same durable `BootContext` rather than
-creating two unrelated definitions of a boot context:
+Before first successful redemption, an enrollment credential does not yet belong to an
+Endpoint credential chain.
 
-- `boot_nonce` belongs to the trusted-bootstrap contract; it is generated by
-  the Endpoint/trusted-bootstrap stage itself, supplied to Boot Orchestration
-  when the `BootContext`/enrollment credential is issued, and later verified
-  through `BootstrapEvidence` after `SessionEstablished`.
-- Reusing `boot_nonce` for pre-authentication credential lookup would couple
-  two currently independent security contracts (trusted-boot-chain
-  authenticity, and credential redemption) without providing additional
-  authentication strength — `boot_nonce`'s freshness guarantee is scoped to
-  the signed bootstrap assertion, not to credential correlation.
-- Boot Orchestration already owns enrollment-credential issuance
-  (`m0-stack-and-boundaries-baseline.md` "Component responsibilities and
-  boundaries"; ADR-0004 point 2), so it also owns `boot_context_id` and the
-  correlation evidence associated with that issuance.
+Its non-secret lookup component is `boot_context_id`, which resolves a durable PostgreSQL
+`BootContext`.
 
-`boot_context_id` is generated by Boot Orchestration at enrollment-credential
-issuance time and carried as the credential's non-secret lookup component,
-alongside independently generated secret material (point 6). It is not
-embedded inside a signed payload — see the amendment recorded under
-"Consequences" for why the originally referenced signed-token representation
-no longer applies. Exact encoding remains implementation-time.
-
-### 4. BootContext is short-lived but durable
-
-`BootContext` is persisted in PostgreSQL, not held only in server-process
-memory, so a still-valid enrollment credential is not stranded merely by a
-Server process restart. Its durability is also what makes the credential's
-secret material independently verifiable across restart without any
-installation-global signing key (see the amendment recorded under
-"Consequences"). Conceptually it holds at least:
+`BootContext` contains at least:
 
 - `boot_context_id`;
-- the exact 32-byte trusted-bootstrap `boot_nonce` supplied by the trusted-
-  bootstrap/boot boundary at issuance;
-- a one-way verifier/hash of the enrollment credential's secret material — no
-  plaintext secret is ever persisted;
+- the exact trusted-bootstrap `boot_nonce` supplied for that boot;
+- a one-way verifier of the enrollment secret;
 - expiry;
 - Server/Boot-Orchestration-observed correlation evidence;
-- `resolved_endpoint_id`, initially absent.
+- optional `resolved_endpoint_id`.
 
-Correlation evidence remains evidence only — never durable Endpoint identity,
-never authentication, never sufficient trust by itself, and potentially
-spoofable depending on the concrete DHCP/PXE/boot observation mechanism. This
-is unchanged from ADR-0004 and is not reopened here.
+No plaintext enrollment secret is persisted.
 
-Adding `boot_nonce` does not make `inventory_signal` authentication, does not
-make the nonce a credential lookup identifier, and does not alter any lookup,
-secret-verification, expiry, promotion, or redemption rule in this ADR.
+Correlation evidence remains evidence only. It is not identity, authentication, or sufficient
+trust.
 
-No exact SQL schema is mandated by this ADR. Physical cleanup of expired
-`BootContext` rows is not designed here.
+### `boot_context_id` and `boot_nonce` remain distinct
 
-### 5. Enrollment credential promotion
+`boot_context_id` exists to locate pre-authentication Server state.
 
-Before first successful redemption, `boot_context_id` resolves through
-`BootContext` to its correlation evidence. On first successful E1/E2
-redemption, the presented enrollment credential is promoted into the
-Endpoint's normal credential chain as the predecessor — the same non-secret
-identifier therefore serves sequentially as pre-redemption `boot_context_id`
-and post-redemption `predecessor_lookup_id`. Possession of that identifier
-alone never authenticates anything; verification against the stored one-way
-verifier is still required.
+`boot_nonce` belongs to trusted-bootstrap freshness/correlation and is later verified through
+the trusted-bootstrap evidence path.
 
-In the successful PostgreSQL transaction, the following commit atomically:
+They coexist in the same `BootContext`, but one must not substitute for the other. Reusing
+`boot_nonce` as credential lookup would couple independent security responsibilities without
+adding authentication strength.
 
-- the Endpoint identity/credential transition;
-- required domain event(s) and audit state where the underlying transition
-  already requires them (this ADR does not imply first contact itself
-  requires an audit record beyond what the existing approved event/audit
-  contract requires, `m0-persistence-observability-and-domain-events.md`);
+### Enrollment credentials are stateful, not globally signed
+
+An unresolved enrollment credential is:
+
+`boot_context_id + high-entropy secret`
+
+Admission verifies the presented secret against the one-way verifier stored in the durable
+`BootContext` and checks its unresolved expiry.
+
+No installation-global enrollment signing key, signing-key persistence, rotation, backup, or
+compromise domain is required by this design.
+
+### Persist `BootContext` before delivering the credential
+
+Boot Orchestration creates the identifier/secret, receives the current boot nonce, derives the
+one-way verifier, and durably commits the `BootContext` before delivering the enrollment
+credential.
+
+Therefore:
+
+- crash before commit means no valid credential was delivered;
+- crash after commit but before delivery may leave an expiring orphan record;
+- crash after delivery does not prevent later redemption after Server restart.
+
+### Promote successful enrollment redemption into the normal chain
+
+On first successful redemption, the enrollment credential becomes the predecessor in the
+Endpoint's normal credential chain.
+
+The successful transaction atomically commits the applicable:
+
+- Endpoint identity/credential transition;
+- required event/audit effects from the existing persistence contract;
 - `BootContext.resolved_endpoint_id`;
-- the normal persisted predecessor lookup mapping.
-- selection of this `BootContext` and its `boot_nonce` as the Endpoint's
-  authoritative current boot, initialized with trusted bootstrap
-  `NotEstablished`.
+- persisted predecessor lookup mapping;
+- authoritative current `BootContext`/`boot_nonce`;
+- trusted-bootstrap current-boot state initialized to `NotEstablished`.
 
-After this commit, authentication or retry of that E1/E2 no longer depends on
-the `BootContext` row. The row remains a durable historical boot record, but
-historical resolution is not evidence that it is still the Endpoint's current
-boot; the Endpoint current-boot projection is authoritative for that decision.
+After that commit, retry/authentication routes through the normal persisted credential index.
+The historical `BootContext` record does not remain an independent authentication path and
+does not determine which boot is currently authoritative.
 
-### 6. Promoted-predecessor expiry semantics
+### Promotion changes which expiry governs retry
 
-An unresolved E1/E2 is a stateful, self-locating credential (point 3), not a
-self-verifying signed token: before promotion, admission is governed by
-verifying its presented secret against the one-way verifier stored in
-`BootContext` (point 4) and by `BootContext.expires_at` — never by
-HMAC/signature verification and never by an installation-global signing key
-(see the amendment recorded under "Consequences"). `BootContext.expires_at`
-governs only whether that boot-scoped credential may perform its **first**
-successful redemption. After successful promotion, the credential is a
-persisted predecessor in the Endpoint credential chain; future retries are
-validated against the persisted `CredentialSlot`'s own expiry/grace semantics
-(ADR-0012), not by re-running enrollment-token verification.
+`BootContext.expires_at` governs only the unresolved enrollment credential's first successful
+redemption.
 
-The promoted predecessor may therefore remain valid beyond `BootContext`'s
-original expiry when the persisted credential-chain validity window extends
-further. This is intentional:
+After promotion, the credential is a normal predecessor; its persisted credential-slot
+expiry/grace semantics govern retries, even if they extend beyond the original
+`BootContext.expires_at`.
 
-- ADR-0012 already treats an enrollment credential and a runtime credential
-  uniformly once acting as predecessor;
-- predecessor retention exists specifically to recover from a lost
-  `SessionEstablished` / unconfirmed successor;
-- retaining the much shorter enrollment-token expiry after promotion could
-  strand an Agent precisely during the first credential exchange;
-- after promotion, the credential is bound to one durable Endpoint chain,
-  persisted only through its one-way verifier/hash, subject to normal
-  revocation and serialized credential rules.
+Otherwise a lost first `SessionEstablished` could strand the Agent despite ADR-0012's
+predecessor-recovery model.
 
-This does not contradict, and does not require amending, ADR-0012; it is made
-explicit in `m0-endpoint-identity-lifecycle.md`.
+### Routing is indexed and fail-closed
 
-### 7. Safe AuthRequest routing
+Conceptually:
 
-Conceptual routing (no concrete Rust API shape decided here):
+1. parse credential kind and non-secret lookup identifier;
+2. try the persisted Endpoint credential index;
+3. if found, lock/serialize the owning Endpoint and verify the credential secret;
+4. only for an enrollment credential not found there, locate its `BootContext`;
+5. under the `BootContext` lock, re-read its state;
+6. if already resolved, route to the existing Endpoint/normal chain;
+7. if unresolved, verify secret and expiry, then perform first-contact/genuine-reboot
+   resolution.
 
-1. Parse credential kind and non-secret lookup identifier from the presented
-   value.
-2. Look up the identifier in the persisted Endpoint credential index.
-3. If found: serialize/lock the owning Endpoint, then verify/authenticate
-   against its persisted credential chain (ADR-0012).
-4. If no persisted credential mapping exists **and** the credential is an
-   enrollment credential: locate and lock/re-read its `BootContext` by
-   `boot_context_id`. If already resolved (`resolved_endpoint_id` set), route
-   to that Endpoint and authenticate against its persisted promoted chain
-   instead of re-running first-contact resolution (point 8). If unresolved,
-   verify the presented secret against the `BootContext` one-way verifier and
-   evaluate `BootContext.expires_at` at commit-time, then continue through
-   first-contact / genuine-reboot resolution (ADR-0004; ADR-0012 point 1). No
-   HMAC/signature verification precedes this `BootContext` lookup (see the
-   amendment recorded under "Consequences").
+Lookup never substitutes for secret verification.
 
-The lookup identifier never authenticates the Agent by itself.
+### Concurrent first redemption resolves once
 
-### 8. Concurrency correction for BootContext resolution
+Two requests may race before either commits.
 
-Two concurrent first redemptions of the same E1/E2 may both perform the
-initial persisted-credential lookup (step 2 above) before either has
-committed. To keep exactly one Endpoint resolution/creation per
-`BootContext`:
+After acquiring the `BootContext` lock, the implementation must re-read it. Only a still-
+unresolved context may run first-contact/genuine-reboot resolution.
 
-- after acquiring the `BootContext` lock, the implementation **must** re-read
-  `BootContext` under that lock;
-- if `resolved_endpoint_id` is already set, the request routes to that
-  existing Endpoint and authenticates against its already-persisted
-  credential chain — it must **not** run first-contact resolution again;
-- only if `resolved_endpoint_id` is still absent may the unresolved
-  first-contact/genuine-reboot resolution execute.
+If `resolved_endpoint_id` is already present, the request uses that existing Endpoint and
+must not create/resolve another one.
 
-This mirrors, at the `BootContext` level, the same commit-time concurrency
-invariant ADR-0012 point 7 already establishes for the credential chain
-itself. No specific SQL locking syntax is mandated.
+Specific SQL locking syntax is implementation-time.
 
-### 9. Retry after commit
+### Retry after commit uses the normal chain
 
-If the durable commit (point 5) succeeds but `SessionEstablished` is lost, the
-same E1/E2 lookup identifier is already present in the normal persisted
-credential index. Retry routes to the same Endpoint; ADR-0012's
-predecessor/replacement semantics apply normally, and `BootContext` existence
-is no longer required. `BootContext` expiry after successful promotion must
-therefore never strand the already-established credential chain.
+If promotion commits but `SessionEstablished` is lost, retry finds the promoted predecessor
+in the Endpoint credential index and ADR-0012 recovery applies normally.
 
-### 10. Genuine reboot and revocation are not reopened
+Later `BootContext` expiry or cleanup therefore cannot invalidate an already-promoted
+credential solely because its original boot-context expiry elapsed.
 
-For E2 (genuine reboot): a new boot produces a new `boot_context_id` /
-`BootContext` and a fresh `boot_nonce`; correlation evidence may resolve a
-candidate existing Enrolled Endpoint per ADR-0004; successful genuine reboot
-promotes E2 as the new predecessor, replaces the old chain, replaces the
-Endpoint authoritative current-boot projection, and resets trusted bootstrap
-to `NotEstablished`, all before `SessionEstablished`; operator enrollment
-approval is not repeated when legitimate identity continuity holds. Same-boot
-runtime reconnect/credential rotation preserves the current `BootContext`,
-nonce, and trusted-bootstrap state exactly. `CredentialRevoked` still
-blocks establishment of a new chain, per the already-approved ADR-0012
-amendment (point 8) — unchanged and not reopened by this ADR.
+### Existing reboot, revocation, and trust semantics remain independent
 
-### 11. Persist-before-deliver issuance ordering
+A genuine reboot creates a new `BootContext` and `boot_nonce`; successful resolution updates
+the authoritative current boot according to the Endpoint Specification.
 
-This model requires no installation-global enrollment signing key, so no
-signing-key restart-survival requirement applies (see the amendment recorded
-under "Consequences"). Restart-safety instead follows directly from
-`BootContext`'s own durability (point 4), provided issuance observes a
-mandatory ordering: Boot Orchestration generates `boot_context_id` and the
-enrollment secret, receives the fresh `boot_nonce` established by the trusted-
-bootstrap/boot boundary, derives the secret's one-way verifier, and commits
-`BootContext` (verifier, expiry, correlation evidence, nonce) durably — only
-after that commit succeeds does it deliver the E1/E2 credential to the
-booting Endpoint.
+`CredentialRevoked` still blocks establishing a new credential chain until explicit recovery.
 
-- A crash **before** the `BootContext` commit means no valid credential was
-  ever delivered — nothing to recover.
-- A crash **after** commit but **before** delivery may leave a short-lived
-  orphan `BootContext` row; this is acceptable and requires no special
-  reconciliation — it expires naturally through `expires_at`.
-- A crash **after** delivery does not strand E1/E2: all state required to
-  validate it (verifier, expiry, correlation evidence, nonce) is already durable, so
-  a Server restart before the Endpoint's first `AuthRequest` does not affect
-  redemption.
-
-No key-storage, rotation, backup/recovery, or secret-management design is
-required by this ADR as a consequence. Physical cleanup of orphaned or
-expired `BootContext` rows remains out of scope (point 4).
+Neither hardware correlation nor resolving a `BootContext` establishes trusted bootstrap.
 
 ## Alternatives considered
 
-- **Adding explicit lookup fields to `AuthRequest`** (`endpoint_id`,
-  `inventory_signal`, `boot_context_id`, or similar): rejected — reopens Agent
-  Protocol v1's accepted wire shape for no behavioral gain, since a
-  self-locating opaque credential already carries everything the Server needs
-  without exposing internal correlation concepts on the wire.
-- **Database-wide credential-hash scanning**: rejected — verifying a presented
-  secret against every persisted hash to find a match does not scale, and
-  contradicts the indexed-lookup requirement point 2 establishes; a
-  non-secret lookup identifier makes the search a direct index lookup instead.
-- **Using MAC/inventory signal as authentication**: rejected outright — MAC
-  addresses and other inventory signals are explicitly evidence, never
-  authentication or trust anchors (`AGENTS.md` "Safety"; ADR-0004). This
-  option was never seriously considered as anything but a violation of an
-  existing mandatory rule.
-- **Purely in-memory BootContext**: rejected — a Server process restart
-  between enrollment-credential issuance and first redemption would strand an
-  otherwise still-valid E1/E2, with no way to recover it. Persisting
-  `BootContext` in PostgreSQL avoids this at negligible cost, consistent with
-  ADR-0013's baseline.
-- **Embedding full correlation evidence directly into a stateless enrollment
-  token**: rejected — correlation evidence must remain revisable/queryable
-  server-side (e.g., for operator review) and must never be trusted merely
-  because a client presented it back; a stateless token carrying evidence
-  would let a client replay or fabricate evidence the Server never
-  independently observed. `BootContext` keeps this evidence Server-owned.
-- **Reusing trusted-bootstrap `boot_nonce` as `boot_context_id`**: rejected —
-  see point 3 above. `boot_nonce`'s Server-authoritative correlation is
-  established only after `SessionEstablished`/`BootstrapEvidence`, too late to
-  serve as a pre-authentication credential lookup key, and coupling the two
-  contracts provides no additional authentication strength.
+### Add lookup fields to Agent Protocol
 
-The adopted hybrid design is preferred because each credential kind is
-resolved through the mechanism proportionate to its own lifecycle stage:
+Rejected. A self-locating opaque credential solves routing without exposing internal
+correlation concepts or changing `AuthRequest`.
 
-- a **runtime credential** is self-locating, since it already belongs to an
-  existing persisted Endpoint chain — a direct indexed lookup is sufficient
-  and requires no additional server-side state;
-- an **unresolved enrollment credential** is `BootContext`-backed, since no
-  persisted Endpoint chain exists yet to index into, and the correlation
-  evidence backing first-contact/genuine-reboot resolution must be
-  Server-owned and restart-safe;
-- a **promoted enrollment predecessor** falls back to the same normal
-  persisted credential lookup as any runtime credential, the instant it is no
-  longer boot-scoped — avoiding two permanently parallel lookup mechanisms
-  for what becomes, after promotion, the same kind of chain entry.
+### Scan every credential verifier
+
+Rejected. Direct indexed lookup is simpler and avoids verification work proportional to all
+persisted credentials.
+
+### Use MAC/inventory evidence as authentication
+
+Rejected. Hardware/network observations are continuity/correlation evidence only.
+
+### Keep `BootContext` only in memory
+
+Rejected. A Server restart between issuance and redemption would strand an otherwise valid
+enrollment credential.
+
+### Put correlation evidence in a stateless token
+
+Rejected. Correlation evidence is Server-observed state and should remain Server-owned rather
+than being trusted because a client returned it.
+
+### Reuse `boot_nonce` as `boot_context_id`
+
+Rejected because the values serve different security responsibilities and the nonce does not
+add authentication strength to credential lookup.
+
+### Installation-global HMAC-signed enrollment token
+
+Superseded by the owner-approved amendment. Durable `BootContext` state makes a global signing
+key unnecessary; a stateful identifier + secret with one-way verification has a smaller
+secrets-management surface.
 
 ## Consequences
 
-- `docs/specifications/m0-endpoint-identity-lifecycle.md` is amended to define
-  the non-secret lookup identifier, runtime-credential self-location,
-  unresolved-enrollment `BootContext` lookup and its one-way enrollment-secret
-  verifier, promotion into the normal credential chain, and the
-  promoted-predecessor expiry semantics (point 6) in the "Credential chain,
-  rotation, and revocation" subsection it already owns. That Specification
-  remains the normative lifecycle definition; this ADR records the decision
-  and its reasoning.
-- `docs/decisions/0004-endpoint-identity-and-enrollment-bootstrap.md` is not
-  reopened or amended — its enrollment/bootstrap model and operator-approval
-  gate are consumed, not changed.
-- `docs/decisions/0012-runtime-agent-credential-issuance-rotation-and-reconnect-recovery.md`
-  is not reopened or amended — no contradiction was found; this ADR is
-  additive, resolving the lookup/correlation problem ADR-0012 left open
-  rather than changing any of its rotation/grace/replacement/confirmation/
-  revocation rules.
-- `docs/decisions/0013-postgresql-persistence-backend-baseline.md` is not
-  reopened or amended.
-- `docs/specifications/m0-agent-protocol-contract.md` is not amended — Agent
-  Protocol v1's wire shape is unchanged, and its existing statement that
-  `runtime_credential`'s internal representation is owned by
-  `m0-endpoint-identity-lifecycle.md` and ADR-0012 already covers this ADR's
-  addition without requiring new wording there.
-- `docs/specifications/m0-trusted-bootstrap-and-server-fingerprint-contract.md`
-  is amended by the later owner-approved WP1 trusted-bootstrap checkpoint to
-  compose its `boot_nonce` with this ADR's durable `BootContext` and the
-  Endpoint authoritative current-boot projection; credential lookup semantics
-  remain unchanged.
-- No product code, migration, or PostgreSQL schema is changed by this ADR.
-  The current WP1 checkpoint's `inventory_signal`-keyed `redeem` parameter
-  (`crates/server/src/ports.rs`, `crates/server/src/application/mod.rs`)
-  remains a Simulator-fixture stand-in until the real
-  `AuthRequest{credential}`-only redemption path is implemented against this
-  decision in a future round.
-- **Amendment (owner-approved, post-acceptance):** points 3, 4, 6, 7, and 11
-  are amended. The original text of this ADR described, and point 11
-  deferred storage/rotation design for, a self-verifying HMAC-signed
-  enrollment token backed by an installation-global Server `SigningKey`
-  (`crates/domain/src/credential.rs` `enrollment` module — the historical
-  implementation this ADR predates and does not itself change). That
-  representation existed because enrollment credentials originally had no
-  durable pre-redemption Server-side state to consult before verifying them.
-  This ADR's own point 4 — a durable, PostgreSQL-persisted `BootContext` for
-  every unresolved E1/E2 — removes that premise: a `BootContext` row already
-  exists at issuance, so the credential is instead a stateful, self-locating
-  value (non-secret `boot_context_id` + high-entropy secret, point 3)
-  verified against a one-way verifier stored in `BootContext` (point 4),
-  with no installation-global enrollment signing key, no signing-key
-  persistence/rotation/backup requirement, and no signing-key-compromise
-  blast radius. Issuance must follow the persist-before-deliver ordering in
-  point 11. The later trusted-bootstrap amendment additionally supplies and
-  persists the `boot_nonce` for that same `BootContext`. No functional routing
-  precedence changes as a result: enrollment credentials are still resolved
-  only after the persisted Endpoint credential
-  index lookup misses (point 7), and possession of `boot_context_id` alone
-  still never authenticates anything. This amendment does not reopen
-  `boot_context_id` vs. `boot_nonce` distinction (point 3), promoted-predecessor
-  semantics (point 5), `CredentialRevoked` durability (point 10), or Agent
-  Protocol wire shape (point 1). It does not amend ADR-0004 or ADR-0012.
-- **Amendment (owner-approved, WP1 trusted-bootstrap checkpoint):** the existing
-  durable `BootContext` additionally owns the trusted-bootstrap `boot_nonce`
-  supplied at issuance. A resolved Endpoint owns a separate authoritative
-  current-boot projection containing `boot_context_id`, `boot_nonce`, and
-  `TrustedBootstrapState`; historical resolution alone never selects the
-  current boot. First contact initializes this projection as
-  `NotEstablished`, genuine reboot replaces it and resets it, and same-boot
-  credential activity preserves it. Evidence acceptance serializes directly
-  under the Endpoint lock using the projection, without a reverse
-  `Endpoint -> BootContext` locking dependency against redemption's existing
-  `BootContext -> ... -> Endpoint` order. This is additive composition with
-  the trusted-bootstrap contract and does not alter credential lookup or
-  redemption semantics.
+- Runtime credentials locate existing Endpoint chains directly through indexed non-secret IDs.
+- Unresolved enrollment credentials locate durable Server-owned `BootContext` state.
+- Promoted enrollment credentials converge onto the same normal lookup path as runtime
+  credentials.
+- `boot_context_id`, `boot_nonce`, hardware evidence, and credential secret retain separate
+  responsibilities.
+- Enrollment issuance and promotion remain restart-safe through persist-before-deliver and
+  atomic persistence.
+- No installation-global enrollment signing key is required.
+- Exact token encoding, SQL schema/index definitions, lock mechanism, TTL values, and cleanup
+  policy remain implementation concerns.
 
-## Related architecture
+## Related
 
-- `docs/specifications/m0-endpoint-identity-lifecycle.md` — the "Credential
-  chain, rotation, and revocation" subsection this ADR's decision is recorded
-  against and which is amended by this ADR.
-- `docs/specifications/m0-agent-protocol-contract.md` — the `AuthRequest`/
-  `SessionEstablished` wire contract this ADR's decision must remain
-  compatible with, unchanged.
-- `docs/specifications/m0-trusted-bootstrap-and-server-fingerprint-contract.md`
-  — the `boot_nonce`/`BootstrapEvidence` sequencing this ADR distinguishes
-  `boot_context_id` from, unchanged.
-- `docs/specifications/m0-persistence-observability-and-domain-events.md` —
-  the atomic state+event+audit transaction model this ADR's promotion commit
-  (point 5) relies on.
-
-## Related work
-
-- ADR-0004 — Endpoint identity and enrollment/trust bootstrap model
-  (`Accepted`) — the enrollment/runtime-credential model this ADR consumes
-  without reopening.
-- ADR-0012 — Runtime Agent credential issuance, rotation, and reconnect
-  recovery (`Accepted`) — the credential-chain model this ADR resolves the
-  lookup/correlation gap for, without reopening its rotation/grace/
-  replacement/confirmation/revocation rules.
-- ADR-0013 — PostgreSQL persistence backend baseline (`Accepted`) — the
-  persistence backend `BootContext` and the credential index are persisted
-  under; not reopened.
-- Issue #17 — `[WP] Establish simulated Endpoint trust, enrollment, and Agent
-  session` — the Work Package whose current checkpoint's `inventory_signal`
-  stand-in surfaced this gap, and whose remaining execution (real
-  `AuthRequest{credential}`-only redemption) implements this ADR's model.
+- ADR-0004 — Endpoint identity and enrollment bootstrap.
+- ADR-0012 — runtime credential rotation/reconnect recovery.
+- ADR-0013 — PostgreSQL persistence backend.
+- `docs/specifications/m0-endpoint-identity-lifecycle.md` — normative credential and
+  BootContext lifecycle.
+- `docs/specifications/m0-agent-protocol-contract.md` — `AuthRequest` wire contract.
+- `docs/specifications/m0-trusted-bootstrap-and-server-fingerprint-contract.md` —
+  `boot_nonce` authority.
+- `docs/specifications/m0-persistence-observability-and-domain-events.md` — atomic persistence
+  and persist-before-send.
+- Issue #17 — implementation history that surfaced the lookup/correlation gap.
