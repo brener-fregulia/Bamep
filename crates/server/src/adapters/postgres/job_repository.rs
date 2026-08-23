@@ -8,11 +8,17 @@
 //! workflow possible on any failure path.
 
 use async_trait::async_trait;
-use bamep_domain::{EndpointId, Job, JobId, JobState, JobStep, JobStepId, JobStepState};
+use bamep_domain::{
+    DestructiveIntent, EndpointId, InventoryRevisionId, Job, JobId, JobState, JobStep, JobStepId,
+    JobStepState, TargetFingerprint,
+};
 use sqlx::{PgPool, Row};
 
 use super::shared::{to_backend_err, PgIdentityState};
-use crate::ports::{CreateWorkflowError, JobRepository, RepositoryError};
+use crate::ports::{
+    AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError, CreateWorkflowError,
+    JobRepository, RepositoryError,
+};
 
 /// Adapter-local representation of the `job_state` PostgreSQL ENUM
 /// (`docs/development/persistence.md` "Closed categorical values"). Domain
@@ -164,8 +170,9 @@ impl JobRepository for PostgresJobRepository {
         let state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
 
         let step_rows = sqlx::query(
-            "SELECT id, job_id, step_order, state FROM job_steps \
-             WHERE job_id = $1 ORDER BY step_order ASC",
+            "SELECT id, job_id, step_order, state, \
+                    authorized_inventory_revision_id, authorized_target_fingerprint \
+             FROM job_steps WHERE job_id = $1 ORDER BY step_order ASC",
         )
         .bind(id.0)
         .fetch_all(&self.pool)
@@ -174,16 +181,7 @@ impl JobRepository for PostgresJobRepository {
 
         let mut steps = Vec::with_capacity(step_rows.len());
         for row in &step_rows {
-            let step_id: uuid::Uuid = row.try_get("id").map_err(to_backend_err)?;
-            let step_job_id: uuid::Uuid = row.try_get("job_id").map_err(to_backend_err)?;
-            let order: i32 = row.try_get("step_order").map_err(to_backend_err)?;
-            let step_state: PgJobStepState = row.try_get("state").map_err(to_backend_err)?;
-            steps.push(JobStep {
-                id: JobStepId(step_id),
-                job_id: JobId(step_job_id),
-                order,
-                state: step_state.into(),
-            });
+            steps.push(row_to_job_step(row)?);
         }
 
         Ok(Some(Job {
@@ -193,4 +191,97 @@ impl JobRepository for PostgresJobRepository {
             steps,
         }))
     }
+
+    async fn authorize_destructive_intent(
+        &self,
+        job_id: JobId,
+        step_id: JobStepId,
+        decide: AuthorizeDestructiveIntentDecision,
+    ) -> Result<DestructiveIntent, AuthorizeDestructiveIntentError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        let row = sqlx::query(
+            "SELECT id, job_id, step_order, state, \
+                    authorized_inventory_revision_id, authorized_target_fingerprint \
+             FROM job_steps WHERE id = $1 AND job_id = $2 FOR UPDATE",
+        )
+        .bind(step_id.0)
+        .bind(job_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+
+        let Some(row) = row else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(AuthorizeDestructiveIntentError::JobStepNotFound(
+                step_id, job_id,
+            ));
+        };
+        let step = row_to_job_step(&row).map_err(AuthorizeDestructiveIntentError::Repository)?;
+
+        let intent = match decide(&step) {
+            Ok(intent) => intent,
+            Err(bamep_domain::DestructiveIntentError::WrongJob) => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Err(AuthorizeDestructiveIntentError::JobStepNotFound(
+                    step_id, job_id,
+                ));
+            }
+            Err(bamep_domain::DestructiveIntentError::NotEligible) => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Err(AuthorizeDestructiveIntentError::NotEligible(step_id));
+            }
+            Err(bamep_domain::DestructiveIntentError::AlreadyAuthorized) => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Err(AuthorizeDestructiveIntentError::AlreadyAuthorized(step_id));
+            }
+        };
+
+        sqlx::query(
+            "UPDATE job_steps SET authorized_inventory_revision_id = $1, \
+             authorized_target_fingerprint = $2 WHERE id = $3",
+        )
+        .bind(intent.authorized_inventory_revision_id.0)
+        .bind(intent.authorized_target_fingerprint.as_str())
+        .bind(step_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+
+        tx.commit().await.map_err(to_backend_err)?;
+        Ok(intent)
+    }
+}
+
+fn row_to_job_step(row: &sqlx::postgres::PgRow) -> Result<JobStep, RepositoryError> {
+    let step_id: uuid::Uuid = row.try_get("id").map_err(to_backend_err)?;
+    let step_job_id: uuid::Uuid = row.try_get("job_id").map_err(to_backend_err)?;
+    let order: i32 = row.try_get("step_order").map_err(to_backend_err)?;
+    let step_state: PgJobStepState = row.try_get("state").map_err(to_backend_err)?;
+    let revision_id: Option<uuid::Uuid> = row
+        .try_get("authorized_inventory_revision_id")
+        .map_err(to_backend_err)?;
+    let fingerprint: Option<String> = row
+        .try_get("authorized_target_fingerprint")
+        .map_err(to_backend_err)?;
+    let destructive_intent = match (revision_id, fingerprint) {
+        (Some(revision_id), Some(fingerprint)) => Some(DestructiveIntent {
+            authorized_inventory_revision_id: InventoryRevisionId(revision_id),
+            authorized_target_fingerprint: TargetFingerprint::new(fingerprint),
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(RepositoryError::Backend(
+                "persisted job_steps destructive intent is partially populated".to_string(),
+            ))
+        }
+    };
+
+    Ok(JobStep {
+        id: JobStepId(step_id),
+        job_id: JobId(step_job_id),
+        order,
+        state: step_state.into(),
+        destructive_intent,
+    })
 }

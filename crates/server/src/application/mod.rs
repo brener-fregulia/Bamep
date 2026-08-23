@@ -13,16 +13,18 @@ use bamep_agent_protocol::{BootstrapEvidenceMessage, InventoryReportMessage};
 use bamep_domain::credential::CredentialHash;
 use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_domain::{
-    transitions, Actor, BootContext, BootNonce, EmptyWorkflow, EndpointId,
-    InvalidIdentityTransition, InventoryRevision, InventorySnapshot, Job, DEFAULT_CREDENTIAL_TTL,
+    transitions, Actor, BootContext, BootNonce, DestructiveIntent, EmptyWorkflow, EndpointId,
+    InvalidIdentityTransition, InventoryRevision, InventorySnapshot, Job, JobId, JobStepId,
+    DEFAULT_CREDENTIAL_TTL,
 };
 use bamep_trusted_bootstrap::{AcceptedSiteKeys, BootstrapAssertion, ServerCertFingerprint};
 use chrono::{DateTime, Duration, Utc};
 
 use crate::ports::{
-    BootContextRepository, CreateWorkflowError, CredentialRedemptionRepository, EndpointRepository,
-    EndpointUpdateError, InventoryRepository, JobRepository, RedemptionDecision, RedemptionTarget,
-    RepositoryError,
+    AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError, BootContextRepository,
+    CreateWorkflowError, CredentialRedemptionRepository, EndpointRepository, EndpointUpdateError,
+    InventoryRepository, JobRepository, RedemptionDecision, RedemptionTarget, RepositoryError,
+    TargetRevalidationPort,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +33,18 @@ pub enum ApplicationError {
     EndpointNotFound(EndpointId),
     #[error("endpoint {0:?} is not enrolled")]
     EndpointNotEnrolled(EndpointId),
+    #[error("job {0:?} not found")]
+    JobNotFound(JobId),
+    #[error("job step {0:?} not found in job {1:?}")]
+    JobStepNotFound(JobStepId, JobId),
+    #[error("job step {0:?} is not eligible for destructive intent authorization")]
+    JobStepNotEligible(JobStepId),
+    #[error("job step {0:?} already has a destructive intent")]
+    JobStepAlreadyAuthorized(JobStepId),
+    #[error("endpoint {0:?} has no current durable inventory revision")]
+    NoCurrentInventory(EndpointId),
+    #[error("endpoint {0:?} has no current target fingerprint")]
+    NoCurrentTarget(EndpointId),
     #[error(transparent)]
     InvalidTransition(#[from] InvalidIdentityTransition),
     #[error(transparent)]
@@ -57,6 +71,23 @@ impl From<CreateWorkflowError> for ApplicationError {
                 ApplicationError::EndpointNotEnrolled(id)
             }
             CreateWorkflowError::Repository(e) => ApplicationError::Repository(e),
+        }
+    }
+}
+
+impl From<AuthorizeDestructiveIntentError> for ApplicationError {
+    fn from(err: AuthorizeDestructiveIntentError) -> Self {
+        match err {
+            AuthorizeDestructiveIntentError::JobStepNotFound(step_id, job_id) => {
+                ApplicationError::JobStepNotFound(step_id, job_id)
+            }
+            AuthorizeDestructiveIntentError::NotEligible(step_id) => {
+                ApplicationError::JobStepNotEligible(step_id)
+            }
+            AuthorizeDestructiveIntentError::AlreadyAuthorized(step_id) => {
+                ApplicationError::JobStepAlreadyAuthorized(step_id)
+            }
+            AuthorizeDestructiveIntentError::Repository(e) => ApplicationError::Repository(e),
         }
     }
 }
@@ -172,6 +203,90 @@ impl<J: JobRepository> JobService<J> {
         let job = bamep_domain::create_workflow(endpoint_id, step_count)?;
         self.repo.create_workflow(&job).await?;
         Ok(job)
+    }
+}
+
+/// The internal Application/harness path that authorizes one eligible
+/// `Pending` JobStep's durable destructive intent (Issue #31 "Application /
+/// internal harness path"). Callers identify the Job/JobStep only — this
+/// service, not the caller, derives the authoritative evidence:
+/// [`InventoryRepository::find_current_inventory`] for the Server-owned
+/// current inventory revision (#18) and [`TargetRevalidationPort`] for the
+/// current target fingerprint (#30). There is no parameter through which a
+/// caller could supply an authoritative revision, fingerprint, or an
+/// Endpoint-id override for the Job's own target.
+///
+/// If either evidence source is unavailable, no intent is persisted and no
+/// partial authorization state is left behind — evidence is derived before
+/// [`JobRepository::authorize_destructive_intent`] is ever called.
+pub struct DestructiveIntentService<J: JobRepository, I: InventoryRepository> {
+    job_repo: Arc<J>,
+    inventory_repo: Arc<I>,
+    target_revalidation: Arc<dyn TargetRevalidationPort>,
+}
+
+impl<J: JobRepository, I: InventoryRepository> DestructiveIntentService<J, I> {
+    pub fn new(
+        job_repo: Arc<J>,
+        inventory_repo: Arc<I>,
+        target_revalidation: Arc<dyn TargetRevalidationPort>,
+    ) -> Self {
+        Self {
+            job_repo,
+            inventory_repo,
+            target_revalidation,
+        }
+    }
+
+    /// Authorizes destructive intent for `step_id` under `job_id`.
+    ///
+    /// Sequence (Issue #31 "Application / internal harness path"):
+    /// 1. resolve the Job/JobStep and its owning Endpoint;
+    /// 2. verify the step belongs to that Job — a preliminary check; the
+    ///    atomic authoritative check happens again under lock in step 6;
+    /// 3. obtain the Endpoint's current durable inventory revision;
+    /// 4. obtain the Endpoint's current target fingerprint;
+    /// 5. construct the `DestructiveIntent` from those Server-owned facts;
+    /// 6. atomically persist it on exactly that JobStep, re-verifying
+    ///    eligibility under lock.
+    pub async fn authorize(
+        &self,
+        job_id: JobId,
+        step_id: JobStepId,
+    ) -> Result<DestructiveIntent, ApplicationError> {
+        let job = self
+            .job_repo
+            .find_job(job_id)
+            .await?
+            .ok_or(ApplicationError::JobNotFound(job_id))?;
+        if !job.steps.iter().any(|step| step.id == step_id) {
+            return Err(ApplicationError::JobStepNotFound(step_id, job_id));
+        }
+
+        let current_inventory = self
+            .inventory_repo
+            .find_current_inventory(job.endpoint_id)
+            .await?
+            .ok_or(ApplicationError::NoCurrentInventory(job.endpoint_id))?;
+        let current_target = self
+            .target_revalidation
+            .current_target_fingerprint(job.endpoint_id)
+            .ok_or(ApplicationError::NoCurrentTarget(job.endpoint_id))?;
+
+        let authorized_inventory_revision_id = current_inventory.id;
+        let decide: AuthorizeDestructiveIntentDecision = Box::new(move |step| {
+            bamep_domain::authorize_destructive_intent(
+                step,
+                job_id,
+                authorized_inventory_revision_id,
+                current_target,
+            )
+        });
+
+        self.job_repo
+            .authorize_destructive_intent(job_id, step_id, decide)
+            .await
+            .map_err(ApplicationError::from)
     }
 }
 
@@ -621,5 +736,363 @@ mod tests {
 
         assert!(matches!(err, ApplicationError::Repository(_)));
         assert!(repo.persisted().is_empty());
+    }
+
+    mod destructive_intent_service {
+        use super::*;
+        use bamep_domain::{create_workflow, InventoryRevisionId, JobStep, TargetFingerprint};
+        use std::collections::HashMap;
+
+        /// In-memory `JobRepository` fake mirroring `PostgresJobRepository`'s
+        /// `authorize_destructive_intent` contract (Issue #31 "Application /
+        /// internal harness path"): `decide` is invoked with the current
+        /// freshly-read `JobStep` and only an `Ok` result is applied, exactly
+        /// like the real Adapter's lock-then-decide-then-persist sequence.
+        /// The real PostgreSQL persistence/atomicity/race path is covered
+        /// separately by `crates/server/tests/destructive_intent_authorization.rs`.
+        #[derive(Default)]
+        struct FakeJobRepository {
+            jobs: Mutex<HashMap<JobId, Job>>,
+            fail_persist: bool,
+        }
+
+        impl FakeJobRepository {
+            fn with_job(job: Job) -> Self {
+                let mut jobs = HashMap::new();
+                jobs.insert(job.id, job);
+                Self {
+                    jobs: Mutex::new(jobs),
+                    fail_persist: false,
+                }
+            }
+
+            fn failing_persist(job: Job) -> Self {
+                let mut jobs = HashMap::new();
+                jobs.insert(job.id, job);
+                Self {
+                    jobs: Mutex::new(jobs),
+                    fail_persist: true,
+                }
+            }
+
+            fn step(&self, job_id: JobId, step_id: JobStepId) -> JobStep {
+                self.jobs
+                    .lock()
+                    .unwrap()
+                    .get(&job_id)
+                    .unwrap()
+                    .steps
+                    .iter()
+                    .find(|s| s.id == step_id)
+                    .unwrap()
+                    .clone()
+            }
+        }
+
+        #[async_trait]
+        impl JobRepository for FakeJobRepository {
+            async fn create_workflow(&self, job: &Job) -> Result<(), CreateWorkflowError> {
+                self.jobs.lock().unwrap().insert(job.id, job.clone());
+                Ok(())
+            }
+
+            async fn find_job(&self, id: JobId) -> Result<Option<Job>, RepositoryError> {
+                Ok(self.jobs.lock().unwrap().get(&id).cloned())
+            }
+
+            async fn authorize_destructive_intent(
+                &self,
+                job_id: JobId,
+                step_id: JobStepId,
+                decide: AuthorizeDestructiveIntentDecision,
+            ) -> Result<DestructiveIntent, AuthorizeDestructiveIntentError> {
+                let mut jobs = self.jobs.lock().unwrap();
+                let Some(job) = jobs.get_mut(&job_id) else {
+                    return Err(AuthorizeDestructiveIntentError::JobStepNotFound(
+                        step_id, job_id,
+                    ));
+                };
+                let Some(index) = job.steps.iter().position(|s| s.id == step_id) else {
+                    return Err(AuthorizeDestructiveIntentError::JobStepNotFound(
+                        step_id, job_id,
+                    ));
+                };
+
+                let intent = match decide(&job.steps[index]) {
+                    Ok(intent) => intent,
+                    Err(bamep_domain::DestructiveIntentError::WrongJob) => {
+                        return Err(AuthorizeDestructiveIntentError::JobStepNotFound(
+                            step_id, job_id,
+                        ))
+                    }
+                    Err(bamep_domain::DestructiveIntentError::NotEligible) => {
+                        return Err(AuthorizeDestructiveIntentError::NotEligible(step_id))
+                    }
+                    Err(bamep_domain::DestructiveIntentError::AlreadyAuthorized) => {
+                        return Err(AuthorizeDestructiveIntentError::AlreadyAuthorized(step_id))
+                    }
+                };
+
+                if self.fail_persist {
+                    return Err(AuthorizeDestructiveIntentError::Repository(
+                        RepositoryError::Backend("simulated persistence failure".into()),
+                    ));
+                }
+                job.steps[index].destructive_intent = Some(intent.clone());
+                Ok(intent)
+            }
+        }
+
+        /// In-memory `InventoryRepository` fake exposing only a configurable
+        /// current revision per Endpoint — `record_inventory` is unused by
+        /// `DestructiveIntentService` and is not exercised here.
+        #[derive(Default)]
+        struct FakeInventoryRepository {
+            current: Mutex<HashMap<EndpointId, InventoryRevision>>,
+        }
+
+        impl FakeInventoryRepository {
+            fn new() -> Self {
+                Self::default()
+            }
+
+            fn set_current(&self, endpoint_id: EndpointId, revision: InventoryRevision) {
+                self.current.lock().unwrap().insert(endpoint_id, revision);
+            }
+        }
+
+        #[async_trait]
+        impl InventoryRepository for FakeInventoryRepository {
+            async fn record_inventory(
+                &self,
+                _endpoint_id: EndpointId,
+                _inventory: InventorySnapshot,
+                _recorded_at: DateTime<Utc>,
+            ) -> Result<Option<InventoryRevision>, EndpointUpdateError> {
+                unimplemented!("DestructiveIntentService never records inventory")
+            }
+
+            async fn find_current_inventory(
+                &self,
+                endpoint_id: EndpointId,
+            ) -> Result<Option<InventoryRevision>, EndpointUpdateError> {
+                Ok(self.current.lock().unwrap().get(&endpoint_id).cloned())
+            }
+        }
+
+        /// In-memory `TargetRevalidationPort` fake, independent of any
+        /// `InventoryRevision` state — mirrors
+        /// `crate::adapters::target_revalidation_fixture::FixtureTargetRevalidation`.
+        #[derive(Default)]
+        struct FakeTargetRevalidation {
+            current: Mutex<HashMap<EndpointId, TargetFingerprint>>,
+        }
+
+        impl FakeTargetRevalidation {
+            fn new() -> Self {
+                Self::default()
+            }
+
+            fn set_current(&self, endpoint_id: EndpointId, fingerprint: TargetFingerprint) {
+                self.current
+                    .lock()
+                    .unwrap()
+                    .insert(endpoint_id, fingerprint);
+            }
+        }
+
+        impl TargetRevalidationPort for FakeTargetRevalidation {
+            fn current_target_fingerprint(
+                &self,
+                endpoint_id: EndpointId,
+            ) -> Option<TargetFingerprint> {
+                self.current.lock().unwrap().get(&endpoint_id).cloned()
+            }
+        }
+
+        fn inventory_revision(endpoint_id: EndpointId) -> InventoryRevision {
+            InventoryRevision {
+                id: InventoryRevisionId(uuid::Uuid::new_v4()),
+                endpoint_id,
+                snapshot: InventorySnapshot(serde_json::Map::new()),
+                recorded_at: now(),
+            }
+        }
+
+        fn service(
+            job_repo: FakeJobRepository,
+            inventory_repo: FakeInventoryRepository,
+            target: FakeTargetRevalidation,
+        ) -> DestructiveIntentService<FakeJobRepository, FakeInventoryRepository> {
+            DestructiveIntentService::new(
+                Arc::new(job_repo),
+                Arc::new(inventory_repo),
+                Arc::new(target),
+            )
+        }
+
+        #[tokio::test]
+        async fn captures_current_inventory_revision_and_target_fingerprint() {
+            let endpoint_id = EndpointId::new();
+            let job = create_workflow(endpoint_id, 1).unwrap();
+            let step_id = job.steps[0].id;
+            let job_id = job.id;
+            let revision = inventory_revision(endpoint_id);
+            let revision_id = revision.id;
+            let fingerprint = TargetFingerprint::new("disk-a");
+
+            let job_repo = FakeJobRepository::with_job(job);
+            let inventory_repo = FakeInventoryRepository::new();
+            inventory_repo.set_current(endpoint_id, revision);
+            let target = FakeTargetRevalidation::new();
+            target.set_current(endpoint_id, fingerprint.clone());
+            let svc = service(job_repo, inventory_repo, target);
+
+            let intent = svc.authorize(job_id, step_id).await.unwrap();
+
+            assert_eq!(intent.authorized_inventory_revision_id, revision_id);
+            assert_eq!(intent.authorized_target_fingerprint, fingerprint);
+        }
+
+        #[tokio::test]
+        async fn missing_current_inventory_blocks_authorization_without_persisting() {
+            let endpoint_id = EndpointId::new();
+            let job = create_workflow(endpoint_id, 1).unwrap();
+            let step_id = job.steps[0].id;
+            let job_id = job.id;
+
+            let job_repo = FakeJobRepository::with_job(job);
+            let inventory_repo = FakeInventoryRepository::new(); // no current revision set
+            let target = FakeTargetRevalidation::new();
+            target.set_current(endpoint_id, TargetFingerprint::new("disk-a"));
+            let svc = service(job_repo, inventory_repo, target);
+
+            let err = svc.authorize(job_id, step_id).await.unwrap_err();
+
+            assert!(matches!(err, ApplicationError::NoCurrentInventory(id) if id == endpoint_id));
+        }
+
+        #[tokio::test]
+        async fn missing_current_target_blocks_authorization_without_persisting() {
+            let endpoint_id = EndpointId::new();
+            let job = create_workflow(endpoint_id, 1).unwrap();
+            let step_id = job.steps[0].id;
+            let job_id = job.id;
+
+            let job_repo = FakeJobRepository::with_job(job);
+            let inventory_repo = FakeInventoryRepository::new();
+            inventory_repo.set_current(endpoint_id, inventory_revision(endpoint_id));
+            let target = FakeTargetRevalidation::new(); // no current target set
+            let svc = service(job_repo, inventory_repo, target);
+
+            let err = svc.authorize(job_id, step_id).await.unwrap_err();
+
+            assert!(matches!(err, ApplicationError::NoCurrentTarget(id) if id == endpoint_id));
+        }
+
+        #[tokio::test]
+        async fn wrong_job_step_correlation_is_rejected() {
+            let endpoint_id = EndpointId::new();
+            let job_a = create_workflow(endpoint_id, 1).unwrap();
+            let job_b = create_workflow(endpoint_id, 1).unwrap();
+            let job_a_id = job_a.id;
+            let unrelated_step_id = job_b.steps[0].id;
+
+            let job_repo = FakeJobRepository::with_job(job_a);
+            let inventory_repo = FakeInventoryRepository::new();
+            inventory_repo.set_current(endpoint_id, inventory_revision(endpoint_id));
+            let target = FakeTargetRevalidation::new();
+            target.set_current(endpoint_id, TargetFingerprint::new("disk-a"));
+            let svc = service(job_repo, inventory_repo, target);
+
+            let err = svc
+                .authorize(job_a_id, unrelated_step_id)
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(err, ApplicationError::JobStepNotFound(step_id, job_id) if step_id == unrelated_step_id && job_id == job_a_id)
+            );
+        }
+
+        #[tokio::test]
+        async fn ineligible_non_pending_step_is_rejected() {
+            let endpoint_id = EndpointId::new();
+            let mut job = create_workflow(endpoint_id, 1).unwrap();
+            job.steps[0].state = bamep_domain::JobStepState::PreconditionsSatisfied;
+            let job_id = job.id;
+            let step_id = job.steps[0].id;
+
+            let job_repo = FakeJobRepository::with_job(job);
+            let inventory_repo = FakeInventoryRepository::new();
+            inventory_repo.set_current(endpoint_id, inventory_revision(endpoint_id));
+            let target = FakeTargetRevalidation::new();
+            target.set_current(endpoint_id, TargetFingerprint::new("disk-a"));
+            let svc = service(job_repo, inventory_repo, target);
+
+            let err = svc.authorize(job_id, step_id).await.unwrap_err();
+
+            assert!(matches!(err, ApplicationError::JobStepNotEligible(id) if id == step_id));
+        }
+
+        #[tokio::test]
+        async fn an_already_authorized_step_cannot_be_silently_reauthorized() {
+            let endpoint_id = EndpointId::new();
+            let job = create_workflow(endpoint_id, 1).unwrap();
+            let job_id = job.id;
+            let step_id = job.steps[0].id;
+
+            let job_repo = Arc::new(FakeJobRepository::with_job(job));
+            let inventory_repo = Arc::new(FakeInventoryRepository::new());
+            inventory_repo.set_current(endpoint_id, inventory_revision(endpoint_id));
+            let target = Arc::new(FakeTargetRevalidation::new());
+            target.set_current(endpoint_id, TargetFingerprint::new("disk-a"));
+            let svc = DestructiveIntentService::new(
+                Arc::clone(&job_repo),
+                Arc::clone(&inventory_repo),
+                Arc::clone(&target) as Arc<dyn TargetRevalidationPort>,
+            );
+
+            let first = svc.authorize(job_id, step_id).await.unwrap();
+
+            // A later, independently-derived attempt must not silently
+            // replace the original snapshot even though current evidence
+            // could change between calls (here it does not, deliberately, to
+            // isolate the "already authorized" rejection from evidence
+            // drift, which the stale-inventory/target Postgres scenarios
+            // cover separately).
+            let err = svc.authorize(job_id, step_id).await.unwrap_err();
+
+            assert!(matches!(err, ApplicationError::JobStepAlreadyAuthorized(id) if id == step_id));
+            assert_eq!(
+                job_repo.step(job_id, step_id).destructive_intent,
+                Some(first)
+            );
+        }
+
+        #[tokio::test]
+        async fn persistence_failure_leaves_no_half_intent() {
+            let endpoint_id = EndpointId::new();
+            let job = create_workflow(endpoint_id, 1).unwrap();
+            let job_id = job.id;
+            let step_id = job.steps[0].id;
+
+            let job_repo = FakeJobRepository::failing_persist(job);
+            let inventory_repo = FakeInventoryRepository::new();
+            inventory_repo.set_current(endpoint_id, inventory_revision(endpoint_id));
+            let target = FakeTargetRevalidation::new();
+            target.set_current(endpoint_id, TargetFingerprint::new("disk-a"));
+            let job_repo = Arc::new(job_repo);
+            let svc = DestructiveIntentService::new(
+                Arc::clone(&job_repo),
+                Arc::new(inventory_repo),
+                Arc::new(target) as Arc<dyn TargetRevalidationPort>,
+            );
+
+            let err = svc.authorize(job_id, step_id).await.unwrap_err();
+
+            assert!(matches!(err, ApplicationError::Repository(_)));
+            assert_eq!(job_repo.step(job_id, step_id).destructive_intent, None);
+        }
     }
 }

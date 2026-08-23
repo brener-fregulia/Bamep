@@ -68,6 +68,20 @@ This path never runs through Agent Protocol message handling. It stops at durabl
 admission into `Running`, scheduling, resource leases, dispatch authorization, and Attempt
 creation are not yet implemented.
 
+## Implemented destructive JobStep intent authorization
+
+A structurally separate internal Application control path
+(`bamep_server::application::DestructiveIntentService::authorize`) attaches one durable
+destructive-operation authorization snapshot — the Server's current inventory revision and
+current target-disk fingerprint at authorization time — to one eligible `Pending` JobStep,
+atomically, through the `JobRepository` Port and its PostgreSQL Adapter. The caller identifies
+only the Job/JobStep; the evidence itself always comes from the real `InventoryRepository` and
+`TargetRevalidationPort`, never from a caller-supplied value. The snapshot is single-assignment:
+once attached it is never refreshed from later inventory/target observations, and a JobStep
+remains `Pending` throughout. This path stops at the durable snapshot: admission into `Running`,
+scheduling, resource leases, final dispatch revalidation, and Attempt creation are not yet
+implemented.
+
 ## Implemented safe-dispatch evidence inputs
 
 Three independent evidence inputs for the later destructive-dispatch gate exist structurally

@@ -13,6 +13,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::inventory::InventoryRevisionId;
+use crate::target_fingerprint::TargetFingerprint;
 use crate::EndpointId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -71,6 +73,35 @@ pub enum JobStepState {
     Cancelled,
 }
 
+/// The durable destructive-operation authorization snapshot for one JobStep
+/// (Issue #31 "Persist simulated destructive JobStep intent";
+/// `docs/specifications/m0-endpoint-identity-lifecycle.md` "Destructive-
+/// operation authorization preconditions" 4 and 5). Presence of this value on
+/// a [`JobStep`] classifies that step as destructive for the M1 workflow
+/// path. Both fields are captured once, from Server-owned facts current at
+/// authorization time, and are never refreshed from later inventory/target
+/// observations — later staleness is detected by comparison, not by rewriting
+/// this snapshot (`m0-job-lifecycle-and-scheduling.md` "Final pre-dispatch
+/// revalidation", owned by #25).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestructiveIntent {
+    pub authorized_inventory_revision_id: InventoryRevisionId,
+    pub authorized_target_fingerprint: TargetFingerprint,
+}
+
+/// Rejections from [`authorize_destructive_intent`]. None of these represent
+/// a JobStep state change — a rejected call leaves the JobStep exactly as it
+/// was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DestructiveIntentError {
+    #[error("job step does not belong to the specified job")]
+    WrongJob,
+    #[error("job step is not eligible for destructive intent authorization")]
+    NotEligible,
+    #[error("job step already has a destructive intent")]
+    AlreadyAuthorized,
+}
+
 /// One ordered linear stage of its owning [`Job`]. `order` is the explicit
 /// stable linear position required by the accepted linear-workflow baseline
 /// (`m0-job-lifecycle-and-scheduling.md`: "The baseline workflow is linear;
@@ -84,6 +115,12 @@ pub struct JobStep {
     pub job_id: JobId,
     pub order: i32,
     pub state: JobStepState,
+    /// Single-assignment for this M1 boundary (Issue #31): `None` until one
+    /// [`authorize_destructive_intent`] call succeeds, then bound for the
+    /// life of this JobStep. A future explicit lifecycle/authorization
+    /// operation — not introduced here — would be required to replace an
+    /// already-attached intent.
+    pub destructive_intent: Option<DestructiveIntent>,
 }
 
 /// One workflow targeting one Endpoint, composed of an ordered sequence of
@@ -125,6 +162,7 @@ pub fn create_workflow(endpoint_id: EndpointId, step_count: usize) -> Result<Job
             job_id,
             order: order as i32,
             state: JobStepState::Pending,
+            destructive_intent: None,
         })
         .collect();
     Ok(Job {
@@ -132,6 +170,40 @@ pub fn create_workflow(endpoint_id: EndpointId, step_count: usize) -> Result<Job
         endpoint_id,
         state: JobState::Pending,
         steps,
+    })
+}
+
+/// Decides whether `step` may receive one durable [`DestructiveIntent`]
+/// snapshot (Issue #31 "Application / internal harness path"). Pure — takes
+/// the already Server-derived `authorized_inventory_revision_id` and
+/// `authorized_target_fingerprint` as given facts; this function only
+/// verifies eligibility and correlation, never derives or validates the
+/// evidence itself. `job_id` is the caller's claimed owning Job, checked
+/// against `step.job_id` so a caller cannot authorize a step under the wrong
+/// Job by mistake.
+///
+/// Eligible means: `step` belongs to `job_id`, `step.state` is `Pending`, and
+/// `step.destructive_intent` is not already set. Attaching an intent never
+/// changes `step.state` — the returned value is only the intent to attach;
+/// the caller remains responsible for persisting it without mutating state.
+pub fn authorize_destructive_intent(
+    step: &JobStep,
+    job_id: JobId,
+    authorized_inventory_revision_id: InventoryRevisionId,
+    authorized_target_fingerprint: TargetFingerprint,
+) -> Result<DestructiveIntent, DestructiveIntentError> {
+    if step.job_id != job_id {
+        return Err(DestructiveIntentError::WrongJob);
+    }
+    if step.state != JobStepState::Pending {
+        return Err(DestructiveIntentError::NotEligible);
+    }
+    if step.destructive_intent.is_some() {
+        return Err(DestructiveIntentError::AlreadyAuthorized);
+    }
+    Ok(DestructiveIntent {
+        authorized_inventory_revision_id,
+        authorized_target_fingerprint,
     })
 }
 
@@ -191,5 +263,88 @@ mod tests {
         assert_ne!(a.id, b.id);
         assert_ne!(a.steps[0].id, b.steps[0].id);
         assert_ne!(a.steps[1].id, b.steps[1].id);
+    }
+
+    fn intent() -> (InventoryRevisionId, TargetFingerprint) {
+        (
+            InventoryRevisionId(Uuid::new_v4()),
+            TargetFingerprint::new("disk-a"),
+        )
+    }
+
+    #[test]
+    fn new_jobsteps_have_no_destructive_intent() {
+        let job = create_workflow(EndpointId::new(), 1).unwrap();
+        assert_eq!(job.steps[0].destructive_intent, None);
+    }
+
+    #[test]
+    fn attaching_an_intent_classifies_the_step_as_destructive_without_changing_state_or_identity() {
+        let job = create_workflow(EndpointId::new(), 1).unwrap();
+        let step = &job.steps[0];
+        let (revision_id, fingerprint) = intent();
+
+        let attached =
+            authorize_destructive_intent(step, job.id, revision_id, fingerprint.clone()).unwrap();
+
+        assert_eq!(attached.authorized_inventory_revision_id, revision_id);
+        assert_eq!(attached.authorized_target_fingerprint, fingerprint);
+        // authorize_destructive_intent returns the intent to attach; it does
+        // not itself mutate `step` — identity/order/job correlation/state are
+        // whatever the caller preserves when persisting alongside it.
+        assert_eq!(step.id, job.steps[0].id);
+        assert_eq!(step.job_id, job.id);
+        assert_eq!(step.order, job.steps[0].order);
+        assert_eq!(step.state, JobStepState::Pending);
+    }
+
+    #[test]
+    fn wrong_job_correlation_is_rejected() {
+        let job = create_workflow(EndpointId::new(), 1).unwrap();
+        let other_job_id = JobId::new();
+        let (revision_id, fingerprint) = intent();
+
+        assert_eq!(
+            authorize_destructive_intent(&job.steps[0], other_job_id, revision_id, fingerprint),
+            Err(DestructiveIntentError::WrongJob)
+        );
+    }
+
+    #[test]
+    fn non_pending_step_is_not_eligible() {
+        let job = create_workflow(EndpointId::new(), 1).unwrap();
+        let mut step = job.steps[0].clone();
+        step.state = JobStepState::PreconditionsSatisfied;
+        let (revision_id, fingerprint) = intent();
+
+        assert_eq!(
+            authorize_destructive_intent(&step, job.id, revision_id, fingerprint),
+            Err(DestructiveIntentError::NotEligible)
+        );
+    }
+
+    #[test]
+    fn an_existing_intent_cannot_be_silently_overwritten() {
+        let job = create_workflow(EndpointId::new(), 1).unwrap();
+        let mut step = job.steps[0].clone();
+        let (first_revision, first_fingerprint) = intent();
+        step.destructive_intent = Some(
+            authorize_destructive_intent(&step, job.id, first_revision, first_fingerprint.clone())
+                .unwrap(),
+        );
+
+        let (second_revision, second_fingerprint) = intent();
+        let result =
+            authorize_destructive_intent(&step, job.id, second_revision, second_fingerprint);
+
+        assert_eq!(result, Err(DestructiveIntentError::AlreadyAuthorized));
+        assert_eq!(
+            step.destructive_intent,
+            Some(DestructiveIntent {
+                authorized_inventory_revision_id: first_revision,
+                authorized_target_fingerprint: first_fingerprint,
+            }),
+            "the original snapshot must remain exactly as first authorized"
+        );
     }
 }

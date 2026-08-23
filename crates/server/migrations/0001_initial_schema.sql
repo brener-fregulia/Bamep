@@ -199,12 +199,28 @@ CREATE INDEX idx_jobs_endpoint_id ON jobs (endpoint_id);
 -- requires; the UNIQUE constraint protects that ordering durably.
 -- Branching/parallel/skip ordering is out of scope
 -- (m0-job-lifecycle-and-scheduling.md "Out of scope").
+--
+-- authorized_inventory_revision_id/authorized_target_fingerprint are the
+-- durable destructive-operation authorization snapshot (Issue #31): the
+-- Server-owned inventory revision and opaque target-disk fingerprint
+-- authorized for this JobStep at the moment #25's Application path attaches
+-- them. Presence classifies this JobStep as destructive for the M1 workflow
+-- path. Both columns are nullable and CHECK'd all-or-none so PostgreSQL
+-- itself cannot persist a half-intent; they are never rewritten once set
+-- (single-assignment for this M1 boundary — a later explicit lifecycle/
+-- authorization operation would be required to replace one).
 CREATE TABLE job_steps (
     id UUID PRIMARY KEY,
     job_id UUID NOT NULL REFERENCES jobs (id),
     step_order INTEGER NOT NULL CHECK (step_order >= 0),
     state job_step_state NOT NULL,
-    UNIQUE (job_id, step_order)
+    authorized_inventory_revision_id UUID,
+    authorized_target_fingerprint TEXT,
+    UNIQUE (job_id, step_order),
+    CONSTRAINT job_steps_destructive_intent_all_or_none CHECK (
+        (authorized_inventory_revision_id IS NULL AND authorized_target_fingerprint IS NULL)
+        OR (authorized_inventory_revision_id IS NOT NULL AND authorized_target_fingerprint IS NOT NULL)
+    )
 );
 
 CREATE INDEX idx_job_steps_job_id ON job_steps (job_id);

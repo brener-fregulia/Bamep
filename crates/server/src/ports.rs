@@ -18,9 +18,10 @@
 use async_trait::async_trait;
 use bamep_domain::presented_credential::{CredentialKind, CredentialLookupId};
 use bamep_domain::{
-    BootContext, BootContextResolveError, EndpointAggregate, EndpointId, InvalidIdentityTransition,
-    InventoryRevision, InventorySnapshot, Job, JobId, RedeemOutcome, TargetFingerprint,
-    TransitionOutcome, TrustedBootstrapOutcome,
+    BootContext, BootContextResolveError, DestructiveIntent, DestructiveIntentError,
+    EndpointAggregate, EndpointId, InvalidIdentityTransition, InventoryRevision, InventorySnapshot,
+    Job, JobId, JobStep, JobStepId, RedeemOutcome, TargetFingerprint, TransitionOutcome,
+    TrustedBootstrapOutcome,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -116,6 +117,31 @@ pub enum CreateWorkflowError {
     Repository(#[from] RepositoryError),
 }
 
+/// A pure decision over one freshly locked [`JobStep`]'s current state,
+/// producing the [`DestructiveIntent`] to persist or the reason it cannot be
+/// attached right now (`m0-job-lifecycle-and-scheduling.md`; Issue #31). The
+/// closure captures the already Server-derived authorized inventory revision
+/// and target fingerprint — it never reads them from the `JobStep` itself —
+/// and only calls into `bamep_domain::authorize_destructive_intent`, mirroring
+/// [`UpdateDecision`]/[`TrustedBootstrapDecision`]: the Adapter locks and
+/// reads current state, the Domain decides, the Adapter persists the result
+/// atomically in the same transaction.
+pub type AuthorizeDestructiveIntentDecision =
+    Box<dyn FnOnce(&JobStep) -> Result<DestructiveIntent, DestructiveIntentError> + Send>;
+
+/// Errors from [`JobRepository::authorize_destructive_intent`].
+#[derive(Debug, thiserror::Error)]
+pub enum AuthorizeDestructiveIntentError {
+    #[error("job step {0:?} not found in job {1:?}")]
+    JobStepNotFound(JobStepId, JobId),
+    #[error("job step {0:?} is not eligible for destructive intent authorization")]
+    NotEligible(JobStepId),
+    #[error("job step {0:?} already has a destructive intent")]
+    AlreadyAuthorized(JobStepId),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
 /// Durable Job/JobStep workflow persistence
 /// (`m0-job-lifecycle-and-scheduling.md` "Domain model"). Issue #24 stops at
 /// durable workflow creation; later Work Packages (#25-#28) extend this Port
@@ -133,6 +159,22 @@ pub trait JobRepository: Send + Sync {
     /// Read-only lookup of a persisted workflow and its ordered `JobStep`s,
     /// for verification/reporting only.
     async fn find_job(&self, id: JobId) -> Result<Option<Job>, RepositoryError>;
+
+    /// Locks exactly the `JobStep` identified by `(job_id, step_id)`, invokes
+    /// `decide` with its current freshly-read state, and — only on `Ok` —
+    /// atomically persists the returned [`DestructiveIntent`] on that row in
+    /// the same transaction (Issue #31 "Persistence"). Persists nothing when
+    /// the step does not exist under `job_id`, or `decide` rejects it: this
+    /// is the atomicity boundary that prevents a concurrent authorization
+    /// attempt from silently overwriting an already-attached intent — the
+    /// second attempt observes it under the same lock and `decide` rejects
+    /// it with [`DestructiveIntentError::AlreadyAuthorized`].
+    async fn authorize_destructive_intent(
+        &self,
+        job_id: JobId,
+        step_id: JobStepId,
+        decide: AuthorizeDestructiveIntentDecision,
+    ) -> Result<DestructiveIntent, AuthorizeDestructiveIntentError>;
 }
 
 /// Persistence for newly issued `BootContext`s (ADR-0014 point 11
