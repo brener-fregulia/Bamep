@@ -4,278 +4,259 @@ Status: **Approved**
 
 ## Classification
 
-Type: Feature/Epic-level Specification (post-M0 first implementation milestone).
+Type: Feature/Epic-level Specification for the first post-M0 implementation milestone.
 
-Execution grouping: native GitHub Milestone #2
-("M1 — Simulated Vertical Slice & Baseline Validation").
+Execution grouping: GitHub Milestone #2, **M1 — Simulated Vertical Slice & Baseline Validation**.
 
 ## Context
 
-M0 (`docs/specifications/m0-architecture-baseline.md`) closed the architecture and
-contract phase only: at M0 closure, all 11 ADRs were `Accepted`, all 11 M0
-Specifications were `Approved`, and the owner had explicitly approved that
-baseline (`m0-architecture-baseline.md`, Status line). At the time this M1
-Specification was approved, no product implementation existed yet — the
-repository contained no Cargo workspace and no source code
-(`docs/architecture/README.md` — "no implemented application architecture yet" at
-that time). These are point-in-time facts about the M0/M1-approval moment, not a
-claim about current repository state — see the individual ADRs/Specifications and
-GitHub for current status (for example, ADR-0007 was later superseded by
-ADR-0013 during M1 execution; see "Traceability" below).
-M0's own "First implementation slice after M0" section
-(`m0-architecture-baseline.md` "First implementation slice after M0") already
-defines the required scope of the milestone that follows it; this Specification
-turns that already-approved scope into an executable Feature/Epic-level
-Specification.
+M0 closed the architecture-and-contract phase before implementation. Its retained completion
+record is `docs/specifications/m0-architecture-baseline.md`; current detailed behavior remains
+owned by the individual M0 Specifications and ADRs.
+
+M1 implements and empirically validates the hardware-independent successor slice recorded by M0.
+At the time M1 was approved no product implementation existed; that is historical context, not a
+claim about current repository state.
+
+ADR-0013 later superseded ADR-0007's SQLite backend selection and made PostgreSQL the current
+persistence baseline without removing M1's persistence-load validation obligation.
 
 ## Goal
 
-Implement, and empirically validate, the first integrated, executable Bamep system —
-a Simulated Endpoint connects, authenticates/enrolls, reports inventory, has a Job
-created, is scheduled, receives a dispatched typed action, executes a simulated
-transfer, has progress/events persisted, survives disconnect/reconnect, reaches a
-terminal Job state, and has that result observable through Bamep Web — entirely
-without physical endpoint hardware, and empirically validate the ADR-0013
-persistence-load expectation (originally established by ADR-0007) and the 20–24
-concurrent Simulated Endpoint scenario
-required by M0.
+Implement and validate the first integrated executable Bamep vertical slice:
+
+```text
+Simulated Endpoint connects
+-> authenticated/enrolled
+-> inventory reported
+-> Job created
+-> scheduler evaluates resources
+-> typed action dispatched
+-> simulated transfer executed
+-> progress/events persisted
+-> disconnect/reconnect handled
+-> Job reaches terminal state
+-> Web reflects result
+```
+
+The milestone remains entirely hardware-independent and includes empirical validation of the
+PostgreSQL persistence baseline and the **20–24 concurrent Simulated Endpoint** target.
 
 ## Scope
 
-- minimum repository and development-tooling bootstrap required by the functional
-  slice, including Rust components and Bamep Web tooling as needed, introduced only
-  to the extent each functional Work Package actually requires it. This
-  Specification does not mandate a particular crate, package, or binary structure.
-  The Simulator's Agent-side participant must use the real Agent Protocol v1
-  transport path (`m0-simulator-contract-and-validation-strategy.md`), but that
-  requirement alone does not determine physical crate/binary boundaries
-  (`m0-stack-and-boundaries-baseline.md`);
-- Endpoint identity/credential/hardware-confidence lifecycle, including
-  operator-approval-gated first enrollment as the M0 default path
-  (`m0-endpoint-identity-lifecycle.md`);
-- Agent Protocol v1 real transport, handshake, `BootstrapEvidence`, action
-  envelope (`m0-agent-protocol-contract.md`);
-- the trusted-bootstrap invariant (destructive-operation precondition 7)
-  represented through the Simulator fixture semantics owned by
-  `m0-trusted-bootstrap-and-server-fingerprint-contract.md` Section 8, consistent
-  with ADR-0010's explicit allowance for a deterministic non-production fixture;
-- Job/JobStep/Attempt persistence, scheduling, and resource leases, including the
-  full destructive-operation precondition gate
-  (`m0-job-lifecycle-and-scheduling.md`, `m0-endpoint-identity-lifecycle.md`);
-- durable/transient persistence split, domain events, and audit records
-  (`m0-persistence-observability-and-domain-events.md`), on PostgreSQL as the
-  accepted entering baseline (ADR-0013, superseding ADR-0007's SQLite selection);
-- data-plane chunked transfer, transfer-session authentication, and Artifact
-  lifecycle (`m0-data-plane-and-storage-contracts.md`);
-- Administrative API v1 read surface and a minimal Bamep Web read view
-  (`m0-administrative-api-web-read-contract.md`);
-- the Bamep Simulator, at real-Agent-Protocol-transport fidelity
-  (`m0-simulator-contract-and-validation-strategy.md`);
-- execution of the full required Simulator scenario table, at deterministic small
-  scale or at the 20–24 concurrent Simulated Endpoint target as specifically
-  required per scenario (see "Non-functional requirements" and the Work Package
-  decomposition owned by the M1 Milestone).
+M1 covers:
+
+- the minimum repository/tooling bootstrap needed by each Work Package;
+- Endpoint identity, enrollment, credential, hardware-confidence, and current-boot behavior;
+- real Agent Protocol v1 transport for Simulator-level Agent participation;
+- trusted-bootstrap fixture semantics for the simulated environment;
+- Job/JobStep/Attempt persistence, scheduling, resource leases, cancellation, and reconciliation;
+- the complete destructive-operation authorization gate;
+- PostgreSQL-backed durable/transient persistence, domain events, and audit records;
+- authenticated chunked data-plane transfer and Artifact lifecycle;
+- Administrative API v1 read behavior and a minimal Bamep Web read view;
+- required Simulator scenarios at deterministic scale or at the explicit 20–24 Endpoint target.
+
+This Specification does not prescribe a particular crate/package/module layout beyond the
+accepted M0 boundaries.
 
 ## Out of scope
 
-Physical PXE/DHCP/UEFI/GRUB/WinPE/Alpine boot delivery; real firmware Secure Boot
-execution; the real operator-verified site-key pairing ceremony of ADR-0011 (its
-concrete UX/transport is explicitly deferred to the Integration Environment by
-`m0-trusted-bootstrap-and-server-fingerprint-contract.md`); production Secure Boot
-deployment; real Windows deployment or destructive real-disk operations;
-MikroTik-specific production integration; production administrative
-authentication/RBAC; a generic Web command/write API; live-Windows backup; final
-production backup/snapshot format; HA or multi-site; ERP integration — all already
-excluded by M0 (`m0-architecture-baseline.md` "Out of scope";
-`m0-administrative-api-web-read-contract.md` "Unresolved findings surfaced for
-owner review").
+M1 does not implement or validate:
 
-M1 does not introduce any Web write capability — no Job creation, no
-enrollment-approval action, no cancellation — through Bamep Web merely to
-demonstrate the vertical slice. Where an approved contract requires an action that
-Web cannot originate (Job creation, operator enrollment approval), that action is
-originated by the Simulator/test harness or another internal implementation
-mechanism, distinct from Bamep Web.
+- physical PXE/DHCP/UEFI/GRUB/WinPE/Alpine delivery;
+- real firmware Secure Boot execution;
+- the physical/operator ceremony for ADR-0011 site-key pairing;
+- real Windows deployment or destructive physical-disk operations;
+- MikroTik-specific production integration;
+- production administrative authentication/RBAC;
+- Web-originated Job creation, enrollment approval, cancellation, or other write operations;
+- live-Windows backup or the final production backup/snapshot format;
+- HA, multi-site, or ERP integration.
+
+Actions required by the vertical slice but intentionally absent from Bamep Web are originated by
+the Simulator/test harness or another internal development control path.
 
 ## Functional requirements
 
-- RF-001: A Simulated Endpoint's trusted-bootstrap stage first establishes the
-  Simulator fixture equivalent of `trusted bootstrap established`
-  (`m0-trusted-bootstrap-and-server-fingerprint-contract.md` Section 6, "Agent
-  bootstrap sequence"): a nonce-bound signed bootstrap assertion is verified
-  locally, which makes an authenticated expected Server TLS certificate fingerprint
-  available. Only after that authenticated fingerprint is available does the Agent
-  open a real WSS connection to the Server; the Agent verifies the Server's
-  presented TLS certificate fingerprint against the already-authenticated expected
-  fingerprint (pinning), and only on match does Agent Protocol v1 authentication
-  (credential redemption/validation via `AuthRequest`) proceed. Trusted-bootstrap
-  verification strictly precedes the WSS connection and fingerprint pinning — it is
-  never performed after, or as part of, Agent Protocol v1 authentication. On
-  successful credential validation, the Server responds `SessionEstablished` and,
-  per `m0-endpoint-identity-lifecycle.md` ("first successful credential exchange"),
-  the Endpoint identity record is created in `PendingEnrollment` at this point —
-  independent of, and strictly before, any `BootstrapEvidence` exchange. Only after
-  `SessionEstablished` does the Agent report authenticated `BootstrapEvidence`
-  (`boot_nonce`, the assertion, `local_boot_trust: Established`), which the Server
-  independently verifies before recording the trusted-bootstrap fact for that boot
-  context. A `PendingEnrollment` session resulting from a valid credential exchange
-  remains intact and unaffected even when `BootstrapEvidence` is absent, malformed,
-  or rejected — only the trusted-bootstrap fact for that boot context becomes/
-  remains `NotEstablished` (`m0-agent-protocol-contract.md` "Trusted bootstrap
-  evidence"; `m0-trusted-bootstrap-and-server-fingerprint-contract.md` "Failure
-  semantics").
-- RF-002: An explicit, distinct operator-approval action transitions the Endpoint
-  from `PendingEnrollment` to `Enrolled` (`m0-endpoint-identity-lifecycle.md`,
-  ADR-0004 default path). This action is originated by a control path separate
-  from the Simulated Agent participant — a harness command, CLI, or development
-  fixture standing in for the operator decision point. The Simulated
-  Endpoint/Agent participant must not, and semantically cannot, approve its own
-  enrollment: the mechanism that records this decision is invoked independently
-  of the Agent's own protocol messages, even though its concrete technique
-  remains implementation-time. The underlying state machine and the requirement
-  that approval be a real, explicit, durable, auditable step must not be
-  simplified into automatic enrollment merely because the Endpoint is simulated.
-- RF-003: Inventory is durably recorded on change only.
-- RF-004: A Job/JobStep/Attempt is created (via Simulator/harness, not a Web write
-  API), scheduled, dispatched, and reaches a terminal state, including
-  reconciliation after disconnect or Server restart. The full 7-precondition
-  destructive-operation gate (`m0-endpoint-identity-lifecycle.md`
-  "Destructive-operation authorization preconditions") is implemented and tested
-  at this small deterministic scale, including the negative case where
-  preconditions 1–6 hold and precondition 7 (trusted bootstrap) alone fails. All
-  destructive-labeled operations exercised in M1 remain simulated and do not touch
-  physical hardware or disks — their effect is represented within the
-  Simulator/fake storage adapter boundary.
-- RF-005: A simulated data-plane transfer completes end-to-end with
-  transfer-session authentication, chunk resume, and Artifact verification,
-  without touching physical storage hardware.
-- RF-006: Bamep Web observes Endpoint/Job/JobStep/Attempt/Transfer state
-  exclusively through Administrative API v1 reads.
-- RF-007: The Simulator orchestrates 20–24 concurrent Simulated Endpoints
-  specifically to exercise the three scenario categories M0 explicitly ties to
-  that concurrency target: scheduler contention, the ADR-0013 persistence-load
-  measurement (obligation originally established by ADR-0007), and data-plane
-  chunked transfer at scale
-  (`m0-simulator-contract-and-validation-strategy.md` "Concurrency target"). The
-  remaining required Simulator scenarios (duplicate/delayed messages, stale
-  inventory, endpoint disappearance, Agent restart, Server restart, resource
-  exhaustion, partial failure, cancellation, recovery after interruption,
-  trusted-bootstrap independence) are proven correct at deterministic smaller
-  scale and are not required individually or simultaneously at the 20–24 target,
-  unless combining a given scenario with concurrency is necessary to exercise the
-  specific behavior under test.
+### RF-001 — Trusted bootstrap and Agent session
+
+A Simulated Endpoint uses the deterministic Simulator trusted-bootstrap fixture while preserving
+the real security ordering defined by the M0 trusted-bootstrap, Endpoint, and Agent Protocol
+Specifications:
+
+1. the simulated trusted-bootstrap stage establishes an authenticated expected Server TLS
+   certificate fingerprint for the current boot;
+2. only then does the Agent open WSS and verify the presented Server certificate against that
+   authenticated fingerprint;
+3. only after successful Server authentication does `AuthRequest` credential authentication
+   proceed;
+4. on valid authentication, the Server durably commits the applicable credential state and, on
+   first contact, creates the Endpoint as `PendingEnrollment` before attempting to deliver
+   `SessionEstablished`;
+5. `PendingEnrollment` and the authenticated session lifecycle remain independent of
+   `BootstrapEvidence`;
+6. only after `SessionEstablished` may the Agent report `BootstrapEvidence`;
+7. the Server independently verifies that evidence before marking trusted bootstrap established
+   for the authoritative current boot.
+
+Absent, malformed, or rejected `BootstrapEvidence` does not undo the durable authentication/
+enrollment state; trusted bootstrap simply remains `NotEstablished` for that boot.
+
+### RF-002 — Explicit enrollment approval
+
+An explicit operator-approval action transitions `PendingEnrollment -> Enrolled`.
+
+The approval control path is independent from the Simulated Agent participant. The Agent cannot
+approve its own enrollment, and simulation must not collapse this into automatic enrollment.
+The decision is durable and auditable according to the Endpoint/persistence contracts.
+
+### RF-003 — Inventory persistence
+
+Inventory is durably recorded on change only.
+
+### RF-004 — Job lifecycle and safe dispatch
+
+A Job/JobStep/Attempt is created through an internal Simulator/harness path, scheduled,
+persisted-before-send, dispatched through typed Agent Protocol actions, reconciled across
+disconnect/Server restart, and reaches the correct terminal state.
+
+The complete **seven** destructive-operation preconditions owned by
+`m0-endpoint-identity-lifecycle.md` are implemented and tested at deterministic small scale.
+
+The required negative case is explicit: when preconditions 1–6 hold and only precondition 7
+(trusted current bootstrap) fails, no destructive Attempt, durable dispatch commitment, or
+`ActionDispatch` may be created/sent.
+
+All destructive-labeled effects remain simulated.
+
+### RF-005 — Authenticated resumable data-plane transfer
+
+A simulated data-plane JobStep completes end to end with transfer authorization,
+sender-constrained transfer authentication, chunk resume, Artifact lifecycle, and Artifact
+verification against disposable local data.
+
+Required fail-closed cases remain those owned by the data-plane and Simulator Specifications.
+
+### RF-006 — Administrative API and Web observation
+
+Bamep Web observes the required Endpoint/Job/JobStep/Attempt/Transfer/Artifact state exclusively
+through Administrative API v1 reads.
+
+M1 introduces no Web write path.
+
+### RF-007 — Concurrency target
+
+The Simulator exercises **20–24 concurrent Simulated Endpoints** for the three scenario categories
+explicitly tied to that target:
+
+- scheduler/resource contention;
+- PostgreSQL persistence-load validation;
+- chunked data-plane transfer at scale.
+
+Other required Simulator scenarios may be proven at deterministic smaller scale unless
+concurrency is necessary to exercise the behavior under test.
 
 ## Non-functional requirements
 
-- NF-001 (persistence-load empirical validation): PostgreSQL is the accepted
-  baseline entering M1 (ADR-0013, superseding ADR-0007's SQLite selection while
-  carrying forward its durable-write-model expectation). M1 must execute the
-  empirical measurement ADR-0013 requires — durable write volume, contention,
-  latency, and backpressure under sustained concurrent Job/JobStep/Attempt
-  activity at the 20–24 endpoint target — and record the actual observed result
-  against the adopted PostgreSQL backend, not merely assumed acceptable because a
-  different backend was chosen. No numeric acceptance threshold is invented before
-  that measurement runs (`m0-simulator-contract-and-validation-strategy.md`
-  "Persistence-load validation"). If the representative 20–24-endpoint measurement
-  shows unacceptable contention, latency, write pressure, or backpressure,
-  ADR-0013 must be explicitly revisited — a pre-declared contingency, not
-  something to be silently worked around in implementation.
-- NF-002 (reference environment): Linux is Bamep's development and production
-  reference environment (`AGENTS.md`). Automated validation targeting
-  Linux-specific responsibilities must be executed in a genuinely Linux
-  environment — either native Linux development, or, when validating from Windows
-  11, WSL2 when it faithfully represents the responsibility under test. WSL2 or
-  containers are a means of reaching the Linux reference environment from
-  Windows, not the reference environment itself; native Linux execution is
-  equally valid reference evidence. Native-Windows-only execution is not
-  sufficient evidence for Linux-specific responsibilities.
+### NF-001 — Persistence-load empirical validation
+
+PostgreSQL is the accepted persistence baseline under ADR-0013.
+
+At the 20–24 Endpoint target, M1 records actual:
+
+- durable write volume;
+- contention;
+- persistence latency;
+- backpressure.
+
+No numeric acceptance threshold is invented before measurement. If representative behavior is
+unacceptable, ADR-0013 must be explicitly revisited rather than silently bypassed or weakened.
+
+### NF-002 — Reference environment
+
+Linux is Bamep's development and production reference environment.
+
+Validation of Linux-specific responsibilities must run in an environment that faithfully
+represents those responsibilities. Native Linux is valid; WSL2 may be used from Windows when it
+faithfully represents the responsibility under test. Native-Windows-only execution is not
+sufficient evidence for Linux-specific behavior.
+
+`docs/development/testing.md` owns the general validation-environment policy.
 
 ## Safety invariants
 
-The full 7 destructive-operation preconditions
-(`m0-endpoint-identity-lifecycle.md` "Destructive-operation authorization
-preconditions") are implemented and independently tested at small deterministic
-scale in the Work Package that introduces destructive-action dispatch — not first
-demonstrated at Simulator/concurrency scale. This includes precondition 7's
-independence from precondition 2: a valid Agent credential must never be treated
-as proof the current boot path was itself trusted
-(`m0-simulator-contract-and-validation-strategy.md`, the required
-trusted-bootstrap-independence scenario). No blind redispatch of destructive
-actions on reconnect, timeout, or `Unknown`/`Indeterminate` outcomes.
-Transfer-session authentication fails closed with a single non-enumerable denial
-reason. All destructive-labeled operations exercised anywhere in M1 remain
-simulated — none touch physical hardware or physical disks.
+M1 must preserve the M0 safety contracts, especially:
+
+- none of the seven destructive-operation preconditions may be inferred from another;
+- `CredentialActive` never implies trusted current bootstrap;
+- reconnect, timeout, missing acknowledgement, `Unknown`, or `Indeterminate` never justify blind
+  destructive redispatch;
+- transfer authorization fails closed and does not expose enumerable internal denial reasons;
+- destructive-labeled Simulator operations never touch physical hardware or physical disks.
+
+The authoritative detailed gates remain in the Endpoint, Job, data-plane, trusted-bootstrap, and
+Simulator Specifications.
 
 ## Architecture constraints
 
-Rust modular monolith with Worker process isolation (ADR-0001); Server in Rust
-(ADR-0002); Agent/Worker in Rust with contract-independence from wire protocols
-(ADR-0003); PostgreSQL persistence behind the `repositories` Port as the accepted
-entering baseline, subject to NF-001 (ADR-0013, superseding ADR-0007);
-Presentation / Application / Domain / Runtime Services / Ports / Adapters /
-Workers as dependency boundaries, not a mandated crate/package/module layout
-(`m0-stack-and-boundaries-baseline.md`). M1 is not responsible for empirically
-revalidating every M0 decision — see "Traceability" below.
+M1 follows the accepted architecture without revalidating it:
 
-## Traceability
+- modular monolith with Worker process isolation — ADR-0001;
+- Server in Rust — ADR-0002;
+- Agent/Worker in Rust with wire-contract independence — ADR-0003;
+- PostgreSQL behind the `repositories` Port — ADR-0013;
+- Presentation / Application / Domain / Runtime Services / Ports / Adapters / Workers remain
+  dependency boundaries rather than mandated crate/package/module layout.
 
-Directly exercised by M1: `m0-architecture-baseline.md`,
-`m0-stack-and-boundaries-baseline.md`, `m0-endpoint-identity-lifecycle.md`,
-`m0-agent-protocol-contract.md`, `m0-job-lifecycle-and-scheduling.md`,
-`m0-persistence-observability-and-domain-events.md`,
-`m0-data-plane-and-storage-contracts.md`,
-`m0-simulator-contract-and-validation-strategy.md`,
-`m0-administrative-api-web-read-contract.md`,
-`m0-trusted-bootstrap-and-server-fingerprint-contract.md`; ADR-0004 through
-ADR-0006, ADR-0008; ADR-0010 (fixture-level trusted-bootstrap substitution only,
-per its own allowance for a deterministic non-production fixture — not real
-Secure Boot/firmware mechanics); ADR-0012 (runtime Agent credential issuance,
-rotation, and reconnect recovery — directly exercised by WP1); ADR-0013
-(PostgreSQL persistence backend baseline, superseding ADR-0007's SQLite selection
-while carrying forward its durable/transient boundary and transactional-
-consistency invariants — directly exercised by every M1 Work Package that
-persists durable state).
+Current implemented structure is described only by `docs/architecture/README.md`.
 
-Architectural constraints preserved (followed, not empirically retested by M1):
-ADR-0001 (modular monolith, Worker process isolation), ADR-0002 (Server: Rust),
-ADR-0003 (Agent/Worker: Rust, contract independence from wire protocols).
+## Authoritative inputs
 
-Relevant M0 decisions outside M1 execution: ADR-0009 (driver-provider integration
-boundary — out of scope for the vertical slice); ADR-0011 (operator-verified
-site-key pairing — its real ceremony is explicitly deferred to the Integration
-Environment by `m0-trusted-bootstrap-and-server-fingerprint-contract.md`; M1
-satisfies destructive-operation precondition 7 only through the ADR-0010 fixture
-substitution, not through ADR-0011's real ceremony).
+M1 directly consumes:
 
-## Validation expectations
+- `m0-endpoint-identity-lifecycle.md` — Endpoint/enrollment/current-boot state and destructive gate;
+- `m0-agent-protocol-contract.md` — real Agent Protocol v1 wire behavior;
+- `m0-trusted-bootstrap-and-server-fingerprint-contract.md` — trusted-bootstrap and fixture
+  semantics;
+- `m0-job-lifecycle-and-scheduling.md` — Job/JobStep/Attempt, scheduling, cancellation, retry, and
+  reconciliation;
+- `m0-persistence-observability-and-domain-events.md` — durable state/events/audit contract;
+- `m0-data-plane-and-storage-contracts.md` — transfer/Artifact contract;
+- `m0-simulator-contract-and-validation-strategy.md` — Simulator fidelity, scenarios, concurrency,
+  and persistence-load validation;
+- `m0-administrative-api-web-read-contract.md` — Administrative API v1 read boundary;
+- `m0-stack-and-boundaries-baseline.md` — product/component dependency boundaries;
+- ADR-0004, ADR-0005, ADR-0006, ADR-0008, ADR-0010, ADR-0012, and ADR-0013 for the rationale behind
+  the directly exercised contracts.
 
-M1 uses the following layers of `docs/development/testing.md`'s general test-layer
-model: Unit/Domain, Contract, Component/Integration, Simulator, and Owner manual
-validation — per the per-concept itemization already present in each M0
-Specification's own "Validation expectations" section, not restated here.
-Integration Environment remains a layer of the overall Bamep testing strategy but
-is not a completion requirement of M1 for behaviors explicitly deferred to
-physical hardware (see "Integration Environment boundary" below).
+ADR-0007 is historical (`Superseded by ADR-0013`). ADR-0009 and the real ADR-0011 ceremony remain
+outside M1 execution.
+
+## Validation
+
+M1 uses the validation model defined by `docs/development/testing.md`.
+
+Each Work Package selects the applicable Unit/Domain, Contract, Component/Integration, Simulator,
+and owner-manual validation from the normative contracts it implements. M1 does not redefine
+per-contract test cases already owned by those Specifications.
+
+The Integration Environment is not required to complete M1 because physical boot, firmware,
+network-boot, hardware, and real-disk behavior are outside this milestone.
 
 ## Integration Environment boundary
 
-None of M1's required scenarios need physical hardware. PXE, DHCP, UEFI, GRUB,
-Alpine boot, physical NIC behavior, MikroTik integration, real disk tooling,
-Windows deployment, WinPE, the real ADR-0011 operator-verified site-key pairing
-ceremony, and hardware-specific compatibility remain deferred to the Integration
-Environment (`m0-simulator-contract-and-validation-strategy.md` "What the
-Simulator cannot represent"; `m0-trusted-bootstrap-and-server-fingerprint-contract.md`
-"Validation expectations").
+Passing M1 does not validate physical provisioning.
+
+PXE, DHCP, physical UEFI/Secure Boot, GRUB/WinPE/Alpine delivery, physical NIC behavior,
+MikroTik integration, real disk tooling, Windows deployment, the real ADR-0011 pairing ceremony,
+and hardware-specific compatibility remain Integration Environment responsibilities according to
+the Simulator and trusted-bootstrap boundaries.
 
 ## Open questions
 
-1. Concrete technique for the operator-approval control path separate from the
-   Simulated Agent participant (harness command / CLI / development fixture /
-   other) — implementation-time; the semantic separation from the Agent
-   participant is already decided (see RF-002).
-2. Concrete technique for Job-creation origination (harness / CLI / other) —
-   implementation-time, same category as above.
-3. Numeric persistence-load acceptance thresholds — established only once
-   NF-001's measurement runs, not decided here.
-
-Status: **Approved**
+1. Concrete implementation of the operator-approval control path (harness, CLI, development
+   fixture, or equivalent); its semantic independence from the Agent is already decided.
+2. Concrete implementation of Job-creation origination outside Web.
+3. Numeric persistence-load acceptance thresholds, which may only be established from NF-001
+   empirical evidence.
