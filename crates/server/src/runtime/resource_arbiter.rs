@@ -94,27 +94,48 @@ impl TechnicalResourceArbiter {
     /// bypass this check — same-kind claims within one request are merged
     /// before the capacity comparison. On success, returns an opaque
     /// [`ReservationId`] good for exactly one later [`Self::release`]. On
-    /// failure, no capacity is consumed.
+    /// failure — including an arithmetic overflow while aggregating
+    /// same-kind claims or while combining a requested quantity with
+    /// already-reserved capacity — no capacity is consumed. An overflow can
+    /// never represent a legitimate grant (the true required total exceeds
+    /// what `u64` — and therefore any representable capacity, even
+    /// `u64::MAX` — can hold), so it is treated exactly like exceeding
+    /// configured capacity rather than panicking, wrapping, or silently
+    /// saturating into a false "fits" result.
     pub fn acquire(
         &self,
         claims: Vec<ResourceClaim>,
     ) -> Result<ReservationId, InsufficientCapacity> {
         let mut requested: HashMap<ResourceKind, u64> = HashMap::new();
         for claim in &claims {
-            *requested.entry(claim.kind.clone()).or_insert(0) += claim.quantity;
+            let entry = requested.entry(claim.kind.clone()).or_insert(0);
+            *entry = entry
+                .checked_add(claim.quantity)
+                .ok_or(InsufficientCapacity)?;
         }
 
         let mut reserved = self.reserved.lock().expect("arbiter lock poisoned");
+
+        // Validate every requested kind first, computing its new reserved
+        // total without mutating anything yet.
+        let mut new_totals: HashMap<ResourceKind, u64> = HashMap::with_capacity(requested.len());
         for (kind, quantity) in &requested {
             let capacity = self.capacities.get(kind).copied().unwrap_or(0);
             let already_reserved = reserved.get(kind).copied().unwrap_or(0);
-            if already_reserved.saturating_add(*quantity) > capacity {
+            let new_total = already_reserved
+                .checked_add(*quantity)
+                .ok_or(InsufficientCapacity)?;
+            if new_total > capacity {
                 return Err(InsufficientCapacity);
             }
+            new_totals.insert(kind.clone(), new_total);
         }
 
-        for (kind, quantity) in requested {
-            *reserved.entry(kind).or_insert(0) += quantity;
+        // Every kind is already validated above — apply the precomputed
+        // totals directly (a plain assignment, never further arithmetic, so
+        // this step itself cannot overflow).
+        for (kind, new_total) in new_totals {
+            reserved.insert(kind, new_total);
         }
         drop(reserved);
 
@@ -282,6 +303,67 @@ mod tests {
             arbiter.acquire(vec![ResourceClaim::new(storage(), 1)]),
             Err(InsufficientCapacity)
         );
+    }
+
+    #[test]
+    fn multiple_claims_for_the_same_kind_aggregate_correctly() {
+        let arbiter = TechnicalResourceArbiter::new([(network(), 10)]);
+
+        // Two claims of 4 each for the same kind must aggregate to 8 before
+        // the capacity check, not be treated as two independent claims each
+        // checked against the full capacity.
+        assert!(arbiter
+            .acquire(vec![
+                ResourceClaim::new(network(), 4),
+                ResourceClaim::new(network(), 4),
+            ])
+            .is_ok());
+
+        // 8 is already reserved; only 2 more units must fit.
+        assert_eq!(
+            arbiter.acquire(vec![ResourceClaim::new(network(), 3)]),
+            Err(InsufficientCapacity)
+        );
+        assert!(arbiter
+            .acquire(vec![ResourceClaim::new(network(), 2)])
+            .is_ok());
+    }
+
+    #[test]
+    fn overflowing_same_kind_requested_quantities_are_rejected_without_consuming_capacity() {
+        let arbiter = TechnicalResourceArbiter::new([(network(), u64::MAX)]);
+
+        // Aggregating these two claims for the same kind overflows u64.
+        let result = arbiter.acquire(vec![
+            ResourceClaim::new(network(), u64::MAX),
+            ResourceClaim::new(network(), 1),
+        ]);
+        assert_eq!(result, Err(InsufficientCapacity));
+
+        // Nothing was consumed: the full capacity must still be acquirable.
+        assert!(arbiter
+            .acquire(vec![ResourceClaim::new(network(), u64::MAX)])
+            .is_ok());
+    }
+
+    #[test]
+    fn already_reserved_plus_requested_overflow_is_rejected_even_at_u64_max_capacity() {
+        let arbiter = TechnicalResourceArbiter::new([(network(), u64::MAX)]);
+        let first = arbiter
+            .acquire(vec![ResourceClaim::new(network(), u64::MAX - 5)])
+            .unwrap();
+
+        // already_reserved (MAX - 5) + requested (10) overflows u64. A
+        // saturating comparison against a `u64::MAX` capacity would
+        // incorrectly appear to "fit"; this must still be rejected.
+        let result = arbiter.acquire(vec![ResourceClaim::new(network(), 10)]);
+        assert_eq!(result, Err(InsufficientCapacity));
+
+        // The original reservation must be untouched by the rejected attempt.
+        arbiter.release(first);
+        assert!(arbiter
+            .acquire(vec![ResourceClaim::new(network(), u64::MAX)])
+            .is_ok());
     }
 
     #[test]

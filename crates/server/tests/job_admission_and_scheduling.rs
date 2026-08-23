@@ -235,6 +235,99 @@ async fn two_pending_jobs_for_the_same_endpoint_race_admission_and_exactly_one_w
 }
 
 #[tokio::test]
+async fn admission_rolls_back_atomically_when_job_started_event_persistence_fails() {
+    let db = TestDatabase::setup().await;
+    let services = build_services(db.pool.clone());
+    let now = Utc::now();
+    let endpoint_id = enrolled_endpoint(&services, "job-admit-atomic-01", now).await;
+    let job = services.jobs.create_workflow(endpoint_id, 1).await.unwrap();
+
+    // Deliberately force the `JobStarted` domain_events insert to fail,
+    // proving the whole admission transaction — including the already
+    // in-transaction `jobs` state UPDATE — rolls back rather than leaving
+    // `Running` without its required event
+    // (`m0-persistence-observability-and-domain-events.md` "Atomic
+    // persistence": "A crash must not leave committed state without its
+    // required event/audit record"). Mirrors
+    // `job_workflow_creation.rs`'s `failure_partway_through_jobstep_persistence_leaves_no_partial_workflow`
+    // test-only trigger technique against this disposable database.
+    sqlx::query(
+        "CREATE FUNCTION reject_job_started_event() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.event_type = 'JobStarted' THEN RAISE EXCEPTION 'forced job_started event failure'; END IF; RETURN NEW; END $$"
+    ).execute(&db.pool).await.unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_job_started_event BEFORE INSERT ON domain_events \
+         FOR EACH ROW EXECUTE FUNCTION reject_job_started_event()",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let err = services.scheduling.admit(job.id).await.unwrap_err();
+    assert!(matches!(err, ApplicationError::Repository(_)));
+
+    assert_eq!(
+        job_state(&db.pool, job.id).await,
+        "Pending",
+        "the Job row must roll back together with its missing JobStarted event"
+    );
+    assert_eq!(
+        domain_event_count_for_job(&db.pool, job.id, "JobStarted").await,
+        0,
+        "no JobStarted event may exist for a Job that never durably committed Running"
+    );
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn endpoint_exclusivity_survives_restart_and_blocks_a_second_admission() {
+    let db = TestDatabase::setup().await;
+    let services = build_services(db.pool.clone());
+    let now = Utc::now();
+    let endpoint_id = enrolled_endpoint(&services, "job-admit-restart-01", now).await;
+
+    let job_a = services.jobs.create_workflow(endpoint_id, 1).await.unwrap();
+    let job_b = services.jobs.create_workflow(endpoint_id, 1).await.unwrap();
+
+    services.scheduling.admit(job_a.id).await.unwrap();
+
+    // Close the pool and reconnect through the real Adapter's own connect
+    // path — the same restart-style pattern already used by
+    // `reload_preserves_running_state_after_admission` — so this test proves
+    // durable schema/state behavior (the partial unique index), not an
+    // in-memory scheduling artifact that a fresh process would not inherit.
+    db.pool.close().await;
+    let reloaded_pool = bamep_server::adapters::postgres::connect(&db.db_url)
+        .await
+        .unwrap();
+    let reloaded_repo = Arc::new(PostgresJobRepository::new(reloaded_pool.clone()));
+    let reloaded_scheduling = JobSchedulingService::new(Arc::clone(&reloaded_repo));
+
+    let err = reloaded_scheduling.admit(job_b.id).await.unwrap_err();
+
+    assert!(matches!(err, ApplicationError::EndpointNotAvailable));
+    assert_eq!(
+        job_state(&reloaded_pool, job_a.id).await,
+        "Running",
+        "Job A must remain Running across the restart"
+    );
+    assert_eq!(
+        job_state(&reloaded_pool, job_b.id).await,
+        "Pending",
+        "Job B must remain Pending after the blocked admission"
+    );
+    assert_eq!(
+        domain_event_count_for_job(&reloaded_pool, job_b.id, "JobStarted").await,
+        0,
+        "the blocked admission must never emit a JobStarted event for Job B"
+    );
+
+    reloaded_pool.close().await;
+    db.teardown().await;
+}
+
+#[tokio::test]
 async fn jobs_for_different_endpoints_may_both_become_running_independently() {
     let db = TestDatabase::setup().await;
     let services = build_services(db.pool.clone());
