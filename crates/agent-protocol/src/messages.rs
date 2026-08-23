@@ -1,8 +1,8 @@
-//! The WP1 handshake/evidence message slice of Agent Protocol v1
+//! The currently implemented Agent Protocol v1 message set
 //! (`docs/specifications/m0-agent-protocol-contract.md` "Message types"):
 //! `AuthRequest`, `SessionEstablished`, `AuthError` (Agent Protocol
 //! handshake), `BootstrapEvidence` (trusted-bootstrap evidence report), and
-//! `InventoryReport` (opaque observed inventory snapshot).
+//! `InventoryReport` (post-session opaque observed inventory snapshot).
 //!
 //! Every field beyond the common [`Envelope`] is opaque to this crate:
 //! `credential`, `runtime_credential`, `bootstrap_assertion`, and
@@ -26,7 +26,7 @@ use crate::envelope::{Envelope, MessageTimestamp, ProtocolId};
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AuthRequestBody {
     /// Opaque presented credential wire value. Never parsed here — the
-    /// future Server Gateway passes it, unmodified, to
+    /// Server Gateway (`agent_gateway.rs`) passes it, unmodified, to
     /// `EnrollmentService::redeem`.
     pub credential: String,
 }
@@ -80,8 +80,9 @@ impl AuthRequestMessage {
 pub struct SessionEstablishedBody {
     pub session_id: ProtocolId,
     /// Opaque freshly issued runtime credential wire value (ADR-0012). The
-    /// future Server Gateway converts the Domain `PresentedCredential`
-    /// produced by `RedeemResult` into this value at the boundary.
+    /// Server Gateway (`agent_gateway.rs`) converts the Domain
+    /// `PresentedCredential` produced by `RedeemResult` into this value at
+    /// the boundary.
     pub runtime_credential: String,
     pub credential_expires_at: MessageTimestamp,
 }
@@ -310,15 +311,15 @@ impl InventoryReportMessage {
 // Top-level message union
 // ---------------------------------------------------------------------
 
-/// The WP1 slice of Agent Protocol v1 messages, internally tagged on the
-/// wire `"type"` field with exactly the normative message names.
+/// The currently implemented Agent Protocol v1 messages, internally tagged
+/// on the wire `"type"` field with exactly the normative message names.
 ///
 /// An unrecognized `"type"` value fails deserialization explicitly (a
 /// `serde` "unknown variant" error) rather than silently falling back to any
 /// variant — satisfying "Unknown top-level message type must fail parsing as
 /// an unknown message type." Generating the corresponding `AuthError` /
-/// `ProtocolError` response belongs to the future handshake/session
-/// handler, not this crate.
+/// `ProtocolError` response belongs to the Server's handshake/session
+/// handler (`agent_gateway.rs`), not this crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AgentProtocolMessage {

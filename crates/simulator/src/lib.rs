@@ -14,7 +14,9 @@
 //! ([`trusted_bootstrap::establish_trusted_bootstrap`]) and the
 //! establish-then-connect composition helper
 //! ([`trusted_bootstrap::connect_after_trusted_bootstrap`]) and sends the
-//! retained assertion as post-authentication `BootstrapEvidence`.
+//! retained assertion as post-authentication `BootstrapEvidence`. Issue #18
+//! added the post-session inventory-reporting helper
+//! ([`handshake::send_inventory_report`]).
 //!
 //! Production dependency direction: `bamep-simulator` depends on
 //! `bamep-agent-protocol` for the wire model and on

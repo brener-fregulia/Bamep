@@ -38,6 +38,25 @@ fn object(value: Value) -> Map<String, Value> {
     value.as_object().unwrap().clone()
 }
 
+/// The already-implemented Endpoint dimensions that inventory reporting must
+/// never implicitly change: identity/enrollment, credential state/chain, the
+/// authoritative current boot, and trusted-bootstrap state.
+/// Hardware-confidence is not yet implemented and is deliberately not part
+/// of this snapshot.
+async fn endpoint_dimensions(
+    pool: &sqlx::PgPool,
+    endpoint_id: uuid::Uuid,
+) -> (String, bool, Vec<u8>, String) {
+    sqlx::query_as(
+        "SELECT identity_state::text, c.revoked, e.current_boot_nonce, e.trusted_bootstrap_state::text \
+         FROM endpoints e JOIN endpoint_credentials c ON c.endpoint_id = e.id WHERE e.id = $1",
+    )
+    .bind(endpoint_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn inventory_revision_current_pointer_and_event_roll_back_together() {
     let db = TestDatabase::setup().await;
@@ -185,25 +204,103 @@ async fn inventory_on_change_and_phase_rejection_cross_real_wss_and_survive_relo
     else {
         panic!("session must establish")
     };
+
+    // Only one Endpoint exists in this database at this point.
+    let endpoint_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM endpoints")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    // Captured after session establishment but strictly before the first
+    // InventoryReport: the baseline that inventory reporting itself must
+    // never implicitly change.
+    let dimensions_before = endpoint_dimensions(&db.pool, endpoint_id).await;
+
+    const MALFORMED_INVENTORY_REPORT: &str = r#"{"type":"InventoryReport","inventory":[]}"#;
+
     client
-        .send(Message::text(
-            r#"{"type":"InventoryReport","inventory":[]}"#,
-        ))
+        .send(Message::text(MALFORMED_INVENTORY_REPORT))
         .await
         .unwrap();
     let malformed_response = client.next().await.unwrap().unwrap().into_text().unwrap();
     assert!(malformed_response.contains("ProtocolError"));
+    assert_eq!(
+        endpoint_dimensions(&db.pool, endpoint_id).await,
+        dimensions_before
+    );
+
+    // Each valid report below is followed by a malformed report used purely
+    // as a synchronization barrier: `run_authenticated_session` processes
+    // frames strictly in order on this one connection, so the barrier's
+    // ProtocolError response can only arrive once the Server has finished
+    // processing the preceding report — making the dimensions query that
+    // follows guaranteed to observe post-report durable state.
     send_inventory_report(&mut client, object(json!({"cpu":"sim", "memory_bytes":8})))
         .await
         .unwrap();
+    client
+        .send(Message::text(MALFORMED_INVENTORY_REPORT))
+        .await
+        .unwrap();
+    assert!(client
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap()
+        .contains("ProtocolError"));
+    assert_eq!(
+        endpoint_dimensions(&db.pool, endpoint_id).await,
+        dimensions_before,
+        "the first observed InventoryReport must not change identity/credential/boot/trusted-bootstrap state"
+    );
+
     send_inventory_report(&mut client, object(json!({"memory_bytes":8, "cpu":"sim"})))
         .await
         .unwrap();
+    client
+        .send(Message::text(MALFORMED_INVENTORY_REPORT))
+        .await
+        .unwrap();
+    assert!(client
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap()
+        .contains("ProtocolError"));
+    assert_eq!(
+        endpoint_dimensions(&db.pool, endpoint_id).await,
+        dimensions_before,
+        "an unchanged re-report must not change identity/credential/boot/trusted-bootstrap state"
+    );
+
     send_inventory_report(&mut client, object(json!({"cpu":"sim", "memory_bytes":16})))
         .await
         .unwrap();
+    client
+        .send(Message::text(MALFORMED_INVENTORY_REPORT))
+        .await
+        .unwrap();
+    assert!(client
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap()
+        .contains("ProtocolError"));
+    assert_eq!(
+        endpoint_dimensions(&db.pool, endpoint_id).await,
+        dimensions_before,
+        "a meaningfully changed inventory report must not change identity/credential/boot/trusted-bootstrap state"
+    );
+
     client.close(None).await.unwrap();
     let session = server.await.unwrap();
+    assert_eq!(session.endpoint_id.0, endpoint_id);
 
     let revision_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM inventory_revisions WHERE endpoint_id = $1")
@@ -214,10 +311,6 @@ async fn inventory_on_change_and_phase_rejection_cross_real_wss_and_survive_relo
     let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_events WHERE endpoint_id = $1 AND event_type = 'InventoryRevisionRecorded'")
         .bind(session.endpoint_id.0).fetch_one(&db.pool).await.unwrap();
     assert_eq!((revision_count, event_count), (2, 2));
-
-    let dimensions_before: (String, bool, Vec<u8>, String) = sqlx::query_as(
-        "SELECT identity_state::text, c.revoked, e.current_boot_nonce, e.trusted_bootstrap_state::text FROM endpoints e JOIN endpoint_credentials c ON c.endpoint_id=e.id WHERE e.id=$1"
-    ).bind(session.endpoint_id.0).fetch_one(&db.pool).await.unwrap();
 
     // A known InventoryReport in the handshake phase is rejected as AuthError
     // and cannot reach the inventory service.
@@ -265,10 +358,11 @@ async fn inventory_on_change_and_phase_rejection_cross_real_wss_and_survive_relo
         .unwrap()
         .unwrap();
     assert_eq!(current.snapshot.0["memory_bytes"], 16);
-    let dimensions_after: (String, bool, Vec<u8>, String) = sqlx::query_as(
-        "SELECT identity_state::text, c.revoked, e.current_boot_nonce, e.trusted_bootstrap_state::text FROM endpoints e JOIN endpoint_credentials c ON c.endpoint_id=e.id WHERE e.id=$1"
-    ).bind(session.endpoint_id.0).fetch_one(&reloaded_pool).await.unwrap();
-    assert_eq!(dimensions_after, dimensions_before);
+    let dimensions_after_reload = endpoint_dimensions(&reloaded_pool, endpoint_id).await;
+    assert_eq!(
+        dimensions_after_reload, dimensions_before,
+        "PostgreSQL reload must preserve identity/credential/boot/trusted-bootstrap state independent from inventory persistence"
+    );
     reloaded_pool.close().await;
     db.teardown().await;
 }

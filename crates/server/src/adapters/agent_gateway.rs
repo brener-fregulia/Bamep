@@ -1,10 +1,12 @@
 //! Agent Control Gateway: Agent Protocol v1 handshake semantics over an
-//! already-established WebSocket (`docs/specifications/m0-agent-protocol-contract.md`
+//! already-established WebSocket, plus the authenticated post-session
+//! message loop (`docs/specifications/m0-agent-protocol-contract.md`
 //! "Transport and handshake", "Runtime credential issuance and rotation").
 //!
-//! Boundary (Issue #17 WP1 handshake checkpoint): `agent_transport` owns
-//! TCP/TLS/WebSocket establishment; this module owns only what happens on the
-//! Agent Protocol JSON stream once that WebSocket already exists —
+//! Boundary (Issue #17 handshake checkpoint, extended by Issue #18's
+//! post-session `InventoryReport`): `agent_transport` owns TCP/TLS/WebSocket
+//! establishment; this module owns only what happens on the Agent Protocol
+//! JSON stream once that WebSocket already exists —
 //! `AuthRequest` -> `EnrollmentService::redeem` -> `SessionEstablished`/
 //! `AuthError`. It never touches TLS/fingerprint verification (already
 //! complete by the time [`AgentControlGateway::handshake`] is called), never
@@ -12,9 +14,10 @@
 //! accept/reject decision is exactly the one `EnrollmentService::redeem`
 //! already made.
 //!
-//! After authentication this module drives the session loop, delegates
-//! `BootstrapEvidence` verification to the Application service, and handles
-//! post-session protocol violations.
+//! After authentication this module drives the session loop, delegating
+//! `BootstrapEvidence` verification and `InventoryReport` recording to their
+//! respective Application services, and handles post-session protocol
+//! violations.
 
 use std::sync::Arc;
 
