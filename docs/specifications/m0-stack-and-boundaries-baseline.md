@@ -29,6 +29,21 @@ Bamep is also commercially agnostic: commercial product/catalog concepts (custom
 
 (Source: `docs/discovery/architecture-redesign.md`, "Product boundary" — already accepted.)
 
+## User-facing localization baseline
+
+Bamep Web user-facing text must use localization boundaries rather than scattered hardcoded strings.
+
+The established product direction is:
+
+- `pt-BR` is the initial UI locale;
+- `en-US` is the planned additional locale.
+
+This section records product behavior and direction, not a localization implementation design. The choice of localization library, catalog structure, fallback mechanism, and loading strategy remains an implementation concern unless a future Specification constrains it.
+
+`en-US` support is not an M0 or current M1 acceptance requirement merely because it is planned here. It becomes delivery scope only when an approved Specification or work item explicitly requires it.
+
+Canonical repository engineering content remains English according to `docs/development/documentation-policy.md`; repository language and user-facing UI locale are separate concerns.
+
 ## Component responsibilities and boundaries
 
 **Approved as the M0 baseline** (elevating Discovery's "Proposed component boundaries"):
