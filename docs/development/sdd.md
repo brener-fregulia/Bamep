@@ -2,273 +2,215 @@
 
 ## Purpose
 
-Bamep uses Specification-Driven Development (SDD) so important work can be understood, approved, implemented, validated, and resumed without depending on conversation history or a specific AI session.
+Bamep uses Specification-Driven Development (SDD) to make important intent, constraints,
+decisions, safety requirements, and acceptance boundaries explicit before execution.
 
-The repository stores permanent technical context.
+SDD defines how work moves from an idea or unresolved problem to approved, materialized
+work that is ready for execution.
 
-GitHub stores approved work, operational workflow state, and milestone or release scope.
+It does not define the execution workflow itself.
 
-The process exists to preserve:
+Related authorities:
 
-* explicit requirements;
-* architectural decisions;
-* safety constraints;
-* scope control;
-* validation expectations;
-* continuity across development sessions.
+- `docs/development/documentation-policy.md` — where information is authoritative and how
+  durable knowledge is promoted or retired;
+- `docs/development/workflow.md` — how approved work is executed, validated, handed off,
+  and completed;
+- `docs/development/testing.md` — testing and validation strategy;
+- `docs/decisions/README.md` — ADR format and lifecycle;
+- `AGENTS.md` — mandatory repository-wide guardrails.
 
-Use only as much process as necessary to preserve those properties.
+Use only as much process as necessary to preserve intent, evidence, scope, safety,
+architectural reasoning, and continuity.
 
-## Sources of truth
+## SDD flow
 
-### Repository
-
-The repository is the permanent technical source of truth.
-
-Relevant responsibilities include:
-
-* implementation and tests: currently implemented behavior;
-* `AGENTS.md`: mandatory repository-wide agent rules;
-* `docs/discovery/`: investigation and evidence gathered before decisions;
-* `docs/specifications/`: persistent specifications when repository-level documentation is appropriate;
-* `docs/architecture/`: currently implemented architecture;
-* `docs/decisions/`: Architectural Decision Records;
-* `docs/development/`: engineering process;
-* `docs/reference/`: factual technical knowledge, compatibility findings, and validated external constraints.
-
-`docs/architecture/` must describe implemented reality, not intended future architecture.
-
-### GitHub
-
-After approved work is materialized:
-
-* Issues represent approved work such as Features, Fixes, Refactors, Technical Spikes, and Work Packages;
-* Projects represent workflow state and progress;
-* Milestones group milestones or release scope when useful.
-
-An AI session or chat must never be the only place containing information required to continue, validate, review, or understand relevant work.
-
-## Lifecycle
-
-The normal Bamep lifecycle is:
+The normal pre-execution flow is:
 
 ```text
-Idea
-  ↓
-Discovery
-  ↓
-Specification
-  ↓
+Idea or problem
+      ↓
+Discovery, when needed
+      ↓
+Technical Spike, when evidence is insufficient
+      ↓
+Specification or scoped work definition
+      ↓
 Owner approval
-  ↓
+      ↓
+Work decomposition, when needed
+      ↓
 GitHub materialization
-  ↓
-Execution
-  ↓
-Automated validation
-  ↓
-Owner manual validation
-  ↓
-Done
+      ↓
+Ready for execution
 ```
 
-Not every change requires every formal artifact.
+Not every change requires every step or artifact.
 
-The hierarchy and process should remain as small as possible while preserving useful context, decisions, safety, and traceability.
+Once approved work is ready for execution, `docs/development/workflow.md` owns the
+operational lifecycle.
 
 ## Discovery
 
-Discovery is analysis, not implementation.
+Discovery is investigation, not implementation.
 
-Its purpose is to establish enough evidence to define the problem correctly before selecting or implementing a solution.
+Use Discovery when the requested outcome, current behavior, constraints, architecture,
+safety implications, or viable solution space are not yet understood well enough to define
+approved work confidently.
 
-Discovery should, when relevant:
+Discovery should inspect, as relevant:
 
-1. understand the requested outcome;
-2. inspect current implementation and nearby tests when they exist;
-3. inspect relevant architecture documentation and ADRs;
-4. inspect relevant historical or reference material;
-5. distinguish current behavior from proposed behavior;
-6. identify affected responsibilities and boundaries;
-7. identify constraints and explicit non-goals;
-8. identify safety implications;
-9. identify unresolved architectural decisions;
-10. determine validation expectations;
-11. determine whether work decomposition is useful;
-12. determine whether empirical evidence requires a Technical Spike.
+1. the requested outcome and explicit non-goals;
+2. current implementation and nearby tests;
+3. current Architecture documentation;
+4. applicable Specifications and ADRs;
+5. relevant Reference evidence and prior work;
+6. affected responsibilities and boundaries;
+7. safety and destructive-operation implications;
+8. unresolved architectural questions;
+9. evidence gaps that may require a Technical Spike;
+10. expected validation obligations.
 
 Do not invent requirements to fill gaps.
 
-When evidence is insufficient, preserve the uncertainty explicitly.
+When evidence is incomplete, preserve the uncertainty explicitly rather than choosing a
+solution silently.
 
-Discovery may produce:
+Discovery may conclude that:
 
-* a Specification proposal;
-* one or more architectural questions;
-* a proposed Technical Spike;
-* a recommendation that no implementation work is currently justified.
+- a Specification can be proposed;
+- a Technical Spike is required;
+- an ADR question must be resolved;
+- work can be defined directly with reduced SDD;
+- no implementation work is currently justified.
 
-Discovery findings that remain useful beyond one session should be persisted in the repository or approved GitHub work rather than remaining only in conversation history.
+Persistent Discovery material must follow
+`docs/development/documentation-policy.md`. Resolved Discovery does not remain authoritative
+after its durable conclusions have been promoted.
 
 ## Technical Spikes
 
-A Technical Spike is a focused empirical investigation used when existing evidence is insufficient to make a specification or architectural decision confidently.
+A Technical Spike is a focused investigation used when empirical evidence is required
+before a Specification or architectural decision can be completed confidently.
 
-Examples may include:
+Typical examples include:
 
-* evaluating a WinPE boot mechanism;
-* determining whether a backup format can support meaningful resumability;
-* validating Secure Boot behavior;
-* measuring resource usage or throughput;
-* testing PXE, firmware, network, or storage compatibility.
+- boot or firmware viability;
+- transfer resumability;
+- Secure Boot or trust-chain behavior;
+- hardware or driver compatibility;
+- resource or throughput measurement;
+- storage, network, or protocol behavior that cannot be resolved by inspection alone.
 
-A Technical Spike must define, as applicable:
+A Spike should define, as applicable:
 
-* the question being investigated;
-* why existing evidence is insufficient;
-* relevant constraints and assumptions;
-* the experiment or validation method;
-* success or evaluation criteria;
-* evidence collected;
-* conclusion;
-* remaining uncertainty.
+- the question;
+- why existing evidence is insufficient;
+- constraints and assumptions;
+- method or experiment;
+- evaluation or success criteria;
+- evidence collected;
+- conclusion;
+- remaining uncertainty.
 
-Spike implementation is experimental.
+Spike code and experiments are evidence gathering. They do not become accepted
+architecture or production implementation merely because they work.
 
-It must not be treated as production architecture merely because it works.
-
-A Spike may inform:
-
-* a Specification;
-* an ADR;
-* an architecture constraint;
-* a future Work Package.
-
-It must not silently establish architectural policy.
-
-Reusable factual findings should be moved to the appropriate permanent source, such as `docs/reference/`, instead of preserving experimental notes indefinitely as the only source of truth.
+A completed Spike may feed a Specification, ADR, Reference document, or later work item.
+Durable output placement follows `docs/development/documentation-policy.md`.
 
 ## Specification
 
-A Specification defines intended behavior before execution begins.
+A Specification defines approved intended behavior or constraints for a scope that needs a
+durable normative contract.
 
-Before owner approval, a Specification is a proposal.
+Before owner approval, it is a proposal.
 
-After owner approval, it becomes the approved specification for that scope.
+After owner approval, it is normative for its scope until changed through the appropriate
+SDD process.
 
-Use only sections that contribute useful information.
+Useful sections may include:
 
-Typical sections include:
+- classification;
+- context;
+- current behavior;
+- goal;
+- scope;
+- out of scope;
+- functional or non-functional requirements;
+- business rules;
+- safety invariants;
+- acceptance criteria;
+- architecture impact;
+- related ADRs;
+- Technical Spikes or evidence;
+- validation expectations;
+- work decomposition;
+- open questions.
 
-* Classification
-* Context
-* Current behavior
-* Goal
-* Scope
-* Out of scope
-* Functional Requirements (`RF-###`)
-* Non-Functional Requirements (`RNF-###`)
-* Business Rules (`RN-###`)
-* Safety invariants
-* Acceptance Criteria
-* Architecture impact
-* Related ADRs
-* Technical Spikes
-* Work Package decomposition
-* Automated validation expectations
-* Manual validation expectations
-* Open questions
+Use only sections that add information.
 
-Not every Specification needs RF, RNF, and RN sections.
+Do not create empty RF, RNF, RN, architecture, or validation sections merely to satisfy a
+template.
 
-Do not create empty categories merely to satisfy a template.
+Requirements describe intended behavior or constraints. They should not encode incidental
+implementation choices unless those choices are already accepted architectural
+constraints.
 
-Requirements must describe intended behavior or constraints, not implementation choices unless the implementation choice has already been accepted as an architectural constraint.
-
-Implementation must not begin merely because a Specification draft exists.
+Repository-level Specifications are justified when the contract has durable system value.
+Routine work may be specified directly in GitHub when a second repository copy would add
+no durable authority.
 
 ## Work classification
 
-Use the smallest classification that accurately represents the work.
+Use the smallest classification that accurately describes the work.
 
-### Epic
+| Classification | Purpose |
+| --- | --- |
+| Epic | Optional grouping for a larger objective containing multiple related Features |
+| Feature | Introduces one coherent product capability or behavior |
+| Fix | Corrects behavior that does not match its intended or specified behavior |
+| Refactor | Changes internal structure while preserving intended behavior unless explicitly specified otherwise |
+| Technical Spike | Gathers evidence needed before a decision or Specification can be completed |
+| Work Package | Smallest approved and tracked unit of delivery and acceptance |
 
-An Epic is an optional grouping for a larger objective that contains multiple related Features and benefits from shared context.
+Do not create hierarchy for ceremony.
 
-Do not create an Epic when one Feature is sufficient.
+A parent Feature, Fix, or Refactor may contain Work Packages when decomposition improves
+scope control, review, validation, or continuity.
 
-### Feature
+## Work decomposition
 
-A Feature introduces one coherent product capability or behavior.
+Decompose work only when smaller units create a clearer delivery and acceptance boundary.
 
-A Feature may contain multiple Work Packages when implementation, review, or validation benefits from decomposition.
+A Work Package should normally represent **one concrete, reviewable result** with a
+coherent acceptance boundary.
 
-### Fix
+Split work when:
 
-A Fix corrects existing behavior that does not match its intended or specified behavior.
+- independent outcomes can be delivered or accepted separately;
+- one unit would span unrelated responsibilities;
+- safety-critical work benefits from isolation;
+- one unit depends on evidence or decisions another unit must produce first;
+- validation would otherwise mix materially different concerns;
+- the resulting work would be too broad to review or resume reliably.
 
-Complex Fixes may be decomposed into Work Packages.
+Do not split merely because implementation may require several commits or sessions.
 
-### Refactor
+Do not combine transversal changes across many unrelated authorities into one Work Package
+only because they share a general theme.
 
-A Refactor changes internal structure while preserving intended externally observable behavior unless its approved Specification explicitly states otherwise.
-
-Architectural refactors still require appropriate Discovery and ADR handling when they change durable boundaries.
-
-### Technical Spike
-
-A Technical Spike gathers evidence required before a decision or Specification can be completed.
-
-A Spike is not production implementation by default.
-
-### Work Package
-
-A Work Package is the smallest approved and tracked unit of delivery and acceptance that is worth materializing as project work.
-
-A Work Package:
-
-* has coherent scope and acceptance criteria;
-* may span multiple development or AI sessions;
-* may require multiple implementation checkpoints (see "Checkpoint" below);
-* remains the GitHub workflow and status unit;
-* does not need to map one-to-one to a commit, branch, or agent session.
-
-It must contain enough persistent context for another development session to execute and validate it without relying on the conversation that created it.
-
-## Work hierarchy
-
-Use only as much hierarchy as necessary.
-
-Possible structures include:
-
-```text
-Milestone
-├── Feature
-│   ├── Work Package
-│   └── Work Package
-├── Fix
-│   └── Work Package
-├── Refactor
-│   └── Work Package
-└── Technical Spike
-```
-
-Or, when shared context justifies it:
-
-```text
-Milestone
-└── Epic
-    ├── Feature
-    │   └── Work Package
-    └── Feature
-        └── Work Package
-```
-
-Do not create hierarchy merely for ceremony.
+A checkpoint is an execution detail inside already-approved work. It is not a planning
+unit, a new approval boundary, or a GitHub Issue by default. Checkpoint execution semantics
+belong to `docs/development/workflow.md`.
 
 ## Work Package definition
 
-A Work Package should contain only the information needed to execute and validate that unit of work.
+A Work Package is the smallest approved project unit worth tracking independently through
+execution and acceptance.
+
+It should contain enough persistent context for another session to understand what must be
+delivered without depending on the conversation that created it.
 
 Useful sections include:
 
@@ -276,37 +218,103 @@ Useful sections include:
 Objective
 Scope
 Out of scope
-Related requirements
-Relevant architecture
-Related ADRs
+Authoritative inputs / related architecture
+Dependencies
 Safety constraints
 Acceptance criteria
-Implementation notes
-Automated validation
-Manual validation
-Outcome
+Validation
+Implementation notes, only when they constrain execution
 ```
 
-A Work Package must not silently absorb responsibilities from another package or from unapproved future work.
+Not every Work Package needs every section.
 
-If execution reveals that its scope is incomplete or architecturally incorrect, stop and return to the appropriate SDD stage instead of expanding implementation implicitly.
+A Work Package should:
 
-## Checkpoint
+- have one coherent result;
+- have explicit acceptance criteria;
+- identify dependencies that materially block execution;
+- identify authoritative Specifications, ADRs, Architecture, or Reference evidence rather
+  than copying them;
+- preserve safety constraints required for its own execution;
+- state validation obligations relevant to acceptance;
+- avoid absorbing unrelated future work.
 
-A checkpoint is a bounded implementation or review step inside an already-approved Work Package.
+Implementation detail that does not constrain the approved outcome should normally be left
+to execution.
 
-A checkpoint:
+If a proposed Work Package still contains unresolved questions that can materially change
+its scope or architecture, return to Discovery or create a Technical Spike instead of
+pretending the work is ready.
 
-* is intentionally small enough for one focused agent session or review cycle;
-* exists to prevent context exhaustion and overly broad implementation prompts;
-* is not a new Feature, Work Package, or Issue by default;
-* is not independently represented in GitHub Project status;
-* is not a new approval boundary when it merely decomposes already-approved scope;
-* may result in one coherent commit when useful.
+## Architecture decisions
 
-Checkpoints are execution granularity, not an additional project hierarchy level. Do not create ceremony around them.
+A durable architectural choice with meaningful alternatives, trade-offs, or long-term
+constraints requires ADR handling.
 
-If a checkpoint discovers new scope, a new architectural decision, or a safety question, the Discovery, Specification, and ADR rules defined elsewhere in this document still apply.
+During Discovery or Specification:
+
+1. identify the architectural question;
+2. inspect existing ADRs;
+3. gather relevant alternatives and evidence;
+4. use a Technical Spike when empirical evidence is required;
+5. obtain owner approval;
+6. create or update the ADR according to `docs/decisions/README.md`;
+7. make Specifications and work items consume the accepted decision without duplicating its
+   reasoning.
+
+Do not establish architectural policy implicitly through a Specification detail, Work
+Package, or implementation plan when the decision itself deserves an ADR.
+
+Accepted ADR history must remain historically honest.
+
+## Safety-sensitive specification
+
+Bamep can modify or destroy endpoint data and operating system installations.
+
+Discovery, Specifications, and Work Packages must explicitly surface safety implications
+when scope involves, for example:
+
+- disk preparation, partitioning, formatting, deployment, restore, or artifact deletion;
+- Endpoint identity, enrollment, authentication, or trust;
+- destructive storage mutation;
+- privilege boundaries;
+- retry or reconciliation of destructive work.
+
+Define the safety contract at the authority that owns the behavior.
+
+As applicable, specify:
+
+- preconditions;
+- identity and authorization assumptions;
+- stale-state handling;
+- interruption and reconciliation behavior;
+- retry and cancellation semantics;
+- integrity requirements;
+- verification required before destructive execution;
+- Integration Environment obligations where simulation cannot represent the risk.
+
+Do not infer that a generic retry policy makes a destructive operation safe to replay.
+
+## Validation expectations
+
+SDD defines **what must be demonstrated**, not the detailed mechanics of running tests.
+
+Specifications and Work Packages should identify validation obligations that are material
+to acceptance, especially for:
+
+- safety invariants;
+- protocol interoperability;
+- persistence and crash correctness;
+- destructive-operation behavior;
+- Simulator fidelity;
+- Integration Environment behavior.
+
+The testing layers and selection strategy belong to `docs/development/testing.md`.
+
+The execution and recording of validation results belong to
+`docs/development/workflow.md`.
+
+Do not use tests to invent requirements that the approved contract does not define.
 
 ## Owner approval
 
@@ -314,267 +322,99 @@ Owner approval is the boundary between proposed work and approved work.
 
 Approval is required before:
 
-* materializing planned work as approved execution scope;
-* beginning non-trivial planned implementation;
-* accepting a significant architectural decision;
-* expanding an approved Specification in a materially different direction.
+- beginning non-trivial planned implementation;
+- treating a Specification as approved;
+- accepting a significant architectural decision;
+- materializing proposed work as approved execution scope;
+- materially expanding or changing approved scope.
 
-Approval may be explicit in conversation or represented by approved persistent project state.
+Approval may be explicit in conversation or represented by an approved persistent project
+state.
 
-Do not infer approval merely because a proposal was discussed.
+Do not infer approval merely because an option was discussed.
 
-Material changes after approval must be surfaced rather than silently incorporated.
+If a material requirement, decision, or scope boundary changes after approval, surface the
+change and return to the appropriate SDD stage.
 
 ## GitHub materialization
 
-GitHub materialization turns approved plans into operational work items.
+GitHub materialization converts approved work into operational work items.
 
 Materialize only approved work.
 
-Do not populate GitHub with speculative implementation tasks before Specification exists.
+GitHub Issues may represent Features, Fixes, Refactors, Technical Spikes, and Work
+Packages. Parent items group work; child Work Packages carry concrete delivery and
+acceptance boundaries.
 
-Materialization may create:
+An Issue owns actionable scope, acceptance, dependencies, execution context, and outcome.
+It should link to durable repository authorities instead of copying their full contracts
+or architectural reasoning.
 
-* Feature Issues;
-* Fix Issues;
-* Refactor Issues;
-* Technical Spike Issues;
-* Work Package Issues;
-* Milestone relationships;
-* Project items.
+GitHub Projects own operational status. GitHub Milestones own milestone or release
+grouping.
 
-ADRs themselves remain permanent repository documents under `docs/decisions/`.
+The detailed status lifecycle begins once work is ready and belongs to
+`docs/development/workflow.md`.
 
-GitHub work may track investigation or implementation related to an ADR, but the Issue is not the authoritative architectural decision record.
+## Ready boundary
 
-## Status model
+SDD is complete for a work item when another execution session can start without guessing
+about intent or relying on prior conversation history.
 
-The default workflow states are:
+Before work is considered ready, confirm that:
 
-| Status      | Meaning                                                                                                    |
-| ----------- | ---------------------------------------------------------------------------------------------------------- |
-| Backlog     | Work is known but definition, priority, dependencies, evidence, or ordering may remain unresolved.         |
-| Ready       | Approved context is sufficient for another session to start without relying on prior conversation history. |
-| In Progress | Execution and relevant automated validation are active.                                                    |
-| Validation  | Execution and required automated validation are complete; owner manual validation is pending.              |
-| Done        | The owner accepted the work after validation.                                                              |
+- scope and out of scope are sufficiently explicit;
+- acceptance criteria are reviewable;
+- authoritative inputs are identifiable;
+- blocking architectural decisions are resolved or explicitly isolated;
+- required evidence exists or is delegated to a prior Spike;
+- safety constraints are explicit where applicable;
+- validation obligations are known;
+- material dependencies are identified.
 
-A Work Package should enter `Ready` only when its persistent context is sufficient for execution.
-
-Known required automated validation must not be failing when work moves to `Validation`.
-
-A problem discovered during manual validation returns the affected work to `In Progress`.
-
-## Execution
-
-Execution follows approved scope.
-
-Before making changes:
-
-1. identify the approved work item;
-2. inspect its Specification or Work Package;
-3. inspect relevant architecture and ADRs;
-4. inspect the current implementation and nearby tests;
-5. verify that no unresolved question blocks execution.
-
-During execution:
-
-* implement only approved scope;
-* preserve established boundaries;
-* add or update relevant automated tests;
-* use fakes and simulation at external or destructive boundaries where appropriate;
-* record meaningful deviations instead of silently changing the plan;
-* stop when a new durable architectural decision is required.
-
-Execution may include documentation, Technical Spikes, architecture work, or implementation depending on the approved work.
-
-Production code is not required for every SDD work item.
-
-## Architectural decisions during execution
-
-If Discovery or execution reveals a durable architectural decision with meaningful alternatives:
-
-1. record the question in the current Specification, Spike, or Work Package;
-2. inspect existing ADRs;
-3. stop the affected architectural choice;
-4. identify relevant alternatives and trade-offs;
-5. obtain owner approval for the decision;
-6. create or update the ADR;
-7. continue work according to the accepted decision.
-
-Agents must not establish architectural policy silently through generated code.
-
-Accepted ADRs are current architectural constraints.
-
-Reconsider an accepted ADR only when new requirements, evidence, or constraints justify doing so.
-
-When a decision changes, preserve decision history rather than rewriting accepted historical reasoning as if the previous decision never existed.
-
-## Safety-sensitive work
-
-Bamep includes operations capable of modifying or destroying endpoint data and operating system installations.
-
-Specifications involving any of the following require explicit safety treatment:
-
-* disk preparation;
-* partition modification;
-* formatting;
-* image deployment;
-* backup deletion;
-* restore operations;
-* endpoint identity;
-* enrollment and authentication;
-* recovery artifacts;
-* destructive storage mutation;
-* privilege boundaries.
-
-Relevant Specifications or Work Packages must define, when applicable:
-
-* safety invariants;
-* preconditions;
-* identity assumptions;
-* authorization requirements;
-* stale-state handling;
-* interruption behavior;
-* retry semantics;
-* cancellation semantics;
-* recovery behavior;
-* required verification before destructive execution.
-
-Generic retry policies must never imply that destructive operations are automatically safe to replay.
-
-When simulator or fake-based validation cannot adequately represent a destructive or hardware-dependent risk, define explicit Integration Environment and owner-manual validation.
-
-## Automated validation
-
-Relevant automated validation is part of execution completeness.
-
-The exact testing policy belongs in `docs/development/testing.md`.
-
-Validation should be proportional to the affected behavior and risk.
-
-Depending on scope, it may include:
-
-* domain tests;
-* state-machine tests;
-* protocol contract tests;
-* adapter contract tests;
-* simulator scenarios;
-* integration tests;
-* safety regression tests;
-* data-transfer interruption tests;
-* frontend tests.
-
-Testing must verify specified behavior.
-
-Do not use tests to invent missing requirements.
-
-## Owner manual validation
-
-Owner manual validation is the acceptance gate before `Done`.
-
-Manual validation is particularly important when behavior depends on:
-
-* PXE;
-* firmware;
-* GRUB;
-* Alpine boot environments;
-* real storage devices;
-* network hardware;
-* Windows or WinPE;
-* destructive provisioning;
-* hardware-specific compatibility;
-* complete workflows that active automated layers cannot represent reliably.
-
-Agents may define and report manual validation procedures.
-
-Agents must not claim that owner validation has been completed on the owner's behalf.
-
-## Outcome record
-
-Before work reaches `Done`, preserve only outcome information that remains useful for future development, review, or release preparation.
-
-A concise record may include:
-
-```text
-Outcome
-- implemented or validated result;
-- relevant deviation from the approved plan.
-
-Automated validation
-- relevant commands, scenarios, and results.
-
-Manual validation
-- relevant scenarios and owner result.
-
-Related changes
-- ADRs, architecture documents, or reference material updated.
-```
-
-Do not reproduce the code diff or conversation transcript.
-
-## Session handoff
-
-When a session ends with unfinished work, persistent project context must be sufficient for another session to continue.
-
-Update the relevant Specification, Work Package, Spike, Issue, or other authoritative source with:
-
-* current status;
-* completed work;
-* remaining work;
-* relevant evidence;
-* validation results;
-* unresolved blockers;
-* unresolved architectural questions.
-
-The next session reconstructs context from the repository and GitHub rather than assuming previous conversation history.
+If those conditions are not met, the work is not ready for execution.
 
 ## Reduced SDD
 
-Small, isolated, low-risk changes may use a reduced process when they do not require meaningful Discovery, decomposition, architectural decisions, or safety analysis.
+Small, isolated, low-risk work may use a reduced process when intent and scope are already
+clear and there is no meaningful architecture, safety, or evidence gap.
 
-Examples may include:
+Examples include:
 
-* typo corrections;
-* broken documentation links;
-* minor documentation wording corrections;
-* trivial configuration maintenance;
-* small reproducible fixes with obvious scope and no architectural impact.
+- typo corrections;
+- broken links;
+- minor documentation corrections;
+- trivial configuration maintenance;
+- small reproducible fixes with obvious scope and no architectural impact.
 
-Reduced SDD may use:
+A reduced path may be:
 
 ```text
 scope confirmation
+→ owner approval when required
 → execution
-→ proportional automated validation
-→ owner manual validation when relevant
-→ Done
 ```
 
-Reduced SDD must not be used to bypass:
+Execution and validation still follow `docs/development/workflow.md` and
+`docs/development/testing.md`.
 
-* required safety analysis;
-* architectural decisions;
-* significant requirements;
-* meaningful scope ambiguity;
-* destructive-operation validation;
-* repository inspection;
-* owner-controlled Git or publication rules.
+Reduced SDD must not bypass:
+
+- meaningful scope ambiguity;
+- safety analysis;
+- architectural decisions;
+- significant requirements;
+- required empirical investigation;
+- destructive-operation constraints.
+
+If any of those appear, return to the normal SDD path.
 
 ## Guiding rule
 
-Use enough process to preserve:
+SDD exists to make the important questions explicit **before** execution becomes the place
+where hidden decisions are made.
 
-* intent;
-* evidence;
-* scope;
-* architectural reasoning;
-* safety;
-* validation;
-* continuity.
+Use enough structure to preserve intent, evidence, scope, architecture, safety, and
+acceptance.
 
-Do not add hierarchy, documentation, or ceremony that provides no useful project context.
-
-The purpose of SDD is not to produce documents.
-
-The purpose of SDD is to ensure that important Bamep behavior and decisions are explicit before they become difficult to change.
+Do not produce documents or hierarchy that have no unique authority or project value.
