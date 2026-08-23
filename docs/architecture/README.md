@@ -64,10 +64,10 @@ A structurally separate internal Application control path
 (`bamep_server::application::JobService::create_workflow`, exercised directly by tests today)
 creates one durable `Pending` Job with one or more ordered `Pending` JobSteps for an existing
 `Enrolled` Endpoint, atomically, through the `JobRepository` Port and its PostgreSQL Adapter.
-This path never runs through Agent Protocol message handling. It stops at durable creation:
-final dispatch revalidation and Attempt creation are not yet implemented (admission into
-`Running` and preliminary JobStep eligibility are — see "Implemented Job admission and
-scheduling baseline" below).
+This path never runs through Agent Protocol message handling. It stops at durable creation;
+admission into `Running`, preliminary JobStep eligibility, and final destructive-dispatch
+commitment are implemented separately — see "Implemented Job admission and scheduling
+baseline" and "Implemented final destructive-dispatch commitment" below.
 
 ## Implemented destructive JobStep intent authorization
 
@@ -79,13 +79,14 @@ atomically, through the `JobRepository` Port and its PostgreSQL Adapter. The cal
 only the Job/JobStep; the evidence itself always comes from the real `InventoryRepository` and
 `TargetRevalidationPort`, never from a caller-supplied value. The snapshot is single-assignment:
 once attached it is never refreshed from later inventory/target observations, and a JobStep
-remains `Pending` throughout. This path stops at the durable snapshot: final dispatch
-revalidation and Attempt creation are not yet implemented.
+remains `Pending` throughout. This path stops at the durable snapshot; final dispatch
+revalidation and Attempt creation are implemented separately — see "Implemented final
+destructive-dispatch commitment" below.
 
 ## Implemented safe-dispatch evidence inputs
 
-Three independent evidence inputs for the later destructive-dispatch gate exist structurally
-today, without any admission/scheduling/dispatch behavior built on them yet:
+Three independent evidence inputs for the destructive-dispatch gate exist structurally, now
+composed by the final destructive-dispatch commitment path below:
 
 - durable hardware confidence is a fourth `EndpointAggregate` dimension, persisted with the
   Endpoint and initialized to `Consistent` at creation, independently of enrollment approval;
@@ -114,9 +115,32 @@ transitions, atomically, through the `JobRepository` Port and its PostgreSQL Ada
 A separate in-process Runtime Service, `bamep_server::runtime::resource_arbiter::TechnicalResourceArbiter`,
 grants/releases deterministic transient Attempt-scoped technical-resource reservations
 (opaque `ReservationId` handles over generic named resource kinds and quantities). It is
-memory-only, never persisted, and not yet composed into any admission/dispatch path — that
-composition, along with final dispatch revalidation and Attempt creation, remains
-unimplemented.
+memory-only, never persisted, and is composed by the final destructive-dispatch commitment
+path below.
+
+## Implemented final destructive-dispatch commitment
+
+A structurally separate internal Application control path
+(`bamep_server::application::FinalDispatchService::commit_destructive_dispatch`) performs the
+final destructive-dispatch authorization gate and durable commitment. It acquires the required
+technical-resource reservation from `TechnicalResourceArbiter` first; on success it locks the
+Job/JobStep/Endpoint state through the `JobRepository` Port and its PostgreSQL Adapter, resolves
+current Runtime Presence Registry and `TargetRevalidationPort` evidence and "now" only after
+that lock is held, and calls the pure Domain decision
+`bamep_domain::evaluate_final_destructive_dispatch` (`bamep-domain`'s `final_dispatch` module),
+which composes workflow/scheduler authorization with the complete seven-item destructive gate
+without inferring any one precondition from another.
+
+On success, one PostgreSQL transaction atomically commits the candidate JobStep's
+`PreconditionsSatisfied -> Dispatching` transition, one fresh `attempts` row
+(`bamep_domain::Attempt`/`AttemptId`/`ActionId`, currently only ever `Dispatched`), and a
+destructive-dispatch `audit_records` row correlating `endpoint_id`/`job_id`/`job_step_id`/
+`attempt_id`/`action_id`. On revalidation failure the JobStep returns to `Pending` and the
+reservation is released; on resource unavailability nothing is touched. No new `DomainEvent` is
+introduced for this commitment.
+
+This path never sends `ActionDispatch` and never opens an Agent Protocol/WebSocket connection —
+transmission of the already-committed Attempt remains unimplemented.
 
 ## Maintenance rule
 

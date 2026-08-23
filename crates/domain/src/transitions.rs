@@ -351,6 +351,10 @@ pub fn approve_enrollment(
         actor: operator,
         occurred_at: now,
         detail: "EnrollmentApproved".to_string(),
+        job_id: None,
+        job_step_id: None,
+        attempt_id: None,
+        action_id: None,
     };
 
     Ok(TransitionOutcome {

@@ -123,6 +123,13 @@ CREATE INDEX idx_domain_events_job_id ON domain_events (job_id);
 
 -- Durable safety-relevant audit records. Actor attribution is relational, and
 -- the actor label must be present exactly for operator actors.
+--
+-- job_id/job_step_id/attempt_id/action_id are narrow optional correlation
+-- columns (Issue #25): the destructive-dispatch commitment audit record
+-- populates all four so its correlation is structural, never hidden solely in
+-- `detail`. Every audit record predating #25 (e.g. enrollment approval)
+-- leaves all four NULL. Their FK constraints are added below, once `jobs`,
+-- `job_steps`, and `attempts` exist — mirroring `domain_events_job_id_fk`.
 CREATE TABLE audit_records (
     audit_id UUID PRIMARY KEY,
     endpoint_id UUID NOT NULL REFERENCES endpoints (id),
@@ -130,6 +137,10 @@ CREATE TABLE audit_records (
     actor_label TEXT,
     occurred_at TIMESTAMPTZ NOT NULL,
     detail TEXT NOT NULL,
+    job_id UUID,
+    job_step_id UUID,
+    attempt_id UUID,
+    action_id UUID,
     CONSTRAINT audit_records_actor_label_check CHECK (
         (actor_kind = 'operator' AND actor_label IS NOT NULL)
         OR (actor_kind = 'system' AND actor_label IS NULL)
@@ -249,3 +260,42 @@ CREATE TABLE job_steps (
 );
 
 CREATE INDEX idx_job_steps_job_id ON job_steps (job_id);
+
+-- The full authoritative Attempt state vocabulary
+-- (m0-job-lifecycle-and-scheduling.md "Attempt lifecycle"). Issue #25
+-- persists only 'Dispatched'; the remaining values are represented so later
+-- Work Packages do not need a schema change.
+CREATE TYPE attempt_state AS ENUM (
+    'Dispatched',
+    'InProgress',
+    'AwaitingReconciliation',
+    'Succeeded',
+    'Failed',
+    'Cancelled',
+    'Rejected',
+    'Indeterminate'
+);
+
+-- Durable Attempt: one concrete execution of a JobStep
+-- (m0-job-lifecycle-and-scheduling.md "Domain model"; Issue #25). job_step_id
+-- is deliberately NOT UNIQUE: a JobStep may accumulate more than one Attempt
+-- over its lifetime once retry policy exists (later Work Packages). action_id
+-- is globally UNIQUE and distinct from `id` even though correlated 1:1
+-- (m0-persistence-observability-and-domain-events.md "Correlation").
+CREATE TABLE attempts (
+    id UUID PRIMARY KEY,
+    job_step_id UUID NOT NULL REFERENCES job_steps (id),
+    action_id UUID NOT NULL UNIQUE,
+    state attempt_state NOT NULL
+);
+
+CREATE INDEX idx_attempts_job_step_id ON attempts (job_step_id);
+
+ALTER TABLE audit_records ADD CONSTRAINT audit_records_job_id_fk
+    FOREIGN KEY (job_id) REFERENCES jobs (id);
+ALTER TABLE audit_records ADD CONSTRAINT audit_records_job_step_id_fk
+    FOREIGN KEY (job_step_id) REFERENCES job_steps (id);
+ALTER TABLE audit_records ADD CONSTRAINT audit_records_attempt_id_fk
+    FOREIGN KEY (attempt_id) REFERENCES attempts (id);
+
+CREATE INDEX idx_audit_records_job_step_id ON audit_records (job_step_id);

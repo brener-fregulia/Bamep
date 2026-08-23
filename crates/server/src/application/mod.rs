@@ -10,22 +10,29 @@
 use std::sync::Arc;
 
 use bamep_agent_protocol::{BootstrapEvidenceMessage, InventoryReportMessage};
-use bamep_domain::credential::CredentialHash;
+use bamep_domain::credential::{CredentialDimension, CredentialHash};
 use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_domain::{
-    transitions, Actor, BootContext, BootNonce, DestructiveIntent, EmptyWorkflow, EndpointId,
-    InvalidIdentityTransition, InventoryRevision, InventorySnapshot, Job, JobId, JobStepId,
-    DEFAULT_CREDENTIAL_TTL,
+    evaluate_final_destructive_dispatch, transitions, Actor, AuditRecord, BootContext, BootNonce,
+    DestructiveIntent, EmptyWorkflow, EndpointId, FinalDispatchInputs, FinalDispatchOutcome,
+    FinalDispatchRejection, IdentityState, InvalidIdentityTransition, InventoryRevision,
+    InventorySnapshot, Job, JobId, JobStepId, TrustedBootstrapState, DEFAULT_CREDENTIAL_TTL,
 };
 use bamep_trusted_bootstrap::{AcceptedSiteKeys, BootstrapAssertion, ServerCertFingerprint};
 use chrono::{DateTime, Duration, Utc};
+use uuid::Uuid;
 
 use crate::ports::{
     AdmitJobDecision, AdmitJobError, AuthorizeDestructiveIntentDecision,
-    AuthorizeDestructiveIntentError, BootContextRepository, CreateWorkflowError,
-    CredentialRedemptionRepository, EndpointRepository, EndpointUpdateError, InventoryRepository,
+    AuthorizeDestructiveIntentError, BootContextRepository, CommitDestructiveDispatchError,
+    CreateWorkflowError, CredentialRedemptionRepository, EndpointRepository, EndpointUpdateError,
+    FinalDispatchCommit, FinalDispatchDecision, FinalDispatchLockedFacts, InventoryRepository,
     JobRepository, RedemptionDecision, RedemptionTarget, RepositoryError,
     SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError, TargetRevalidationPort,
+};
+use crate::runtime::presence::PresenceRegistry;
+use crate::runtime::resource_arbiter::{
+    InsufficientCapacity, ReservationId, ResourceClaim, TechnicalResourceArbiter,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -389,6 +396,193 @@ impl<J: JobRepository, I: InventoryRepository> DestructiveIntentService<J, I> {
             .authorize_destructive_intent(job_id, step_id, decide)
             .await
             .map_err(ApplicationError::from)
+    }
+}
+
+/// Outcome of one [`FinalDispatchService::commit_destructive_dispatch`] call
+/// (Issue #25 "Transient resource reservation": the three cases the WP
+/// requires the caller to distinguish).
+#[derive(Debug)]
+pub enum FinalDispatchResult {
+    /// The required technical-resource reservation could not be acquired.
+    /// Final revalidation never began: the candidate JobStep remains exactly
+    /// `PreconditionsSatisfied`, and nothing was persisted.
+    ResourceUnavailable,
+    /// Final revalidation failed after the reservation was acquired
+    /// (`bamep_domain::FinalDispatchRejection` identifies why). The
+    /// reservation has already been released.
+    Rejected(FinalDispatchRejection),
+    /// The dispatch commitment durably succeeded: the reservation remains
+    /// held, returned here together with the committed Attempt/JobStep
+    /// context so a later Work Package (#26) can consume it.
+    Committed {
+        outcome: FinalDispatchOutcome,
+        reservation: ReservationId,
+    },
+}
+
+/// The internal Application/harness final destructive-dispatch authorization
+/// path (Issue #25 "[WP] Schedule Jobs and enforce safe dispatch gate").
+/// Composes #32's [`TechnicalResourceArbiter`], the Runtime Presence
+/// Registry, and [`TargetRevalidationPort`] around the pure Domain gate
+/// (`bamep_domain::evaluate_final_destructive_dispatch`), following `lock ->
+/// freshly read -> Domain decision -> persist -> commit`
+/// (`m0-job-lifecycle-and-scheduling.md` "Final pre-dispatch revalidation").
+///
+/// Callers identify only the Job/JobStep and the technical resource claims
+/// this Attempt requires — every authoritative Endpoint/credential/inventory/
+/// target/confidence/bootstrap fact, and the fresh `AttemptId`/`ActionId`
+/// themselves, are resolved by this service and the Domain gate it calls, at
+/// decision time, never accepted from the caller (Issue #25 "Application
+/// boundary").
+///
+/// This service never constructs or sends `ActionDispatch`: its only output
+/// is the durably committed Attempt/action correlation plus the transient
+/// [`ReservationId`] context for #26.
+pub struct FinalDispatchService<J: JobRepository> {
+    repo: Arc<J>,
+    clock: Arc<dyn Clock>,
+    presence: Arc<PresenceRegistry>,
+    target_revalidation: Arc<dyn TargetRevalidationPort>,
+    arbiter: Arc<TechnicalResourceArbiter>,
+}
+
+impl<J: JobRepository> FinalDispatchService<J> {
+    pub fn new(
+        repo: Arc<J>,
+        presence: Arc<PresenceRegistry>,
+        target_revalidation: Arc<dyn TargetRevalidationPort>,
+        arbiter: Arc<TechnicalResourceArbiter>,
+    ) -> Self {
+        Self::with_clock(
+            repo,
+            Arc::new(SystemClock),
+            presence,
+            target_revalidation,
+            arbiter,
+        )
+    }
+
+    pub fn with_clock(
+        repo: Arc<J>,
+        clock: Arc<dyn Clock>,
+        presence: Arc<PresenceRegistry>,
+        target_revalidation: Arc<dyn TargetRevalidationPort>,
+        arbiter: Arc<TechnicalResourceArbiter>,
+    ) -> Self {
+        Self {
+            repo,
+            clock,
+            presence,
+            target_revalidation,
+            arbiter,
+        }
+    }
+
+    /// Attempts to commit exactly one destructive dispatch for `step_id`
+    /// under `job_id`, acquiring `claims` from the technical-resource arbiter
+    /// first (Issue #25 "Transient resource reservation").
+    ///
+    /// Sequence:
+    /// 1. acquire `claims` atomically from the arbiter; unavailable capacity
+    ///    returns [`FinalDispatchResult::ResourceUnavailable`] without
+    ///    touching durable state;
+    /// 2. lock the owning Job/JobStep/Endpoint/existing-Attempt state
+    ///    (`JobRepository::commit_destructive_dispatch`);
+    /// 3. inside that lock, resolve the transient Runtime Presence Registry
+    ///    and `TargetRevalidationPort` reads, and "now", then call the pure
+    ///    Domain gate;
+    /// 4. on gate failure, release the reservation and return
+    ///    [`FinalDispatchResult::Rejected`];
+    /// 5. on persistence failure, release the reservation and return an
+    ///    [`ApplicationError`];
+    /// 6. on success, keep the reservation held and return
+    ///    [`FinalDispatchResult::Committed`].
+    pub async fn commit_destructive_dispatch(
+        &self,
+        job_id: JobId,
+        step_id: JobStepId,
+        claims: Vec<ResourceClaim>,
+    ) -> Result<FinalDispatchResult, ApplicationError> {
+        let reservation = match self.arbiter.acquire(claims) {
+            Ok(id) => id,
+            Err(InsufficientCapacity) => return Ok(FinalDispatchResult::ResourceUnavailable),
+        };
+
+        let clock = Arc::clone(&self.clock);
+        let presence = Arc::clone(&self.presence);
+        let target_revalidation = Arc::clone(&self.target_revalidation);
+        let decide: FinalDispatchDecision = Box::new(move |facts: FinalDispatchLockedFacts| {
+            let now = clock.now();
+            let identity_enrolled = facts.endpoint.identity == IdentityState::Enrolled;
+            let credential_active = matches!(
+                facts.endpoint.credential.dimension(now),
+                CredentialDimension::CredentialActive
+            );
+            let agent_present = presence.is_present(facts.endpoint.id);
+            let hardware_confidence = facts.endpoint.hardware_confidence;
+            let trusted_bootstrap_established = facts
+                .endpoint
+                .current_boot
+                .as_ref()
+                .is_some_and(|cb| cb.trusted_bootstrap() == TrustedBootstrapState::Established);
+            let current_target_fingerprint =
+                target_revalidation.current_target_fingerprint(facts.endpoint.id);
+            let endpoint_id = facts.endpoint.id;
+
+            let inputs = FinalDispatchInputs {
+                job: facts.job,
+                step_id,
+                existing_active_attempt: facts.existing_active_attempt,
+                identity_enrolled,
+                credential_active,
+                agent_present,
+                current_inventory_revision_id: facts.current_inventory_revision_id,
+                current_target_fingerprint,
+                hardware_confidence,
+                trusted_bootstrap_established,
+            };
+            let outcome = evaluate_final_destructive_dispatch(&inputs)?;
+
+            let audit = AuditRecord {
+                audit_id: Uuid::new_v4(),
+                endpoint_id,
+                actor: Actor::System,
+                occurred_at: now,
+                detail: format!(
+                    "destructive dispatch committed for job_step {:?} attempt {:?} action {:?}",
+                    step_id, outcome.attempt.id, outcome.attempt.action_id
+                ),
+                job_id: Some(job_id),
+                job_step_id: Some(step_id),
+                attempt_id: Some(outcome.attempt.id),
+                action_id: Some(outcome.attempt.action_id),
+            };
+            Ok(FinalDispatchCommit { outcome, audit })
+        });
+
+        match self
+            .repo
+            .commit_destructive_dispatch(job_id, step_id, decide)
+            .await
+        {
+            Ok(outcome) => Ok(FinalDispatchResult::Committed {
+                outcome,
+                reservation,
+            }),
+            Err(CommitDestructiveDispatchError::Rejected(rejection)) => {
+                self.arbiter.release(reservation);
+                Ok(FinalDispatchResult::Rejected(rejection))
+            }
+            Err(CommitDestructiveDispatchError::JobNotFound(id)) => {
+                self.arbiter.release(reservation);
+                Err(ApplicationError::JobNotFound(id))
+            }
+            Err(CommitDestructiveDispatchError::Repository(e)) => {
+                self.arbiter.release(reservation);
+                Err(ApplicationError::Repository(e))
+            }
+        }
     }
 }
 
@@ -960,6 +1154,16 @@ mod tests {
             ) -> Result<JobStep, crate::ports::SatisfyStepPreconditionsError> {
                 unimplemented!("DestructiveIntentService never advances a JobStep")
             }
+
+            async fn commit_destructive_dispatch(
+                &self,
+                _job_id: JobId,
+                _step_id: JobStepId,
+                _decide: crate::ports::FinalDispatchDecision,
+            ) -> Result<FinalDispatchOutcome, crate::ports::CommitDestructiveDispatchError>
+            {
+                unimplemented!("DestructiveIntentService never commits a dispatch")
+            }
         }
 
         /// In-memory `InventoryRepository` fake exposing only a configurable
@@ -1212,6 +1416,646 @@ mod tests {
 
             assert!(matches!(err, ApplicationError::Repository(_)));
             assert_eq!(job_repo.step(job_id, step_id).destructive_intent, None);
+        }
+    }
+
+    mod final_dispatch_service {
+        use super::*;
+        use crate::adapters::target_revalidation_fixture::FixtureTargetRevalidation;
+        use crate::runtime::resource_arbiter::{ResourceClaim, ResourceKind};
+        use bamep_domain::credential::{CredentialChain, CredentialHash};
+        use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
+        use bamep_domain::{
+            create_workflow, Attempt, AttemptState, BootNonce, CurrentBoot, DestructiveIntent,
+            EndpointAggregate, HardwareConfidence, IdentityState, InventoryRevisionId, JobStep,
+            JobStepState, TargetFingerprint, TrustedBootstrapState,
+        };
+        use std::collections::HashMap;
+
+        /// In-memory `JobRepository` fake mirroring
+        /// `PostgresJobRepository::commit_destructive_dispatch`'s lock ->
+        /// decide -> persist sequence closely enough to exercise
+        /// `FinalDispatchService` end to end without PostgreSQL. The real
+        /// atomicity/concurrency/reload behavior is covered separately by
+        /// `crates/server/tests/final_dispatch_authorization.rs`.
+        #[derive(Default)]
+        struct FakeJobRepository {
+            jobs: Mutex<HashMap<JobId, Job>>,
+            endpoints: Mutex<HashMap<EndpointId, EndpointAggregate>>,
+            current_inventory: Mutex<HashMap<EndpointId, InventoryRevisionId>>,
+            attempts: Mutex<Vec<Attempt>>,
+            audits: Mutex<Vec<AuditRecord>>,
+            fail_persist: bool,
+        }
+
+        impl FakeJobRepository {
+            fn new(job: Job, endpoint: EndpointAggregate) -> Self {
+                let mut jobs = HashMap::new();
+                let mut endpoints = HashMap::new();
+                endpoints.insert(endpoint.id, endpoint);
+                jobs.insert(job.id, job);
+                Self {
+                    jobs: Mutex::new(jobs),
+                    endpoints: Mutex::new(endpoints),
+                    current_inventory: Mutex::new(HashMap::new()),
+                    attempts: Mutex::new(Vec::new()),
+                    audits: Mutex::new(Vec::new()),
+                    fail_persist: false,
+                }
+            }
+
+            fn failing_persist(job: Job, endpoint: EndpointAggregate) -> Self {
+                let mut fake = Self::new(job, endpoint);
+                fake.fail_persist = true;
+                fake
+            }
+
+            fn set_current_inventory(
+                &self,
+                endpoint_id: EndpointId,
+                revision: InventoryRevisionId,
+            ) {
+                self.current_inventory
+                    .lock()
+                    .unwrap()
+                    .insert(endpoint_id, revision);
+            }
+
+            fn step_state(&self, job_id: JobId, step_id: JobStepId) -> JobStepState {
+                self.jobs.lock().unwrap()[&job_id]
+                    .steps
+                    .iter()
+                    .find(|s| s.id == step_id)
+                    .unwrap()
+                    .state
+            }
+
+            fn attempt_count(&self) -> usize {
+                self.attempts.lock().unwrap().len()
+            }
+
+            fn audit_count(&self) -> usize {
+                self.audits.lock().unwrap().len()
+            }
+        }
+
+        #[async_trait]
+        impl JobRepository for FakeJobRepository {
+            async fn create_workflow(&self, _job: &Job) -> Result<(), CreateWorkflowError> {
+                unimplemented!("FinalDispatchService never creates a workflow")
+            }
+
+            async fn find_job(&self, id: JobId) -> Result<Option<Job>, RepositoryError> {
+                Ok(self.jobs.lock().unwrap().get(&id).cloned())
+            }
+
+            async fn authorize_destructive_intent(
+                &self,
+                _job_id: JobId,
+                _step_id: JobStepId,
+                _decide: AuthorizeDestructiveIntentDecision,
+            ) -> Result<DestructiveIntent, AuthorizeDestructiveIntentError> {
+                unimplemented!("FinalDispatchService never authorizes destructive intent")
+            }
+
+            async fn admit_job(
+                &self,
+                _job_id: JobId,
+                _decide: AdmitJobDecision,
+            ) -> Result<Job, AdmitJobError> {
+                unimplemented!("FinalDispatchService never admits a Job")
+            }
+
+            async fn satisfy_current_step_preconditions(
+                &self,
+                _job_id: JobId,
+                _step_id: JobStepId,
+                _decide: SatisfyStepPreconditionsDecision,
+            ) -> Result<JobStep, SatisfyStepPreconditionsError> {
+                unimplemented!("FinalDispatchService never advances a JobStep")
+            }
+
+            async fn commit_destructive_dispatch(
+                &self,
+                job_id: JobId,
+                step_id: JobStepId,
+                decide: FinalDispatchDecision,
+            ) -> Result<FinalDispatchOutcome, CommitDestructiveDispatchError> {
+                let Some(job) = self.jobs.lock().unwrap().get(&job_id).cloned() else {
+                    return Err(CommitDestructiveDispatchError::JobNotFound(job_id));
+                };
+                let endpoint = self
+                    .endpoints
+                    .lock()
+                    .unwrap()
+                    .get(&job.endpoint_id)
+                    .cloned()
+                    .expect("test fixture endpoint must exist");
+                let existing_active_attempt = self.attempts.lock().unwrap().iter().any(|a| {
+                    a.job_step_id == step_id
+                        && matches!(
+                            a.state,
+                            AttemptState::Dispatched
+                                | AttemptState::InProgress
+                                | AttemptState::AwaitingReconciliation
+                        )
+                });
+                let current_inventory_revision_id = self
+                    .current_inventory
+                    .lock()
+                    .unwrap()
+                    .get(&job.endpoint_id)
+                    .copied();
+
+                let facts = FinalDispatchLockedFacts {
+                    job,
+                    endpoint,
+                    existing_active_attempt,
+                    current_inventory_revision_id,
+                };
+
+                match decide(facts) {
+                    Ok(commit) => {
+                        if self.fail_persist {
+                            return Err(CommitDestructiveDispatchError::Repository(
+                                RepositoryError::Backend("simulated persistence failure".into()),
+                            ));
+                        }
+                        let mut jobs = self.jobs.lock().unwrap();
+                        let job = jobs.get_mut(&job_id).unwrap();
+                        if let Some(step) = job.steps.iter_mut().find(|s| s.id == step_id) {
+                            step.state = commit.outcome.job_step.state;
+                        }
+                        drop(jobs);
+                        self.attempts.lock().unwrap().push(commit.outcome.attempt);
+                        self.audits.lock().unwrap().push(commit.audit);
+                        Ok(commit.outcome)
+                    }
+                    Err(rejection) => {
+                        if rejection.requires_pending_transition() {
+                            let mut jobs = self.jobs.lock().unwrap();
+                            let job = jobs.get_mut(&job_id).unwrap();
+                            if let Some(step) = job.steps.iter_mut().find(|s| s.id == step_id) {
+                                step.state = JobStepState::Pending;
+                            }
+                        }
+                        Err(CommitDestructiveDispatchError::Rejected(rejection))
+                    }
+                }
+            }
+        }
+
+        fn intent(
+            revision_id: InventoryRevisionId,
+            fingerprint: TargetFingerprint,
+        ) -> DestructiveIntent {
+            DestructiveIntent {
+                authorized_inventory_revision_id: revision_id,
+                authorized_target_fingerprint: fingerprint,
+            }
+        }
+
+        /// Builds a `Running` Job with one destructive JobStep at
+        /// `PreconditionsSatisfied`, carrying `intent`, targeting
+        /// `endpoint_id`.
+        fn preconditions_satisfied_job(
+            endpoint_id: EndpointId,
+            intent: DestructiveIntent,
+        ) -> (Job, JobStepId) {
+            let mut job = create_workflow(endpoint_id, 1).unwrap();
+            job.steps[0].destructive_intent = Some(intent);
+            let running = bamep_domain::admit_job(&job, Utc::now()).unwrap().job;
+            let step_id = running.steps[0].id;
+            let advanced =
+                bamep_domain::satisfy_preliminary_preconditions(&running, step_id).unwrap();
+            let mut running = running;
+            running.steps[0] = advanced;
+            (running, step_id)
+        }
+
+        /// Builds a minimal `EndpointAggregate` with every safety dimension
+        /// independently controllable. `credential_active` selects whether
+        /// the credential chain's shared expiry sits in the future (`Active`)
+        /// or the past (`Expired`) relative to `now` — never `Revoked`, kept
+        /// out of scope for these tests.
+        fn endpoint_with(
+            identity_enrolled: bool,
+            credential_active: bool,
+            hardware_confidence: HardwareConfidence,
+            trusted_bootstrap_established: bool,
+            now: DateTime<Utc>,
+        ) -> EndpointAggregate {
+            let e1 = PresentedCredential::generate(CredentialKind::Enrollment);
+            let verifier = CredentialHash::of_bytes(e1.secret().expose_secret_bytes());
+            let r1 = PresentedCredential::generate(CredentialKind::Runtime);
+            let ttl = if credential_active {
+                Duration::hours(1)
+            } else {
+                Duration::hours(-1)
+            };
+            let chain = CredentialChain::establish(e1.lookup_id().clone(), verifier, &r1, now, ttl)
+                .unwrap();
+            let boot_nonce = BootNonce::generate().expect("OS CSPRNG must be available in tests");
+            let current_boot = Some(CurrentBoot::new(
+                e1.lookup_id().clone(),
+                boot_nonce,
+                if trusted_bootstrap_established {
+                    TrustedBootstrapState::Established
+                } else {
+                    TrustedBootstrapState::NotEstablished
+                },
+            ));
+
+            EndpointAggregate {
+                id: EndpointId::new(),
+                inventory_signal: format!("sim-final-dispatch-{}", Uuid::new_v4()),
+                identity: if identity_enrolled {
+                    IdentityState::Enrolled
+                } else {
+                    IdentityState::PendingEnrollment
+                },
+                credential: chain,
+                hardware_confidence,
+                current_boot,
+                created_at: now,
+                updated_at: now,
+            }
+        }
+
+        /// Every safety dimension passing — the baseline every negative test
+        /// starts from and flips exactly one field away from.
+        fn all_pass_fixture() -> (
+            FakeJobRepository,
+            Arc<PresenceRegistry>,
+            Arc<FixtureTargetRevalidation>,
+            JobId,
+            JobStepId,
+        ) {
+            let now = Utc::now();
+            let endpoint = endpoint_with(true, true, HardwareConfidence::Consistent, true, now);
+            let endpoint_id = endpoint.id;
+            let revision_id = InventoryRevisionId(Uuid::new_v4());
+            let fingerprint = TargetFingerprint::new("disk-a");
+            let (job, step_id) =
+                preconditions_satisfied_job(endpoint_id, intent(revision_id, fingerprint.clone()));
+            let job_id = job.id;
+
+            let repo = FakeJobRepository::new(job, endpoint);
+            repo.set_current_inventory(endpoint_id, revision_id);
+
+            let presence = Arc::new(PresenceRegistry::new());
+            presence.register(endpoint_id, bamep_agent_protocol::ProtocolId::generate());
+
+            let target = Arc::new(FixtureTargetRevalidation::new());
+            target.set_current_target(endpoint_id, fingerprint);
+
+            (repo, presence, target, job_id, step_id)
+        }
+
+        fn claims() -> Vec<ResourceClaim> {
+            vec![ResourceClaim::new(ResourceKind::new("network"), 1)]
+        }
+
+        fn service(
+            repo: FakeJobRepository,
+            presence: Arc<PresenceRegistry>,
+            target: Arc<FixtureTargetRevalidation>,
+            arbiter: Arc<TechnicalResourceArbiter>,
+        ) -> FinalDispatchService<FakeJobRepository> {
+            FinalDispatchService::new(
+                Arc::new(repo),
+                presence,
+                target as Arc<dyn TargetRevalidationPort>,
+                arbiter,
+            )
+        }
+
+        #[tokio::test]
+        async fn all_pass_commits_dispatching_step_and_one_dispatched_attempt() {
+            let (repo, presence, target, job_id, step_id) = all_pass_fixture();
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                10,
+            )]));
+            let svc = service(repo, presence, target, Arc::clone(&arbiter));
+
+            let result = svc
+                .commit_destructive_dispatch(job_id, step_id, claims())
+                .await
+                .unwrap();
+
+            match result {
+                FinalDispatchResult::Committed { outcome, .. } => {
+                    assert_eq!(outcome.job_step.state, JobStepState::Dispatching);
+                    assert_eq!(outcome.attempt.state, AttemptState::Dispatched);
+                }
+                other => panic!("expected Committed, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn credential_active_without_presence_blocks_dispatch() {
+            let (repo, _presence, target, job_id, step_id) = all_pass_fixture();
+            // A fresh, empty PresenceRegistry: CredentialActive holds (the
+            // fixture endpoint's chain is still valid) but no authenticated
+            // session is registered.
+            let empty_presence = Arc::new(PresenceRegistry::new());
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                10,
+            )]));
+            let svc = service(repo, empty_presence, target, Arc::clone(&arbiter));
+
+            let result = svc
+                .commit_destructive_dispatch(job_id, step_id, claims())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                result,
+                FinalDispatchResult::Rejected(FinalDispatchRejection::AgentNotPresent)
+            ));
+        }
+
+        #[tokio::test]
+        async fn presence_with_inactive_credential_blocks_dispatch() {
+            let now = Utc::now();
+            let endpoint = endpoint_with(true, false, HardwareConfidence::Consistent, true, now);
+            let endpoint_id = endpoint.id;
+            let revision_id = InventoryRevisionId(Uuid::new_v4());
+            let fingerprint = TargetFingerprint::new("disk-a");
+            let (job, step_id) =
+                preconditions_satisfied_job(endpoint_id, intent(revision_id, fingerprint.clone()));
+            let job_id = job.id;
+            let repo = FakeJobRepository::new(job, endpoint);
+            repo.set_current_inventory(endpoint_id, revision_id);
+
+            let presence = Arc::new(PresenceRegistry::new());
+            presence.register(endpoint_id, bamep_agent_protocol::ProtocolId::generate());
+            let target = Arc::new(FixtureTargetRevalidation::new());
+            target.set_current_target(endpoint_id, fingerprint);
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                10,
+            )]));
+            let svc = service(repo, presence, target, Arc::clone(&arbiter));
+
+            let result = svc
+                .commit_destructive_dispatch(job_id, step_id, claims())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                result,
+                FinalDispatchResult::Rejected(FinalDispatchRejection::CredentialNotActive)
+            ));
+        }
+
+        #[tokio::test]
+        async fn current_inventory_equality_cannot_compensate_for_target_mismatch() {
+            let (repo, presence, target, job_id, step_id) = all_pass_fixture();
+            let endpoint_id = *repo.endpoints.lock().unwrap().keys().next().unwrap();
+            // Inventory still matches; independently break the target.
+            target.set_current_target(endpoint_id, TargetFingerprint::new("disk-mismatch"));
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                10,
+            )]));
+            let svc = service(repo, presence, target, Arc::clone(&arbiter));
+
+            let result = svc
+                .commit_destructive_dispatch(job_id, step_id, claims())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                result,
+                FinalDispatchResult::Rejected(FinalDispatchRejection::TargetMismatch)
+            ));
+        }
+
+        #[tokio::test]
+        async fn matching_target_cannot_compensate_for_stale_inventory() {
+            let (repo, presence, target, job_id, step_id) = all_pass_fixture();
+            let endpoint_id = *repo.endpoints.lock().unwrap().keys().next().unwrap();
+            // Target still matches; independently make inventory stale.
+            repo.set_current_inventory(endpoint_id, InventoryRevisionId(Uuid::new_v4()));
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                10,
+            )]));
+            let svc = service(repo, presence, target, Arc::clone(&arbiter));
+
+            let result = svc
+                .commit_destructive_dispatch(job_id, step_id, claims())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                result,
+                FinalDispatchResult::Rejected(FinalDispatchRejection::StaleInventory)
+            ));
+        }
+
+        #[tokio::test]
+        async fn consistent_hardware_confidence_is_required_independently() {
+            let now = Utc::now();
+            let endpoint =
+                endpoint_with(true, true, HardwareConfidence::LoweredConfidence, true, now);
+            let endpoint_id = endpoint.id;
+            let revision_id = InventoryRevisionId(Uuid::new_v4());
+            let fingerprint = TargetFingerprint::new("disk-a");
+            let (job, step_id) =
+                preconditions_satisfied_job(endpoint_id, intent(revision_id, fingerprint.clone()));
+            let job_id = job.id;
+            let repo = FakeJobRepository::new(job, endpoint);
+            repo.set_current_inventory(endpoint_id, revision_id);
+            let presence = Arc::new(PresenceRegistry::new());
+            presence.register(endpoint_id, bamep_agent_protocol::ProtocolId::generate());
+            let target = Arc::new(FixtureTargetRevalidation::new());
+            target.set_current_target(endpoint_id, fingerprint);
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                10,
+            )]));
+            let svc = service(repo, presence, target, Arc::clone(&arbiter));
+
+            let result = svc
+                .commit_destructive_dispatch(job_id, step_id, claims())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                result,
+                FinalDispatchResult::Rejected(
+                    FinalDispatchRejection::HardwareConfidenceNotConsistent
+                )
+            ));
+        }
+
+        #[tokio::test]
+        async fn trusted_bootstrap_is_required_independently() {
+            let now = Utc::now();
+            let endpoint = endpoint_with(true, true, HardwareConfidence::Consistent, false, now);
+            let endpoint_id = endpoint.id;
+            let revision_id = InventoryRevisionId(Uuid::new_v4());
+            let fingerprint = TargetFingerprint::new("disk-a");
+            let (job, step_id) =
+                preconditions_satisfied_job(endpoint_id, intent(revision_id, fingerprint.clone()));
+            let job_id = job.id;
+            let repo = FakeJobRepository::new(job, endpoint);
+            repo.set_current_inventory(endpoint_id, revision_id);
+            let presence = Arc::new(PresenceRegistry::new());
+            presence.register(endpoint_id, bamep_agent_protocol::ProtocolId::generate());
+            let target = Arc::new(FixtureTargetRevalidation::new());
+            target.set_current_target(endpoint_id, fingerprint);
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                10,
+            )]));
+            let svc = service(repo, presence, target, Arc::clone(&arbiter));
+
+            let result = svc
+                .commit_destructive_dispatch(job_id, step_id, claims())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                result,
+                FinalDispatchResult::Rejected(
+                    FinalDispatchRejection::TrustedBootstrapNotEstablished
+                )
+            ));
+        }
+
+        #[tokio::test]
+        async fn resource_unavailable_leaves_step_preconditions_satisfied_without_persisting() {
+            let (repo, presence, target, job_id, step_id) = all_pass_fixture();
+            // Zero capacity: the arbiter must reject before final revalidation
+            // ever begins.
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                0,
+            )]));
+            let repo = Arc::new(repo);
+            let svc = FinalDispatchService::new(
+                Arc::clone(&repo),
+                presence,
+                target as Arc<dyn TargetRevalidationPort>,
+                Arc::clone(&arbiter),
+            );
+
+            let result = svc
+                .commit_destructive_dispatch(job_id, step_id, claims())
+                .await
+                .unwrap();
+
+            assert!(matches!(result, FinalDispatchResult::ResourceUnavailable));
+            assert_eq!(
+                repo.step_state(job_id, step_id),
+                JobStepState::PreconditionsSatisfied
+            );
+        }
+
+        #[tokio::test]
+        async fn gate_failure_after_resource_acquisition_releases_reservation_and_becomes_pending()
+        {
+            let (repo, presence, target, job_id, step_id) = all_pass_fixture();
+            let endpoint_id = *repo.endpoints.lock().unwrap().keys().next().unwrap();
+            target.set_current_target(endpoint_id, TargetFingerprint::new("disk-mismatch"));
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                1,
+            )]));
+            let repo = Arc::new(repo);
+            let svc = FinalDispatchService::new(
+                Arc::clone(&repo),
+                presence,
+                target as Arc<dyn TargetRevalidationPort>,
+                Arc::clone(&arbiter),
+            );
+
+            let result = svc
+                .commit_destructive_dispatch(job_id, step_id, claims())
+                .await
+                .unwrap();
+            assert!(matches!(
+                result,
+                FinalDispatchResult::Rejected(FinalDispatchRejection::TargetMismatch)
+            ));
+            assert_eq!(repo.step_state(job_id, step_id), JobStepState::Pending);
+
+            // The reservation must have been released: full capacity (1 unit)
+            // must be acquirable again.
+            assert!(arbiter.acquire(claims()).is_ok());
+        }
+
+        #[tokio::test]
+        async fn persistence_failure_releases_reservation_and_creates_nothing() {
+            let now = Utc::now();
+            let endpoint = endpoint_with(true, true, HardwareConfidence::Consistent, true, now);
+            let endpoint_id = endpoint.id;
+            let revision_id = InventoryRevisionId(Uuid::new_v4());
+            let fingerprint = TargetFingerprint::new("disk-a");
+            let (job, step_id) =
+                preconditions_satisfied_job(endpoint_id, intent(revision_id, fingerprint.clone()));
+            let job_id = job.id;
+            let repo = FakeJobRepository::failing_persist(job, endpoint);
+            repo.set_current_inventory(endpoint_id, revision_id);
+            let presence = Arc::new(PresenceRegistry::new());
+            presence.register(endpoint_id, bamep_agent_protocol::ProtocolId::generate());
+            let target = Arc::new(FixtureTargetRevalidation::new());
+            target.set_current_target(endpoint_id, fingerprint);
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                1,
+            )]));
+            let repo = Arc::new(repo);
+            let svc = FinalDispatchService::new(
+                Arc::clone(&repo),
+                presence,
+                target as Arc<dyn TargetRevalidationPort>,
+                Arc::clone(&arbiter),
+            );
+
+            let err = svc
+                .commit_destructive_dispatch(job_id, step_id, claims())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, ApplicationError::Repository(_)));
+            assert_eq!(repo.attempt_count(), 0);
+            assert_eq!(repo.audit_count(), 0);
+            // Reservation released: full capacity acquirable again.
+            assert!(arbiter.acquire(claims()).is_ok());
+        }
+
+        #[tokio::test]
+        async fn success_keeps_the_reservation_held() {
+            let (repo, presence, target, job_id, step_id) = all_pass_fixture();
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                1,
+            )]));
+            let svc = service(repo, presence, target, Arc::clone(&arbiter));
+
+            let result = svc
+                .commit_destructive_dispatch(job_id, step_id, claims())
+                .await
+                .unwrap();
+            assert!(matches!(result, FinalDispatchResult::Committed { .. }));
+
+            // Full capacity (1 unit) is already held by the successful
+            // commitment: a second claim must fail until it is explicitly
+            // released.
+            assert_eq!(
+                arbiter.acquire(claims()),
+                Err(crate::runtime::resource_arbiter::InsufficientCapacity)
+            );
+            if let FinalDispatchResult::Committed { reservation, .. } = result {
+                arbiter.release(reservation);
+            }
+            assert!(arbiter.acquire(claims()).is_ok());
         }
     }
 }

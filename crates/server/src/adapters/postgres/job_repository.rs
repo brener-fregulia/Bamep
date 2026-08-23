@@ -9,15 +9,19 @@
 
 use async_trait::async_trait;
 use bamep_domain::{
-    DestructiveIntent, EndpointId, InventoryRevisionId, Job, JobAdmissionError, JobId, JobState,
-    JobStep, JobStepEligibilityError, JobStepId, JobStepState, TargetFingerprint,
+    AttemptState, DestructiveIntent, EndpointId, InventoryRevisionId, Job, JobAdmissionError,
+    JobId, JobState, JobStep, JobStepEligibilityError, JobStepId, JobStepState, TargetFingerprint,
 };
 use sqlx::{PgPool, Row};
 
-use super::shared::{event_payload, to_backend_err, PgDomainEventType, PgIdentityState};
+use super::shared::{
+    actor_label, event_payload, to_backend_err, PgAuditActorKind, PgDomainEventType,
+    PgIdentityState,
+};
 use crate::ports::{
     AdmitJobDecision, AdmitJobError, AuthorizeDestructiveIntentDecision,
-    AuthorizeDestructiveIntentError, CreateWorkflowError, JobRepository, RepositoryError,
+    AuthorizeDestructiveIntentError, CommitDestructiveDispatchError, CreateWorkflowError,
+    FinalDispatchDecision, FinalDispatchLockedFacts, JobRepository, RepositoryError,
     SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError,
 };
 
@@ -95,6 +99,40 @@ impl From<PgJobStepState> for JobStepState {
             PgJobStepState::Succeeded => JobStepState::Succeeded,
             PgJobStepState::Failed => JobStepState::Failed,
             PgJobStepState::Cancelled => JobStepState::Cancelled,
+        }
+    }
+}
+
+/// Adapter-local representation of the `attempt_state` PostgreSQL ENUM
+/// (`docs/development/persistence.md` "Closed categorical values"). Domain
+/// (`bamep_domain::AttemptState`) stays free of SQLx/PostgreSQL derives. Only
+/// `Dispatched` is ever persisted by this Work Package (#25); the remaining
+/// variants are mapped so later Work Packages do not need a schema/Adapter
+/// type change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "attempt_state")]
+enum PgAttemptState {
+    Dispatched,
+    InProgress,
+    AwaitingReconciliation,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Rejected,
+    Indeterminate,
+}
+
+impl From<AttemptState> for PgAttemptState {
+    fn from(state: AttemptState) -> Self {
+        match state {
+            AttemptState::Dispatched => PgAttemptState::Dispatched,
+            AttemptState::InProgress => PgAttemptState::InProgress,
+            AttemptState::AwaitingReconciliation => PgAttemptState::AwaitingReconciliation,
+            AttemptState::Succeeded => PgAttemptState::Succeeded,
+            AttemptState::Failed => PgAttemptState::Failed,
+            AttemptState::Cancelled => PgAttemptState::Cancelled,
+            AttemptState::Rejected => PgAttemptState::Rejected,
+            AttemptState::Indeterminate => PgAttemptState::Indeterminate,
         }
     }
 }
@@ -394,6 +432,133 @@ impl JobRepository for PostgresJobRepository {
 
         tx.commit().await.map_err(to_backend_err)?;
         Ok(updated_step)
+    }
+
+    async fn commit_destructive_dispatch(
+        &self,
+        job_id: JobId,
+        step_id: JobStepId,
+        decide: FinalDispatchDecision,
+    ) -> Result<bamep_domain::FinalDispatchOutcome, CommitDestructiveDispatchError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        let job_row = sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+        let Some(job_row) = job_row else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(CommitDestructiveDispatchError::JobNotFound(job_id));
+        };
+        let endpoint_id: uuid::Uuid = job_row.try_get("endpoint_id").map_err(to_backend_err)?;
+        let job_state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
+
+        let steps = fetch_job_steps(&mut tx, job_id, true)
+            .await
+            .map_err(CommitDestructiveDispatchError::Repository)?;
+        let job = Job {
+            id: job_id,
+            endpoint_id: EndpointId(endpoint_id),
+            state: job_state.into(),
+            steps,
+        };
+
+        let endpoint = super::shared::load_by_id_for_update(&mut tx, EndpointId(endpoint_id))
+            .await
+            .map_err(CommitDestructiveDispatchError::Repository)?
+            .ok_or_else(|| {
+                CommitDestructiveDispatchError::Repository(RepositoryError::Backend(
+                    "job references an endpoint that no longer exists".to_string(),
+                ))
+            })?;
+
+        let current_inventory_revision_id: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT current_inventory_revision_id FROM endpoints WHERE id = $1")
+                .bind(endpoint_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(to_backend_err)?;
+        let current_inventory_revision_id = current_inventory_revision_id.map(InventoryRevisionId);
+
+        let existing_active_attempt: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM attempts \
+                WHERE job_step_id = $1 \
+                  AND state IN ('Dispatched', 'InProgress', 'AwaitingReconciliation') \
+                FOR UPDATE \
+             )",
+        )
+        .bind(step_id.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+
+        let facts = FinalDispatchLockedFacts {
+            job,
+            endpoint,
+            existing_active_attempt,
+            current_inventory_revision_id,
+        };
+
+        let commit = match decide(facts) {
+            Ok(commit) => commit,
+            Err(rejection) => {
+                if rejection.requires_pending_transition() {
+                    sqlx::query("UPDATE job_steps SET state = 'Pending' WHERE id = $1")
+                        .bind(step_id.0)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(to_backend_err)?;
+                    tx.commit().await.map_err(to_backend_err)?;
+                } else {
+                    tx.rollback().await.map_err(to_backend_err)?;
+                }
+                return Err(CommitDestructiveDispatchError::Rejected(rejection));
+            }
+        };
+
+        sqlx::query("UPDATE job_steps SET state = $1 WHERE id = $2")
+            .bind(PgJobStepState::from(commit.outcome.job_step.state))
+            .bind(step_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+
+        sqlx::query(
+            "INSERT INTO attempts (id, job_step_id, action_id, state) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(commit.outcome.attempt.id.0)
+        .bind(step_id.0)
+        .bind(commit.outcome.attempt.action_id.0)
+        .bind(PgAttemptState::from(commit.outcome.attempt.state))
+        .execute(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+
+        let audit = &commit.audit;
+        sqlx::query(
+            "INSERT INTO audit_records \
+             (audit_id, endpoint_id, actor_kind, actor_label, occurred_at, detail, \
+              job_id, job_step_id, attempt_id, action_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(audit.audit_id)
+        .bind(audit.endpoint_id.0)
+        .bind(PgAuditActorKind::from(&audit.actor))
+        .bind(actor_label(&audit.actor))
+        .bind(audit.occurred_at)
+        .bind(&audit.detail)
+        .bind(audit.job_id.map(|id| id.0))
+        .bind(audit.job_step_id.map(|id| id.0))
+        .bind(audit.attempt_id.map(|id| id.0))
+        .bind(audit.action_id.map(|id| id.0))
+        .execute(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+
+        tx.commit().await.map_err(to_backend_err)?;
+        Ok(commit.outcome)
     }
 }
 

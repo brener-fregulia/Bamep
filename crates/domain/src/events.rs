@@ -2,8 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::attempt::{ActionId, AttemptId};
 use crate::endpoint::EndpointId;
-use crate::job::JobId;
+use crate::job::{JobId, JobStepId};
 
 /// Actor attribution for an operator decision
 /// (`m0-persistence-observability-and-domain-events.md` "Auditability").
@@ -99,6 +100,13 @@ impl DomainEvent {
 
 /// A durable, immutable audit record for safety-relevant activity
 /// (`m0-persistence-observability-and-domain-events.md` "Auditability").
+///
+/// `job_id`/`job_step_id`/`attempt_id`/`action_id` are narrow optional
+/// correlation fields added by Issue #25 for the destructive-dispatch
+/// commitment audit record, which "must carry applicable correlation
+/// structurally" rather than hidden solely inside `detail`. Every audit
+/// record predating #25 (enrollment approval, etc.) leaves all four `None` —
+/// this extension preserves that existing behavior unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub audit_id: Uuid,
@@ -106,6 +114,10 @@ pub struct AuditRecord {
     pub actor: Actor,
     pub occurred_at: DateTime<Utc>,
     pub detail: String,
+    pub job_id: Option<JobId>,
+    pub job_step_id: Option<JobStepId>,
+    pub attempt_id: Option<AttemptId>,
+    pub action_id: Option<ActionId>,
 }
 
 /// The full result of one durable domain transition: the new aggregate

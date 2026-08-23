@@ -18,10 +18,11 @@
 use async_trait::async_trait;
 use bamep_domain::presented_credential::{CredentialKind, CredentialLookupId};
 use bamep_domain::{
-    BootContext, BootContextResolveError, DestructiveIntent, DestructiveIntentError,
-    EndpointAggregate, EndpointId, InvalidIdentityTransition, InventoryRevision, InventorySnapshot,
-    Job, JobAdmissionError, JobAdmissionOutcome, JobId, JobStep, JobStepEligibilityError,
-    JobStepId, RedeemOutcome, TargetFingerprint, TransitionOutcome, TrustedBootstrapOutcome,
+    AuditRecord, BootContext, BootContextResolveError, DestructiveIntent, DestructiveIntentError,
+    EndpointAggregate, EndpointId, FinalDispatchOutcome, FinalDispatchRejection,
+    InvalidIdentityTransition, InventoryRevision, InventoryRevisionId, InventorySnapshot, Job,
+    JobAdmissionError, JobAdmissionOutcome, JobId, JobStep, JobStepEligibilityError, JobStepId,
+    RedeemOutcome, TargetFingerprint, TransitionOutcome, TrustedBootstrapOutcome,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -261,6 +262,103 @@ pub trait JobRepository: Send + Sync {
         step_id: JobStepId,
         decide: SatisfyStepPreconditionsDecision,
     ) -> Result<JobStep, SatisfyStepPreconditionsError>;
+
+    /// Locks exactly the `Job` identified by `job_id` (including its current
+    /// ordered `JobStep`s), the owning `Endpoint`, and any existing
+    /// non-terminal `Attempt` for `step_id`, then invokes `decide` with that
+    /// freshly-read [`FinalDispatchLockedFacts`] (Issue #25 "Commit-time
+    /// revalidation/locking"). Every durable lock this method acquires is
+    /// held before `decide` runs, so a transient read the closure performs
+    /// internally (Runtime Presence Registry, `TargetRevalidationPort`, "now")
+    /// always observes state no older than that lock acquisition.
+    ///
+    /// On `Ok`, atomically persists — in the same transaction — the
+    /// candidate JobStep's `PreconditionsSatisfied -> Dispatching`
+    /// transition, the new `attempts` row, and the destructive-dispatch
+    /// audit record together (`m0-persistence-observability-and-domain-events.md`
+    /// "Atomic persistence"). No `ActionDispatch` is sent by this method or
+    /// anything it calls.
+    ///
+    /// On `Err`, persists `PreconditionsSatisfied -> Pending` only when
+    /// [`FinalDispatchRejection::requires_pending_transition`] is `true`;
+    /// otherwise (a structural mismatch — the JobStep was not, or is no
+    /// longer, `PreconditionsSatisfied`) nothing is persisted. Never creates
+    /// an Attempt, action correlation, or audit record on any `Err` path.
+    async fn commit_destructive_dispatch(
+        &self,
+        job_id: JobId,
+        step_id: JobStepId,
+        decide: FinalDispatchDecision,
+    ) -> Result<FinalDispatchOutcome, CommitDestructiveDispatchError>;
+}
+
+/// Durable facts read under lock immediately before the final destructive-
+/// dispatch decision (Issue #25 "Commit-time revalidation/locking"):
+/// everything [`bamep_domain::evaluate_final_destructive_dispatch`] needs
+/// except the transient Runtime Presence Registry / `TargetRevalidationPort`
+/// reads and "now", which [`FinalDispatchDecision`] performs/obtains itself
+/// when the Adapter invokes it — always after every lock represented here was
+/// already acquired, never before.
+pub struct FinalDispatchLockedFacts {
+    /// The owning Job, including every ordered `JobStep`, locked and freshly
+    /// read in the same transaction that may later persist this decision.
+    pub job: Job,
+    /// The Job's owning Endpoint, locked and freshly read in the same
+    /// transaction — its `identity`, `credential`, `hardware_confidence`, and
+    /// `current_boot` fields are the durable halves of destructive
+    /// preconditions 1, 2, 6, and 7.
+    pub endpoint: EndpointAggregate,
+    /// Whether an `Attempt` already exists for the candidate JobStep in a
+    /// non-terminal state, read under lock so a concurrent dispatch
+    /// commitment cannot race past it.
+    pub existing_active_attempt: bool,
+    /// The Endpoint's current durable inventory revision id, read from the
+    /// same locked `endpoints` row — `None` when no inventory has ever been
+    /// recorded.
+    pub current_inventory_revision_id: Option<InventoryRevisionId>,
+}
+
+/// A pure decision over freshly locked [`FinalDispatchLockedFacts`],
+/// producing the durable commitment to persist — the advanced `JobStep` +
+/// `Attempt` plus the audit record that must commit atomically with them —
+/// or the reason final dispatch is not currently authorized
+/// (`bamep_domain::evaluate_final_destructive_dispatch`; Issue #25). Mirrors
+/// [`AdmitJobDecision`]/[`SatisfyStepPreconditionsDecision`]: the Adapter
+/// locks and reads current state, this closure decides (performing its own
+/// transient Runtime Presence Registry / `TargetRevalidationPort` reads and
+/// obtaining "now" only once invoked, i.e. after every lock is held), and the
+/// Adapter persists the result atomically in the same transaction.
+pub type FinalDispatchDecision = Box<
+    dyn FnOnce(FinalDispatchLockedFacts) -> Result<FinalDispatchCommit, FinalDispatchRejection>
+        + Send,
+>;
+
+/// A successful [`FinalDispatchDecision`] result: the Domain outcome plus the
+/// immutable destructive-dispatch [`AuditRecord`] that must commit
+/// atomically alongside it (`m0-persistence-observability-and-domain-events.md`
+/// "Auditability"). Assembled by the Application-level decision closure, not
+/// by Domain itself — `bamep_domain::final_dispatch` intentionally has no
+/// audit/event concept, and no new `DomainEvent` is introduced for this
+/// commitment.
+pub struct FinalDispatchCommit {
+    pub outcome: FinalDispatchOutcome,
+    pub audit: AuditRecord,
+}
+
+/// Errors from [`JobRepository::commit_destructive_dispatch`].
+#[derive(Debug, thiserror::Error)]
+pub enum CommitDestructiveDispatchError {
+    #[error("job {0:?} not found")]
+    JobNotFound(JobId),
+    /// Final revalidation rejected the candidate JobStep
+    /// (`bamep_domain::FinalDispatchRejection`). The caller's Job/JobStep
+    /// durable state reflects whatever
+    /// [`FinalDispatchRejection::requires_pending_transition`] required —
+    /// this is not itself a repository failure.
+    #[error("final dispatch was not authorized: {0}")]
+    Rejected(FinalDispatchRejection),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
 }
 
 /// Persistence for newly issued `BootContext`s (ADR-0014 point 11

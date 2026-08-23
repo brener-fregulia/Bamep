@@ -216,6 +216,7 @@ async fn migrations_apply_cleanly_to_a_fresh_database() {
     assert_eq!(
         tables,
         vec![
+            "attempts",
             "audit_records",
             "boot_contexts",
             "domain_events",
