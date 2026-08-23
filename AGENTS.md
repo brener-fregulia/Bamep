@@ -2,122 +2,163 @@
 
 ## Purpose
 
-This file defines the mandatory rules for any AI agent working in the Bamep repository.
+This file defines mandatory repository-wide guardrails for any AI agent working on Bamep.
+
+It is not a second SDD, workflow, testing, architecture, or documentation handbook.
+
+Detailed authorities:
+
+- `docs/development/documentation-policy.md` — documentation ownership, promotion, and
+  retirement;
+- `docs/development/sdd.md` — Discovery, Specification, approval, and work decomposition;
+- `docs/development/workflow.md` — execution from `Ready` through owner acceptance;
+- `docs/development/testing.md` — testing and validation strategy;
+- `docs/decisions/README.md` — ADR lifecycle;
+- `docs/architecture/` — current implemented architecture;
+- `docs/specifications/` — normative approved behavior and contracts.
 
 Tool-specific instructions belong in files such as `CLAUDE.md` and `.claude/`.
-Detailed procedures belong in `docs/development/`.
 
-`README.md` is public product documentation and must not be used as a source of agent instructions.
+`README.md` is public product documentation and must not be used as an agent instruction
+source.
 
-## Sources of truth
+## Repository truth
 
-The repository is the permanent source of Bamep technical context.
+Never guess repository state.
 
-Implementation and tests are the source of truth for currently implemented behavior.
-
-After approved work is materialized:
-
-- GitHub Issues store approved specifications and Work Packages;
-- GitHub Projects store operational workflow state and progress;
-- GitHub Milestones group milestones or releases when applicable.
-
-An AI session must never be the only place containing information required to understand, continue, validate, or maintain relevant work.
-
-Before proposing or making changes:
+Before proposing or making a material change:
 
 - inspect the relevant implementation and nearby tests when they exist;
 - read only the documentation needed for the task;
-- inspect relevant architecture documents and ADRs;
-- verify paths, commands, configuration, and conventions in the repository;
-- report conflicts between the request, specification, ADRs, documentation, and actual repository state;
-- do not invent files, APIs, behavior, requirements, commands, conventions, or validation results.
+- inspect applicable Specifications, Architecture, and ADRs;
+- verify paths, commands, configuration, dependency versions, and conventions from the
+  repository;
+- report contradictions between the request, approved contracts, documentation, and
+  implementation;
+- distinguish implemented behavior from planned or approved-but-unimplemented behavior.
 
-## Scope and SDD
+Do not invent:
 
-Follow `docs/development/sdd.md`.
+- files or paths;
+- APIs or protocol behavior;
+- requirements;
+- commands;
+- dependencies;
+- repository conventions;
+- validation results;
+- implementation status.
 
-- Discovery is analysis, not implementation.
-- Non-trivial work must have sufficient specification before implementation.
-- Explicit owner approval is required before approved work is materialized or planned implementation begins.
-- Implement one approved Work Package or one reduced-SDD responsibility at a time.
-- Do not silently expand approved scope.
-- Significant architectural decisions must not emerge silently through implementation.
-- Relevant automated tests are part of implementation completeness.
-- `Validation` is the owner manual validation stage before `Done`.
+Code and tests are the final evidence for currently implemented behavior.
 
-Use only as much process as necessary to preserve scope, decisions, validation, and continuity.
+Conversation history may provide context but must not become the sole durable source of
+project knowledge.
+
+## Scope and approval
+
+Follow the approved work boundary.
+
+- Non-trivial planned implementation requires sufficient approved scope according to
+  `docs/development/sdd.md`.
+- Do not silently expand a Work Package, Fix, Refactor, Spike, or reduced-SDD task.
+- Do not implement unrelated cleanup merely because nearby code could be improved.
+- Do not turn an implementation detail into a new requirement without returning to SDD.
+- Do not establish a durable architectural decision silently through code.
+- If execution discovers a material requirement, architectural decision, or safety
+  question outside approved scope, stop the affected work and surface it.
+
+Use `docs/development/workflow.md` for execution and handoff rules.
 
 ## Repository protection
 
-Preserve existing working-tree changes, including changes not created by the agent.
+Preserve the user's existing work.
 
-- Never discard, overwrite, revert, or reformat unrelated work.
+- Never discard, overwrite, revert, reset, or reformat unrelated changes.
 - Inspect a file before replacing or deleting it.
-- Do not modify generated files, vendored dependencies, build output, or local configuration unless explicitly required.
-- Prefer changing the responsible source or generator instead of generated output.
-- Do not expose, store, or print secrets, credentials, signing keys, tokens, or private environment values.
-- Do not weaken checks, tests, warnings, or security controls to make a task pass.
+- Do not modify generated files, vendored dependencies, build output, or local
+  configuration unless the approved task requires it.
+- Prefer changing the responsible source or generator rather than generated output.
+- Do not expose, persist, print, or commit secrets, credentials, signing keys, tokens, or
+  private environment values.
+- Do not weaken checks, warnings, security controls, or tests merely to obtain a passing
+  result.
+
+When repository state is ambiguous, inspect it rather than assuming a clean tree or a
+particular branch state.
 
 ## Architecture and dependencies
 
-`docs/architecture/` documents only architecture that actually exists.
+Consume existing architecture instead of reconstructing it from historical projects.
 
-Do not describe planned architecture as if it were already implemented.
+- `docs/architecture/` describes implemented architecture only.
+- Approved future behavior belongs to Specifications and accepted decisions belong to
+  ADRs.
+- Preserve accepted dependency and responsibility boundaries.
+- Before adding a dependency, confirm that the existing platform or workspace does not
+  already provide the required capability.
+- Introduce a dependency only when its maintenance, deployment, security, runtime, and
+  operational costs are justified by the approved work.
 
-Before introducing or changing a module, abstraction, service, adapter, worker, boundary, protocol, or dependency:
+Bamep must not inherit stacks, directories, protocols, runtime boundaries, or design
+patterns from FORGE, Pascoal, or another project merely because they were previously used.
 
-1. identify the current requirement that justifies the change;
-2. identify the correct architectural responsibility;
-3. inspect existing patterns and nearby solutions;
-4. inspect relevant ADRs;
-5. preserve accepted decisions or explicitly propose changing them.
-
-Bamep must not inherit stacks, directories, protocols, runtime boundaries, or architectural patterns from FORGE, Pascoal, or any other project without justification based on Bamep's own requirements.
-
-Do not introduce dependencies merely for convenience. Evaluate their impact on maintenance, deployment, security, runtime footprint, and operational support.
+Historical projects may provide evidence or process lessons. Bamep requirements and
+accepted decisions remain authoritative for Bamep.
 
 ## Safety
 
-Bamep will perform operations capable of modifying or destroying data and operating system installations.
+Bamep can modify or destroy endpoint data and operating system installations.
 
 Safety takes precedence over implementation convenience.
 
-- Never weaken identity, inventory, authorization, or destructive-operation safeguards to make a workflow pass.
-- Destructive operations must have explicit preconditions and safety invariants.
-- A MAC address is an inventory signal, not authentication and not a permanent endpoint identity.
-- Do not use unrestricted remote shell execution as a substitute for typed Agent actions.
-- Do not execute real destructive filesystem, partitioning, formatting, deployment, or data operations without explicit and specific owner authorization for that environment and target.
-- Automated tests must use appropriate fakes, fixtures, temporary storage, simulators, or disposable devices.
-- Real hardware and destructive operations belong to the integration layer when they cannot be represented safely in local development.
+Mandatory rules:
 
-## Development environment
+- never weaken identity, inventory, authorization, trust, integrity, or
+  destructive-operation safeguards to make a workflow pass;
+- destructive behavior must consume its authoritative preconditions and safety invariants
+  from the applicable Specification;
+- a MAC address is an inventory signal, not authentication and not permanent Endpoint
+  identity;
+- unrestricted remote shell execution must not replace approved typed Agent actions;
+- generic retry must not be assumed safe for destructive work;
+- missing or stale authoritative safety state must fail closed where the applicable
+  contract requires it;
+- automated tests must use safe fakes, fixtures, temporary storage, Simulator scenarios, or
+  disposable devices when those can represent the required behavior faithfully.
 
-The physical Bamep server and laboratory are an Integration Environment, not a required development environment.
+Do not execute real filesystem destruction, partitioning, formatting, deployment,
+restore, destructive storage mutation, or equivalent real-world destructive operations
+without explicit and specific owner authorization for the exact environment and target.
 
-Most development must be possible locally without:
+Physical or destructive validation that cannot be represented safely in local automation
+belongs to the Integration Environment according to `docs/development/testing.md`.
 
-- a physical Bamep server;
-- real PXE infrastructure;
-- MikroTik hardware;
-- real client endpoints;
-- destructive disks;
-- production storage.
+## Development and validation environments
 
-Use simulators, fake adapters, temporary storage, and deterministic fixtures at appropriate boundaries.
+The physical Bamep server and laboratory are an Integration Environment, not a mandatory
+development environment.
 
-Linux is the primary development environment and the production target for Bamep Server.
+Most development must remain possible without requiring physical PXE infrastructure,
+MikroTik hardware, real client endpoints, or production storage.
 
-Portable parts should remain reasonably developable and testable on Windows 11 when doing so does not compromise Linux-specific responsibilities.
+Linux is the production target for Bamep Server and the reference environment for
+Linux-specific behavior.
 
-Do not create artificial abstractions merely to pretend inherently Linux-specific responsibilities are platform-independent.
+Use WSL2, containers, fakes, fixtures, temporary storage, and Simulator scenarios only
+where they faithfully represent the responsibility being tested. Do not treat them as
+proof of physical firmware, PXE, Secure Boot, NIC, storage-controller, or WinPE behavior.
+
+Detailed environment and test-boundary policy belongs to
+`docs/development/testing.md`.
 
 ## Git and publication
 
 The repository owner retains control of Git and publication.
 
-Inspection commands such as `git status`, `git diff`, `git log`, and `git show` are allowed when relevant.
+Read-only inspection such as status, diff, log, show, file inspection, and repository
+search is allowed when relevant.
 
-Unless explicitly and specifically authorized for the current task, do not perform Git or GitHub operations that modify:
+Unless explicitly and specifically authorized for the current task, do not perform
+operations that modify:
 
 - the working tree or index;
 - branches or tags;
@@ -128,97 +169,96 @@ Unless explicitly and specifically authorized for the current task, do not perfo
 - publication state;
 - GitHub Project state.
 
-This includes staging, commits, amendments, checkout or restore operations, branch creation, merges, rebases, resets, stashes, pulls, pushes, tags, and release publication.
+This restriction includes staging, committing, amending, checkout/restore that changes
+files, branch creation, merge, rebase, reset, stash, pull, push, tag creation, release
+publication, and equivalent GitHub mutations.
 
-A request to implement, test, review, or document something does not implicitly authorize publication or Git state changes.
+A request to implement, test, review, or document something does not implicitly authorize
+Git or publication changes.
 
-After local changes, suggest a Conventional Commit message when useful, but do not execute it without explicit authorization.
+When useful, suggest a Conventional Commit message after a coherent change. Do not execute
+the commit unless explicitly authorized.
 
-## Validation
+## Validation integrity
 
-Use the narrowest validation that meaningfully demonstrates the changed behavior, and broaden validation when risk or scope justifies it.
+Follow `docs/development/testing.md` for validation strategy and
+`docs/development/workflow.md` for execution/handoff.
 
-Follow `docs/development/testing.md`.
+Mandatory reporting rules:
 
-- Do not claim a test, build, lint, check, or validation passed unless it was actually executed.
-- Do not hide failures or weaken checks.
-- Do not increase timeouts, disable cases, or add retries merely to mask failures without understanding the cause.
-- When evidence allows, distinguish failures caused by the current change from environment limitations or pre-existing repository failures.
-- Clearly report which automated validations were executed and which manual checks remain.
-- Never claim owner manual validation was completed on the owner's behalf.
+- never claim that a test, build, lint, check, Spike experiment, Simulator scenario, or
+  Integration Environment validation passed unless it actually ran;
+- report failures rather than hiding them;
+- do not delete, skip, weaken, retry, or extend timeouts merely to mask a failure without
+  understanding the cause;
+- distinguish current-change failures, pre-existing failures, missing prerequisites, and
+  environment limitations when evidence permits;
+- report only the validation actually performed;
+- never claim owner manual validation on the owner's behalf.
+
+Tests demonstrate implementation behavior. They must not invent missing product
+requirements.
 
 ## Documentation
 
-Use documentation according to its responsibility.
+Follow `docs/development/documentation-policy.md`.
 
-Primary locations:
+In particular:
 
-- `README.md`: public product overview;
-- `docs/discovery/`: discovery and investigation;
-- `docs/specifications/`: persistent specifications when appropriate;
-- `docs/architecture/`: currently implemented architecture;
-- `docs/decisions/`: architectural decisions and ADR history;
-- `docs/development/`: engineering process, including persistence and schema-evolution conventions (`docs/development/persistence.md`);
-- `docs/reference/`: factual knowledge, compatibility notes, and technical reference material.
+- one durable fact should have one authoritative owner;
+- use short context and links instead of maintaining competing copies;
+- Specifications own normative behavior;
+- ADRs own decision rationale and history;
+- Architecture owns implemented structure;
+- Reference owns reusable empirical evidence;
+- Discovery owns unresolved investigation;
+- GitHub Issues own actionable work and outcome history.
 
-Detailed documentation ownership belongs in `docs/development/documentation-policy.md` when that document exists.
-
-Each piece of information should have one primary source. Avoid maintaining the same information in multiple places.
+Do not preserve a document in HEAD solely because it is historical when Git history or the
+GitHub work item already preserves that history and no unique durable responsibility
+remains.
 
 ## Language
 
-Use English for repository content, including:
+Use English for canonical repository engineering content, including source code,
+identifiers, comments, documentation, ADRs, Specifications, Discovery, Reference material,
+internal logs, schemas, protocol fields, domain events, and GitHub work items.
 
-- source code;
-- identifiers;
-- source filenames where appropriate;
-- comments;
-- docstrings;
-- schemas;
-- APIs;
-- protocol fields;
-- internal logs;
-- domain events;
-- architecture documentation;
-- ADRs;
-- Discovery;
-- specifications;
-- SDD;
-- workflow documentation;
-- testing documentation;
-- reference documentation;
-- GitHub Issues and Work Packages.
+User-facing UI strings must use localization boundaries rather than scattered hardcoded
+text.
 
-User-facing UI text must use localization boundaries rather than scattered hardcoded strings.
+Until the product-level localization requirement is promoted to its durable normative
+owner, preserve the currently established direction:
 
-The initial UI locale is `pt-BR`.
+- initial UI locale: `pt-BR`;
+- planned additional locale: `en-US`.
 
-The planned additional locale is `en-US`.
+Academic or TCC-facing material may be maintained separately in Brazilian Portuguese but
+must not become a competing authoritative copy of engineering documentation.
 
-Academic and TCC-facing material may be written separately in Brazilian Portuguese and must not become a second authoritative copy of the engineering documentation.
+## Final response after repository work
 
-## Final response
+After changing repository files, report at minimum:
 
-After changing files, report at minimum:
-
-- a summary of the changes;
+- what changed;
 - files changed;
-- validation actually performed and its results;
-- limitations and remaining manual checks;
-- relevant out-of-scope findings without implementing them;
+- validation actually performed and results;
+- relevant limitations or manual checks still required;
+- relevant out-of-scope findings without silently implementing them;
 - one suggested Conventional Commit message when appropriate.
 
-When no files were changed, state that clearly.
+When no files were changed, say so clearly.
 
 ## Instruction precedence
 
-When instructions conflict, use this order:
+When project instructions conflict, use this order:
 
 1. safety, data protection, and prevention of destructive operations;
 2. explicit owner instructions for the current task;
 3. this `AGENTS.md`;
-4. tool-specific instructions;
+4. tool-specific repository instructions;
 5. relevant project documentation;
 6. established implementation patterns.
 
-An operation that is normally restricted requires explicit, specific, and task-limited authorization. It must not be inferred implicitly.
+An operation restricted by these guardrails requires explicit, specific, task-limited
+authorization. Do not infer that authorization from adjacent requests.
