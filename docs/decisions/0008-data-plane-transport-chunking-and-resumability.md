@@ -4,556 +4,236 @@ Status: Accepted
 
 ## Context
 
-During M0, Bamep needed durable architectural decisions for large Artifact transfer before
-implementation could begin.
+Bamep needed architectural decisions for large Artifact transfer before implementation.
 
-Issue #6 (`[WP] Define data-plane and storage contracts`) had to resolve:
+Issue #6 defined the data-plane/storage problem; Issue #9 supplied empirical resumability
+evidence; Issue #15 later resolved transfer-session authentication.
 
-- whether bulk transfer belongs on the Agent control connection or on a separate channel;
-- what kind of resumability can be claimed honestly;
-- how integrity and incomplete Artifact state are represented;
-- how capture consistency relates to cryptographic verification;
-- how Storage Targets are modeled without embedding physical layout assumptions;
-- how source provenance composes with later destructive target-disk selection.
+The reusable Spike conclusion is retained in
+`docs/reference/transfer-resumability-spike.md`: independently identified chunks allow
+verification and selective retransmission, but cannot make changed source bytes reproduce a
+previous capture.
 
-Resumability could not be decided safely from design preference alone.
-
-Issue #9 (`[Spike] Evaluate resumable volume/image transfer`) therefore tested byte-offset
-resume, fixed-size chunking, per-chunk verification, per-chunk compression, and
-source mutation. The reusable empirical findings are retained in
-`docs/reference/transfer-resumability-spike.md`.
-
-That evidence established a critical boundary:
-
-> Chunking can provide independent verification and selective retransmission, but it cannot
-> make a changed source reproduce the bytes of an earlier capture.
-
-Issue #15 later resolved the remaining transfer-session authentication question. The
-result had to satisfy Bamep's existing trust model without turning the provisioning LAN
-into a trust anchor, reusing the long-lived Agent credential as a bulk-transfer bearer
-secret, or introducing a new client-PKI system solely for the data plane.
-
-The original form of this ADR also contained detailed wire fields, state transitions,
-replay behavior, restart flows, manifest construction rules, and Simulator scenarios.
-
-Those details are now normative in
-`docs/specifications/m0-data-plane-and-storage-contracts.md` and, where Agent Protocol
-messages are involved, `docs/specifications/m0-agent-protocol-contract.md`.
-
-This ADR preserves **why the architecture was selected**.
+Normative transfer, Artifact, authorization, restart, provenance, and storage behavior is
+defined in `docs/specifications/m0-data-plane-and-storage-contracts.md`.
 
 ## Decision
 
-### Separate control plane and data plane
+### Separate control and data planes
 
-Bulk Artifact bytes use a dedicated HTTP-based data-plane channel rather than the Agent
-Protocol WebSocket control connection.
+Bulk Artifact bytes use HTTPS rather than the Agent Protocol WebSocket.
 
-The separation exists because:
+This keeps high-throughput transfer/backpressure/failure behavior independent from
+safety-relevant control traffic such as action status, cancellation, and reconciliation.
 
-- large transfers have different throughput and backpressure characteristics from
-  safety-relevant control messages;
-- transfer interruption must not obstruct cancellation, status, reconciliation, or other
-  control-plane traffic;
-- bulk transfer has its own authorization, integrity, and resumability concerns.
-
-The data-plane transport is **HTTPS**.
-
-Server identity reuses the Server TLS identity already pinned through Bamep's trusted
-bootstrap/site trust model. The data plane does not establish a second independent Server
-trust relationship.
-
-Agent Protocol remains the control plane and carries only the small transfer-control and
-authorization messages defined by its Specification.
+HTTPS reuses the Server TLS identity already trusted by the Agent; no separate data-plane
+Server trust anchor is introduced.
 
 ### Chunk-oriented transfer
 
-Bamep uses fixed-boundary chunk-oriented transfer with independently verifiable chunk
-identities.
+Artifacts are transferred as independently verifiable chunks.
 
-The decision follows directly from the transfer-resumability evidence:
+General raw byte-offset resume is rejected because it is only safe when the producer can
+reproduce exactly the same bytes at the requested offset. Chunk identities provide explicit
+integrity and retransmission boundaries.
 
-- plain byte-offset resume is honest only when the producer can reproduce exactly the same
-  bytes at the requested offset;
-- an unframed continuous transformed stream cannot generally provide that guarantee after
-  its source or earlier transformation input changes;
-- independently identified chunks provide safe verification boundaries;
-- missing or corrupt chunks can be retransmitted selectively without redefining already
-  verified content.
+The design applies in both directions:
 
-The same architectural pattern applies in both directions:
+- Agent -> Server capture;
+- Server -> Agent restore/provisioning.
 
-- Agent -> Server capture/backup;
-- Server -> Agent provisioning/restore.
+Chunk size and digest algorithm are not selected by this ADR. The Spike's 4 MiB/SHA-256
+parameters were experiment choices, not architectural conclusions.
 
-The exact manifest schema, chunk-transfer behavior, sealing rules, and Artifact lifecycle
-are contract concerns owned by the data-plane Specification.
+### Resumability depends on source reproducibility
 
-### Cryptographic integrity is explicit
+Chunking detects changed/missing content; it does not solve source mutation.
 
-Chunks and complete Artifacts require cryptographic integrity identities.
+If a previously identified chunk can no longer be reproduced exactly, it must fail rather
+than receive a new identity under the same Artifact.
 
-The architecture requires the selected digest algorithm to be explicit in the contract so
-different participants never infer an algorithm implicitly.
+### V1 capture is offline
 
-This ADR deliberately does **not** select:
+V1 backup/capture occurs in the maintenance environment while installed Windows is not
+running and the relevant source is treated read-only.
 
-- the concrete digest algorithm;
-- the exact chunk size.
+This removes the normal concurrent writer and avoids requiring VSS/live snapshot machinery
+for V1.
 
-The Spike used SHA-256 and 4 MiB chunks only as experiment parameters. It did not compare
-digest algorithms or tune chunk size, so treating either as an architectural conclusion
-would overstate the evidence.
+Offline capture establishes source stability during capture, not semantic filesystem or
+application health.
 
-Those parameters must be fixed at the appropriate implementation/interoperability boundary
-before concrete wire interoperability depends on them.
+Live-Windows capture remains outside V1.
 
-### Resumability is bounded by source reproducibility
+### Integrity and capture consistency are separate
 
-Chunking is not a source-consistency mechanism.
+Cryptographic verification proves stored bytes match the Artifact identity.
 
-A previously identified chunk may be resumed/retransmitted only if the exact bytes
-belonging to that Artifact remain reproducible or have already been durably staged.
+Capture consistency proves the accepted source-stability conditions were established.
 
-If regenerated bytes no longer match the recorded identity, Bamep must reject them rather
-than rewrite the identity to fit the new source.
+Neither implies the other. The normative states and destructive-use gates belong to the
+data-plane Specification.
 
-This is the load-bearing result of Spike Experiment E.
+### Artifact completion is explicit
 
-### V1 uses offline maintenance capture
+Incomplete or partially verified Artifact content must not be exposed as usable complete
+content.
 
-Bamep V1 resolves source consistency for normal backup/capture through the maintenance
-workflow rather than through live-Windows snapshot technology.
-
-The baseline capture model is:
-
-- the endpoint boots the maintenance environment;
-- the installed Windows OS is not running during capture;
-- source disks/volumes/filesystems used for the safety capture are treated read-only for
-  that capture.
-
-This removes the normal concurrent writer from the V1 capture path.
-
-Therefore VSS, live quiescing, and another live-Windows snapshot mechanism are not required
-for the V1 architecture.
-
-This decision does **not** claim that an offline source is semantically healthy.
-
-A filesystem can already be dirty, hibernated, or contain application state from an
-unclean shutdown before the maintenance environment starts. Offline capture establishes
-source stability during capture, not application-level correctness of the captured state.
-
-Live backup while installed Windows remains running is outside V1 and requires a future
-architecture decision if introduced.
-
-### Capture consistency and cryptographic verification are independent facts
-
-Cryptographic integrity answers whether stored bytes match the sealed Artifact identity.
-
-Capture consistency answers whether the relevant source-stability conditions were
-positively established for the capture.
-
-These are different claims and must remain representable independently.
-
-The data-plane contract therefore carries a separate capture-consistency fact rather than
-overloading `Verified` to mean both things.
-
-For a critical backup whose Artifact type requires capture consistency, destructive use
-requires both:
-
-- cryptographic verification; and
-- established capture consistency.
-
-The exact normative values, Artifact lifecycle transitions, and dispatch-time gates belong
-to the data-plane and Job lifecycle Specifications.
-
-### Artifact completion is explicit and atomic
-
-An Artifact is not considered usable merely because some or all bytes have arrived.
-
-The architecture requires an explicit incomplete/verification lifecycle and an atomic
-boundary at which a completely verified Artifact becomes consumable.
-
-This prevents a partially transferred or only partially verified Artifact from appearing
-to downstream workflow as a valid safety backup.
-
-Detailed lifecycle states and manifest-sealing rules belong to
-`docs/specifications/m0-data-plane-and-storage-contracts.md`.
+The exact Artifact lifecycle and manifest sealing rules belong to the Specification.
 
 ### Storage is capability-based
 
-Storage Targets are modeled by logical capabilities, not by:
+Storage Targets expose logical capabilities rather than physical layout.
 
-- raw Linux device names;
-- a required filesystem;
-- RAID layout;
-- one hard-coded physical topology.
+Baseline roles are `SYSTEM`, `CACHE`, and `ARCHIVE`, and one target may expose multiple
+roles.
 
-The baseline role vocabulary is:
+Domain/Application logic must not depend on RAID layout, filesystem, or raw device names.
 
-- `SYSTEM`;
-- `CACHE`;
-- `ARCHIVE`.
+Verification and retention remain separate concerns.
 
-Roles form a set: one physical Storage Target may satisfy more than one role.
+### Volume/Image and Selective backup are distinct
 
-This allows scheduling and placement policy to reason about what storage can do without
-making Domain logic depend on how the operator physically assembled it.
+Volume/Image is a linear byte-range capture.
 
-Verification and retention remain independent:
+Selective backup is file-granular in the baseline direction and may use chunking for large
+files.
 
-- a verified Artifact is not automatically archived;
-- placing bytes in `ARCHIVE` does not make an unverified Artifact verified.
+Per-file Selective behavior was not empirically validated by the transfer Spike and must
+not be presented as a measured finding.
 
-The detailed role semantics belong to the data-plane/storage Specification.
+### Transfer authorization is sender-constrained
 
-### Volume/Image and Selective backup remain distinct strategies
+A data-plane request uses a short-lived Server-issued capability scoped to one transfer and
+bound to an ephemeral Agent-held proof key.
 
-Bamep does not use a generic `backup=true` concept that hides materially different capture
-semantics.
+A plain bearer token is rejected because possession alone would allow misuse if token bytes
+were stolen.
 
-Volume/Image backup is naturally a linear byte-range capture and directly fits the chunk
-model.
+The accepted capability:
 
-Selective backup is file-granular in the current baseline direction and may use chunking
-inside large files.
+- is issued through the authenticated Agent Protocol control plane;
+- is scoped to the Endpoint/transfer/Artifact/direction/Attempt context;
+- requires proof of possession;
+- is revalidated against current durable authorization;
+- uses bounded anti-replay state.
 
-The transfer Spike did **not** empirically validate per-file Selective backup behavior.
-That distinction must remain explicit: the file-granularity direction is an architectural
-design choice informed by the evidence, not a measured finding of the Spike.
+It is not the Agent runtime credential, an Endpoint identity credential, a client
+certificate, or a persistent Endpoint key.
 
-### Transfer authorization is sender-constrained and transfer-scoped
+Detailed claims, proof fields, replay rules, TTLs, renewal, and failure behavior belong to
+the Specification.
 
-A data-plane request requires authorization tied to the already authenticated Endpoint
-context.
+### Reuse existing trust; no mTLS/OAuth stack
 
-A plain bearer transfer token was rejected.
+The data plane reuses the pinned Server TLS identity.
 
-Even if short-lived and tightly scoped, possession of a bearer token alone cannot prevent
-one Endpoint from using another Endpoint's authorization if the token bytes are obtained.
+Application-level proof of possession is preferred over introducing:
 
-The accepted design is therefore:
+- a second client-certificate PKI;
+- mTLS Agent identity;
+- OAuth/OIDC;
+- DPoP as a protocol dependency.
 
-- a short-lived Server-issued capability;
-- scoped to one logical transfer and its relevant Endpoint/Artifact/direction/Attempt
-  context;
-- sender-constrained to an ephemeral asymmetric proof key held by the Agent;
-- issued through the already-authenticated Agent Protocol control plane;
-- presented over HTTPS together with fresh proof of possession;
-- revalidated against current durable authorization state;
-- protected against replay with bounded runtime anti-replay state.
+Those systems solve broader problems than Bamep's internal transfer authorization requires.
 
-The capability is not:
+### Authorization lifetime is not transfer identity
 
-- the long-lived Agent runtime credential;
-- an Endpoint identity credential;
-- a generic reusable data-plane credential;
-- a client certificate;
-- a new persistent Endpoint key.
+Authorization may expire or be replaced while the same logical transfer continues.
 
-The proof key is intentionally ephemeral and is not promoted into Endpoint identity/trust
-state.
+Renewal/restart must not by itself create a new:
 
-The exact capability claims, proof structure, replay rules, restart behavior, renewal,
-failure semantics, and Agent Protocol authorization messages belong to the normative
-Specifications.
+- `transfer_id`;
+- Artifact;
+- Attempt;
+- destructive retry.
 
-### Reuse the existing Server trust anchor; do not introduce mTLS or OAuth infrastructure
+`transfer_id` identifies the durable logical transfer, not one HTTP request, connection,
+capability, `action_id`, or `attempt_id`.
 
-The HTTPS data plane authenticates the same Server identity already trusted by the Agent
-control plane.
+### Source provenance and target identity are separate
 
-Sender constraint is implemented at the application authorization layer.
+An Artifact records where its bytes came from.
 
-The architecture does not introduce:
+A destructive operation separately authorizes the currently installed target disk.
 
-- a separate data-plane PKI;
-- Agent client certificates/mTLS;
-- OAuth 2.0;
-- OIDC;
-- DPoP as a formal protocol dependency.
+These identities must not be forced equal: a valid workflow may capture an old disk,
+replace it, revalidate a new disk, provision it, and restore retained data.
 
-Those mechanisms could provide related properties, but Bamep needs a narrow internal
-proof-of-possession capability between one Server and its authenticated Agent, not a
-general delegated-authorization ecosystem.
-
-### Transfer authorization lifetime is independent from transfer identity
-
-Authorization credentials are deliberately shorter-lived than the durable logical
-transfer.
-
-Expiry, renewal, Agent process restart, or replacement of an ephemeral proof key must not
-by itself:
-
-- create a new Artifact;
-- create a new logical transfer;
-- discard already verified chunks;
-- reset the manifest;
-- imply a new JobStep Attempt;
-- authorize a destructive retry.
-
-Authorization lifetime and transfer lifetime are separate concerns.
-
-### `transfer_id` is durable logical-transfer identity
-
-`transfer_id` identifies one logical data-plane transfer operation.
-
-It is not:
-
-- an HTTP request identifier;
-- one TCP/TLS connection;
-- an authorization capability identifier;
-- an Agent Protocol `action_id`;
-- a JobStep `attempt_id`.
-
-One logical transfer may survive multiple HTTP requests, interrupted connections, and
-authorization renewals.
-
-A genuinely new logical transfer receives a new `transfer_id`, even when it moves the same
-verified Artifact.
-
-Keeping these identifiers separate preserves correlation without coupling data-plane
-identity to one transport/session implementation.
-
-### Artifact source provenance is distinct from Endpoint identity
-
-Endpoints may contain multiple disks, volumes, and filesystems.
-
-An Artifact therefore needs enough provenance to preserve which concrete source it was
-captured from rather than recording only the Endpoint identity.
-
-The exact provenance schema is not decided by this ADR.
-
-### Source identity and destructive target-disk identity are independent
-
-A valid workflow may:
-
-1. capture data from an old disk;
-2. physically replace that disk;
-3. revalidate inventory;
-4. provision a new disk;
-5. restore retained data.
-
-Therefore the destination disk must not be required to have the same fingerprint as the
-Artifact's source disk.
-
-The two facts answer different questions:
-
-- source provenance: where did these bytes come from?
-- target-disk identity: which currently installed disk is this destructive operation
-  authorized to modify?
-
-This decision does not weaken target-disk revalidation.
-
-The current target still must satisfy the complete destructive-dispatch safety contract at
-execution time.
-
-A future planned-hardware-change authorization model must preserve this valid
-disk-replacement use case rather than treating source/destination mismatch as an automatic
-identity failure.
+This does not weaken target-disk revalidation.
 
 ## Alternatives considered
 
 ### Plain byte-offset resume
 
-Rejected as the general resumability mechanism.
+Rejected as the general mechanism because a changed or regenerated stream may not reproduce
+the original bytes at the same offset.
 
-The Spike demonstrated that byte-offset continuation works for a static source but becomes
-dishonest when a regenerated/transformed stream does not reproduce the original bytes.
+### One continuous unchunked stream
 
-An optimization inside one independently verifiable chunk may be considered later, but it
-does not replace the chunk identity boundary.
+Rejected because it lacks independent integrity and selective retransmission boundaries.
 
-### One continuous Artifact stream without independent chunk identities
+### Continuous compression with arbitrary offset resume
 
-Rejected.
+Rejected as a general pattern. The Spike demonstrated the failure mode with gzip. A
+seekable/framed or per-chunk representation may be used later.
 
-It provides no reliable selective retransmission or independent corruption boundary and
-couples recovery to reproducing one continuous byte stream.
+### Live-source snapshot mechanism for V1
 
-### Continuous compression followed by arbitrary byte-offset slicing
+Rejected as unnecessary for the accepted offline maintenance workflow.
 
-Rejected as the general pattern.
+### Combined `Verified` + capture-consistency state
 
-The Spike demonstrated the failure mode with gzip.
+Rejected because byte integrity and source consistency are different facts.
 
-Per-chunk compression or another explicitly seekable/framed representation may preserve
-independent restart boundaries; the final production representation is not decided here.
+### Bulk transfer over Agent Protocol WebSocket
 
-### General live-source snapshot mechanism in V1
+Rejected because transfer backpressure/failure would be coupled to the control plane.
 
-Rejected as unnecessary architecture for the accepted V1 workflow.
+### Long-lived Agent credential for transfer authorization
 
-Offline maintenance capture removes the concurrent installed-OS writer without requiring
-VSS or another live snapshot system.
-
-A future live-backup requirement would justify a new decision.
-
-### Artifact `Verified` as a combined integrity-and-consistency flag
-
-Rejected.
-
-Cryptographic byte integrity and source-capture consistency are independent facts. Combining
-them would hide which guarantee has actually been established.
-
-### Reusing Agent Protocol WebSocket for bulk bytes
-
-Rejected.
-
-It would couple bulk-transfer backpressure and failure behavior to the safety-relevant
-control channel.
-
-### Long-lived Agent runtime credential as data-plane authorization
-
-Rejected.
-
-It gives one transfer substantially more authority than required, increases the blast
-radius of credential exposure, and prevents transfer authorization from being expired or
-revoked independently.
+Rejected as excessive authority and blast radius for a single transfer.
 
 ### Plain bearer transfer capability
 
-Rejected.
+Rejected because token possession alone does not prove the authorized sender.
 
-Scope and expiry reduce impact but do not establish who is presenting the capability.
+### mTLS/client certificates
 
-Sender constraint is required to make stolen capability bytes alone insufficient for
-cross-Endpoint use.
+Rejected because it introduces a second persistent credential/PKI lifecycle for a narrower
+problem.
 
-### mTLS/client-certificate transfer identity
+### OAuth/OIDC/DPoP stack
 
-Rejected.
+Rejected because Bamep does not need a general delegated-authorization ecosystem.
 
-It would introduce a second credential/PKI model for a narrow transfer authorization
-problem already solvable by an ephemeral application-level proof key.
+### Source/target disk fingerprint equality
 
-### OAuth/OIDC/DPoP protocol stack
-
-Rejected.
-
-The baseline does not need third-party authorization servers, delegated authorization, or
-a general relying-party ecosystem.
-
-Bamep adopts the required proof-of-possession property without adopting those frameworks as
-protocol dependencies.
-
-### Persist every issued capability and request proof
-
-Rejected.
-
-The durable transfer/Attempt/credential state already carries the long-lived authorization
-facts.
-
-Short-lived capability material, ephemeral proof keys, and request replay state are
-runtime authorization machinery and should not become durable reusable secrets merely for
-convenience.
-
-### Couple restore authorization to source-disk fingerprint equality
-
-Rejected.
-
-That would make legitimate disk replacement/migration workflows impossible and conflate
-provenance with destructive-target authorization.
+Rejected because it would break legitimate disk replacement and migration workflows.
 
 ## Consequences
 
-- Data-plane bytes travel outside Agent Protocol over HTTPS.
-- Chunk identities and manifests provide the resumability/integrity boundary.
-- Resumability claims remain conditional on exact source-byte reproducibility or durable
-  staging.
-- V1 backup/capture is an offline maintenance workflow; live-Windows capture remains out of
-  scope.
-- Capture consistency and cryptographic verification remain distinct.
-- Artifact usability has an explicit atomic verified-completion boundary.
-- Storage is represented through capabilities/roles rather than physical topology.
-- Transfer authorization is least-authority, transfer-scoped, sender-constrained, and
-  short-lived.
-- Transfer authorization security state includes both durable authorization facts and
-  bounded transient runtime anti-replay state.
-- Restart/reconnect/authorization renewal must not redefine logical transfer identity or
-  verified Artifact content.
-- `transfer_id` remains distinct from Attempt/action/transport identities.
-- Artifact source provenance is preserved independently from the currently authorized
-  destructive target disk.
-- Data-plane implementation must fail closed when contract authorization, integrity, or
-  consistency requirements are not established.
-- A future live-backup capability, materially different storage model, or transfer
-  authorization mechanism requires explicit architecture work rather than silent extension
-  of this decision.
+- Data-plane bytes are separate from Agent Protocol.
+- Chunk identities are the integrity/resume boundary.
+- Resume is valid only while exact content is reproducible or staged.
+- V1 capture is offline; live capture requires future design.
+- Artifact integrity and capture consistency remain independent.
+- Storage policy reasons about capabilities, not topology.
+- Transfer authorization is least-authority, short-lived, sender-constrained, and
+  fail-closed.
+- Transfer authorization/session changes do not redefine logical transfer or Artifact
+  identity.
+- Source provenance does not authorize the destructive target.
+- Detailed normative behavior is centralized in
+  `docs/specifications/m0-data-plane-and-storage-contracts.md`.
 
-## Authority boundary
+## Related
 
-This ADR owns the rationale for:
-
-- separating bulk data from the control plane;
-- selecting chunk-oriented resumability;
-- rejecting general raw byte-offset resume;
-- resolving V1 source consistency through offline maintenance capture;
-- keeping capture consistency independent from cryptographic verification;
-- using capability-based Storage Targets;
-- keeping Volume/Image and Selective strategies distinct;
-- selecting sender-constrained, transfer-scoped authorization over HTTPS;
-- reusing the existing pinned Server TLS trust relationship;
-- keeping durable logical transfer identity independent from authorization/transport
-  sessions;
-- separating Artifact source provenance from destructive target-disk identity.
-
-It does **not** own:
-
-- manifest field definitions;
-- Artifact state tables/transitions;
-- transfer-authorization claim/proof field definitions;
-- exact replay/freshness/renewal procedures;
-- Agent Protocol authorization-message wire schemas;
-- Simulator scenarios;
-- chunk size;
-- digest algorithm;
-- exact HTTP headers/status codes/framing;
-- exact capability/proof algorithms or TTLs;
-- concrete Artifact provenance schema;
-- final production backup format.
-
-Those belong to the applicable Specifications or future implementation decisions.
-
-## Current implementation relationship
-
-Issue #19 (`[WP] Execute authenticated resumable simulated data-plane transfer`) is the
-current M1 implementation Work Package for this architecture.
-
-It remains open.
-
-Therefore this Accepted ADR must not be read as evidence that the data-plane transfer,
-Artifact lifecycle, or transfer-authorization implementation already exists in the current
-repository.
-
-`docs/architecture/README.md` remains authoritative for implemented structure.
-
-## Related specifications and decisions
-
-- `docs/specifications/m0-data-plane-and-storage-contracts.md` — normative manifest,
-  Artifact, storage, transfer authorization, provenance, and validation contract.
-- `docs/specifications/m0-agent-protocol-contract.md` — normative control-plane transfer
-  authorization messages.
-- `docs/specifications/m0-persistence-observability-and-domain-events.md` — durable/transient
-  persistence and `transfer_id` correlation contract.
-- `docs/specifications/m0-job-lifecycle-and-scheduling.md` — Attempt, dispatch,
-  reconciliation, and destructive-use workflow semantics.
-- `docs/specifications/m0-endpoint-identity-lifecycle.md` — Endpoint credential/trust and
-  target-disk destructive safety semantics.
-- ADR-0005 — reason for the Agent control-plane transport and typed protocol.
-- ADR-0006 — reason for the Job/JobStep/Attempt and reconciliation model.
-- ADR-0010 / ADR-0011 — trusted-bootstrap and site trust-anchor decisions whose pinned
-  Server identity is reused by HTTPS data-plane transport.
-
-## Related evidence
-
-- `docs/reference/transfer-resumability-spike.md` — empirical evidence for resumability,
-  integrity boundaries, per-chunk compression, and source-reproducibility limits.
-
-## Related work
-
-- Issue #6 — historical M0 data-plane/storage contract Work Package.
-- Issue #9 — completed resumability Technical Spike.
-- Issue #15 — completed transfer-session authentication Work Package.
-- Issue #19 — current M1 implementation Work Package for authenticated resumable simulated
-  data-plane transfer.
+- `docs/specifications/m0-data-plane-and-storage-contracts.md` — normative contract.
+- `docs/specifications/m0-agent-protocol-contract.md` — transfer-authorization control
+  messages.
+- `docs/reference/transfer-resumability-spike.md` — empirical evidence.
+- ADR-0005 — Agent control-plane transport.
+- ADR-0006 — Attempt/reconciliation model.
+- ADR-0010 / ADR-0011 — trusted Server bootstrap/site trust.
+- Issue #19 — current M1 data-plane implementation Work Package.
