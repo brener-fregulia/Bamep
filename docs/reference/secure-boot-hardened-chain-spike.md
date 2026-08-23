@@ -1,26 +1,25 @@
 # Secure Boot and Hardened Boot Chain — Local Virtualized Evidence
 
+Status: **Completed empirical reference.**
+
+This document preserves the validated virtualized-firmware evidence produced by the Secure Boot spike. It does not define current Bamep security policy. ADR-0010 owns the Secure Boot decision; the trusted-bootstrap Specification owns the normative bootstrap/fingerprint contract.
+
 ## Question
 
-Determine the practical constraints and viable approaches for Secure Boot or an acceptably hardened boot chain for Bamep's target environment, and help determine whether Secure Boot is required, not only how to implement it (Issue #10, `[Spike] Validate Secure Boot and hardened boot chain`).
+Determine whether a practical Secure-Boot-enforced UEFI x86-64 chain was viable for Bamep and identify relevant limitations before relying on it as a production baseline.
 
-## Why existing evidence was insufficient
+## Environment and limits
 
-`docs/discovery/architecture-redesign.md` ("Security invariants") states boot-chain integrity is a requirement even though Secure Boot itself is not an M0 implementation requirement, but no prior evidence established what is practically achievable. This Spike does not revisit or decide the "is Secure Boot required" scope question itself — that remains an owner/architectural decision — but supplies evidence relevant to it.
+The experiment reused the WinPE tooling and VirtualBox VM prepared by `docs/reference/winpe-boot-mechanism-spike.md`.
 
-## Constraints and assumptions
+Environment:
+- VirtualBox **7.2.14**;
+- UEFI x86-64 VM;
+- VirtualBox built-in Microsoft-trusting Secure Boot defaults;
+- Oracle/VirtualBox Platform Key;
+- headless execution with timed screenshots and keyboard injection for observation.
 
-- UEFI x86-64 is the V1 target; Legacy BIOS is out of scope.
-- Secure Boot is not assumed mandatory for M0.
-- Reuses the artifacts, ADK/WinPE tooling, VM, and build toolchain already prepared for Issue #8 (`docs/reference/winpe-boot-mechanism-spike.md`), per owner authorization.
-
-## Environment scoping decision
-
-As with Issue #8, the owner was asked how to scope this Spike given its own "likely requires Integration Environment access" caveat. The owner authorized a **local virtualized approximation**: VirtualBox 7.2.14 genuinely supports Secure Boot enforcement (`VBoxManage modifynvram`), configured with VirtualBox's own built-in Microsoft-trusting defaults. This is a **representative Microsoft-trusting Secure Boot configuration suitable for this virtualized experiment** — it is **not** evidence that the complete trust store, dbx/revocation state, or Platform Key exactly matches any particular OEM firmware; real hardware vendors curate their own PK, and their db/dbx/revocation state can differ from VirtualBox's defaults in ways this experiment does not observe. All results below are recorded explicitly as **virtualized-firmware evidence**, not a substitute for physical Integration Environment validation, consistent with `docs/development/testing.md`'s caution about UEFI/firmware behavior. Physical OEM firmware validation remains required before any production conclusion.
-
-## Method
-
-**Secure Boot configuration (exact commands):**
+Secure Boot configuration:
 
 ```text
 VBoxManage modifynvram "BamepSpike-WinPE-UEFI" inituefivarstore
@@ -29,80 +28,126 @@ VBoxManage modifynvram "BamepSpike-WinPE-UEFI" enrollorclpk
 VBoxManage modifynvram "BamepSpike-WinPE-UEFI" secureboot --enable
 ```
 
-`enrollmssignatures` enrolls VirtualBox's own built-in copies of its Microsoft KEK and db/dbx defaults (VirtualBox's packaged representation of the Microsoft Corporation UEFI CA / Windows Production CA chain, not a copy sourced from or verified against any specific physical firmware). `enrollorclpk` installs the Oracle/VirtualBox Platform Key (PK) — the PK identifies the platform owner (here, VirtualBox/Oracle's default), not Microsoft; on physical hardware the OEM's own PK plays this role, coexisting with whatever Microsoft-issued KEK/db entries that OEM chose to preload. Together these provide a representative Microsoft-trusting Secure Boot configuration suitable for this virtualized experiment — not a verified match to any particular OEM firmware's exact trust store. Confirmed active via `VBoxManage showvminfo --machinereadable | grep -i secureboot` → `SecureBoot="on"` before and after every scenario below.
-
-Boot observation used the same method as Issue #8: headless VM, `VBoxManage controlvm screenshotpng` at timed intervals, `keyboardputstring`/`keyboardputscancode` for interactive commands.
-
-## Scenario 1: stock WinPE / Microsoft-signed boot path
-
-**Target:** the unmodified stock WinPE UEFI ISO from Issue #8's original experiment (`BamepWinPE-amd64.iso`) — ADK 10.1.26100.2454, WinPE build 10.0.26100.1, `EFI\Boot\bootx64.efi` = the Windows Boot Manager as shipped by Microsoft's Windows ADK, unmodified.
-
-**Trust store relevant to this scenario:** the enrolled Microsoft KEK/db chain (`enrollmssignatures`) — VirtualBox's built-in representation of the Microsoft certificate chain the Windows Boot Manager is signed against, not independently verified here against any specific OEM firmware's actual enrolled certificates.
-
-**Result:** boot succeeded, indistinguishable in timing and behavior from the non-Secure-Boot baseline in `docs/reference/winpe-boot-mechanism-spike.md` — `wpeinit` reached at ~15 seconds, fully initialized elevated shell (`Administrator: X:\windows\system32\cmd.exe`) at ~30 seconds. No rejection, no warning, no fail-closed message. **This is the expected, positive result**: Microsoft-signed code validates cleanly against the standard db chain.
-
-**What this proves:** Bamep's currently-assumed WinPE artifact (stock ADK output) is already Secure-Boot-compatible against the standard default trust store, with no additional signing work needed for this specific artifact, in this virtualized environment.
-
-**What this does not prove:** behavior on real OEM firmware, whose exact db/dbx contents and revocation state may differ from VirtualBox's defaults (see "Remaining uncertainty").
-
-## Scenario 2: untrusted / unsigned EFI bootloaders
-
-**Targets:** two unsigned binaries already built for Issue #8, reused unmodified:
-
-- Official iPXE v2.0.0 release `ipxe.efi` (native driver build), SHA-256 `868aa34057ff416ebf2fdfb5781de035e2c540477c04039198a9f8a9c6130034` — not signed by any enrolled authority.
-- Self-built standalone GRUB `grubx64.efi` (via `grub-mkstandalone`, GRUB 2.12-1ubuntu7.3), SHA-256 `dc3f7377f86d78318359224b4e1e55700be25cad7f25af290d6b7d4738c537e7` — self-built, not signed.
-
-**Result — both, identically:**
+Active state was confirmed through:
 
 ```text
-BdsDxe: failed to load Boot0001 "UEFI VBOX CD-ROM ..." from PciRoot(0x0)/Pci(0xD,0x0)/Sata(0x1,0xFFFF,0x0): Access Denied
+VBoxManage showvminfo --machinereadable | grep -i secureboot
 ```
 
-Immediate, clean, deterministic rejection — no hang, no partial execution, no output from either binary (neither iPXE's own startup banner nor GRUB's `echo` commands ever appeared). This is a **distinct error signature** from the ones observed in Issue #8's non-Secure-Boot testing (`No mapping` for a structurally-unrecognized disc, `error: unknown error` for GRUB's own chainloader failure) — `Access Denied` is specifically UEFI firmware's Secure Boot signature-validation rejection, confirming enforcement is genuinely active and discriminating, not merely coincidentally blocking these binaries for an unrelated reason.
+This is **virtualized-firmware evidence only**. VirtualBox's PK, KEK, db, dbx, revocation state, and firmware behavior are not evidence of any particular OEM implementation. Physical Integration Environment validation remains necessary for production hardware claims.
 
-**What this proves:** Secure Boot enforcement in this environment is real and fail-closed for unsigned code — exactly the expected, positive safety behavior. Neither iPXE nor GRUB is "rejected as unsuitable"; both are simply unsigned in the exact builds tested here, which is the expected state for a self-built or unmodified upstream binary with no signing step applied.
+## Scenario 1 — Stock Microsoft-signed WinPE
 
-## Scenario 3: shim + officially-signed GRUB (Ubuntu packages)
+Target:
+- ISO: `BamepWinPE-amd64.iso`;
+- ADK: **10.1.26100.2454**;
+- WinPE: **10.0.26100.1**;
+- `EFI\Boot\bootx64.efi`: unmodified Windows Boot Manager supplied by the Windows ADK.
 
-**Provenance:**
+Observed:
+- boot accepted under Secure Boot;
+- `wpeinit` at approximately 15 seconds;
+- elevated `X:\windows\system32\cmd.exe` shell at approximately 30 seconds;
+- no Secure Boot rejection or warning.
 
-- `shim-signed` **1.58+15.8-0ubuntu1** (Ubuntu 24.04.1 LTS current package), binary `/usr/lib/shim/shimx64.efi.signed`, SHA-256 `6fe6e1bcbe6cf6baec8e056d40361ca1aa715cc04ddcc2855351de060b84350b`. Per Debian/Ubuntu packaging, this `shimx64.efi` is signed by Microsoft's UEFI CA (the same authority already enrolled via `enrollmssignatures`) — shim's entire purpose is to be the one component every mainstream Secure-Boot-enabled firmware already trusts, which then extends trust to a distribution-specific second stage.
-- `grub-efi-amd64-signed` **1.202.5+2.12-1ubuntu7.3** (GRUB 2.12), binary `/usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed`, SHA-256 `a831af01e4fb5e3c9457120e1d08ea13d98a0a47b62728c284b7f502d535965c` — signed by Canonical, validated by shim (not directly by firmware) via shim's embedded vendor certificate/trust database, not the firmware's own db.
+This established compatibility of that exact stock ADK WinPE artifact with the tested Microsoft-trusting Secure Boot configuration. It did not establish compatibility with every OEM db/dbx/revocation state.
 
-**Chain assembled:** `\EFI\Boot\BOOTX64.EFI` = `shimx64.efi.signed` (the firmware-trusted entry point), `\EFI\Boot\grubx64.efi` = `grubx64.efi.signed` (shim's default expected second-stage filename, per upstream/Debian shim convention), `\EFI\Boot\mmx64.efi` = shim's MOK Manager (included for completeness, not exercised). Built via the same `xorriso`/`mtools` generic UEFI El Torito mechanism proven in Issue #8.
+## Scenario 2 — Unsigned EFI executables
 
-**Result:** boot succeeded through the full two-stage signed chain — firmware validated and executed `shimx64.efi.signed` (no `Access Denied`), which validated and chainloaded `grubx64.efi.signed`, which started and reached a genuine interactive `GNU GRUB version 2.12` rescue prompt (`grub>`) — no `grub.cfg` was supplied on this minimal test disc, so GRUB fell back to its rescue shell rather than a full menu, which is expected and does not affect the trust-chain result.
+Targets:
+- iPXE v2.0.0 `ipxe.efi`, SHA-256 `868aa34057ff416ebf2fdfb5781de035e2c540477c04039198a9f8a9c6130034`;
+- self-built GRUB 2.12-1ubuntu7.3 `grubx64.efi`, SHA-256 `dc3f7377f86d78318359224b4e1e55700be25cad7f25af290d6b7d4738c537e7`.
 
-**Attempted follow-up — chainload from the signed GRUB session into WinPE:** with the Issue #8 stock WinPE ISO attached as a second optical device, `ls (cd1)/` and `ls (cd2)/` (the other attached optical/placeholder devices) did not show the WinPE content, and `ls (cd0)/` — the device carrying the WinPE ISO — returned `error: unknown filesystem`, as did `ls (hd0)/` (the blank SATA test disk from Issue #8). **This attempt did not reach the chainload step at all** — it failed earlier, at GRUB's own filesystem recognition of the WinPE disc's UDF/ISO9660 hybrid format, a different and earlier failure point than Issue #8's `chainloader ... error: unknown error` (which occurred *after* successful file listing/resolution). This is recorded as **inconclusive, not attempted further** within this round's bounded scope — plausible candidates include a different module set in the official signed GRUB build versus the custom `grub-mkstandalone` build used in Issue #8 (e.g., missing or differently-loaded `udf`/`iso9660` modules), not diagnosed further here.
+Neither binary was signed by an enrolled authority.
 
-**What this proves:** a fully signature-verified two-stage boot chain (Microsoft-trusted shim → Canonical-signed GRUB) is achievable and does pass Secure Boot validation end-to-end in this environment, using off-the-shelf, officially-signed distribution packages — Bamep is not required to obtain its own Microsoft signing arrangement merely to have *a* working signed chain primitive available. Whether that specific chain can then reach WinPE was not established in this round.
+Both produced:
 
-## Trust-bootstrap implications (evidence-informed, not a decision)
+```text
+BdsDxe: failed to load Boot0001 "UEFI VBOX CD-ROM ..." from
+PciRoot(0x0)/Pci(0xD,0x0)/Sata(0x1,0xFFFF,0x0): Access Denied
+```
 
-The owner asked whether an accepted Secure Boot chain could provide a trustworthy point to deliver the Server TLS fingerprint / enrollment context to the Agent (`docs/specifications/m0-agent-protocol-contract.md` "Transport and handshake": *"The Server's certificate fingerprint must be delivered to the Agent through an authenticated, integrity-protected boot mechanism. This Specification does not assume the current boot chain already provides that assurance."*). This Spike does not choose a PKI, signing strategy, or production mechanism, and does not reopen ADR-0005's WSS transport decision — it only records what the evidence above does and does not support.
+Rejection was immediate and deterministic. Neither binary produced its own startup output and no partial execution was observed. The error was distinct from the non-Secure-Boot failures seen during the WinPE spike.
 
-- **What Secure Boot verifies**: only the *code* identity/integrity of each executable stage as it is loaded (Scenario 2's `Access Denied` vs. Scenarios 1/3's clean execution demonstrate this concretely). It does **not** itself authenticate or protect any *data* payload (such as a TLS fingerprint) carried alongside or embedded within that code, beyond whatever integrity the code's own signature already covers.
-- **Where the verified chain of trust would terminate**: at the last signature-verified executable stage that actually runs. Scenario 3 shows this can be a distribution-signed GRUB reached via a Microsoft-trusted shim; Scenario 1 shows it can be the Microsoft-signed Windows Boot Manager itself. Anything that stage subsequently loads or reads *without its own additional verification* (an unsigned script, an unsigned data file, an unsigned next-stage binary) is no longer covered by Secure Boot's guarantee — chaining trust further requires either another signed stage (as shim → GRUB demonstrates) or an application-level integrity check performed by the last trusted stage itself.
-- **What Bamep would eventually need to sign or verify, if this direction is pursued**: whatever component is the last stage responsible for making the Server TLS fingerprint / enrollment context available to the Agent — e.g., a signed first-stage loader or signed Agent-launching component, or a signed/verified data artifact that a trusted loader reads and hands to the Agent. This Spike does not specify which.
-- **Non-decision, explicitly recorded**: the evidence here shows the underlying trust-chain *primitive* (firmware → shim → signed second stage) is available and functions in this environment. It does **not** establish a specific mechanism for delivering the Server fingerprint through that chain to the Agent — that remains undesigned. This is flagged as an open implication for later review (feeding Issue #2's endpoint identity/trust model and Issue #3's Agent Protocol contract, per their own already-recorded open questions), not resolved by this Spike, and this Spike does not claim the currently-assumed bootstrap is either sufficient or insufficient — only that a viable building block exists.
+This established that Secure Boot enforcement was active and fail-closed for the unsigned EFI binaries tested.
 
-## Conclusion
+## Scenario 3 — Microsoft-trusted shim + Canonical-signed GRUB
 
-Secure Boot enforcement, using VirtualBox's representative Microsoft-trusting default configuration, behaves correctly and predictably in this virtualized environment: it cleanly accepts already-Microsoft-signed code (Scenario 1), cleanly and unambiguously rejects unsigned code with a distinct fail-closed error (Scenario 2), and cleanly accepts a legitimate two-stage signed chain built from off-the-shelf distribution packages (Scenario 3). This is evidence that Secure Boot is **practically viable** for Bamep's UEFI x86-64 target, should the owner decide to require it — no fundamental obstacle was found. Whether Secure Boot should be *required* for Bamep remains an owner/architectural decision this Spike does not make; the evidence here is offered as input to that decision, not a substitute for it.
+Artifacts:
+- `shim-signed` **1.58+15.8-0ubuntu1**, `/usr/lib/shim/shimx64.efi.signed`, SHA-256 `6fe6e1bcbe6cf6baec8e056d40361ca1aa715cc04ddcc2855351de060b84350b`;
+- `grub-efi-amd64-signed` **1.202.5+2.12-1ubuntu7.3**, GRUB **2.12**, `/usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed`, SHA-256 `a831af01e4fb5e3c9457120e1d08ea13d98a0a47b62728c284b7f502d535965c`.
 
-## Remaining uncertainty
+Test chain:
 
-- **This is virtualized-firmware evidence, not physical Integration Environment evidence.** Real OEM firmware's exact db/dbx contents, revocation lists, and Secure Boot implementation quality vary by vendor and are not represented by VirtualBox's default template.
-- **The signed shim+GRUB chain's ability to reach WinPE was not established** — the attempt failed earlier (GRUB filesystem recognition of the WinPE disc) than Issue #8's own GRUB chainload finding, for reasons not diagnosed in this round.
-- **MOK (Machine Owner Key) enrollment** — the mechanism by which a party other than Microsoft/Canonical could get their own signed second-stage binary trusted by shim without going through Microsoft's signing service — was not evaluated; `mmx64.efi` (MOK Manager) was included on the test disc but not exercised.
-- **No mechanism for delivering the Server TLS fingerprint through a verified boot chain to the Agent was designed** — see "Trust-bootstrap implications" above.
-- **Revocation and update handling** (dbx updates, shim/GRUB CVE response) was not evaluated.
-- Physical Integration Environment validation (real UEFI firmware's Secure Boot implementation, real OEM trust store contents) remains required future work before any production decision.
+```text
+\EFI\Boot\BOOTX64.EFI = shimx64.efi.signed
+\EFI\Boot\grubx64.efi = grubx64.efi.signed
+\EFI\Boot\mmx64.efi   = shim MOK Manager
+```
 
-## Related work
+The ISO used the same `xorriso`/`mtools` generic UEFI El Torito technique already validated by the WinPE spike.
 
-- Issue #10 — `[Spike] Validate Secure Boot and hardened boot chain` (this Spike).
-- `docs/reference/winpe-boot-mechanism-spike.md` — Issue #8's boot-mechanism evidence and tooling this Spike reused.
-- `docs/specifications/m0-agent-protocol-contract.md` — the Server-fingerprint delivery mechanism this Spike's trust-bootstrap implications inform, not resolve; ADR-0005's WSS transport decision is explicitly not reopened here.
-- `docs/specifications/m0-endpoint-identity-lifecycle.md` — endpoint trust model this evidence may eventually inform.
-- `docs/specifications/m0-stack-and-boundaries-baseline.md` "Boot-orchestration architectural boundary" — records the Boot Port/Adapter boundary this evidence remains subordinate to; no amendment is made by this document (consistent with the pattern used for Issue #8 and Issue #11 — any amendment requires separate, explicit owner authorization).
+Observed:
+- firmware accepted and executed shim;
+- shim accepted and chainloaded the signed GRUB;
+- GRUB reached a genuine interactive `GNU GRUB version 2.12` `grub>` prompt;
+- no `Access Denied` occurred.
+
+No `grub.cfg` was supplied, so the interactive/rescue prompt was expected.
+
+This established that a Microsoft-trusted shim -> distribution-signed GRUB chain passed Secure Boot enforcement end to end in this virtualized environment using off-the-shelf signed distribution components.
+
+## Follow-up — Signed GRUB to WinPE
+
+A follow-up attempted to access the stock WinPE ISO from the signed GRUB session.
+
+Observed:
+- `ls (cd1)/` and `ls (cd2)/` did not expose the WinPE contents;
+- `ls (cd0)/`, corresponding to the WinPE ISO, returned `error: unknown filesystem`;
+- `ls (hd0)/` returned the same error on the blank SATA test disk.
+
+The experiment therefore **did not reach the chainload operation**. This differed from the earlier custom-GRUB experiment, where file resolution succeeded and the later `chainloader` operation returned `error: unknown error`.
+
+Result: **inconclusive**. The exact cause was not diagnosed. A possible area was module availability/loading in the packaged signed GRUB versus the earlier `grub-mkstandalone` build, including UDF/ISO9660 support, but this was not experimentally established.
+
+## Security observation
+
+The spike demonstrated a distinction later consumed by Bamep's architecture:
+
+- Secure Boot authenticated executable stages accepted by the configured trust chain;
+- Secure Boot did **not**, by itself, authenticate arbitrary site-specific data read by those executables.
+
+A signed boot chain is therefore an executable-integrity primitive; Server fingerprint/enrollment/bootstrap data still requires an authenticated binding to that trusted path.
+
+This evidence informed ADR-0010 and `docs/specifications/m0-trusted-bootstrap-and-server-fingerprint-contract.md`; those documents own the resulting requirements.
+
+## Result summary
+
+| Scenario | Result |
+| --- | --- |
+| Stock Microsoft-signed WinPE | accepted; booted normally |
+| Unsigned iPXE | rejected fail-closed with `Access Denied` |
+| Unsigned self-built GRUB | rejected fail-closed with `Access Denied` |
+| Microsoft-trusted shim -> Canonical-signed GRUB | accepted; GRUB prompt reached |
+| Signed GRUB -> stock WinPE | inconclusive; GRUB could not recognize the WinPE filesystem |
+
+The spike established practical Secure Boot viability for the tested virtualized UEFI x86-64 environment and supplied both positive and negative enforcement evidence.
+
+## Limits and follow-up evidence
+
+Not established by this spike:
+- real OEM firmware compatibility or trust-store equivalence;
+- signed GRUB -> WinPE viability;
+- physical-platform Secure Boot behavior;
+- db/dbx update/revocation behavior;
+- a production Server-fingerprint delivery mechanism.
+
+MOK enrollment was not exercised here; it was later investigated in `docs/reference/site-trust-anchor-provisioning-spike.md`.
+
+## Related
+
+- ADR-0010 — Secure Boot V1 baseline decision.
+- `docs/reference/winpe-boot-mechanism-spike.md` — underlying WinPE/boot tooling and earlier GRUB observations.
+- `docs/reference/site-trust-anchor-provisioning-spike.md` — later MOK and UEFI trust-anchor provisioning evidence.
+- `docs/specifications/m0-trusted-bootstrap-and-server-fingerprint-contract.md` — normative trusted-bootstrap contract.
+- `docs/specifications/m0-stack-and-boundaries-baseline.md` — Boot Port/Adapter boundary.
