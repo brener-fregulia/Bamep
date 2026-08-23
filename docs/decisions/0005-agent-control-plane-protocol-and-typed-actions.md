@@ -4,66 +4,63 @@ Status: Accepted
 
 ## Context
 
-M0 requires resolving the Agent control-plane protocol and typed-action model (`docs/discovery/adr-triage.md` candidates 3 and 4; `docs/specifications/m0-architecture-baseline.md` scope item "control-plane contract"; `docs/discovery/architecture-redesign.md` "Control plane", "Backend and Agent"). Issue #3 executes this Work Package.
+The Agent control plane needs low-latency, bidirectional, Server-initiated dispatch with acknowledgement, progress, cancellation, reconnect recovery, and explicit protocol versioning. The Agent must not expose unrestricted remote command execution, and the protocol must remain independently implementable even if Server and Agent share Rust.
 
-`docs/discovery/architecture-redesign.md` states the protocol choice "remains open and requires an ADR," listing candidates neutrally (REST + polling, REST + long polling, WebSocket with a typed application protocol, SSE for browser events + HTTP commands) and notes Browser and Agent do not need to share the same mechanism. This ADR resolves the **Agent** side only; the Administrative API (Browser/Web ↔ Server) protocol is not decided here.
-
-The Agent must not accept arbitrary `sh -c` execution from the Server (`AGENTS.md`: "Do not use unrestricted remote shell execution as a substitute for typed Agent actions"; architecture-redesign.md "Backend and Agent"). ADR-0004 (Endpoint identity, `Accepted`) defers the concrete Agent/Server authentication mechanism to this Work Package, and its destructive-operation precondition 2 ("authenticated current Agent session") depends on this ADR establishing `CredentialActive`. ADR-0003 (Worker/Agent language, `Accepted`) requires that this protocol remain explicit and independently versioned regardless of the Rust implementation shared across components.
-
-The Server-authentication mechanism this ADR selects (fingerprint pinning) has a dependency on the Secure Boot / hardened boot-chain Technical Spike (Issue #10, `Backlog`, not yet complete): pinning is only as strong as the integrity of the channel that delivers the fingerprint to the Agent, and this ADR does not assume that channel's assurance level in advance of that Spike's evidence.
+Endpoint identity also requires the Agent to authenticate the expected Server before presenting its enrollment/runtime credential. The normative wire contract belongs to `docs/specifications/m0-agent-protocol-contract.md`.
 
 ## Decision
 
-1. **Transport**: WebSocket over TLS (WSS), carrying a typed, versioned application-level message envelope.
-2. **Server authentication via pinned TLS, Agent authentication via credential — not mutual TLS**: the Server is authenticated by the Agent through a pinned TLS certificate fingerprint; the Agent is authenticated by the Server through its enrollment/runtime credential. The Agent does not present a client certificate — this is not mTLS.
-   - The Agent must receive the expected Server fingerprint through an authenticated, integrity-protected boot mechanism. This ADR does not claim the current boot chain already provides that assurance; the concrete mechanism capable of delivering an authenticated fingerprint is informed by the Secure Boot / hardened boot-chain Technical Spike (Issue #10) and is not decided here.
-   - A fingerprint mismatch must fail closed: the Agent refuses the connection outright, never proceeding with a warning or a downgraded trust level.
-   - There is no trust-on-first-use fallback and no acceptance of an unverified Server certificate under any circumstance.
-   - If Issue #10 shows the boot mechanism cannot provide sufficient authenticated fingerprint delivery, this Server-authentication sub-decision must be revisited through the normal SDD process; the WSS/typed-protocol transport decision (point 1) does not change automatically as a result.
-   - Once the Server is authenticated, the Agent presents its enrollment/runtime credential (per ADR-0004's redemption flow) in an `AuthRequest`; the Server validates it against the Endpoint identity/credential state model (`docs/specifications/m0-endpoint-identity-lifecycle.md`) and responds with `SessionEstablished` or an explicit `AuthError`. Successful completion of this handshake is the mechanism that establishes `CredentialActive`, referenced by ADR-0004's destructive-operation precondition 2.
-3. **Message envelope**: every message carries `message_id`, `protocol_version`, `type`, `timestamp`, and a `correlation_id` where applicable (the relevant `action_id`). `protocol_version` is checked at handshake time; an incompatible version is rejected explicitly, never silently accepted or best-effort interpreted.
-4. **Typed action model**: actions are a closed, versioned set of message types, each with a defined parameter schema and result shape. The Agent never accepts a generic/arbitrary command — only a fixed, versioned catalog of typed actions, each ultimately invoking a specific fixed tool available in the Alpine maintenance environment. The concrete catalog of action types accumulates as other M0 Work Packages are implemented; this ADR defines the shape every action must conform to, not a frozen catalog.
-5. **Acknowledgement vs. result, and dispatch rejection**: dispatch (`ActionDispatch`) is acknowledged (`ActionAck`) separately from completion (`ActionResult`), so the Server can distinguish "not delivered" from "delivered, still running" from "finished." `ActionAck` carries an explicit `outcome` of `Accepted` or `Rejected` (e.g., an unknown or malformed `action_type`). A rejected dispatch never executed and must not be represented as an `ActionResult` with outcome `Failed`, since no execution occurred. The exact wire shape is defined in `docs/specifications/m0-agent-protocol-contract.md`.
-6. **Idempotency, bounded by Agent-local state**: the Agent treats redelivery of the same `action_id` as the same logical action **while it retains authoritative local state for that action** — if already completed, it responds with the stored result instead of re-executing; if in progress, it responds with current status instead of starting a second execution. `action_id` uniqueness is the idempotency mechanism; no separate idempotency key is introduced. This is not a claim of exactly-once execution across an Agent restart or any other loss of local action state — see point 10.
-7. **Retry (mechanism only, not policy)**: a retry is a new `ActionDispatch` with a fresh `action_id` and an optional `retry_of` field referencing the prior `action_id`, for audit/correlation. This ADR does not decide when a retry is appropriate — especially for destructive actions, that decision belongs to the Job lifecycle Work Package (Issue #4) and must never be automatic merely because a generic retry policy exists (architecture-redesign.md "Durable workflow"; Issue #3 safety constraint).
-8. **Cancellation**: `CancelAction(action_id)` is a distinct typed message; the Agent attempts graceful cancellation where the invoked tool supports interruption, and reports the actual resulting state (`Cancelled`, `AlreadyCompleted`, or `CannotCancel` — a destructive action already past its point of no return must be reported honestly, never silently marked cancelled).
-9. **Progress**: long-running actions emit periodic `ActionProgress` messages correlated to `action_id` (e.g., percentage, bytes processed, ETA where meaningful). This carries progress metadata only; bulk data transfer itself is the data-plane's responsibility (Issue #6).
-10. **Reconnect and stale-command handling**: a dropped connection does not imply the Agent's in-flight actions were cancelled or should be redispatched. On reconnect (after the handshake in point 2 completes again), the Server issues an explicit `StatusQuery(action_id)` for any action it still considers in-flight and acts only on the Agent's authoritative reported status. `StatusReport` includes an explicit `Unknown` outcome for an `action_id` the Agent has no local record of (e.g., after an Agent restart) — the Server must treat `Unknown` as an unknown execution outcome, never as proof the action was not executed, and must never redispatch a destructive action merely because the Agent no longer remembers the `action_id`. The protocol must never auto-redispatch a destructive action merely because a new session was established; whether/how to act on any reported status, including `Unknown`, is Job-lifecycle policy (Issue #4).
+### Transport and authentication
 
-No concrete architectural blocker was identified for the WSS/typed-protocol transport itself. Bamep's requirement for low-latency, bidirectional, server-initiated dispatch with streamed progress does not fit REST+polling or long-polling without effectively reconstructing an ad hoc push channel. WebSocket is well-supported in Rust's async ecosystem (ADR-0002, ADR-0003), and the provisioning LAN being a dedicated, controlled network (already-accepted assumption) reduces the firewall-traversal concerns that typically motivate polling-based designs on the open Internet. The Server-authentication sub-decision (fingerprint pinning) is selected as the M0 mechanism, but its assurance level is not yet established pending Issue #10's evidence — see point 2.
+Agent ↔ Server control traffic uses WebSocket over TLS (WSS) with a typed, versioned application protocol. This decision applies only to the Agent control plane; Browser/Web ↔ Server communication may use another mechanism.
+
+The Agent authenticates the Server by verifying the expected Server TLS certificate fingerprint before normal protocol authentication. A mismatch fails closed; there is no TOFU or "warn and continue" fallback. The expected fingerprint comes from the independently authenticated trusted-bootstrap contract in `docs/specifications/m0-trusted-bootstrap-and-server-fingerprint-contract.md`.
+
+After Server authentication, the Agent authenticates with its enrollment/runtime credential. The Agent does not present a client certificate; this is intentionally not mTLS. Exact handshake fields, fingerprint definition, credential rotation, errors, and `BootstrapEvidence` behavior are normative in the Specifications.
+
+### Typed actions and execution identity
+
+Agent actions are a closed, versioned catalog with explicit parameter and result schemas. The Agent must never accept a generic arbitrary shell/command payload as a substitute for a typed action. The catalog may grow without changing this decision.
+
+Dispatch acknowledgement is distinct from execution result so the Server can distinguish an action not known to be accepted, accepted/running, rejected before execution, and finished. A rejected dispatch is not an execution failure because no execution occurred.
+
+One `action_id` represents one logical dispatched execution while the Agent retains authoritative local state for it. Redelivery of the same known `action_id` must not start a duplicate execution; the Agent reports its retained state/result instead. This is bounded idempotency, not exactly-once execution across Agent restart or loss of local state.
+
+A retry, when policy permits one, is a new action with a fresh identity and may reference the prior action for correlation. Whether retry is allowed is Job-lifecycle policy, not transport policy.
+
+### Cancellation, progress, and reconnect
+
+Long-running actions may report progress correlated to their action identity. Progress carries control/metadata only; bulk bytes belong to the data plane.
+
+Cancellation is explicit and must report the real outcome. A cancellation request never permits the Server to invent `Cancelled` when execution already completed or cannot safely stop.
+
+Connection loss does not imply that an in-flight action stopped or never executed. After reconnect, uncertain actions are reconciled through explicit status queries/reports. If the Agent no longer knows an action, that means **unknown execution outcome**, not proof of non-execution.
+
+The protocol must never automatically redispatch destructive work merely because a new session was established or Agent-local action state was lost. Job lifecycle owns reconciliation, retry, authorization, and operator-decision policy.
 
 ## Alternatives considered
 
-- **REST + short polling**: rejected as the default — dispatch latency is bounded by the polling interval, and frequent polling from 20+ concurrent Agents adds request overhead for a channel that must also carry progress updates.
-- **REST + long polling**: reduces dispatch latency versus short polling, but progress streaming still requires either very frequent re-polling or a second channel, and does not cleanly unify with acknowledgement/progress/cancellation in one connection. Not rejected as categorically unsuitable — remains a fallback if a future environment cannot sustain persistent WebSocket connections — but not chosen as the M0 default.
-- **SSE for Agent + HTTP commands**: SSE supports Server→Agent push but is one-directional; Agent-originated messages (ack, progress, result) would need a separate HTTP channel, splitting one logical conversation across two channels and complicating correlation. Discovery's SSE mention was specifically for the Browser case, not the Agent case; not adopted here.
-- **Full PKI/mTLS for Server and Agent authentication**: rejected for the same reasons ADR-0004 rejected it for Endpoint identity — certificate lifecycle management (CA, issuance, rotation, revocation) is more machinery than M0's install profiles justify, and it would additionally require the Agent to hold and present its own client certificate, which this direction does not need. Fingerprint pinning is a lighter-weight mechanism, not a claim of assurance equivalent to a full PKI system — its actual strength depends entirely on the integrity of the boot-time fingerprint delivery, which is not yet established (Issue #10 dependency, point 2 above).
+- **REST + short polling:** rejected as the default because dispatch latency follows the polling interval and frequent polling adds avoidable request overhead.
+- **REST + long polling:** not selected because acknowledgement, progress, cancellation, and bidirectional status traffic would still require repeated requests or additional channels; it remains a possible fallback for environments that cannot sustain WebSocket connections.
+- **SSE + HTTP commands:** rejected for the Agent control plane because SSE is one-directional and Agent-originated acknowledgement/progress/results/status would require a second channel.
+- **Full PKI / mTLS:** rejected for V1 because client-certificate issuance, rotation, revocation, and CA lifecycle add substantial machinery without a demonstrated requirement.
 
 ## Consequences
 
-- Agent and Server both depend on a WebSocket-capable Rust stack (consistent with ADR-0002, ADR-0003; no new language constraint introduced).
-- The Boot Orchestrator's security responsibility (established in ADR-0004) extends to distributing the Server's certificate fingerprint alongside the enrollment credential, through a mechanism that must be authenticated/integrity-protected — not merely delivered over the same channel as everything else.
-- The Server-authentication sub-decision in point 2 carries a real dependency on Issue #10; if that Spike finds the boot mechanism insufficient, this ADR's Server-authentication mechanism (not its WSS/typed-protocol transport) must be revisited. **Resolved**: Issue #10 is complete and found the boot mechanism sufficient (ADR-0010, `Accepted` — Secure Boot as the V1 trusted-bootstrap baseline); the downstream trusted-bootstrap/Server-fingerprint-delivery contract this dependency pointed to is itself complete (Issue #13, `Approved` — `docs/specifications/m0-trusted-bootstrap-and-server-fingerprint-contract.md`; ADR-0011, `Accepted`, for site trust-anchor provisioning). This ADR's Server-authentication sub-decision is not revisited.
-- A fingerprint mismatch is a hard, fail-closed connection refusal with no fallback path — implementations must not add a trust-on-first-use or "warn and continue" mode.
-- Per ADR-0003's contract-independence constraint, this protocol (message types, envelope fields, versioning) must be specified explicitly in `docs/specifications/m0-agent-protocol-contract.md` and version-numbered ("Agent Protocol v1") independent of any Rust type definition — a non-Rust Agent or tooling must remain implementable from that Specification alone.
-- The concrete typed-action catalog will grow incrementally as other M0 Work Packages are implemented; this ADR does not freeze it.
-- Job/action authorization semantics (whether a given action is currently allowed) and destructive-step resumption policy after reconnect remain owned by Issue #4, which references this protocol's `StatusQuery`/`ActionDispatch` mechanism rather than having it redefined here.
+- Agent control is a persistent WSS conversation with an independently versioned application protocol.
+- Server authentication, Agent authentication, and trusted-bootstrap establishment remain separate security facts.
+- Generic remote shell execution is not an acceptable implementation shortcut.
+- Transport/action identity does not define retry or destructive resumption policy.
+- Wire details remain authoritative only in the Agent Protocol Specification and must remain implementable without reading Rust source.
+- Bulk data transfer remains outside this control-plane channel.
 
-## Related architecture
+## Related
 
-- `docs/discovery/architecture-redesign.md` — "Control plane", "Backend and Agent".
-- `docs/discovery/adr-triage.md` — candidates 3, 4.
-- ADR-0002, ADR-0003 — Rust across Server/Worker/Agent; contract-independence constraint this ADR satisfies.
-- ADR-0004 — Endpoint identity/credential model this handshake establishes.
-- `docs/specifications/m0-stack-and-boundaries-baseline.md` — this ADR is a Runtime Services "Agent Control Gateway" responsibility.
-- `docs/specifications/m0-agent-protocol-contract.md` — the concrete message-level contract ("Agent Protocol v1").
-
-## Related work
-
-- Issue #3 — `[WP] Define Agent control and action contracts`.
-- Issue #2 — `[WP] Define endpoint identity and trust model` (ADR-0004, consumed by the handshake).
-- Issue #4 — `[WP] Define Job lifecycle and scheduling model` (owns retry/resumption policy and action authorization).
-- Issue #6 — `[WP] Define data-plane and storage contracts` (bulk transfer bytes, distinct from progress metadata).
-- Issue #7 — `[WP] Define Simulator contract and M0 validation strategy` (must simulate this protocol's connect/dispatch/ack/progress/cancel/reconnect scenarios).
-- Issue #10 — `[Spike] Validate Secure Boot and hardened boot chain` (informs whether the boot mechanism can deliver an authenticated Server fingerprint to the Agent; this ADR's Server-authentication sub-decision depends on its evidence). Complete; produced ADR-0010 (`Accepted`).
-- Issue #13 / ADR-0011 — `[WP] Define trusted bootstrap and Server fingerprint delivery contract` (`docs/specifications/m0-trusted-bootstrap-and-server-fingerprint-contract.md`, `Approved`; complete) — the concrete contract this ADR's fingerprint-delivery dependency (point 2) resolves into; does not reopen this ADR's WSS, pinned-TLS, or credential decisions.
+- ADR-0003 — Worker/Agent language strategy and contract independence.
+- ADR-0004 — Endpoint identity and credential rationale.
+- ADR-0006 — Job/JobStep/Attempt retry and reconciliation rationale.
+- ADR-0010 — trusted-bootstrap/Secure Boot rationale.
+- `docs/specifications/m0-agent-protocol-contract.md` — normative Agent Protocol v1 wire contract.
+- `docs/specifications/m0-trusted-bootstrap-and-server-fingerprint-contract.md` — authenticated Server-fingerprint delivery.
+- `docs/specifications/m0-job-lifecycle-and-scheduling.md` — retry/reconciliation policy.
+- `docs/specifications/m0-data-plane-and-storage-contracts.md` — bulk transfer boundary.
