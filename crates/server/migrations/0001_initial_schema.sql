@@ -183,8 +183,8 @@ CREATE TYPE job_step_state AS ENUM (
 
 -- Durable Job: one workflow targeting one Endpoint
 -- (m0-job-lifecycle-and-scheduling.md "Domain model"). Issue #24 durably
--- creates only rows in `Pending`; later Work Packages (#25-#28) own the
--- remaining lifecycle transitions and whatever additional durable
+-- creates only rows in `Pending`; later scheduling/dispatch Work Packages own
+-- the remaining lifecycle transitions and whatever additional durable
 -- state/events/audit they require.
 CREATE TABLE jobs (
     id UUID PRIMARY KEY,
@@ -203,12 +203,14 @@ CREATE INDEX idx_jobs_endpoint_id ON jobs (endpoint_id);
 -- authorized_inventory_revision_id/authorized_target_fingerprint are the
 -- durable destructive-operation authorization snapshot (Issue #31): the
 -- Server-owned inventory revision and opaque target-disk fingerprint
--- authorized for this JobStep at the moment #25's Application path attaches
--- them. Presence classifies this JobStep as destructive for the M1 workflow
--- path. Both columns are nullable and CHECK'd all-or-none so PostgreSQL
--- itself cannot persist a half-intent; they are never rewritten once set
--- (single-assignment for this M1 boundary — a later explicit lifecycle/
--- authorization operation would be required to replace one).
+-- authorized for this JobStep at the moment Issue #31's Application path
+-- (DestructiveIntentService) attaches them. Presence classifies this JobStep
+-- as destructive for the M1 workflow path. Both columns are nullable and
+-- CHECK'd all-or-none so PostgreSQL itself cannot persist a half-intent; they
+-- are never rewritten once set (single-assignment for this M1 boundary — a
+-- later explicit lifecycle/authorization operation would be required to
+-- replace one). A later scheduling/dispatch Work Package consumes/revalidates
+-- this snapshot; it does not attach it.
 CREATE TABLE job_steps (
     id UUID PRIMARY KEY,
     job_id UUID NOT NULL REFERENCES jobs (id),

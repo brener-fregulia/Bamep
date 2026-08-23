@@ -1,14 +1,17 @@
 //! Bamep Domain: Job/JobStep workflow model
-//! (`docs/specifications/m0-job-lifecycle-and-scheduling.md` "Domain model").
+//! (`docs/specifications/m0-job-lifecycle-and-scheduling.md` "Domain model";
+//! `docs/decisions/0006-job-jobstep-attempt-state-model-and-scheduling.md`).
 //!
-//! Issue #24 stops at durable `Pending` workflow creation
-//! (`docs/decisions/0006-job-jobstep-attempt-state-model-and-scheduling.md`):
-//! only the identities, `Job -> Endpoint`/`JobStep -> Job` correlations,
-//! explicit linear order, and initial `Pending` states required by that
-//! boundary are represented here. The complete lifecycle vocabularies already
-//! reflect the Specification's later states so #25-#28 do not need a Domain
-//! type change, but this module performs no I/O and [`create_workflow`]
-//! constructs no state beyond `Pending`.
+//! This module represents durable `Pending` workflow creation — identities,
+//! `Job -> Endpoint`/`JobStep -> Job` correlations, explicit linear order, and
+//! initial `Pending` states (Issue #24) — plus the destructive-operation
+//! authorization snapshot attached to one eligible JobStep before dispatch
+//! (Issue #31: [`DestructiveIntent`]). The complete lifecycle vocabularies
+//! already reflect the Specification's later states so later scheduling/
+//! dispatch Work Packages do not need a Domain type change. This module
+//! performs no I/O, [`create_workflow`] constructs no state beyond `Pending`,
+//! and no concrete Agent action type/version/parameters or Attempt identity
+//! is represented here.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -105,10 +108,12 @@ pub enum DestructiveIntentError {
 /// One ordered linear stage of its owning [`Job`]. `order` is the explicit
 /// stable linear position required by the accepted linear-workflow baseline
 /// (`m0-job-lifecycle-and-scheduling.md`: "The baseline workflow is linear;
-/// branching/parallel JobSteps are outside this contract"). No action/type/
-/// parameter payload is represented yet — Issue #24 owns only workflow
-/// identity/correlation/order/state; an action-specific contract will extend
-/// this still-pre-baseline shape when it is introduced.
+/// branching/parallel JobSteps are outside this contract"). This module owns
+/// workflow identity/correlation/order/state (Issue #24) and the
+/// destructive-operation authorization snapshot (Issue #31); no concrete
+/// Agent action type/version/parameters or Attempt identity is represented
+/// yet — an action-specific contract will extend this still-pre-baseline
+/// shape when it is introduced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobStep {
     pub id: JobStepId,

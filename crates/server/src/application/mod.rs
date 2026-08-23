@@ -194,7 +194,8 @@ impl<J: JobRepository> JobService<J> {
     /// rejects a nonexistent or not-`Enrolled` target Endpoint without
     /// persisting partial state (`crate::ports::JobRepository::create_workflow`).
     /// Does not admit the Job into `Running`, evaluate JobStep preconditions,
-    /// acquire leases, or create an Attempt — those belong to #25.
+    /// acquire leases, or create an Attempt — those belong to later
+    /// scheduling/dispatch Work Packages.
     pub async fn create_workflow(
         &self,
         endpoint_id: EndpointId,

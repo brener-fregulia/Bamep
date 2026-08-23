@@ -143,9 +143,10 @@ pub enum AuthorizeDestructiveIntentError {
 }
 
 /// Durable Job/JobStep workflow persistence
-/// (`m0-job-lifecycle-and-scheduling.md` "Domain model"). Issue #24 stops at
-/// durable workflow creation; later Work Packages (#25-#28) extend this Port
-/// as they add scheduling/dispatch/reconciliation persistence.
+/// (`m0-job-lifecycle-and-scheduling.md` "Domain model"). Issue #24
+/// established durable workflow creation; Issue #31 extended this Port with
+/// destructive-intent authorization. Later scheduling/dispatch/reconciliation
+/// Work Packages extend this Port further as they add that persistence.
 #[async_trait]
 pub trait JobRepository: Send + Sync {
     /// Verifies `job.endpoint_id` is an existing `Enrolled` Endpoint, then
