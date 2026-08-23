@@ -2,105 +2,66 @@
 
 Status: **Approved**
 
-## Purpose
+This Specification defines the normative Bamep V1 product boundary, component/dependency
+boundaries, boot-orchestration boundary, localization direction, and packaging/versioning
+constraints.
 
-This Specification is the durable normative baseline for:
-
-- the Bamep V1 product boundary and core domain vocabulary;
-- component responsibility and dependency boundaries;
-- the boot-orchestration boundary;
-- user-facing localization direction;
-- packaging and versioning constraints.
-
-It defines **what Bamep must preserve** in these areas.
-
-It does not preserve architectural decision rationale or describe current implementation
-structure:
-
-- ADRs in `docs/decisions/` own decision rationale and trade-offs;
-- `docs/architecture/` owns architecture implemented in the current repository;
-- `docs/reference/` owns reusable empirical evidence;
-- unresolved investigation remains in `docs/discovery/`.
-
-This Specification originated from M0 Issue #1
-(`[WP] Define product, runtime, and stack architecture baseline`). Historical Discovery and
-work-item context remain available through Git and GitHub history; they are not normative
-dependencies of this document.
-
-## Product boundary and domain vocabulary
+## Product boundary
 
 Bamep is a standalone bare-metal provisioning and recovery platform for controlled local
 networks.
 
-It is responsible for capabilities including:
+Its responsibilities include:
 
-- discovering and identifying endpoints;
-- coordinating boot and maintenance environments;
-- collecting inventory;
-- executing provisioning and recovery workflows;
-- transferring and managing artifacts;
-- scheduling concurrent resources;
-- providing secure, observable, auditable operation through explicit interfaces.
+- Endpoint discovery/identity and inventory;
+- boot and maintenance orchestration;
+- provisioning and recovery workflows;
+- Artifact transfer/management;
+- resource-aware scheduling;
+- secure, observable, auditable operation through explicit interfaces.
 
 Bamep V1:
 
 - provisions Windows, with Windows 11 as the primary modern target;
 - supports UEFI x86-64 endpoints;
-- initially operates as a single-server deployment;
-- assumes a dedicated provisioning interface, VLAN, or network where Bamep may control
-  DHCP/PXE;
-- must remain operational without Internet access once required artifacts are available
-  locally;
-- does not require MikroTik hardware;
-- does not require dedicated cache or archive storage;
-- does not require RAID.
+- uses a single-server deployment;
+- assumes a dedicated provisioning interface/VLAN/network where Bamep may control DHCP/PXE;
+- operates without Internet access once required artifacts are local;
+- does not require MikroTik hardware, dedicated cache/archive storage, or RAID.
 
-Legacy BIOS, multi-site operation, and HA are outside the V1 baseline unless a later
-approved Specification changes that scope.
+Legacy BIOS, multi-site operation, and HA are outside the V1 baseline unless later approved
+work changes that scope.
 
-Bamep is not:
+Bamep is not an ERP, CRM, financial system, general-purpose RMM, NAS, or general
+switch-management platform.
 
-- an ERP;
-- a CRM;
-- a financial system;
-- a general-purpose RMM;
-- a NAS;
-- a general switch-management platform.
+External commercial/ERP systems integrate through explicit versioned interfaces and/or
+domain events, never Bamep's internal persistence schema.
 
-A future ERP or external commercial system must integrate through explicit versioned
-interfaces and/or domain events rather than through Bamep's internal persistence schema.
+Bamep Domain remains commercially agnostic: customer, contract, subscription, SKU, edition,
+and similar commercial catalog concepts remain outside Domain. ADR-0015 owns the commercial
+entitlement boundary.
 
-Bamep's Domain remains commercially agnostic. Customer, contract, subscription, SKU,
-edition, and equivalent commercial catalog concepts are not Domain vocabulary.
-Commercial-entitlement handling, when configured, remains outside Domain according to
-ADR-0015.
+## Localization
 
-## User-facing localization baseline
+Bamep Web user-facing text uses localization boundaries rather than scattered hardcoded
+strings.
 
-Bamep Web user-facing text must use localization boundaries rather than scattered
-hardcoded strings.
-
-The established product direction is:
-
-- `pt-BR` is the initial UI locale;
+- `pt-BR` is the initial UI locale.
 - `en-US` is the planned additional locale.
 
-`en-US` support is not an M0 or current M1 delivery requirement merely because it is
-planned here. It becomes delivery scope only when an approved Specification or work item
-explicitly requires it.
+Planned `en-US` support is not automatically an M0/current-M1 delivery requirement.
 
-This Specification does not choose a localization library, catalog structure, loading
-strategy, or fallback implementation.
+Localization library, catalog structure, loading, and fallback strategy are implementation
+concerns unless later constrained.
 
-Canonical repository engineering content remains English according to
-`docs/development/documentation-policy.md`. Repository language and user-facing locale are
-separate concerns.
+Repository engineering language is separate from user-facing locale.
 
-## Component responsibility boundaries
+## Component boundaries
 
-The following responsibility boundaries are normative:
+The normative responsibility boundaries are:
 
-- **Presentation** — Web Administration and the Administrative API.
+- **Presentation** — Web Administration and Administrative API.
 - **Application** — Endpoint Management, Provisioning/Recovery Orchestration, Boot
   Orchestration, and Artifact Management.
 - **Domain** — Endpoint, Job, JobStep, Attempt, Inventory, Artifact/Snapshot, Transfer,
@@ -109,165 +70,99 @@ The following responsibility boundaries are normative:
   Coordinator, and Runtime Presence Registry.
 - **Ports** — repositories, Agent transport, boot, discovery, storage, and infrastructure
   metrics.
-- **Adapters** — persistence, boot/PXE integration, switch integration,
-  filesystem/storage integration, and protocol transports.
-- **Workers** — transfer, compression, verification, and artifact movement.
+- **Adapters** — persistence, boot/PXE, switch, filesystem/storage, and protocol transports.
+- **Workers** — transfer, compression, verification, and Artifact movement.
 
-These are responsibility and dependency boundaries, not a required one-to-one mapping to
+These are responsibility/dependency boundaries, not a required one-to-one mapping to
 crates, packages, modules, directories, or processes.
 
-The physical runtime topology is owned by ADR-0001. The Server language is owned by
-ADR-0002. Worker and Agent language strategy is owned by ADR-0003.
-
-Worker isolation is therefore consumed from ADR-0001 rather than re-decided here, and
-Worker/Agent Rust selection is consumed from ADR-0003 rather than treated as open.
+ADR-0001 owns physical runtime topology and Worker isolation. ADR-0002 owns Server language.
+ADR-0003 owns Worker/Agent language.
 
 ## Dependency constraints
 
-Domain logic must remain independent from infrastructure-specific mechanisms.
-
-Domain must not directly depend on concerns such as:
+Domain logic must not directly depend on infrastructure mechanisms such as:
 
 - GRUB, iPXE, wimboot, or concrete PXE mechanics;
 - MikroTik or another switch vendor;
 - Linux device paths such as `/dev/sda`;
-- shell tooling such as `snmpwalk`;
-- WebSocket/TLS transport libraries;
-- PostgreSQL/SQLx or another persistence implementation;
+- shell tools such as `snmpwalk`;
+- WebSocket/TLS libraries;
+- PostgreSQL/SQLx;
 - compression implementations such as zstd.
 
-Those mechanisms belong behind the appropriate Ports and Adapters.
+Infrastructure mechanisms stay behind the appropriate Ports/Adapters.
 
-The current physical implementation may use a simpler subset of the responsibility model.
-`docs/architecture/README.md` is authoritative for what is actually implemented now.
+`docs/architecture/README.md` describes the currently implemented physical structure; it
+may use a simpler subset of these logical boundaries.
 
-## Communication-boundary constraint
+## Communication boundaries
 
-Different Bamep communication responsibilities may use different protocols.
+Different responsibilities may use different protocols:
 
-In particular:
+- Agent ↔ Server control plane — ADR-0005 and `m0-agent-protocol-contract.md`;
+- bulk Artifact transfer — ADR-0008 and `m0-data-plane-and-storage-contracts.md`;
+- Web ↔ Server Administrative API — its own Specification.
 
-- Agent ↔ Server control-plane transport is owned by ADR-0005 and the Agent Protocol
-  Specification;
-- bulk Artifact transfer is owned by the data-plane decision and Specification;
-- Web ↔ Server Administrative API behavior is owned by its own Specification.
+A protocol selected for one boundary does not become a requirement for another.
 
-A protocol selected for one responsibility must not be generalized into a requirement for
-another boundary without an approved decision.
+Externally relevant contracts remain explicit and independently versioned rather than being
+defined solely by shared Rust types.
 
-Externally relevant contracts must remain explicit and independently versioned rather than
-being defined solely by shared Rust implementation types.
+## Boot orchestration
 
-## Boot-orchestration boundary
+Domain must not depend on a concrete network-boot mechanism.
 
-The Domain must not depend on a concrete network-boot mechanism.
+Boot mechanics are Adapter concerns coordinated through Application-level Boot
+Orchestration and the boot Port. GRUB, iPXE, wimboot, PXE delivery, and equivalent future
+mechanisms remain behind that boundary unless explicitly made normative later.
 
-Boot mechanics belong to Adapters and are coordinated through the Application-level Boot
-Orchestration responsibility via the boot Port.
+WinPE UEFI x86-64 viability has been validated in the tested environment; evidence is in
+`docs/reference/winpe-boot-mechanism-spike.md`.
 
-Therefore GRUB, iPXE, wimboot, PXE delivery mechanics, and equivalent future mechanisms
-remain implementation choices behind that boundary unless a later Specification or ADR
-makes one normative.
+The production network-delivered WinPE mechanism remains unresolved in
+`docs/discovery/architecture-redesign.md` and requires Integration Environment evidence
+before production boot implementation.
 
-WinPE itself has validated UEFI x86-64 viability in the tested environment. The reusable
-evidence belongs to `docs/reference/winpe-boot-mechanism-spike.md`.
+Trusted-bootstrap integrity is orthogonal to network delivery. ADR-0010 owns the Secure
+Boot/trusted-bootstrap decision; it does not select GRUB, iPXE, wimboot, or another
+network-delivery mechanism.
 
-The **production network-delivered WinPE mechanism remains unresolved** and is retained as
-active Discovery in `docs/discovery/architecture-redesign.md`. It requires Integration
-Environment evidence before production boot implementation.
+## Packaging and versioning
 
-M0 does not select a production network-delivery mechanism.
+- Server targets Linux, initially Debian.
+- Production distribution direction is native `.deb` packages through a signed APT
+  repository.
+- Server must not silently self-update at application level.
+- Server, Web, and Agent use independent SemVer.
+- Workers ship/version with the Server release.
+- Externally relevant contracts version independently from component SemVer.
+- Independently deployable components do not require lockstep releases unless a compatibility
+  contract explicitly requires it.
 
-Trusted-bootstrap integrity is a separate concern from network-delivery mechanics.
-ADR-0010 owns the Secure Boot trusted-bootstrap decision, and the trusted-bootstrap
-Specifications own its normative contracts. Selecting that trust baseline does not select
-GRUB, iPXE, wimboot, or another network-delivery mechanism.
-
-## Packaging and versioning baseline
-
-The following packaging and versioning constraints are normative:
-
-- Bamep Server targets Linux, with Debian as the initial production distribution;
-- native `.deb` packages and a signed APT repository are the intended production
-  distribution model;
-- Server must not silently self-update at the application level;
-- Server, Web, and Agent are independently versioned with SemVer;
-- Workers ship with the Server release and do not receive independent product versioning,
-  consistent with ADR-0001;
-- externally relevant contracts are versioned independently from component SemVer;
-- independently deployable components do not require lockstep releases unless a future
-  compatibility contract explicitly requires it.
-
-Examples of independently versioned contracts include Agent Protocol v1 and Administrative
-API v1.
-
-## Stack decisions owned by ADRs
-
-This Specification consumes, but does not duplicate the rationale of:
-
-- ADR-0001 — modular-monolith Server topology with Worker/process isolation;
-- ADR-0002 — Rust for the Backend/Server implementation;
-- ADR-0003 — Rust for Worker and Agent, while preserving explicit language-independent
-  external contracts;
-- ADR-0010 — trusted-bootstrap / Secure Boot baseline;
-- ADR-0013 — PostgreSQL persistence-backend baseline;
-- ADR-0015 — commercial-entitlement boundary outside Domain.
-
-Changes to those decisions must occur through the ADR lifecycle rather than by editing this
-Specification as a substitute for reconsidering the decision.
+Examples of separately versioned contracts include Agent Protocol v1 and Administrative API
+v1.
 
 ## Out of scope
 
 This Specification does not define:
 
-- WinPE implementation;
-- the final production network-delivered WinPE mechanism;
-- a production packaging pipeline or signed APT repository build procedure;
-- final production backup/snapshot format;
-- Endpoint identity lifecycle;
-- Agent Protocol message semantics;
-- Job/JobStep/Attempt lifecycle and scheduling;
-- persistence durability semantics;
-- data-plane transfer semantics;
-- Simulator fidelity;
-- ERP implementation;
-- licensing enforcement;
-- multi-site management;
-- HA;
-- Tauri.
+- the production WinPE network-delivery mechanism;
+- concrete packaging-pipeline implementation;
+- final backup/snapshot format;
+- Endpoint, Job, persistence, data-plane, Agent Protocol, or Simulator contracts owned by
+  their respective Specifications;
+- ERP implementation or licensing enforcement;
+- multi-site or HA behavior.
 
-Those responsibilities belong to their own Specifications, ADRs, future approved work, or
-explicitly unresolved Discovery.
+## Related
 
-## M0 acceptance mapping
-
-This document continues to satisfy the M0 baseline responsibilities assigned to Issue #1:
-
-- product boundary, vocabulary, and non-goals are persisted;
-- component responsibilities and dependency boundaries are persisted;
-- packaging and versioning constraints are persisted;
-- the boot-orchestration abstraction boundary is explicit;
-- the concrete production network-delivery mechanism is explicitly isolated rather than
-  hidden inside implementation.
-
-The broader M0 acceptance criteria remain owned by
-`docs/specifications/m0-architecture-baseline.md`.
-
-## Related work
-
-- Issue #1 — `[WP] Define product, runtime, and stack architecture baseline`.
-- Issue #8 — `[Spike] Validate WinPE boot mechanism`; reusable evidence is in
-  `docs/reference/winpe-boot-mechanism-spike.md`.
-- Issue #10 — `[Spike] Validate Secure Boot and hardened boot chain`; the resulting durable
-  decision is ADR-0010 and empirical evidence is in
-  `docs/reference/secure-boot-hardened-chain-spike.md`.
-
-## Remaining question
-
-No unresolved question remains **inside this Specification's owned scope**.
-
-The concrete production network-delivered WinPE mechanism remains intentionally outside
-this Specification as active Discovery and a future Integration Environment validation
-requirement.
-
-Status: Approved.
+- ADR-0001 — runtime topology and Worker isolation.
+- ADR-0002 — Server language.
+- ADR-0003 — Worker and Agent language.
+- ADR-0010 — trusted bootstrap / Secure Boot.
+- ADR-0013 — PostgreSQL persistence backend.
+- ADR-0015 — commercial entitlement boundary.
+- `docs/reference/winpe-boot-mechanism-spike.md` — WinPE boot evidence.
+- `docs/discovery/architecture-redesign.md` — unresolved production network-delivery
+  mechanism.
