@@ -65,8 +65,9 @@ A structurally separate internal Application control path
 creates one durable `Pending` Job with one or more ordered `Pending` JobSteps for an existing
 `Enrolled` Endpoint, atomically, through the `JobRepository` Port and its PostgreSQL Adapter.
 This path never runs through Agent Protocol message handling. It stops at durable creation:
-admission into `Running`, scheduling, resource leases, dispatch authorization, and Attempt
-creation are not yet implemented.
+final dispatch revalidation and Attempt creation are not yet implemented (admission into
+`Running` and preliminary JobStep eligibility are — see "Implemented Job admission and
+scheduling baseline" below).
 
 ## Implemented destructive JobStep intent authorization
 
@@ -78,9 +79,8 @@ atomically, through the `JobRepository` Port and its PostgreSQL Adapter. The cal
 only the Job/JobStep; the evidence itself always comes from the real `InventoryRepository` and
 `TargetRevalidationPort`, never from a caller-supplied value. The snapshot is single-assignment:
 once attached it is never refreshed from later inventory/target observations, and a JobStep
-remains `Pending` throughout. This path stops at the durable snapshot: admission into `Running`,
-scheduling, resource leases, final dispatch revalidation, and Attempt creation are not yet
-implemented.
+remains `Pending` throughout. This path stops at the durable snapshot: final dispatch
+revalidation and Attempt creation are not yet implemented.
 
 ## Implemented safe-dispatch evidence inputs
 
@@ -95,6 +95,28 @@ today, without any admission/scheduling/dispatch behavior built on them yet:
 - a `TargetRevalidationPort` Port, backed today only by a deterministic in-memory fixture
   (`bamep_server::adapters::target_revalidation_fixture`), exposes an opaque current
   target-disk fingerprint per Endpoint, independently of inventory-revision state.
+
+## Implemented Job admission and scheduling baseline
+
+A structurally separate internal Application control path
+(`bamep_server::application::JobSchedulingService`) implements two narrow M1 scheduling
+transitions, atomically, through the `JobRepository` Port and its PostgreSQL Adapter:
+
+- `admit`: a `Pending` Job becomes `Running` only after durably acquiring Job-scoped Endpoint
+  exclusivity, committed atomically with exactly one `JobStarted` domain event. Durable
+  exclusivity is represented by a PostgreSQL partial unique index over `Running`/`Cancelling`
+  Job states per Endpoint (`jobs_active_endpoint_exclusivity`) rather than a separate lease
+  table; a competing same-Endpoint admission attempt is rejected, never silently admitted;
+- `satisfy_current_step_preconditions`: the structurally current ordered `Pending` JobStep of
+  a `Running` Job may become `PreconditionsSatisfied`. A later/non-current step cannot skip an
+  earlier unfinished one. No JobStep becomes `Dispatching` here, and no Attempt exists.
+
+A separate in-process Runtime Service, `bamep_server::runtime::resource_arbiter::TechnicalResourceArbiter`,
+grants/releases deterministic transient Attempt-scoped technical-resource reservations
+(opaque `ReservationId` handles over generic named resource kinds and quantities). It is
+memory-only, never persisted, and not yet composed into any admission/dispatch path — that
+composition, along with final dispatch revalidation and Attempt creation, remains
+unimplemented.
 
 ## Maintenance rule
 

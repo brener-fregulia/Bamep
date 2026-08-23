@@ -13,7 +13,8 @@ CREATE TYPE domain_event_type AS ENUM (
     'EndpointPendingEnrollment',
     'EndpointEnrolled',
     'OperatorDecisionRecorded',
-    'InventoryRevisionRecorded'
+    'InventoryRevisionRecorded',
+    'JobStarted'
 );
 
 CREATE TYPE audit_actor_kind AS ENUM (
@@ -102,17 +103,23 @@ CREATE TABLE endpoint_credentials (
 );
 
 -- Domain-event envelope fields remain queryable columns; payload contains only
--- the event-type-specific remainder.
+-- the event-type-specific remainder. job_id is nullable because only
+-- Job-scoped events (currently JobStarted, Issue #32) carry it; every other
+-- event type currently implemented is Endpoint-scoped only. Its FK is added
+-- below, once the `jobs` table this table is declared ahead of exists —
+-- mirroring `endpoints_current_inventory_revision_fk` above.
 CREATE TABLE domain_events (
     event_id UUID PRIMARY KEY,
     event_type domain_event_type NOT NULL,
     event_version INTEGER NOT NULL DEFAULT 1,
     endpoint_id UUID NOT NULL REFERENCES endpoints (id),
+    job_id UUID,
     occurred_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
 );
 
 CREATE INDEX idx_domain_events_endpoint_id ON domain_events (endpoint_id);
+CREATE INDEX idx_domain_events_job_id ON domain_events (job_id);
 
 -- Durable safety-relevant audit records. Actor attribution is relational, and
 -- the actor label must be present exactly for operator actors.
@@ -193,6 +200,22 @@ CREATE TABLE jobs (
 );
 
 CREATE INDEX idx_jobs_endpoint_id ON jobs (endpoint_id);
+
+ALTER TABLE domain_events ADD CONSTRAINT domain_events_job_id_fk
+    FOREIGN KEY (job_id) REFERENCES jobs (id);
+
+-- Job-scoped Endpoint exclusivity (m0-job-lifecycle-and-scheduling.md
+-- "Resource leases": "at most one Running/Cancelling Job owns one Endpoint at
+-- a time"; Issue #32). The minimum durable representation already implied by
+-- Job state: a partial unique index over the active states, rather than a
+-- separate lease table. PostgreSQL itself enforces this atomically and
+-- race-safely — a concurrent admission attempt against the losing Job's row
+-- either waits behind the winner's uncommitted index entry and then fails
+-- with a unique-violation once the winner commits, or succeeds outright if
+-- the winner's transaction rolled back instead.
+CREATE UNIQUE INDEX jobs_active_endpoint_exclusivity
+    ON jobs (endpoint_id)
+    WHERE state IN ('Running', 'Cancelling');
 
 -- Durable JobStep: one ordered linear stage of its owning Job. step_order is
 -- the explicit stable linear position the accepted linear-workflow baseline

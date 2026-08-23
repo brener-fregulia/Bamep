@@ -20,8 +20,8 @@ use bamep_domain::presented_credential::{CredentialKind, CredentialLookupId};
 use bamep_domain::{
     BootContext, BootContextResolveError, DestructiveIntent, DestructiveIntentError,
     EndpointAggregate, EndpointId, InvalidIdentityTransition, InventoryRevision, InventorySnapshot,
-    Job, JobId, JobStep, JobStepId, RedeemOutcome, TargetFingerprint, TransitionOutcome,
-    TrustedBootstrapOutcome,
+    Job, JobAdmissionError, JobAdmissionOutcome, JobId, JobStep, JobStepEligibilityError,
+    JobStepId, RedeemOutcome, TargetFingerprint, TransitionOutcome, TrustedBootstrapOutcome,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -142,11 +142,67 @@ pub enum AuthorizeDestructiveIntentError {
     Repository(#[from] RepositoryError),
 }
 
+/// A pure decision over one freshly locked [`Job`]'s current state, producing
+/// the [`JobAdmissionOutcome`] to persist or the reason admission is illegal
+/// right now (`m0-job-lifecycle-and-scheduling.md` "Job lifecycle"; Issue
+/// #32). Mirrors [`AuthorizeDestructiveIntentDecision`]: the Adapter locks
+/// and reads current state, the Domain decides, the Adapter persists the
+/// result atomically in the same transaction. This closure never itself
+/// verifies or acquires Job-scoped Endpoint exclusivity — the Adapter's
+/// active-Job uniqueness constraint is the durable guarantee for that.
+pub type AdmitJobDecision =
+    Box<dyn FnOnce(&Job) -> Result<JobAdmissionOutcome, JobAdmissionError> + Send>;
+
+/// Errors from [`JobRepository::admit_job`].
+#[derive(Debug, thiserror::Error)]
+pub enum AdmitJobError {
+    #[error("job {0:?} not found")]
+    JobNotFound(JobId),
+    #[error("job {0:?} is not eligible for admission")]
+    NotEligible(JobId),
+    /// The target Endpoint already has another `Running`/`Cancelling` Job —
+    /// the losing side of a same-Endpoint admission race
+    /// (`m0-job-lifecycle-and-scheduling.md` "Resource leases": "a competing
+    /// Job for that Endpoint remains `Pending`"). Not a repository failure:
+    /// the caller's Job remains durably `Pending`, exactly as before the
+    /// attempt.
+    #[error("endpoint already has an active job")]
+    EndpointNotAvailable,
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
+/// A pure decision over one freshly locked [`Job`] (including its current
+/// ordered `JobStep`s), producing the advanced [`JobStep`] to persist or the
+/// reason `step_id` is not currently eligible
+/// (`m0-job-lifecycle-and-scheduling.md` "JobStep lifecycle"; Issue #32). The
+/// closure captures `step_id` itself, mirroring
+/// [`AuthorizeDestructiveIntentDecision`]/[`AdmitJobDecision`].
+pub type SatisfyStepPreconditionsDecision =
+    Box<dyn FnOnce(&Job) -> Result<JobStep, JobStepEligibilityError> + Send>;
+
+/// Errors from [`JobRepository::satisfy_current_step_preconditions`].
+#[derive(Debug, thiserror::Error)]
+pub enum SatisfyStepPreconditionsError {
+    #[error("job {0:?} not found")]
+    JobNotFound(JobId),
+    #[error("job {0:?} is not Running")]
+    JobNotRunning(JobId),
+    #[error("job step {0:?} not found in job {1:?}")]
+    JobStepNotFound(JobStepId, JobId),
+    #[error("job step {0:?} is not the current eligible step")]
+    NotCurrent(JobStepId),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
 /// Durable Job/JobStep workflow persistence
 /// (`m0-job-lifecycle-and-scheduling.md` "Domain model"). Issue #24
 /// established durable workflow creation; Issue #31 extended this Port with
-/// destructive-intent authorization. Later scheduling/dispatch/reconciliation
-/// Work Packages extend this Port further as they add that persistence.
+/// destructive-intent authorization; Issue #32 extended it further with Job
+/// admission and preliminary JobStep eligibility. Later scheduling/dispatch/
+/// reconciliation Work Packages extend this Port further as they add that
+/// persistence.
 #[async_trait]
 pub trait JobRepository: Send + Sync {
     /// Verifies `job.endpoint_id` is an existing `Enrolled` Endpoint, then
@@ -176,6 +232,35 @@ pub trait JobRepository: Send + Sync {
         step_id: JobStepId,
         decide: AuthorizeDestructiveIntentDecision,
     ) -> Result<DestructiveIntent, AuthorizeDestructiveIntentError>;
+
+    /// Locks exactly the `Job` identified by `job_id`, invokes `decide` with
+    /// its current freshly-read state, and — only on `Ok` — atomically
+    /// persists `Pending -> Running` and the required `JobStarted` domain
+    /// event in the same transaction (Issue #32 "Job admission"). Job-scoped
+    /// Endpoint exclusivity is enforced by the Adapter's active-Job
+    /// uniqueness constraint at this same commit: a concurrent admission
+    /// attempt already `Running`/`Cancelling` against the same Endpoint fails
+    /// with [`AdmitJobError::EndpointNotAvailable`] rather than persisting a
+    /// second active Job, and no transaction ever commits `Running` without
+    /// its `JobStarted` event or vice versa.
+    async fn admit_job(
+        &self,
+        job_id: JobId,
+        decide: AdmitJobDecision,
+    ) -> Result<Job, AdmitJobError>;
+
+    /// Locks the `Job` identified by `job_id` and its current ordered
+    /// `JobStep`s, invokes `decide` with that freshly-read aggregate, and —
+    /// only on `Ok` — atomically persists the returned `JobStep`'s
+    /// `Pending -> PreconditionsSatisfied` transition (Issue #32 "Current
+    /// ordered JobStep preliminary eligibility"). No domain event is
+    /// required for this transition under the current persistence contract.
+    async fn satisfy_current_step_preconditions(
+        &self,
+        job_id: JobId,
+        step_id: JobStepId,
+        decide: SatisfyStepPreconditionsDecision,
+    ) -> Result<JobStep, SatisfyStepPreconditionsError>;
 }
 
 /// Persistence for newly issued `BootContext`s (ADR-0014 point 11

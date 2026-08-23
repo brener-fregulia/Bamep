@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::endpoint::EndpointId;
+use crate::job::JobId;
 
 /// Actor attribution for an operator decision
 /// (`m0-persistence-observability-and-domain-events.md` "Auditability").
@@ -41,6 +42,17 @@ pub enum DomainEvent {
         inventory_revision_id: crate::InventoryRevisionId,
         occurred_at: DateTime<Utc>,
     },
+    /// Emitted exactly once when a `Pending` Job is admitted into `Running`
+    /// (`m0-persistence-observability-and-domain-events.md` "Domain events":
+    /// "`JobStarted` | Job enters `Running`"; Issue #32). Carries both
+    /// `job_id` and `endpoint_id` — the minimum correlation the current event
+    /// contract requires for this transition.
+    JobStarted {
+        event_id: Uuid,
+        job_id: JobId,
+        endpoint_id: EndpointId,
+        occurred_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent {
@@ -49,7 +61,8 @@ impl DomainEvent {
             DomainEvent::EndpointPendingEnrollment { event_id, .. }
             | DomainEvent::EndpointEnrolled { event_id, .. }
             | DomainEvent::OperatorDecisionRecorded { event_id, .. }
-            | DomainEvent::InventoryRevisionRecorded { event_id, .. } => *event_id,
+            | DomainEvent::InventoryRevisionRecorded { event_id, .. }
+            | DomainEvent::JobStarted { event_id, .. } => *event_id,
         }
     }
 
@@ -58,7 +71,8 @@ impl DomainEvent {
             DomainEvent::EndpointPendingEnrollment { endpoint_id, .. }
             | DomainEvent::EndpointEnrolled { endpoint_id, .. }
             | DomainEvent::OperatorDecisionRecorded { endpoint_id, .. }
-            | DomainEvent::InventoryRevisionRecorded { endpoint_id, .. } => *endpoint_id,
+            | DomainEvent::InventoryRevisionRecorded { endpoint_id, .. }
+            | DomainEvent::JobStarted { endpoint_id, .. } => *endpoint_id,
         }
     }
 
@@ -67,7 +81,8 @@ impl DomainEvent {
             DomainEvent::EndpointPendingEnrollment { occurred_at, .. }
             | DomainEvent::EndpointEnrolled { occurred_at, .. }
             | DomainEvent::OperatorDecisionRecorded { occurred_at, .. }
-            | DomainEvent::InventoryRevisionRecorded { occurred_at, .. } => *occurred_at,
+            | DomainEvent::InventoryRevisionRecorded { occurred_at, .. }
+            | DomainEvent::JobStarted { occurred_at, .. } => *occurred_at,
         }
     }
 
@@ -77,6 +92,7 @@ impl DomainEvent {
             DomainEvent::EndpointEnrolled { .. } => "EndpointEnrolled",
             DomainEvent::OperatorDecisionRecorded { .. } => "OperatorDecisionRecorded",
             DomainEvent::InventoryRevisionRecorded { .. } => "InventoryRevisionRecorded",
+            DomainEvent::JobStarted { .. } => "JobStarted",
         }
     }
 }

@@ -9,15 +9,16 @@
 
 use async_trait::async_trait;
 use bamep_domain::{
-    DestructiveIntent, EndpointId, InventoryRevisionId, Job, JobId, JobState, JobStep, JobStepId,
-    JobStepState, TargetFingerprint,
+    DestructiveIntent, EndpointId, InventoryRevisionId, Job, JobAdmissionError, JobId, JobState,
+    JobStep, JobStepEligibilityError, JobStepId, JobStepState, TargetFingerprint,
 };
 use sqlx::{PgPool, Row};
 
-use super::shared::{to_backend_err, PgIdentityState};
+use super::shared::{event_payload, to_backend_err, PgDomainEventType, PgIdentityState};
 use crate::ports::{
-    AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError, CreateWorkflowError,
-    JobRepository, RepositoryError,
+    AdmitJobDecision, AdmitJobError, AuthorizeDestructiveIntentDecision,
+    AuthorizeDestructiveIntentError, CreateWorkflowError, JobRepository, RepositoryError,
+    SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError,
 };
 
 /// Adapter-local representation of the `job_state` PostgreSQL ENUM
@@ -251,6 +252,178 @@ impl JobRepository for PostgresJobRepository {
         tx.commit().await.map_err(to_backend_err)?;
         Ok(intent)
     }
+
+    async fn admit_job(
+        &self,
+        job_id: JobId,
+        decide: AdmitJobDecision,
+    ) -> Result<Job, AdmitJobError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        let job_row = sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+        let Some(job_row) = job_row else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(AdmitJobError::JobNotFound(job_id));
+        };
+        let endpoint_id: uuid::Uuid = job_row.try_get("endpoint_id").map_err(to_backend_err)?;
+        let state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
+
+        let steps = fetch_job_steps(&mut tx, job_id, false)
+            .await
+            .map_err(AdmitJobError::Repository)?;
+
+        let job = Job {
+            id: job_id,
+            endpoint_id: EndpointId(endpoint_id),
+            state: state.into(),
+            steps,
+        };
+
+        let outcome = match decide(&job) {
+            Ok(outcome) => outcome,
+            Err(JobAdmissionError::NotPending) => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Err(AdmitJobError::NotEligible(job_id));
+            }
+        };
+
+        // The `WHERE state = 'Pending'` guard is defensive: holding this
+        // exact job row's lock since the SELECT above already guarantees no
+        // concurrent writer could have changed it. A same-Endpoint admission
+        // race is decided below by the active-Job uniqueness constraint
+        // instead, since that race is between two *different* job rows.
+        let update_result =
+            sqlx::query("UPDATE jobs SET state = $1 WHERE id = $2 AND state = 'Pending'")
+                .bind(PgJobState::from(outcome.job.state))
+                .bind(job_id.0)
+                .execute(&mut *tx)
+                .await;
+
+        match update_result {
+            Ok(result) if result.rows_affected() == 1 => {}
+            Ok(_) => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Err(AdmitJobError::NotEligible(job_id));
+            }
+            Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Err(AdmitJobError::EndpointNotAvailable);
+            }
+            Err(e) => return Err(AdmitJobError::Repository(to_backend_err(e))),
+        }
+
+        let event = &outcome.event;
+        sqlx::query(
+            "INSERT INTO domain_events \
+             (event_id, event_type, event_version, endpoint_id, job_id, occurred_at, payload) \
+             VALUES ($1, $2, 1, $3, $4, $5, $6)",
+        )
+        .bind(event.event_id())
+        .bind(PgDomainEventType::from(event))
+        .bind(event.endpoint_id().0)
+        .bind(job_id.0)
+        .bind(event.occurred_at())
+        .bind(event_payload(event))
+        .execute(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+
+        tx.commit().await.map_err(to_backend_err)?;
+        Ok(outcome.job)
+    }
+
+    async fn satisfy_current_step_preconditions(
+        &self,
+        job_id: JobId,
+        step_id: JobStepId,
+        decide: SatisfyStepPreconditionsDecision,
+    ) -> Result<JobStep, SatisfyStepPreconditionsError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        let job_row = sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+        let Some(job_row) = job_row else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(SatisfyStepPreconditionsError::JobNotFound(job_id));
+        };
+        let endpoint_id: uuid::Uuid = job_row.try_get("endpoint_id").map_err(to_backend_err)?;
+        let state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
+
+        let steps = fetch_job_steps(&mut tx, job_id, true)
+            .await
+            .map_err(SatisfyStepPreconditionsError::Repository)?;
+
+        let job = Job {
+            id: job_id,
+            endpoint_id: EndpointId(endpoint_id),
+            state: state.into(),
+            steps,
+        };
+
+        let updated_step = match decide(&job) {
+            Ok(step) => step,
+            Err(JobStepEligibilityError::JobNotRunning) => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Err(SatisfyStepPreconditionsError::JobNotRunning(job_id));
+            }
+            Err(JobStepEligibilityError::StepNotFound) => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Err(SatisfyStepPreconditionsError::JobStepNotFound(
+                    step_id, job_id,
+                ));
+            }
+            Err(JobStepEligibilityError::NotCurrent) => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Err(SatisfyStepPreconditionsError::NotCurrent(step_id));
+            }
+        };
+
+        sqlx::query("UPDATE job_steps SET state = $1 WHERE id = $2")
+            .bind(PgJobStepState::from(updated_step.state))
+            .bind(step_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+
+        tx.commit().await.map_err(to_backend_err)?;
+        Ok(updated_step)
+    }
+}
+
+/// Reads every `JobStep` for `job_id`, ordered, within `tx`. `lock` rows
+/// `FOR UPDATE` when the caller is about to decide and persist a step
+/// transition (`satisfy_current_step_preconditions`); admission does not
+/// mutate `job_steps` at all, so it reads them unlocked.
+async fn fetch_job_steps(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job_id: JobId,
+    lock: bool,
+) -> Result<Vec<JobStep>, RepositoryError> {
+    const UNLOCKED: &str = "SELECT id, job_id, step_order, state, \
+         authorized_inventory_revision_id, authorized_target_fingerprint \
+         FROM job_steps WHERE job_id = $1 ORDER BY step_order ASC";
+    const LOCKED: &str = "SELECT id, job_id, step_order, state, \
+         authorized_inventory_revision_id, authorized_target_fingerprint \
+         FROM job_steps WHERE job_id = $1 ORDER BY step_order ASC FOR UPDATE";
+
+    let step_rows = sqlx::query(if lock { LOCKED } else { UNLOCKED })
+        .bind(job_id.0)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(to_backend_err)?;
+
+    let mut steps = Vec::with_capacity(step_rows.len());
+    for row in &step_rows {
+        steps.push(row_to_job_step(row)?);
+    }
+    Ok(steps)
 }
 
 fn row_to_job_step(row: &sqlx::postgres::PgRow) -> Result<JobStep, RepositoryError> {

@@ -95,6 +95,7 @@ pub(super) enum PgDomainEventType {
     EndpointEnrolled,
     OperatorDecisionRecorded,
     InventoryRevisionRecorded,
+    JobStarted,
 }
 
 impl From<&DomainEvent> for PgDomainEventType {
@@ -110,6 +111,7 @@ impl From<&DomainEvent> for PgDomainEventType {
             DomainEvent::InventoryRevisionRecorded { .. } => {
                 PgDomainEventType::InventoryRevisionRecorded
             }
+            DomainEvent::JobStarted { .. } => PgDomainEventType::JobStarted,
         }
     }
 }
@@ -215,6 +217,7 @@ pub(super) fn event_payload(event: &DomainEvent) -> serde_json::Value {
             inventory_revision_id,
             ..
         } => serde_json::json!({"inventory_revision_id": inventory_revision_id.0}),
+        DomainEvent::JobStarted { .. } => serde_json::json!({}),
     }
 }
 

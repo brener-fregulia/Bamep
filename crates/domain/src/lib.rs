@@ -34,8 +34,10 @@ pub use inventory::{
     InventorySnapshot,
 };
 pub use job::{
-    authorize_destructive_intent, create_workflow, DestructiveIntent, DestructiveIntentError,
-    EmptyWorkflow, Job, JobId, JobState, JobStep, JobStepId, JobStepState,
+    admit_job, authorize_destructive_intent, create_workflow, satisfy_preliminary_preconditions,
+    DestructiveIntent, DestructiveIntentError, EmptyWorkflow, Job, JobAdmissionError,
+    JobAdmissionOutcome, JobId, JobState, JobStep, JobStepEligibilityError, JobStepId,
+    JobStepState,
 };
 pub use target_fingerprint::TargetFingerprint;
 pub use transitions::{RedeemOutcome, TrustedBootstrapOutcome};

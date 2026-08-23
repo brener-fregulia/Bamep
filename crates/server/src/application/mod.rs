@@ -21,10 +21,11 @@ use bamep_trusted_bootstrap::{AcceptedSiteKeys, BootstrapAssertion, ServerCertFi
 use chrono::{DateTime, Duration, Utc};
 
 use crate::ports::{
-    AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError, BootContextRepository,
-    CreateWorkflowError, CredentialRedemptionRepository, EndpointRepository, EndpointUpdateError,
-    InventoryRepository, JobRepository, RedemptionDecision, RedemptionTarget, RepositoryError,
-    TargetRevalidationPort,
+    AdmitJobDecision, AdmitJobError, AuthorizeDestructiveIntentDecision,
+    AuthorizeDestructiveIntentError, BootContextRepository, CreateWorkflowError,
+    CredentialRedemptionRepository, EndpointRepository, EndpointUpdateError, InventoryRepository,
+    JobRepository, RedemptionDecision, RedemptionTarget, RepositoryError,
+    SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError, TargetRevalidationPort,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -35,12 +36,24 @@ pub enum ApplicationError {
     EndpointNotEnrolled(EndpointId),
     #[error("job {0:?} not found")]
     JobNotFound(JobId),
+    #[error("job {0:?} is not eligible for admission")]
+    JobNotEligibleForAdmission(JobId),
+    #[error("job {0:?} is not Running")]
+    JobNotRunning(JobId),
+    /// The target Endpoint already has another active Job — the losing side
+    /// of a same-Endpoint admission race
+    /// (`m0-job-lifecycle-and-scheduling.md` "Resource leases"). The caller's
+    /// Job remains durably `Pending`.
+    #[error("endpoint already has an active job")]
+    EndpointNotAvailable,
     #[error("job step {0:?} not found in job {1:?}")]
     JobStepNotFound(JobStepId, JobId),
     #[error("job step {0:?} is not eligible for destructive intent authorization")]
     JobStepNotEligible(JobStepId),
     #[error("job step {0:?} already has a destructive intent")]
     JobStepAlreadyAuthorized(JobStepId),
+    #[error("job step {0:?} is not the current eligible step")]
+    JobStepNotCurrent(JobStepId),
     #[error("endpoint {0:?} has no current durable inventory revision")]
     NoCurrentInventory(EndpointId),
     #[error("endpoint {0:?} has no current target fingerprint")]
@@ -51,6 +64,33 @@ pub enum ApplicationError {
     EmptyWorkflow(#[from] EmptyWorkflow),
     #[error(transparent)]
     Repository(#[from] RepositoryError),
+}
+
+impl From<AdmitJobError> for ApplicationError {
+    fn from(err: AdmitJobError) -> Self {
+        match err {
+            AdmitJobError::JobNotFound(id) => ApplicationError::JobNotFound(id),
+            AdmitJobError::NotEligible(id) => ApplicationError::JobNotEligibleForAdmission(id),
+            AdmitJobError::EndpointNotAvailable => ApplicationError::EndpointNotAvailable,
+            AdmitJobError::Repository(e) => ApplicationError::Repository(e),
+        }
+    }
+}
+
+impl From<SatisfyStepPreconditionsError> for ApplicationError {
+    fn from(err: SatisfyStepPreconditionsError) -> Self {
+        match err {
+            SatisfyStepPreconditionsError::JobNotFound(id) => ApplicationError::JobNotFound(id),
+            SatisfyStepPreconditionsError::JobNotRunning(id) => ApplicationError::JobNotRunning(id),
+            SatisfyStepPreconditionsError::JobStepNotFound(step_id, job_id) => {
+                ApplicationError::JobStepNotFound(step_id, job_id)
+            }
+            SatisfyStepPreconditionsError::NotCurrent(step_id) => {
+                ApplicationError::JobStepNotCurrent(step_id)
+            }
+            SatisfyStepPreconditionsError::Repository(e) => ApplicationError::Repository(e),
+        }
+    }
 }
 
 impl From<EndpointUpdateError> for ApplicationError {
@@ -204,6 +244,67 @@ impl<J: JobRepository> JobService<J> {
         let job = bamep_domain::create_workflow(endpoint_id, step_count)?;
         self.repo.create_workflow(&job).await?;
         Ok(job)
+    }
+}
+
+/// The internal Application/harness scheduling control path (Issue #32 "Job
+/// admission and durable Endpoint exclusivity"; "Current ordered JobStep
+/// preliminary eligibility"). Exposes exactly the two narrow M1 scheduling
+/// operations #25 will later compose: admitting a `Pending` Job into
+/// `Running`, and advancing the current eligible `JobStep` to
+/// `PreconditionsSatisfied`. This service does not evaluate the destructive
+/// gate, acquire a technical-resource reservation, or create an Attempt —
+/// those belong to #25.
+pub struct JobSchedulingService<J: JobRepository> {
+    repo: Arc<J>,
+    clock: Arc<dyn Clock>,
+}
+
+impl<J: JobRepository> JobSchedulingService<J> {
+    /// Uses [`SystemClock`] for the `JobStarted` event timestamp. Use
+    /// [`with_clock`](Self::with_clock) to inject a deterministic clock for
+    /// tests.
+    pub fn new(repo: Arc<J>) -> Self {
+        Self::with_clock(repo, Arc::new(SystemClock))
+    }
+
+    pub fn with_clock(repo: Arc<J>, clock: Arc<dyn Clock>) -> Self {
+        Self { repo, clock }
+    }
+
+    /// Attempts to admit `job_id` into `Running`, acquiring its durable
+    /// Job-scoped Endpoint exclusivity atomically with the required
+    /// `JobStarted` domain event (`bamep_domain::admit_job`;
+    /// `crate::ports::JobRepository::admit_job`). A competing Job for the
+    /// same Endpoint remains `Pending` —
+    /// [`ApplicationError::EndpointNotAvailable`] — never a partial
+    /// `Running` state and never a second `JobStarted`.
+    pub async fn admit(&self, job_id: JobId) -> Result<Job, ApplicationError> {
+        let clock = Arc::clone(&self.clock);
+        let decide: AdmitJobDecision =
+            Box::new(move |job| bamep_domain::admit_job(job, clock.now()));
+        self.repo
+            .admit_job(job_id, decide)
+            .await
+            .map_err(ApplicationError::from)
+    }
+
+    /// Advances `step_id`'s current ordered preliminary eligibility to
+    /// `PreconditionsSatisfied` (`bamep_domain::satisfy_preliminary_preconditions`;
+    /// `crate::ports::JobRepository::satisfy_current_step_preconditions`). A
+    /// later/non-current step cannot skip ahead, and the owning Job must
+    /// already be `Running`.
+    pub async fn satisfy_current_step_preconditions(
+        &self,
+        job_id: JobId,
+        step_id: JobStepId,
+    ) -> Result<bamep_domain::JobStep, ApplicationError> {
+        let decide: SatisfyStepPreconditionsDecision =
+            Box::new(move |job| bamep_domain::satisfy_preliminary_preconditions(job, step_id));
+        self.repo
+            .satisfy_current_step_preconditions(job_id, step_id, decide)
+            .await
+            .map_err(ApplicationError::from)
     }
 }
 
@@ -841,6 +942,23 @@ mod tests {
                 }
                 job.steps[index].destructive_intent = Some(intent.clone());
                 Ok(intent)
+            }
+
+            async fn admit_job(
+                &self,
+                _job_id: JobId,
+                _decide: crate::ports::AdmitJobDecision,
+            ) -> Result<Job, crate::ports::AdmitJobError> {
+                unimplemented!("DestructiveIntentService never admits a Job")
+            }
+
+            async fn satisfy_current_step_preconditions(
+                &self,
+                _job_id: JobId,
+                _step_id: JobStepId,
+                _decide: crate::ports::SatisfyStepPreconditionsDecision,
+            ) -> Result<JobStep, crate::ports::SatisfyStepPreconditionsError> {
+                unimplemented!("DestructiveIntentService never advances a JobStep")
             }
         }
 

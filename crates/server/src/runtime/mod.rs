@@ -5,3 +5,4 @@
 //! orchestration).
 
 pub mod presence;
+pub mod resource_arbiter;

@@ -6,16 +6,22 @@
 //! `Job -> Endpoint`/`JobStep -> Job` correlations, explicit linear order, and
 //! initial `Pending` states (Issue #24) — plus the destructive-operation
 //! authorization snapshot attached to one eligible JobStep before dispatch
-//! (Issue #31: [`DestructiveIntent`]). The complete lifecycle vocabularies
-//! already reflect the Specification's later states so later scheduling/
-//! dispatch Work Packages do not need a Domain type change. This module
-//! performs no I/O, [`create_workflow`] constructs no state beyond `Pending`,
-//! and no concrete Agent action type/version/parameters or Attempt identity
-//! is represented here.
+//! (Issue #31: [`DestructiveIntent`]), Job admission into `Running`
+//! ([`admit_job`]), and the preliminary current-JobStep eligibility
+//! transition ([`satisfy_preliminary_preconditions`]) (Issue #32). The
+//! complete lifecycle vocabularies already reflect the Specification's later
+//! states so later scheduling/dispatch Work Packages do not need a Domain
+//! type change. This module performs no I/O, [`create_workflow`] constructs
+//! no state beyond `Pending`, and no concrete Agent action type/version/
+//! parameters or Attempt identity is represented here. Neither [`admit_job`]
+//! nor [`satisfy_preliminary_preconditions`] creates an Attempt or evaluates
+//! the destructive-operation gate.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::events::DomainEvent;
 use crate::inventory::InventoryRevisionId;
 use crate::target_fingerprint::TargetFingerprint;
 use crate::EndpointId;
@@ -212,6 +218,108 @@ pub fn authorize_destructive_intent(
     })
 }
 
+/// Outcome of successfully admitting a `Pending` Job into `Running`
+/// (`m0-job-lifecycle-and-scheduling.md` "Job lifecycle": `Pending -> Running`
+/// "acquire the Job-scoped Endpoint-exclusivity lease"; Issue #32 "Job
+/// admission and durable Endpoint exclusivity"). Durable Endpoint exclusivity
+/// itself is represented by the persisted `Running` state under the
+/// Adapter's active-Job uniqueness constraint, not by anything this pure
+/// function does — [`admit_job`] only decides legality and produces the
+/// exactly-one required [`DomainEvent::JobStarted`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobAdmissionOutcome {
+    pub job: Job,
+    pub event: DomainEvent,
+}
+
+/// Rejection from [`admit_job`]. Never represents a partial/half-admitted
+/// Job — a rejected call leaves the Job exactly as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum JobAdmissionError {
+    #[error("job is not eligible for admission")]
+    NotPending,
+}
+
+/// Decides `Pending -> Running` for `job` at `now`
+/// (`m0-job-lifecycle-and-scheduling.md` "Job lifecycle"). Only a `Pending`
+/// Job may be admitted — a repeated admission attempt against an
+/// already-`Running` (or any other non-`Pending`) Job is rejected rather than
+/// silently re-emitting `JobStarted`. Pure: this function neither verifies
+/// nor acquires Job-scoped Endpoint exclusivity itself — that durable
+/// guarantee belongs to the Adapter's active-Job uniqueness constraint,
+/// enforced when the returned [`JobAdmissionOutcome`] is persisted.
+pub fn admit_job(job: &Job, now: DateTime<Utc>) -> Result<JobAdmissionOutcome, JobAdmissionError> {
+    if job.state != JobState::Pending {
+        return Err(JobAdmissionError::NotPending);
+    }
+    let admitted = Job {
+        state: JobState::Running,
+        ..job.clone()
+    };
+    let event = DomainEvent::JobStarted {
+        event_id: Uuid::new_v4(),
+        job_id: job.id,
+        endpoint_id: job.endpoint_id,
+        occurred_at: now,
+    };
+    Ok(JobAdmissionOutcome {
+        job: admitted,
+        event,
+    })
+}
+
+/// Rejection from [`satisfy_preliminary_preconditions`]. Never represents a
+/// state change — a rejected call leaves the JobStep exactly as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum JobStepEligibilityError {
+    #[error("job is not Running")]
+    JobNotRunning,
+    #[error("job step not found in this job")]
+    StepNotFound,
+    #[error("job step is not the current eligible step")]
+    NotCurrent,
+}
+
+/// Decides the narrow preliminary eligibility transition `Pending ->
+/// PreconditionsSatisfied` for `step_id` under `job`
+/// (`m0-job-lifecycle-and-scheduling.md` "JobStep lifecycle": "preliminary
+/// JobStep-specific eligibility passes; this does not establish workflow
+/// authorization or the destructive gate"; Issue #32 "Current ordered
+/// JobStep preliminary eligibility"). Eligible means: `job.state` is
+/// `Running`, `step_id` identifies a `Pending` JobStep belonging to `job`,
+/// and every earlier ordered JobStep (`order` less than the candidate's) is
+/// already `Succeeded` — the structural, deterministic linear-workflow
+/// "current step" rule. A later step can never skip an earlier unfinished
+/// one. This function does not evaluate the seven destructive-operation
+/// preconditions, does not create an Attempt, and never produces
+/// `Dispatching`.
+pub fn satisfy_preliminary_preconditions(
+    job: &Job,
+    step_id: JobStepId,
+) -> Result<JobStep, JobStepEligibilityError> {
+    if job.state != JobState::Running {
+        return Err(JobStepEligibilityError::JobNotRunning);
+    }
+    let Some(candidate) = job.steps.iter().find(|step| step.id == step_id) else {
+        return Err(JobStepEligibilityError::StepNotFound);
+    };
+    if candidate.state != JobStepState::Pending {
+        return Err(JobStepEligibilityError::NotCurrent);
+    }
+    let earlier_steps_all_succeeded = job
+        .steps
+        .iter()
+        .filter(|step| step.order < candidate.order)
+        .all(|step| step.state == JobStepState::Succeeded);
+    if !earlier_steps_all_succeeded {
+        return Err(JobStepEligibilityError::NotCurrent);
+    }
+    Ok(JobStep {
+        state: JobStepState::PreconditionsSatisfied,
+        ..candidate.clone()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +458,121 @@ mod tests {
                 authorized_target_fingerprint: first_fingerprint,
             }),
             "the original snapshot must remain exactly as first authorized"
+        );
+    }
+
+    fn now() -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    #[test]
+    fn admitting_a_pending_job_produces_running_state_and_one_job_started_event() {
+        let job = create_workflow(EndpointId::new(), 1).unwrap();
+        let outcome = admit_job(&job, now()).unwrap();
+
+        assert_eq!(outcome.job.state, JobState::Running);
+        assert_eq!(outcome.job.id, job.id);
+        assert_eq!(outcome.job.endpoint_id, job.endpoint_id);
+        match outcome.event {
+            DomainEvent::JobStarted {
+                job_id,
+                endpoint_id,
+                ..
+            } => {
+                assert_eq!(job_id, job.id);
+                assert_eq!(endpoint_id, job.endpoint_id);
+            }
+            other => panic!("expected JobStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admitting_an_already_running_job_is_rejected() {
+        let job = create_workflow(EndpointId::new(), 1).unwrap();
+        let running = admit_job(&job, now()).unwrap().job;
+
+        assert_eq!(
+            admit_job(&running, now()),
+            Err(JobAdmissionError::NotPending)
+        );
+    }
+
+    #[test]
+    fn admitting_a_terminal_job_is_rejected() {
+        let mut job = create_workflow(EndpointId::new(), 1).unwrap();
+        job.state = JobState::Succeeded;
+
+        assert_eq!(admit_job(&job, now()), Err(JobAdmissionError::NotPending));
+    }
+
+    fn running_job(step_count: usize) -> Job {
+        let job = create_workflow(EndpointId::new(), step_count).unwrap();
+        admit_job(&job, now()).unwrap().job
+    }
+
+    #[test]
+    fn the_first_pending_step_of_a_running_job_is_eligible() {
+        let job = running_job(1);
+        let step_id = job.steps[0].id;
+
+        let advanced = satisfy_preliminary_preconditions(&job, step_id).unwrap();
+
+        assert_eq!(advanced.state, JobStepState::PreconditionsSatisfied);
+        assert_eq!(advanced.id, step_id);
+    }
+
+    #[test]
+    fn a_later_pending_step_cannot_skip_an_earlier_unfinished_step() {
+        let job = running_job(2);
+        let second_step_id = job.steps[1].id;
+
+        assert_eq!(
+            satisfy_preliminary_preconditions(&job, second_step_id),
+            Err(JobStepEligibilityError::NotCurrent)
+        );
+    }
+
+    #[test]
+    fn the_next_step_becomes_eligible_once_the_prior_step_is_succeeded() {
+        let mut job = running_job(2);
+        job.steps[0].state = JobStepState::Succeeded;
+        let second_step_id = job.steps[1].id;
+
+        let advanced = satisfy_preliminary_preconditions(&job, second_step_id).unwrap();
+
+        assert_eq!(advanced.state, JobStepState::PreconditionsSatisfied);
+    }
+
+    #[test]
+    fn a_non_running_job_cannot_advance_any_step() {
+        let job = create_workflow(EndpointId::new(), 1).unwrap();
+        let step_id = job.steps[0].id;
+
+        assert_eq!(
+            satisfy_preliminary_preconditions(&job, step_id),
+            Err(JobStepEligibilityError::JobNotRunning)
+        );
+    }
+
+    #[test]
+    fn an_unknown_step_id_is_rejected() {
+        let job = running_job(1);
+
+        assert_eq!(
+            satisfy_preliminary_preconditions(&job, JobStepId::new()),
+            Err(JobStepEligibilityError::StepNotFound)
+        );
+    }
+
+    #[test]
+    fn a_non_pending_step_is_not_current() {
+        let mut job = running_job(1);
+        job.steps[0].state = JobStepState::PreconditionsSatisfied;
+        let step_id = job.steps[0].id;
+
+        assert_eq!(
+            satisfy_preliminary_preconditions(&job, step_id),
+            Err(JobStepEligibilityError::NotCurrent)
         );
     }
 }
