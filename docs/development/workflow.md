@@ -2,98 +2,284 @@
 
 ## Purpose
 
-This document defines how approved Bamep work is executed.
+This document defines how **approved Bamep work is executed** from `Ready` through owner
+acceptance.
 
-Related responsibilities:
+It does not define how work is discovered, specified, classified, or decomposed, and it
+does not define the testing strategy.
 
-* `docs/development/sdd.md`: how work is discovered, specified, approved, and classified;
-* `docs/development/testing.md`: testing and validation policy;
-* `AGENTS.md`: mandatory repository, safety, Git, and publication rules.
+Related authorities:
 
-The workflow should preserve owner control, traceability, safety, and continuity without unnecessary ceremony.
+- `docs/development/sdd.md` — Discovery, Specification, approval, decomposition, and the
+  boundary for work becoming `Ready`;
+- `docs/development/testing.md` — test layers, validation selection, isolation, Simulator,
+  and Integration Environment policy;
+- `docs/development/documentation-policy.md` — where durable information belongs;
+- `docs/decisions/README.md` — ADR lifecycle;
+- `AGENTS.md` — mandatory repository, safety, Git, and publication guardrails.
 
-## Principles
-
-* Keep `main` stable.
-* Execute one approved Work Package, Technical Spike, or reduced-SDD responsibility at a time.
-* Normal work may be performed directly on `main`; use a branch only when it provides actual value.
-* A Work Package may be executed through multiple checkpoints across multiple sessions.
-* Do not silently expand approved scope.
-* Work should be resumable from repository and GitHub context, not conversation history.
-* Relevant automated validation is part of execution completeness.
-* Owner manual validation is the acceptance gate before `Done`.
-* Significant architectural decisions must follow the ADR process.
-* Git and publication remain owner-controlled as defined in `AGENTS.md`.
+The workflow exists to execute approved decisions reliably without hidden scope or
+architecture changes.
 
 ## Operational flow
 
-Normal approved work follows:
+Approved work follows:
 
 ```text
-Approved work
-      ↓
 Ready
-      ↓
+  ↓
 In Progress
-      ↓
+  ↓
 Validation
-      ↓
+  ↓
 Done
 ```
 
-During `In Progress`, execution may consist of multiple small checkpoints (see `docs/development/sdd.md`).
-
-Execution may include implementation, documentation, architecture work, Technical Spikes, simulator work, or integration preparation.
-
-For the current owner-driven, sequential Bamep development model, this flow normally runs directly on `main`. See "Branch model" below for when a branch is used instead.
-
 A failed validation returns the affected work to `In Progress`.
 
-## Starting work
-
-Before editing:
-
-1. identify the approved work item;
-2. inspect its scope, acceptance criteria, and relevant requirements;
-3. inspect related architecture and ADRs;
-4. inspect relevant implementation and tests when they exist;
-5. verify that no unresolved architectural or safety question blocks execution.
-
-If persistent context is insufficient, return to the appropriate SDD stage instead of guessing.
+GitHub Projects own the operational status. Repository documentation must not mirror the
+changing state of individual work items.
 
 ## Ready
 
-`Ready` means another session can begin execution without relying on previous conversation history.
+`Ready` means the SDD boundary has been satisfied and another execution session can start
+without reconstructing intent from conversation history.
 
-Before entering `Ready`, the work should have:
+The criteria for becoming `Ready` belong to `docs/development/sdd.md`.
 
-* explicit scope;
-* sufficient acceptance criteria;
-* known architectural constraints;
-* blocking decisions resolved or isolated;
-* relevant safety requirements;
-* known validation expectations;
-* required dependencies available.
+Execution must not begin when a material requirement, dependency, architecture question,
+or safety question is still unresolved unless the approved work is itself the investigation
+that resolves it.
 
-Having a GitHub Issue alone does not make work `Ready`.
+## Starting execution
 
-A Technical Spike may be `Ready` while the Feature or decision depending on its result remains blocked.
+Before editing:
+
+1. identify the approved GitHub work item;
+2. read its scope, out of scope, acceptance criteria, dependencies, and validation
+   obligations;
+3. follow its links to authoritative Specifications, ADRs, Architecture, and Reference
+   evidence;
+4. inspect the current implementation and relevant tests;
+5. verify that repository reality has not invalidated an assumption in the approved work.
+
+If the approved context is insufficient or contradictory, do not guess. Return the
+affected question to the appropriate SDD stage.
+
+## In Progress
+
+`In Progress` means active execution of approved scope.
+
+During execution:
+
+- implement only the approved result;
+- preserve established architecture and dependency boundaries;
+- preserve unrelated working-tree changes;
+- make the smallest coherent change that advances the approved work;
+- add or update validation required by the affected behavior;
+- record meaningful deviations instead of silently changing the plan;
+- report useful out-of-scope findings separately;
+- keep `main` in a known-good state when working directly on it.
+
+Do not silently add unrelated:
+
+- cleanup;
+- refactoring;
+- dependencies;
+- formatting;
+- release work;
+- architecture changes;
+- future capabilities.
+
+Execution may include code, documentation, tests, Simulator work, a Technical Spike, or
+another artifact when that is the approved work.
+
+## Checkpoints
+
+A checkpoint is a bounded execution or review step inside an already-approved Work Package.
+
+Use checkpoints when one Work Package needs several focused implementation or review steps
+to remain understandable and resumable.
+
+A checkpoint:
+
+- is execution granularity, not planning hierarchy;
+- does not become a Feature, Work Package, or GitHub Issue by default;
+- is not a new approval boundary when it remains inside approved scope;
+- is not a GitHub Project status;
+- may span one focused development or agent session;
+- may result in one coherent commit when useful.
+
+Do not create checkpoint ceremony merely to subdivide straightforward work.
+
+If a checkpoint discovers new scope, a new architectural decision, or a new safety
+requirement, stop the affected execution and return to SDD.
+
+## New decisions or scope discovered during execution
+
+Execution must not silently become the place where architecture or requirements are
+invented.
+
+When a material issue appears:
+
+```text
+execution
+   ↓
+new requirement / architectural decision / safety question
+   ↓
+stop affected work
+   ↓
+return to Discovery / Spike / Specification / ADR as appropriate
+   ↓
+owner approval
+   ↓
+resume execution
+```
+
+Unrelated execution may continue only when it does not depend on the unresolved question.
+
+Accepted ADRs remain constraints until explicitly reconsidered through the ADR process.
+
+## Safety-sensitive execution
+
+For destructive, privileged, identity, authentication, trust, or recovery-sensitive work:
+
+- consume the safety contract from the authoritative Specification or approved work item;
+- fail closed when required preconditions or authoritative state are unavailable;
+- do not weaken a safety invariant to make later execution or testing easier;
+- do not assume generic retry makes destructive work replay-safe;
+- use safe test boundaries whenever real destructive execution is unnecessary;
+- use the Integration Environment when the required behavior cannot be represented
+  faithfully through local automation or simulation.
+
+Detailed validation and safe-target selection belong to
+`docs/development/testing.md`.
+
+Real destructive operations remain subject to the explicit authorization rules in
+`AGENTS.md`.
+
+## Validation during execution
+
+Relevant automated validation is part of execution completeness.
+
+Use `docs/development/testing.md` to select the appropriate test layer and environment.
+
+Operationally:
+
+1. run the narrowest relevant validation first;
+2. investigate unexpected failures;
+3. correct failures caused by the current work;
+4. broaden validation according to affected scope and risk;
+5. record only checks that actually ran and their actual results.
+
+A work item may move from `In Progress` to `Validation` when:
+
+- approved execution scope is complete;
+- required automated validation has been performed as far as the current environment
+  permits;
+- no known required automated validation is failing because of the current work;
+- remaining owner-manual or Integration Environment checks are explicit;
+- known limitations or deviations are reported.
+
+Do not describe intended validation as completed validation.
+
+## Validation
+
+`Validation` is the owner acceptance stage.
+
+Before handoff, provide the owner with the information needed to validate the result
+without reconstructing the execution session.
+
+Report, as applicable:
+
+- what changed;
+- acceptance criteria addressed;
+- automated validation actually performed and results;
+- known limitations or unresolved non-blocking findings;
+- exact manual checks remaining;
+- Integration Environment requirements;
+- relevant deviations from the approved plan.
+
+Agents may define manual validation procedures.
+
+Agents must not claim that owner validation has been completed on the owner's behalf.
+
+If owner validation finds a defect or unmet acceptance criterion:
+
+```text
+Validation
+    ↓
+In Progress
+    ↓
+correction + relevant validation
+    ↓
+Validation
+```
+
+## Done
+
+`Done` means the owner accepted the work.
+
+Before completion, ensure that durable information produced by execution is stored at the
+correct authority according to `docs/development/documentation-policy.md`.
+
+The GitHub work item should preserve only useful execution/outcome context, such as:
+
+```text
+Outcome
+- delivered or validated result;
+- relevant deviation from the approved plan.
+
+Validation
+- relevant checks and actual results;
+- owner validation result when provided.
+
+Follow-up
+- unresolved or separately materialized work, if any.
+```
+
+Do not reproduce code diffs, conversation transcripts, or full copies of durable
+Specifications/ADRs in the outcome.
+
+Parent work is complete only when its own acceptance criteria and required child work are
+complete.
+
+## Session handoff
+
+Unfinished work must remain resumable without relying on conversation history.
+
+Before ending an execution session, update the existing authoritative operational source
+when needed with:
+
+- what is complete;
+- what remains;
+- current validation state;
+- relevant evidence or failure information;
+- blockers;
+- newly discovered questions that require SDD.
+
+Prefer the existing GitHub Issue or other established authority.
+
+Do not create a separate handoff document when the current work item can carry the needed
+execution state.
 
 ## Branch model
 
-For the current owner-driven, sequential Bamep development model, normal work may be performed directly on `main`. Do not create a branch merely because a Work Package exists.
+For the current owner-driven, sequential Bamep workflow, approved work may be performed
+directly on `main` when that is the simplest safe path.
 
-Working directly on `main` does not weaken the requirement to keep it stable: preserve small coherent changes, run relevant automated validation, keep Git and publication owner-controlled as defined in `AGENTS.md`, and never leave main in a known-broken state intentionally.
+Working directly on `main` requires small coherent changes and a known-good repository
+state. Do not intentionally leave `main` broken between checkpoints.
 
-Use a branch when it provides actual value, such as:
+Use a branch when isolation provides real value, such as:
 
-* parallel or concurrent work;
-* risky or large isolated changes;
-* Technical Spikes intended to remain isolated or discardable;
-* external contributions or pull requests;
-* work explicitly requested by the owner to be isolated.
+- parallel work;
+- risky or broad changes;
+- discardable Technical Spike experiments;
+- external contributions or pull requests;
+- work the owner explicitly asks to isolate.
 
-When a branch is used, follow the existing naming conventions:
+When a branch is used, use the established prefixes:
 
 ```text
 feature/<name>
@@ -103,246 +289,16 @@ spike/<name>
 docs/<name>
 ```
 
-Examples:
+Do not create a branch per Work Package or checkpoint unless isolation justifies it.
 
-```text
-feature/endpoint-enrollment
-fix/lease-release
-refactor/job-state
-spike/winpe-boot
-docs/sdd-workflow
-```
-
-Work Packages normally share the branch of their parent Feature, Fix, Refactor, or documentation effort when a branch is used.
-
-Do not create a branch per Work Package unless isolation or risk justifies it.
-
-Technical Spike code normally uses `spike/<name>` and must not become production code automatically.
-
-Reduced-SDD work may use a simpler branch strategy when explicitly chosen by the owner.
-
-Branch creation, switching, commits, merges, pushes, pulls, tags, and publication remain subject to `AGENTS.md`.
-
-## In Progress
-
-`In Progress` is active execution.
-
-Execution may consist of multiple small checkpoints. A checkpoint is a bounded implementation or review step inside the approved Work Package, sized for one focused agent session or review cycle. Checkpoints exist to prevent context exhaustion and overly broad implementation prompts; they are not a new Feature, Work Package, Issue, or GitHub Project status by default, and they are not a new approval boundary when they merely decompose already-approved scope. A checkpoint may result in one coherent commit when useful. See `docs/development/sdd.md` for the full definition.
-
-During execution:
-
-* implement only approved scope;
-* preserve unrelated working-tree changes;
-* follow accepted architecture and ADRs;
-* add or update focused tests when applicable;
-* prefer simulators, fakes, fixtures, and temporary storage at external or destructive boundaries;
-* run relevant automated validation;
-* review the result for regressions, safety violations, architectural violations, and accidental scope expansion.
-
-Do not silently add unrelated:
-
-* cleanup;
-* refactoring;
-* dependencies;
-* formatting;
-* release changes;
-* architectural changes.
-
-Report useful out-of-scope findings separately.
-
-## Architectural decisions discovered during execution
-
-If execution reveals a durable architectural decision with meaningful alternatives:
-
-1. record the unresolved question;
-2. inspect existing ADRs;
-3. stop work that depends on the unresolved choice;
-4. gather relevant alternatives and evidence;
-5. use a Technical Spike if empirical evidence is required;
-6. obtain owner approval;
-7. create or update the ADR;
-8. resume affected execution.
-
-Implementation must not establish architectural policy silently.
-
-Unrelated work may continue only when it does not depend on the unresolved decision.
-
-## Technical Spikes
-
-Technical Spikes gather evidence.
-
-During a Spike:
-
-* preserve the approved question;
-* keep experimentation focused;
-* distinguish observation from interpretation;
-* record relevant environment and constraints;
-* preserve failures and negative results when useful;
-* avoid production-hardening experimental code unless explicitly required;
-* do not expand the Spike into implementation of the final solution.
-
-A Spike is complete when it answers its approved question sufficiently or documents why uncertainty remains.
-
-A successful experiment does not automatically become accepted architecture.
-
-Persist reusable conclusions in the appropriate Specification, ADR, or reference document.
-
-## Safety-sensitive execution
-
-Before executing destructive or privileged behavior, verify the safety requirements defined by the approved Specification or Work Package.
-
-This particularly applies to:
-
-* disk preparation;
-* partitioning and formatting;
-* deployment and restore;
-* recovery artifact deletion;
-* endpoint identity;
-* enrollment and authentication;
-* privileged execution.
-
-Prefer safe validation through:
-
-* fake adapters;
-* simulated endpoints;
-* deterministic fixtures;
-* temporary storage;
-* disposable test data.
-
-Real hardware validation belongs to the Integration Environment when local simulation cannot adequately represent the risk.
-
-Destructive real-world operations require the explicit authorization defined in `AGENTS.md`.
-
-## Automated validation
-
-Testing details belong in `docs/development/testing.md`.
-
-Operationally:
-
-1. run the narrowest relevant validation first;
-2. investigate unexpected failures;
-3. fix failures caused by the current work;
-4. broaden validation when scope or risk requires it;
-5. record actual results.
-
-Work may leave `In Progress` when:
-
-* approved execution scope is complete;
-* required focused tests exist when applicable;
-* required automated validation is not known to be failing;
-* remaining manual validation is identified.
-
-## Validation
-
-`Validation` is the owner's manual acceptance stage.
-
-Before handoff, report:
-
-* what changed;
-* automated validation performed and actual results;
-* known limitations;
-* exact manual checks remaining;
-* Integration Environment requirements when applicable.
-
-Manual validation is especially relevant for:
-
-* PXE and UEFI behavior;
-* GRUB and Alpine boot;
-* Windows or WinPE;
-* real network infrastructure;
-* real storage devices;
-* hardware-specific behavior;
-* destructive workflows;
-* complete provisioning flows.
-
-Agents may define manual validation procedures but must not complete owner validation on the owner's behalf.
-
-If validation fails:
-
-```text
-Validation
-    ↓
-In Progress
-    ↓
-correction + validation
-    ↓
-Validation
-```
-
-## Done
-
-`Done` means the owner accepted the work.
-
-Preserve only outcome information that remains useful.
-
-When applicable:
-
-```text
-Outcome
-- implemented or validated result;
-- relevant deviation from the approved plan.
-
-Automated validation
-- relevant checks and results.
-
-Manual validation
-- relevant scenarios and owner result.
-
-Related changes
-- ADRs, architecture, Specifications, or reference material updated.
-```
-
-Do not preserve conversation transcripts or duplicate information already obvious from the repository.
-
-Parent work is complete only when its required child work and acceptance criteria are complete.
-
-## Session handoff
-
-Before ending unfinished work, update the appropriate persistent source with:
-
-* current status;
-* completed work;
-* remaining work;
-* validation results;
-* relevant evidence;
-* blockers;
-* unresolved architectural or safety questions.
-
-Use the existing Issue, Work Package, Specification, Spike, or other authoritative source.
-
-Do not create a separate handoff document when one is unnecessary.
-
-## Review
-
-Review compares executed work against:
-
-* approved scope;
-* acceptance criteria;
-* Specifications;
-* ADRs;
-* implemented architecture;
-* safety invariants;
-* tests and validation.
-
-Prioritize findings involving:
-
-* correctness;
-* data loss;
-* destructive-operation safety;
-* identity and authorization;
-* stale state;
-* regressions;
-* architectural violations;
-* missing error handling;
-* missing tests;
-* unintended coupling;
-* out-of-scope changes.
-
-Review is read-only unless corrections are explicitly requested.
+Git operations and publication remain owner-controlled according to `AGENTS.md`.
 
 ## Commit strategy
 
-Use concise Conventional Commits.
+Prefer small, coherent commits that leave the repository understandable and, when
+applicable, validated.
+
+Use Conventional Commits.
 
 Examples:
 
@@ -351,87 +307,74 @@ feat(agent): add enrollment handshake
 fix(scheduler): release lease after cancellation
 refactor(jobs): separate transition validation
 test(protocol): cover duplicate acknowledgement
-docs(sdd): define technical spike workflow
+docs(workflow): clarify execution handoff
 ```
 
-Implementation and directly related tests may share one commit when they form one coherent change.
+One coherent implementation change and its directly related tests may share a commit.
 
-Use a dedicated `test(...)` commit when test work is independently useful.
+Use a separate `test(...)` commit when the testing work has independent value.
 
-Do not split or combine work merely for ceremony.
+Do not split or combine commits merely for ceremony.
 
-Detailed execution history belongs in the relevant work item, not the commit message.
+Commit messages summarize the change. Detailed execution history belongs in the GitHub
+work item when it is useful.
 
-Agents may suggest commits but must not execute them without explicit authorization.
+Agents may suggest commit messages but must not commit, push, merge, tag, or publish unless
+explicitly authorized.
 
-## GitHub workflow state
+## Review
 
-GitHub Projects uses:
+Review compares the executed result against its authoritative inputs and acceptance
+boundary.
 
-```text
-Backlog
-Ready
-In Progress
-Validation
-Done
-```
+Prioritize findings involving:
 
-Statuses must reflect actual state.
+- correctness;
+- data loss or destructive-operation safety;
+- identity, authorization, and trust;
+- protocol interoperability;
+- persistence or recovery correctness;
+- stale state;
+- regressions;
+- architectural violations;
+- missing failure handling;
+- missing required validation;
+- unintended coupling;
+- scope expansion.
 
-Do not:
-
-* move incomplete work to `Ready`;
-* move work with known required validation failures to `Validation`;
-* move work to `Done` before owner acceptance.
-
-GitHub represents operational state. It does not replace repository documentation, ADRs, Specifications, or implementation.
-
-## Documentation during execution
-
-Update permanent documentation when completed work changes information useful beyond the current task.
-
-Examples:
-
-* accepted architectural decisions;
-* implemented architecture;
-* reusable compatibility findings;
-* engineering process changes.
-
-Do not duplicate the same information across Issues, Specifications, ADRs, architecture, and reference documents.
-
-Planned architecture does not belong in `docs/architecture/` until implemented.
-
-Detailed placement rules belong in `docs/development/documentation-policy.md`.
+Review is read-only unless corrections are explicitly requested.
 
 ## Reduced workflow
 
-Reduced SDD may use:
+Work approved through reduced SDD still uses the same execution principles.
+
+For a small isolated change, the operational path may be:
 
 ```text
-scope confirmation
-      ↓
-execution
-      ↓
+Ready
+  ↓
+In Progress
+  ↓
 proportional validation
-      ↓
-owner validation when relevant
-      ↓
+  ↓
+Validation, when owner acceptance is material
+  ↓
 Done
 ```
 
 Reduced workflow does not bypass:
 
-* repository inspection;
-* scope control;
-* architecture constraints;
-* safety requirements;
-* validation;
-* owner-controlled Git and publication rules.
+- approved scope;
+- architecture constraints;
+- safety requirements;
+- relevant validation;
+- owner-controlled Git and publication rules.
 
-If meaningful ambiguity, architecture impact, or safety risk appears, return to the normal SDD lifecycle.
+If meaningful ambiguity, architecture impact, or safety risk appears, return to normal SDD.
 
 ## Guiding rule
 
-By the time work reaches `Ready`, important questions about intent, scope, architecture, safety, and validation should already be answered or explicitly isolated.
+Execution should consume approved decisions, not create hidden ones.
 
-The workflow exists to execute approved decisions reliably, not to make hidden decisions during implementation.
+Keep work small enough to review and resume, record actual validation, and return to SDD
+whenever execution discovers a material question outside the approved boundary.
