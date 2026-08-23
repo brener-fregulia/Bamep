@@ -2,157 +2,87 @@
 
 Status: **Approved**
 
-## Purpose and authority
+This Specification is the normative contract for Bamep durable/transient state, domain
+events, correlation, auditability, and recovery-relevant persistence behavior. ADR-0013
+owns the PostgreSQL backend decision; `docs/development/persistence.md` owns SQLx/schema/
+migration conventions.
 
-This Specification is the normative persistence contract for Bamep durable state,
-domain events, correlation, auditability, and recovery-relevant persistence behavior.
+## Durable versus transient state
 
-It defines **what must be durable and how persistence semantics compose with domain
-transitions**.
+Persist meaningful domain state and transitions, not every observation.
 
-It does not own:
-
-- the choice of persistence backend — ADR-0013 owns PostgreSQL;
-- SQLx, query style, migration mechanics, schema layout, or current Adapter conventions —
-  `docs/development/persistence.md` owns those implementation conventions;
-- lifecycle state machines owned by other Specifications;
-- wire-protocol message semantics;
-- current implementation structure.
-
-ADR-0007 remains the historical origin of several persistence decisions but is
-`Superseded` by ADR-0013. No current normative behavior should require reconstructing
-requirements from ADR-0007.
-
-## Durable versus transient/high-frequency boundary
-
-Bamep persists meaningful domain state and state transitions, not every observation,
-message, progress update, or telemetry sample.
-
-### Durable state
-
-The following are durable when applicable:
-
-- Job, JobStep, and Attempt state and transitions;
-- Endpoint identity, credential, and hardware-confidence state and transitions;
-- the Endpoint authoritative current-boot projection and trusted-bootstrap state;
-- inventory revisions, written on change;
-- Artifact/Snapshot lifecycle metadata;
+**Durable when applicable:**
+- Job/JobStep/Attempt state;
+- Endpoint identity, credential, hardware-confidence, and authoritative current-boot state;
+- inventory revisions on change;
+- Artifact lifecycle metadata;
 - domain events;
 - safety-relevant audit records;
-- correlation required to relate durable workflow, protocol, and transfer state.
+- correlation needed for recovery and authorization.
 
-Durability means the state required to preserve correctness across Server restart is
-stored in the adopted durable persistence backend.
-
-### Transient or high-frequency state
-
-The following must not become one durable row per observation/message/sample by default:
-
-- Agent connection and presence state;
+**Transient/high-frequency by default:**
+- Agent connection/presence;
 - `ActionProgress` ticks;
-- general application logs;
-- high-frequency telemetry and metrics.
+- general logs;
+- high-frequency telemetry/metrics.
 
-`ActionProgress` may keep only a latest-value representation when useful. General logs
-and telemetry may use their own retention or aggregation mechanisms, but they are not
-domain-history records merely because they are observable.
+New state must be classified explicitly. The default is not "persist everything."
 
-### Classification rule
+### Authoritative current boot
 
-Any new state introduced by later work must be classified deliberately as durable or
-transient.
-
-The default must not be "persist everything."
-
-The deciding question is whether the information is required as durable domain,
-security, audit, recovery, or correlation state — not how frequently the originating
-message arrives.
-
-## Authoritative current-boot persistence
-
-The Endpoint authoritative current-boot projection is durable because it determines which
-boot context is current across restart/reconnect and participates in the destructive
-operation safety model.
-
-The projection includes the durable identity/correlation required by the Endpoint
-Specification, including:
+The Endpoint current-boot projection is durable because it participates in safety decisions
+across restart/reconnect. It includes at least:
 
 - `boot_context_id`;
-- the current 32-byte `boot_nonce`;
-- trusted-bootstrap state (`NotEstablished` or `Established`).
+- current 32-byte `boot_nonce`;
+- trusted-bootstrap state (`NotEstablished | Established`).
 
-Historical `BootContext` records do not become current merely because they resolve to the
-same Endpoint.
+Historical `BootContext` rows never become current merely because they resolve to the same
+Endpoint. Unknown/pre-existing data without an authenticated current boot remains
+current-boot-absent / not trusted; no historical nonce is fabricated.
 
-If no authenticated current boot can be established for pre-existing/unknown data, the
-state remains current-boot-absent and trusted bootstrap is not established. Persistence
-must not fabricate a historical nonce or compatibility path that creates trust.
+Lifecycle and old-boot rejection semantics belong to `m0-endpoint-identity-lifecycle.md`
+and `m0-trusted-bootstrap-and-server-fingerprint-contract.md`.
 
-Detailed current-boot state transitions, old-boot rejection, and trusted-bootstrap
-authorization semantics belong to `docs/specifications/m0-endpoint-identity-lifecycle.md`
-and `docs/specifications/m0-trusted-bootstrap-and-server-fingerprint-contract.md`.
+## Domain events
 
-## Domain-event model
+Domain events are durable coarse-grained facts about committed domain transitions. They are
+not raw protocol history, telemetry, general logs, or an event-sourcing replay log.
 
-Domain events are durable, coarse-grained facts describing committed domain transitions.
-
-They are not:
-
-- raw protocol-message history;
-- telemetry;
-- general application logs;
-- an event-sourcing replay log.
-
-Events are useful for Bamep's own durable history and for future integrations without
-exposing the internal database as an integration contract.
-
-### Baseline event catalog
-
-The catalog is representative and extensible as later Specifications introduce additional
-domain transitions.
+Representative catalog:
 
 | Event | Emitted when |
 |---|---|
-| `EndpointPendingEnrollment` | an Endpoint enters `PendingEnrollment` |
-| `EndpointEnrolled` | an Endpoint enters `Enrolled` |
+| `EndpointPendingEnrollment` | Endpoint enters `PendingEnrollment` |
+| `EndpointEnrolled` | Endpoint enters `Enrolled` |
 | `EndpointHardwareConfidenceChanged` | hardware-confidence state changes |
-| `EndpointRetired` | an Endpoint enters `Retired` |
-| `InventoryRevisionRecorded` | a new durable inventory revision is recorded |
-| `JobStarted` | a Job transitions to `Running` |
-| `JobSucceeded` / `JobFailed` / `JobCancelled` | a Job reaches the matching terminal state |
-| `JobStepFailed` | a JobStep reaches `Failed` |
-| `AttemptIndeterminate` | an Attempt is explicitly closed `Indeterminate` |
-| `ArtifactCreated` / `ArtifactVerified` | the applicable Artifact lifecycle transition occurs |
-| `OperatorDecisionRecorded` | a safety-relevant operator decision is durably recorded |
+| `EndpointRetired` | Endpoint enters `Retired` |
+| `InventoryRevisionRecorded` | a new inventory revision is committed |
+| `JobStarted` | Job enters `Running` |
+| `JobSucceeded` / `JobFailed` / `JobCancelled` | Job reaches matching terminal state |
+| `JobStepFailed` | JobStep reaches `Failed` |
+| `AttemptIndeterminate` | Attempt is closed `Indeterminate` |
+| `ArtifactCreated` / `ArtifactVerified` | applicable Artifact transition occurs |
+| `OperatorDecisionRecorded` | a safety-relevant operator decision is committed |
 
-An event is emitted from the underlying committed transition, not reconstructed from
-high-frequency observations.
+Events are emitted from the underlying transition, not reconstructed from observations.
 
-Artifact-specific event semantics belong to
-`docs/specifications/m0-data-plane-and-storage-contracts.md`.
+### Event envelope
 
-### Domain-event envelope
+Every durable event carries at least:
 
-Every durable domain event carries at least:
-
-- `event_id` — unique and immutable;
-- `event_type` — the event name;
-- `event_version` — the schema version for that event type;
-- `occurred_at` — the time associated with the committed transition;
+- unique immutable `event_id`;
+- `event_type`;
+- independently versioned `event_version`;
+- `occurred_at`;
 - applicable correlation identifiers;
-- `payload` — event-type-specific data.
+- event-specific `payload`.
 
-Event-type versions evolve independently.
+External event delivery/webhooks/brokers are outside this Specification.
 
-This Specification does not define an external event transport, webhook, message broker,
-or ERP-facing publication API.
+## Correlation
 
-## Correlation model
-
-Durable state and domain events carry whichever identifiers are applicable so Bamep can
-relate Endpoint, workflow, protocol, and transfer activity.
-
-The baseline correlation set is:
+Durable state/events carry whichever identifiers apply:
 
 - `endpoint_id`;
 - `job_id`;
@@ -161,326 +91,185 @@ The baseline correlation set is:
 - `action_id`;
 - `transfer_id`.
 
-### Identity separation
+`attempt_id` (Server Domain identity) and `action_id` (Agent Protocol wire identity) remain
+distinct even when related 1:1.
 
-`attempt_id` and `action_id` are distinct:
+`transfer_id` is the durable logical transfer identity defined by
+`m0-data-plane-and-storage-contracts.md`, not an HTTP request/connection identity.
 
-- `attempt_id` is Server-side Domain identity for one JobStep execution attempt;
-- `action_id` is Agent Protocol wire identity.
+## Atomic persistence
 
-An Agent-executed Attempt currently relates them 1:1, but they must not be merged into one
-identifier or coupled to the same identity scheme.
+When a durable transition requires an event and/or audit record, the required:
 
-`transfer_id` is the durable identity of one logical data-plane transfer and is likewise
-distinct from HTTP request/connection identity and from `attempt_id`. Its full lifecycle
-belongs to `docs/specifications/m0-data-plane-and-storage-contracts.md`.
+- domain-state mutation;
+- domain event;
+- audit record
 
-Additional correlation identifiers may be introduced by the Specification that owns a new
-concept. They must compose with, rather than silently replace, the existing identifiers.
+commit atomically in the same persistence transaction.
 
-## Transactional consistency
+A crash must not leave committed state without its required event/audit record, or a
+committed event/audit record for a transition that did not commit.
 
-When a durable domain transition requires a domain event and/or audit record, all required
-parts commit atomically in the same persistence transaction:
+Current durable state is the source of truth; Bamep is not event-sourced.
 
-- the durable domain-state mutation;
-- its required domain event;
-- its required audit record.
+## Persist-before-send
 
-A crash must never leave:
-
-- committed domain state without a required event/audit record; or
-- a committed event/audit record for a transition that did not commit.
-
-An audit record associated with that transition is not a best-effort side write.
-
-### This is not event sourcing
-
-Current durable domain state remains the source of truth for Bamep operation.
-
-Domain events describe committed transitions and become durable as part of the same atomic
-transaction. Bamep does not reconstruct current state by replaying the event stream.
-
-Adopting an external publication mechanism in the future does not change this invariant
-unless a later approved architecture decision explicitly does so.
-
-## Persist-before-send ordering
-
-A persistence transaction and a network send cannot be atomic with each other.
-
-Whenever Bamep creates durable state that authorizes or establishes a later outbound
-protocol effect, the required durable transaction commits **before** the Server attempts
-that outbound delivery.
+A database transaction and network send cannot be atomic. Therefore required durable state
+must commit **before** the Server attempts the corresponding outbound protocol effect.
 
 ### Agent action dispatch
 
-For an Agent-executed Attempt:
+For Agent-executed Attempts:
 
-1. the applicable final dispatch preconditions pass;
-2. the Attempt/action correlation and `Dispatched` commitment are created;
-3. required domain event(s) and audit record(s) are included in the same durable
-   transaction;
+1. final dispatch preconditions pass;
+2. Attempt/action correlation and `Dispatched` commitment are created;
+3. required event/audit records are included;
 4. the transaction commits;
-5. only then may the Server attempt `ActionDispatch`.
+5. only then may `ActionDispatch` be sent.
 
-There must never be a path where the Agent can receive an `ActionDispatch` for which the
-Server has no durable Attempt/correlation/audit state required by this contract.
+A crash after commit but before/during delivery is reconciled through the Job lifecycle and
+Agent Protocol contracts; it never permits blind destructive redispatch.
 
-A crash after commit but before or during transmission is an uncertain delivery outcome.
-It is reconciled through the Job lifecycle and Agent Protocol contracts; it must not cause
-blind redispatch of destructive work.
+### Session establishment
 
-### Credential/session establishment
+Endpoint/credential/current-boot changes required by successful authentication commit
+before `SessionEstablished` is attempted.
 
-Durable Endpoint/credential/current-boot changes required for a successful authentication
-exchange commit before the Server attempts to send the corresponding
-`SessionEstablished`.
+Dropped delivery after commit is a recovery case, not permission to roll back durable
+state.
 
-A dropped connection after commit is therefore a delivery-recovery case, not permission to
-roll back or fabricate durable state.
+## First contact and reboot atomicity
 
-Credential replacement/recovery semantics belong to the Endpoint identity contract and
-the applicable credential ADRs.
+First contact atomically persists the state required by the Endpoint contract, including
+the applicable:
 
-## First contact, reboot, and current-boot atomicity
-
-For first contact, the durable transition establishing the initial Endpoint state must
-atomically include the persistence state required by the Endpoint contract, including:
-
-- Endpoint `PendingEnrollment` when that is the applicable enrollment path;
-- the credential-chain/lookup projection;
-- resolved `BootContext` correlation;
-- authoritative current-boot selection/current nonce;
+- `PendingEnrollment`;
+- credential-chain/lookup projection;
+- resolved `BootContext`;
+- authoritative current boot/nonce;
 - `TrustedBootstrapState::NotEstablished`;
-- the required `EndpointPendingEnrollment` event.
+- required `EndpointPendingEnrollment` event.
 
-That transaction commits before `SessionEstablished` is attempted.
+A genuine reboot atomically persists the new boot correlation/current boot, credential
+changes, and reset to `NotEstablished`.
 
-For a genuine reboot of an existing Endpoint, the applicable identity-continuity and
-credential transition must atomically include:
+Both commit before `SessionEstablished`.
 
-- the new `BootContext` correlation;
-- replacement of the authoritative current boot/current nonce;
-- reset of trusted-bootstrap state to `NotEstablished`;
-- any other durable credential/current-boot changes required by the Endpoint contract.
+Same-boot reconnect/rotation preserves current-boot state. Rejected authentication must not
+partially mutate durable identity/credential/current-boot state.
 
-That transaction also commits before `SessionEstablished` is attempted.
+## Trusted-bootstrap event/audit policy
 
-Same-boot credential reconnect/rotation preserves the authoritative current-boot
-projection according to the Endpoint identity contract.
+Trusted-bootstrap state is durable security/domain state, but under the current contract:
 
-Rejected authentication must not partially mutate this durable state.
+- establishment emits no `TrustedBootstrapEstablished` event;
+- rejected evidence emits no `TrustedBootstrapRejected` event;
+- evidence acceptance/rejection alone creates no immutable audit record.
 
-## Trusted-bootstrap event and audit policy
+Enrollment events and enrollment-approval audit requirements are unchanged. Adding
+trusted-bootstrap-specific event/audit history requires an explicit contract update.
 
-Trusted-bootstrap state is durable security/domain state.
+## Inventory persistence
 
-Under the current contract:
+Inventory is durable **on revision change**, not per report/poll.
 
-- establishing trusted bootstrap does **not** emit a
-  `TrustedBootstrapEstablished` domain event;
-- rejected bootstrap evidence does **not** emit a
-  `TrustedBootstrapRejected` domain event;
-- evidence acceptance/rejection does **not** create a new immutable audit record merely
-  because evidence was processed.
+- unchanged inventory creates no revision;
+- changed inventory creates a new revision;
+- the authoritative current revision identifier is durable;
+- historical revisions are retained sufficiently for required audit/safety behavior.
 
-This is an explicit contract decision.
+Concrete pruning/retention duration is implementation-time.
 
-It does not mean every durable field change generally lacks an event. It means the current
-event/audit catalog has no trusted-bootstrap-specific event or audit obligation.
-
-Existing enrollment events and enrollment-approval audit requirements remain unchanged.
-
-A future requirement for trusted-bootstrap event publication or audit history requires an
-explicit Specification update.
-
-## Inventory persistence boundary
-
-Inventory is durable **on revision change**, not on every report or poll.
-
-Requirements:
-
-- unchanged observed inventory creates no new durable inventory revision;
-- a changed inventory creates a new durable revision;
-- the authoritative current inventory-revision identifier is persisted for use by
-  lifecycle/safety contracts;
-- historical revisions are retained sufficiently for the audit and precondition behavior
-  required by the product.
-
-A concrete pruning duration or retention window is not defined here.
-
-The Endpoint and Job lifecycle Specifications own the semantics of "sufficiently fresh
-inventory" for destructive dispatch. This Specification owns the persistence behavior of
-the revision itself.
+Freshness semantics for destructive dispatch belong to Endpoint/Job lifecycle contracts.
 
 ## Auditability
 
-Audit records are durable and immutable once written.
+Audit records are durable and immutable and carry applicable correlation plus known actor
+information (`operator` or `system`).
 
-They carry applicable correlation identifiers and whichever actor information is known at
-the point of recording.
+Required safety-relevant operator decisions include:
 
-Actor attribution distinguishes, when known:
+- enrollment approval;
+- hardware-confidence resolution;
+- closing an Attempt `Indeterminate`;
+- authorizing further destructive work where required;
+- Job cancellation.
 
-- an **operator actor** for a human decision;
-- a **system actor** for an automated system decision.
+Destructive execution additionally requires durable auditability of:
 
-The concrete operator authentication/identity model is outside this Specification.
+- applicable authorization/decision;
+- destructive dispatch commitment;
+- known terminal outcome or eventual `Indeterminate` resolution.
 
-### Safety-relevant operator decisions
+The dispatch-commitment audit record proves the Server durably authorized/committed the
+dispatch; it does **not** prove network transmission, receipt, or execution. Agent-side
+knowledge comes from Agent Protocol evidence and resulting Attempt state.
 
-Audit records are required for applicable safety-relevant operator decisions, including:
+Required audit records participate in the same atomic transaction as their transition/event.
 
-- Endpoint enrollment approval;
-- hardware-confidence conflict resolution;
-- reconciliation decisions that close an Attempt as `Indeterminate`;
-- authorization of a further destructive Attempt where explicit authorization is required;
-- Job cancellation decisions.
+## Observability
 
-### Destructive execution
+Correlation is the structural observability baseline.
 
-Destructive execution requires durable auditability of:
+Domain events provide durable transition history. High-frequency telemetry provides
+runtime detail. Neither substitutes for the other.
 
-- the authorization/decision enabling dispatch when one is applicable;
-- the destructive dispatch commitment;
-- the known terminal outcome, or the eventual `Indeterminate` resolution when the real
-  outcome cannot be established.
+Telemetry retention/aggregation is an implementation/operations policy unless a later
+product requirement constrains it.
 
-The dispatch-commitment audit record represents the Server's durable authorization and
-commitment to transmit. It does **not** prove that the network frame was sent, received, or
-executed.
+## Backend boundary
 
-Actual Agent-side knowledge remains represented by Agent Protocol acknowledgement/result/
-status evidence and the resulting Attempt lifecycle state.
+PostgreSQL is selected by ADR-0013, but this contract is backend-independent at the
+Domain/Application boundary.
 
-## Observability responsibilities
-
-The structural observability baseline is correlation.
-
-Domain events provide durable transition-level history.
-
-High-frequency telemetry provides a different kind of operational visibility and must not
-be treated as a substitute for domain events.
-
-Likewise, domain events are not a substitute for high-frequency runtime telemetry.
-
-Telemetry retention/aggregation, if implemented, is an implementation/operations policy
-outside this Specification unless a later product requirement constrains it.
-
-## Persistence-backend relationship
-
-PostgreSQL is the current backend selected by ADR-0013.
-
-The semantic requirements in this Specification are not PostgreSQL implementation details.
-
-Domain/Application code must consume persistence through the appropriate Port boundary
-rather than making this contract depend on PostgreSQL/SQLx APIs.
-
-Current PostgreSQL/SQLx schema, query, migration, and Adapter conventions belong to
+PostgreSQL/SQLx schema, query, migration, and Adapter conventions belong to
 `docs/development/persistence.md`.
 
 ## Out of scope
 
-This Specification does not define:
-
-- concrete PostgreSQL schema/table layout;
-- indexes or query plans;
-- SQLx API usage;
-- migration tooling or migration-history policy;
-- concrete database connection/pool configuration;
-- operator authentication/identity implementation;
-- telemetry retention/aggregation policy;
-- external domain-event delivery or publication;
-- Artifact-specific event payloads beyond the generic event/correlation contract;
-- Job/JobStep/Attempt lifecycle transitions;
-- Endpoint identity/credential/current-boot lifecycle semantics;
-- Agent Protocol wire semantics;
+- concrete schema/tables/indexes/query plans;
+- SQLx APIs and migration mechanics;
+- database pool/connection configuration;
+- operator authentication implementation;
+- telemetry retention policy;
+- external event publication;
+- lifecycle/wire semantics owned by other Specifications;
 - fixed numeric persistence-performance thresholds.
 
-## Validation expectations
-
-Validation must cover the persistence semantics defined here.
-
-### Unit/domain and contract validation
+## Validation
 
 At minimum:
 
-- domain events are emitted according to the applicable transition contract without
-  unintended duplication;
-- domain-event envelope/version expectations are validated;
-- unchanged inventory does not create a new durable revision;
-- changed inventory does;
-- trusted-bootstrap state changes follow the explicit current event/audit policy.
+**Domain/contract**
+- required events are emitted once for their transitions;
+- event envelope/version rules hold;
+- unchanged inventory creates no revision; changed inventory does;
+- trusted-bootstrap state follows the explicit no-event/no-audit policy.
 
-### Persistence and recovery validation
+**Persistence/recovery**
+- durable state survives Server restart;
+- transient presence/progress loss is not interpreted as domain-state loss;
+- required state + event + audit commit together or fail together;
+- persist-before-send ordering holds;
+- first-contact/reboot persistence cannot leave partial identity/credential/current-boot
+  state.
 
-At minimum:
+Implementation-level persistence tests use the real adopted backend.
 
-- required durable state survives Server restart;
-- transient presence/progress loss after restart is not interpreted as durable-state loss;
-- state + required event + required audit commit together or fail together;
-- persist-before-send ordering is preserved;
-- first-contact/reboot persistence does not leave partial credential/current-boot state.
+**Representative load**
+Issue #21 owns M1 validation at 20–24 concurrent Simulated Endpoints, measuring actual
+durable write volume, contention, latency, and backpressure. No numeric threshold is
+invented here before evidence exists; unacceptable results require explicit reconsideration
+of the persistence baseline.
 
-Implementation-level persistence tests must use the real adopted backend according to
-`docs/development/testing.md` and `docs/development/persistence.md`.
+## Related
 
-### Representative load validation
-
-The adopted persistence baseline must be measured under the M1 20–24 concurrent Simulated
-Endpoint target.
-
-The measurement records actual:
-
-- durable write volume;
-- contention;
-- latency;
-- backpressure.
-
-No numeric pass/fail threshold is invented in this Specification before evidence exists.
-
-Issue #21 (`[WP] Validate Simulator concurrency and M1 persistence baseline`) owns execution
-and recording of this empirical M1 validation.
-
-If the representative result is unacceptable, the persistence-backend decision in
-ADR-0013 must be reconsidered explicitly rather than silently worked around.
-
-## Acceptance mapping
-
-This Specification satisfies the M0 persistence/observability contract by defining:
-
-- the durable/transient boundary;
-- domain-event semantics and envelope;
-- correlation requirements;
-- atomic transition/event/audit persistence;
-- persist-before-send behavior;
-- inventory revision persistence;
-- auditability;
-- validation obligations.
-
-Issue #5 is the historical M0 Work Package that produced this contract.
-
-## Related specifications and decisions
-
-- ADR-0013 — current PostgreSQL persistence-backend decision.
-- ADR-0007 — superseded historical SQLite persistence decision.
-- `docs/specifications/m0-endpoint-identity-lifecycle.md` — Endpoint, credential,
-  current-boot, inventory-safety, and destructive-precondition semantics.
-- `docs/specifications/m0-job-lifecycle-and-scheduling.md` — Job/JobStep/Attempt,
-  dispatch, reconciliation, and retry semantics.
-- `docs/specifications/m0-agent-protocol-contract.md` — Agent wire correlation,
-  acknowledgement, progress, status, and result semantics.
-- `docs/specifications/m0-data-plane-and-storage-contracts.md` — Artifact and transfer
-  lifecycle/correlation semantics.
-- `docs/specifications/m0-simulator-contract-and-validation-strategy.md` — Simulator
-  validation contract.
-- `docs/development/persistence.md` — current PostgreSQL/SQLx implementation and migration
-  conventions.
-- `docs/development/testing.md` — validation strategy and test-layer responsibilities.
-
-## Related work
-
-- Issue #5 — historical M0 persistence/observability/domain-event Work Package.
-- Issue #21 — current M1 concurrency and persistence-load validation Work Package.
-
-Status: Approved.
+- ADR-0013 — PostgreSQL backend decision.
+- ADR-0007 — superseded historical SQLite decision.
+- `m0-endpoint-identity-lifecycle.md` — Endpoint/current-boot semantics.
+- `m0-job-lifecycle-and-scheduling.md` — Job/Attempt dispatch and reconciliation.
+- `m0-agent-protocol-contract.md` — Agent wire correlation/evidence.
+- `m0-data-plane-and-storage-contracts.md` — Artifact/transfer semantics.
+- `docs/development/persistence.md` — PostgreSQL/SQLx implementation conventions.
+- `docs/development/testing.md` — test-layer responsibilities.
+- Issue #21 — M1 persistence-load validation.
