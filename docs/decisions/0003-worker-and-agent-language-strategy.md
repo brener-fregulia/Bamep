@@ -4,57 +4,243 @@ Status: Accepted
 
 ## Context
 
-With ADR-0002 fixing Rust for the Bamep Server, M0 also requires evaluating the implementation language for:
+After ADR-0002 selected Rust for the Bamep Server, M0 still required independent evaluation
+of the implementation language for two different responsibilities:
 
-- the **Worker** boundary established in ADR-0001 (transfer, compression, verification, artifact-movement workloads, release-coupled to the Server per that ADR);
-- the **Agent** (the endpoint-resident supervisor running inside the Alpine maintenance/live environment, executing typed actions only — no arbitrary `sh -c`, per `docs/discovery/architecture-redesign.md` "Backend and Agent").
+- the **Worker** boundary established by ADR-0001 for transfer, compression, verification,
+  and artifact-movement workloads;
+- the future endpoint-resident **Agent**, responsible for participating in the versioned
+  control protocol and executing only approved typed actions in the maintenance
+  environment.
 
-Issue #1 records explicit owner direction that this decision is intentionally left open: "The Worker language is intentionally unresolved. Rust and Go are the primary candidates... Do not select Go solely as a learning opportunity" and "Do not assume the Agent must use the same language as the Server without evaluating its own constraints."
+Issue #1 (`[WP] Define product, runtime, and stack architecture baseline`) explicitly
+required that these choices not be inferred automatically from the Server language.
 
-This ADR records the evaluation performed against that instruction and the owner's resulting decision.
+The owner direction recorded there was:
+
+- Rust and Go were the primary Worker candidates;
+- Go must not be selected merely as a learning opportunity;
+- the Agent must be evaluated against its own runtime and deployment constraints;
+- the cost of maintaining a polyglot stack matters for a primarily solo-maintained
+  project.
+
+This ADR records that evaluation and the resulting decision.
+
+The original text also referenced M0 Discovery material that has since been reduced after
+its durable conclusions were promoted. Issue #1 and Git history preserve the planning
+history; this ADR preserves the architectural rationale.
 
 ## Evaluation
 
-**Worker** (compression, transfer, verification, artifact movement; release-coupled to the Server per ADR-0001):
+### Worker
 
-- *Rust*: shares a single toolchain, CI, and release pipeline with the Server; no GC pauses during large transfers/compression; static binaries; because Workers ship with the Server release rather than independently, a shared build pipeline has direct operational value beyond code reuse.
-- *Go*: simpler goroutine-based concurrency, fast compile times, straightforward static-binary deployment; but introduces a second toolchain, dependency ecosystem, and CI/release pipeline for artifacts that are release-coupled to a Rust Server anyway.
+The Worker is release-coupled to the Server by ADR-0001 but executes heavy workloads behind
+a separate process/isolation boundary.
 
-**Agent** (endpoint-resident supervisor inside the Alpine/musl live environment; typed actions, authentication, state machine, retries, cancellation, process supervision):
+#### Rust
 
-- *Rust*: compiles to static musl-compatible binaries well suited to an Alpine live environment; no bundled GC runtime; matches the "supervisor with typed actions" direction already accepted in Discovery.
-- *Go*: also cross-compiles to static binaries and is historically simple for daemon/supervisor-style programs; includes a GC runtime, a small but non-zero footprint cost in a RAM-constrained diskless-boot environment (`docs/reference/poc-lessons.md` records storage/RAM pressure already observed during the previous PoC's diskless Alpine boot, though under different conditions).
+Advantages considered:
 
-**Cross-cutting factor**: `docs/discovery/architecture-redesign.md` explicitly frames the language question in terms of "the cost of operating a polyglot stack as a primarily solo-maintained project." A single language across Server, Worker, and Agent minimizes the number of toolchains, dependency ecosystems, and CI/release pipelines one maintainer must operate, and maximizes direct sharing of protocol/contract types between components without an additional schema-generation step.
+- shared toolchain and dependency ecosystem with the Server;
+- shared CI/build knowledge;
+- static native binaries suitable for the Linux appliance model;
+- no garbage-collected runtime;
+- strong fit for CPU- and I/O-intensive systems workloads;
+- direct reuse of internal Rust libraries where doing so does not collapse an external
+  contract boundary.
+
+Because Workers ship with the Server release, using the same language also reduces
+operational complexity for build and release.
+
+#### Go
+
+Go was considered technically viable.
+
+Advantages included:
+
+- simple concurrency primitives;
+- fast compilation;
+- straightforward static-binary deployment;
+- mature support for network and systems services.
+
+The principal cost was introducing a second toolchain, dependency ecosystem, and build
+path for a component already release-coupled to a Rust Server.
+
+No Worker-specific requirement identified during M0 materially outweighed that maintenance
+cost.
+
+### Agent
+
+The Agent has different constraints from the Server and Worker and therefore required its
+own evaluation.
+
+Relevant requirements included:
+
+- operation inside a Linux maintenance/live environment;
+- small and predictable runtime footprint;
+- typed protocol participation;
+- authentication and reconnect behavior;
+- action state handling;
+- process/tool supervision;
+- cancellation and result reporting;
+- suitability for static or self-contained deployment.
+
+#### Rust
+
+Rust provides:
+
+- static musl-compatible build options appropriate for Alpine-style environments;
+- no garbage-collected runtime;
+- strong compile-time representation of protocol and state-machine behavior;
+- consistency with the Server implementation ecosystem.
+
+#### Go
+
+Go was also technically viable for an Agent:
+
+- easy cross-compilation;
+- static-binary deployment;
+- a mature runtime for daemon-style software.
+
+Its additional runtime footprint was not demonstrated to be a blocker, but selecting it
+would introduce a second implementation ecosystem without a concrete Agent requirement
+that demanded doing so.
+
+Reusable PoC evidence about resource pressure in diskless maintenance environments remains
+in `docs/reference/poc-lessons.md`. That evidence informed caution about footprint but did
+not by itself prove either Rust or Go unsuitable.
+
+### Cross-cutting maintenance cost
+
+A split-language design is architecturally possible because Bamep contracts are explicitly
+versioned.
+
+However, for a primarily solo-maintained project, another implementation language creates
+real recurring cost:
+
+- another toolchain;
+- another dependency ecosystem;
+- another set of build/release conventions;
+- another security/update surface;
+- duplicated implementation knowledge.
+
+No identified Worker or Agent requirement justified paying that cost in M0.
 
 ## Decision
 
-Rust is accepted as the implementation language for both the Worker and the Agent, for consistency with the Server (ADR-0002), the solo-maintainer cost argument above, and because no identified requirement specifically favors Go's concurrency model or footprint for either workload.
+Rust is the implementation language for both the Worker and the Agent.
 
-**Contract independence is a required constraint of this decision, not an incidental detail.** Using Rust across Server, Worker, and Agent must not make shared Rust types or crates the sole definition of any inter-process or wire contract. The Agent Protocol, the Administrative API, and any other externally relevant contract must remain explicit and independently versioned, as already required by `docs/discovery/architecture-redesign.md` ("Any Agent Protocol must define correlation, acknowledgement, duplicate handling, timeout, reconnect, cancellation, progress, protocol version, and idempotency semantics") and by the packaging baseline's "contracts versioned separately" direction (`docs/specifications/m0-stack-and-boundaries-baseline.md`).
+The principal reasons are:
 
-Sharing implementation types or generated representations between Server, Worker, and Agent is allowed where useful (for example, generating Rust bindings from a schema, or sharing an internal crate between same-language components), but the architecture must preserve the ability to implement a contract participant in another language without redefining the protocol. A single-language stack is a deployment and maintenance convenience; it must not become the load-bearing definition of a contract that the Agent Protocol or Administrative API Work Packages (Issues #2, #3) are responsible for specifying explicitly.
+- consistency with the Rust Server selected by ADR-0002;
+- reduced operational and maintenance cost;
+- suitable deployment/runtime characteristics for both evaluated responsibilities;
+- no identified Worker- or Agent-specific requirement that materially favored Go.
+
+This is an implementation-language decision, not a contract-definition decision.
+
+## Contract independence
+
+**Externally relevant contracts must remain independent from the shared Rust implementation
+language.**
+
+Using Rust across Server, Worker, and Agent must not make Rust types, shared crates, or
+internal APIs the sole definition of a wire or inter-process contract.
+
+In particular:
+
+- Agent Protocol is defined normatively by
+  `docs/specifications/m0-agent-protocol-contract.md`;
+- Administrative API behavior is defined by its applicable Specification;
+- future externally relevant Worker or extension contracts must receive their own explicit
+  contract authority when introduced.
+
+Shared Rust representations are allowed as implementation conveniences.
+
+For example, components may:
+
+- share an internal crate;
+- generate Rust representations from an explicit schema;
+- reuse validation or codec libraries.
+
+But a contract participant must remain implementable from the authoritative contract
+without requiring inspection of another component's Rust source.
+
+The single-language stack is a maintenance and deployment choice. It is not the
+load-bearing definition of interoperability.
 
 ## Alternatives considered
 
-- **Go for Worker and/or Agent**: viable; not recommended above, but not eliminated by a concrete blocker either — the owner may still choose it for reasons this evaluation cannot weigh (e.g., a distinct, explicitly-stated non-"learning opportunity" justification).
-- **Split stack** (e.g., Rust Server + Worker, Go Agent, or the reverse): technically viable via a versioned wire contract (Agent Protocol v1) regardless of language pairing, but reintroduces the polyglot maintenance cost the owner asked to be weighed.
-- **Python for Worker**: not seriously considered; weak fit for CPU-bound compression/verification, and the previous PoC's Python/FastAPI use is historical evidence only (`docs/reference/poc-lessons.md`), not a forward candidate here.
+### Go for Worker and/or Agent
+
+Viable, but not selected.
+
+No concrete technical blocker eliminated Go. The decision instead reflects the absence of
+a requirement strong enough to justify a second implementation ecosystem.
+
+A later materially different runtime requirement may justify reconsidering one component's
+language independently.
+
+### Split-language stack
+
+Examples include Rust Server + Worker with a Go Agent, or Rust Server + Agent with a Go
+Worker.
+
+Technically valid because explicit versioned contracts permit independent implementations.
+
+Rejected for the baseline because it introduces polyglot maintenance cost without an
+identified project requirement that benefits from it.
+
+### Python for Worker
+
+Not selected as a primary candidate.
+
+Python had historical value in the FORGE PoC, but CPU-intensive Worker responsibilities
+and the new Rust Server baseline did not provide a concrete reason to add Python as another
+production implementation ecosystem.
+
+This is not a general claim that Python cannot perform such work; it was simply not the
+preferred fit for this Bamep boundary.
 
 ## Consequences
 
-- Bamep becomes a single-language (Rust) stack across Server, Worker, and Agent, simplifying CI/build/release and enabling shared crates for internal implementation types where useful.
-- The Agent Protocol, Administrative API, and other externally relevant contracts must still be specified explicitly and versioned independently of any shared Rust type — this ADR does not substitute for that contract work, owned by the relevant M0 Work Packages (Issues #2, #3).
-- A future contract participant (e.g., a third-party integration, or a language change for one component) must remain implementable from the versioned contract alone, without needing to read Rust source.
-- Worker and Agent implementation itself remains out of scope for M0; this ADR only fixes the language, not an authorization to begin implementation.
+- Server, Worker, and Agent share Rust as their selected implementation language.
+- Build and release infrastructure should avoid unnecessary language-specific duplication
+  across those components.
+- Internal Rust crates may be shared where useful and where doing so preserves the
+  responsibility boundaries of the architecture.
+- External contracts remain explicit and independently versioned.
+- A future non-Rust implementation must remain possible from the relevant contract alone.
+- Changing the language of one component does not inherently require changing the others;
+  such a change would require its own architectural justification.
+- This ADR does not authorize or imply that Worker or Agent implementation already exists.
 
-## Related architecture
+## Current implementation relationship
 
-- `docs/discovery/architecture-redesign.md` — "Backend and Agent".
-- ADR-0001 — Runtime topology (establishes the Worker boundary this ADR evaluates).
-- ADR-0002 — Backend/Server language (Rust; the baseline this ADR evaluates consistency against).
+The current repository already implements Rust for Server and the shared protocol/trust
+libraries.
+
+Worker and production Agent implementation are not implied by this ADR and must not be
+described as implemented until code exists.
+
+`docs/architecture/README.md` is authoritative for the currently implemented repository
+structure.
+
+## Related specifications and decisions
+
+- ADR-0001 — Server runtime topology and Worker/process isolation.
+- ADR-0002 — Server/backend implementation language.
+- `docs/specifications/m0-stack-and-boundaries-baseline.md` — normative responsibility,
+  dependency, packaging, and versioning baseline.
+- `docs/specifications/m0-agent-protocol-contract.md` — normative Agent Protocol contract.
+
+## Related evidence
+
+- `docs/reference/poc-lessons.md` — reusable lessons from the FORGE PoC, including
+  maintenance-environment resource constraints.
 
 ## Related work
 
 - Issue #1 — `[WP] Define product, runtime, and stack architecture baseline`.
-- Issue #3 — `[WP] Define Agent control and action contracts` (owns the explicit, independently versioned Agent Protocol this ADR's contract-independence constraint depends on).
+- Issue #3 — historical M0 Work Package that produced the Agent control/action contract
+  baseline now persisted in its durable Specification and ADRs.
