@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use bamep_agent_protocol::{
     decode, encode, AgentProtocolMessage, AuthRequestMessage, BootstrapEvidenceMessage, Envelope,
-    ProtocolErrorMessage, ProtocolVersion,
+    InventoryReportMessage, ProtocolErrorMessage, ProtocolVersion,
 };
 use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_server::adapters::agent_gateway::{
@@ -39,6 +39,7 @@ use bamep_trusted_bootstrap::ServerCertFingerprint;
 use bamep_trusted_bootstrap::{fixture::FixtureAssertionSigner, AcceptedSiteKeys};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
+use serde_json::json;
 use sqlx::PgPool;
 use support::{ManualClock, TestDatabase};
 use tokio_tungstenite::tungstenite::Message;
@@ -110,6 +111,10 @@ async fn total_endpoint_count(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+fn object(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    value.as_object().unwrap().clone()
 }
 
 /// A connected, no-TLS in-process WebSocket pair: a real WS Upgrade
@@ -564,6 +569,301 @@ async fn repository_failure_surfaces_as_gateway_error_not_auth_error() {
     assert!(
         no_response.is_err(),
         "no handshake response frame must be sent when redeem fails with a repository error"
+    );
+
+    db.teardown().await;
+}
+
+/// Runtime Presence Registry integration (Issue #30): the real
+/// `AgentControlGateway` registers presence only once its authenticated
+/// session loop is active, and reliably removes it on close — using the same
+/// in-memory duplex harness as the rest of this file, since presence
+/// semantics do not depend on real TLS/WSS transport.
+#[tokio::test]
+async fn authenticated_session_registers_presence_while_active_and_unregisters_on_close() {
+    let db = TestDatabase::setup().await;
+    let clock = Arc::new(ManualClock::new(Utc::now()));
+    let (boot, enrollment) =
+        build_services(db.pool.clone(), Arc::clone(&clock), Duration::minutes(10));
+    let signer = FixtureAssertionSigner::from_seed([31; 32]);
+    let evidence = Arc::new(BootstrapEvidenceService::new(
+        Arc::new(PostgresEndpointRepository::new(db.pool.clone())),
+        AcceptedSiteKeys::single(signer.public_key()),
+    ));
+    let gateway =
+        Arc::new(Gateway::new(Arc::clone(&enrollment)).with_bootstrap_evidence_service(evidence));
+
+    let e1 = issue_e1(&boot, "presence-basic-01", clock.now()).await;
+    let (mut client_ws, mut server_ws) = websocket_pair().await;
+    send_text(
+        &mut client_ws,
+        encode(&AgentProtocolMessage::AuthRequest(AuthRequestMessage::new(
+            e1.to_wire_value(),
+        )))
+        .unwrap(),
+    )
+    .await;
+    let HandshakeOutcome::Established(session) = gateway.handshake(&mut server_ws).await.unwrap()
+    else {
+        panic!("expected a valid AuthRequest to establish")
+    };
+    let endpoint_id = session.endpoint_id;
+    let _ = recv_message(&mut client_ws).await; // consume SessionEstablished
+
+    assert!(
+        !gateway.presence().is_present(endpoint_id),
+        "presence must not register merely from a completed handshake"
+    );
+
+    let gw = Arc::clone(&gateway);
+    let task = tokio::spawn(async move {
+        gw.run_authenticated_session(
+            &mut server_ws,
+            session,
+            ServerCertFingerprint::from_sha256_digest([1; 32]),
+        )
+        .await
+    });
+
+    // Synchronize on a real response so presence is observed only once the
+    // session loop has provably started (registration happens-before the
+    // loop that can produce this response).
+    send_text(&mut client_ws, "{".to_string()).await;
+    assert!(matches!(
+        recv_message(&mut client_ws).await,
+        AgentProtocolMessage::ProtocolError(_)
+    ));
+    assert!(
+        gateway.presence().is_present(endpoint_id),
+        "the Endpoint must be present while its authenticated session loop is active"
+    );
+
+    client_ws.close(None).await.unwrap();
+    task.await.unwrap().unwrap();
+    assert!(
+        !gateway.presence().is_present(endpoint_id),
+        "closing the only session must remove presence"
+    );
+
+    db.teardown().await;
+}
+
+/// One Endpoint may have multiple simultaneous authenticated sessions
+/// (obtained here the same way `enrollment_lifecycle.rs`'s
+/// `predecessor_retry_after_unconfirmed_successor_supersedes_and_reissues`
+/// proves is legal: E1 remains a valid, unconfirmed predecessor and may be
+/// redeemed more than once, each redemption minting its own fresh successor
+/// and — through the Gateway — its own fresh `SessionId`). Registering S2
+/// must not erase S1, and the Endpoint becomes absent only once both close.
+#[tokio::test]
+async fn presence_tracks_multiple_concurrent_sessions_for_one_endpoint() {
+    let db = TestDatabase::setup().await;
+    let clock = Arc::new(ManualClock::new(Utc::now()));
+    let (boot, enrollment) =
+        build_services(db.pool.clone(), Arc::clone(&clock), Duration::minutes(10));
+    let signer = FixtureAssertionSigner::from_seed([32; 32]);
+    let evidence = Arc::new(BootstrapEvidenceService::new(
+        Arc::new(PostgresEndpointRepository::new(db.pool.clone())),
+        AcceptedSiteKeys::single(signer.public_key()),
+    ));
+    let gateway =
+        Arc::new(Gateway::new(Arc::clone(&enrollment)).with_bootstrap_evidence_service(evidence));
+
+    let e1 = issue_e1(&boot, "presence-multi-01", clock.now()).await;
+
+    async fn establish(
+        gateway: &Gateway,
+        wire: &str,
+    ) -> (
+        WebSocketStream<tokio::io::DuplexStream>,
+        WebSocketStream<tokio::io::DuplexStream>,
+        bamep_server::adapters::agent_gateway::AuthenticatedSession,
+    ) {
+        let (mut client_ws, mut server_ws) = websocket_pair().await;
+        send_text(
+            &mut client_ws,
+            encode(&AgentProtocolMessage::AuthRequest(AuthRequestMessage::new(
+                wire,
+            )))
+            .unwrap(),
+        )
+        .await;
+        let HandshakeOutcome::Established(session) =
+            gateway.handshake(&mut server_ws).await.unwrap()
+        else {
+            panic!("expected a valid AuthRequest to establish")
+        };
+        let _ = recv_message(&mut client_ws).await;
+        (client_ws, server_ws, session)
+    }
+
+    let (mut client1, server1, session1) = establish(&gateway, &e1.to_wire_value()).await;
+    let (mut client2, server2, session2) = establish(&gateway, &e1.to_wire_value()).await;
+    assert_eq!(session1.endpoint_id, session2.endpoint_id);
+    assert_ne!(session1.session_id, session2.session_id);
+    let endpoint_id = session1.endpoint_id;
+
+    let gw1 = Arc::clone(&gateway);
+    let mut server1 = server1;
+    let task1 = tokio::spawn(async move {
+        gw1.run_authenticated_session(
+            &mut server1,
+            session1,
+            ServerCertFingerprint::from_sha256_digest([2; 32]),
+        )
+        .await
+    });
+    send_text(&mut client1, "{".to_string()).await;
+    assert!(matches!(
+        recv_message(&mut client1).await,
+        AgentProtocolMessage::ProtocolError(_)
+    ));
+
+    let gw2 = Arc::clone(&gateway);
+    let mut server2 = server2;
+    let task2 = tokio::spawn(async move {
+        gw2.run_authenticated_session(
+            &mut server2,
+            session2,
+            ServerCertFingerprint::from_sha256_digest([3; 32]),
+        )
+        .await
+    });
+    send_text(&mut client2, "{".to_string()).await;
+    assert!(matches!(
+        recv_message(&mut client2).await,
+        AgentProtocolMessage::ProtocolError(_)
+    ));
+
+    assert!(gateway.presence().is_present(endpoint_id));
+
+    client1.close(None).await.unwrap();
+    task1.await.unwrap().unwrap();
+    assert!(
+        gateway.presence().is_present(endpoint_id),
+        "S2 remains active — S1 closing must not erase it"
+    );
+
+    client2.close(None).await.unwrap();
+    task2.await.unwrap().unwrap();
+    assert!(
+        !gateway.presence().is_present(endpoint_id),
+        "only removal of the last session makes the Endpoint absent"
+    );
+
+    db.teardown().await;
+}
+
+/// A rejected `AuthRequest` must never register presence — proven against a
+/// known, already-existing Endpoint whose own session loop is never run in
+/// this test, isolating the assertion to the effect of the rejected attempt
+/// alone.
+#[tokio::test]
+async fn rejected_auth_request_never_registers_presence() {
+    let db = TestDatabase::setup().await;
+    let clock = Arc::new(ManualClock::new(Utc::now()));
+    let (boot, enrollment) =
+        build_services(db.pool.clone(), Arc::clone(&clock), Duration::minutes(10));
+    let gateway = Arc::new(Gateway::new(Arc::clone(&enrollment)));
+
+    let e1 = issue_e1(&boot, "presence-rejected-01", clock.now()).await;
+    let (mut setup_client, mut setup_server) = websocket_pair().await;
+    send_text(
+        &mut setup_client,
+        encode(&AgentProtocolMessage::AuthRequest(AuthRequestMessage::new(
+            e1.to_wire_value(),
+        )))
+        .unwrap(),
+    )
+    .await;
+    let HandshakeOutcome::Established(session) =
+        gateway.handshake(&mut setup_server).await.unwrap()
+    else {
+        panic!("expected a valid AuthRequest to establish")
+    };
+    let endpoint_id = session.endpoint_id;
+
+    let (mut client_ws, mut server_ws) = websocket_pair().await;
+    send_text(
+        &mut client_ws,
+        encode(&AgentProtocolMessage::AuthRequest(AuthRequestMessage::new(
+            "not-a-valid-credential-wire-value",
+        )))
+        .unwrap(),
+    )
+    .await;
+    let outcome = gateway.handshake(&mut server_ws).await.unwrap();
+    assert!(matches!(outcome, HandshakeOutcome::Rejected));
+
+    assert!(
+        !gateway.presence().is_present(endpoint_id),
+        "a rejected AuthRequest must never register presence for any Endpoint"
+    );
+
+    db.teardown().await;
+}
+
+/// Cleanup must be reliable on an error exit path too, not only the normal
+/// close path: forces `AgentGatewayError::InventoryServiceNotConfigured` by
+/// establishing a session on a Gateway with no `InventoryService` configured,
+/// then sending a well-formed `InventoryReport`.
+#[tokio::test]
+async fn session_loop_error_path_still_removes_presence() {
+    let db = TestDatabase::setup().await;
+    let clock = Arc::new(ManualClock::new(Utc::now()));
+    let (boot, enrollment) =
+        build_services(db.pool.clone(), Arc::clone(&clock), Duration::minutes(10));
+    let signer = FixtureAssertionSigner::from_seed([33; 32]);
+    let evidence = Arc::new(BootstrapEvidenceService::new(
+        Arc::new(PostgresEndpointRepository::new(db.pool.clone())),
+        AcceptedSiteKeys::single(signer.public_key()),
+    ));
+    // Deliberately no `.with_inventory_service(...)`.
+    let gateway =
+        Arc::new(Gateway::new(Arc::clone(&enrollment)).with_bootstrap_evidence_service(evidence));
+
+    let e1 = issue_e1(&boot, "presence-error-path-01", clock.now()).await;
+    let (mut client_ws, mut server_ws) = websocket_pair().await;
+    send_text(
+        &mut client_ws,
+        encode(&AgentProtocolMessage::AuthRequest(AuthRequestMessage::new(
+            e1.to_wire_value(),
+        )))
+        .unwrap(),
+    )
+    .await;
+    let HandshakeOutcome::Established(session) = gateway.handshake(&mut server_ws).await.unwrap()
+    else {
+        panic!("expected a valid AuthRequest to establish")
+    };
+    let endpoint_id = session.endpoint_id;
+    let _ = recv_message(&mut client_ws).await;
+
+    let gw = Arc::clone(&gateway);
+    let task = tokio::spawn(async move {
+        gw.run_authenticated_session(
+            &mut server_ws,
+            session,
+            ServerCertFingerprint::from_sha256_digest([4; 32]),
+        )
+        .await
+    });
+
+    let report = InventoryReportMessage::new(object(json!({"cpu": "sim"})));
+    send_text(
+        &mut client_ws,
+        encode(&AgentProtocolMessage::InventoryReport(report)).unwrap(),
+    )
+    .await;
+
+    let result = task.await.unwrap();
+    assert!(matches!(
+        result,
+        Err(AgentGatewayError::InventoryServiceNotConfigured)
+    ));
+    assert!(
+        !gateway.presence().is_present(endpoint_id),
+        "cleanup on an error exit path must still remove presence"
     );
 
     db.teardown().await;

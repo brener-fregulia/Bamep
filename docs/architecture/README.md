@@ -47,7 +47,8 @@ The current Simulator/Server slice:
 4. exchanges Agent Protocol v1 authentication over the real WebSocket transport;
 5. sends retained trusted-bootstrap evidence after session establishment;
 6. evaluates Endpoint identity, credential, BootContext, and trusted-bootstrap state through
-   Server Application/Domain logic;
+   Server Application/Domain logic, alongside the durable hardware-confidence dimension every
+   newly created Endpoint now carries;
 7. accepts post-session opaque `InventoryReport` snapshots and records a Server-owned current
    inventory revision only on semantic change;
 8. persists durable state and required domain events atomically through the PostgreSQL Adapter
@@ -66,6 +67,20 @@ creates one durable `Pending` Job with one or more ordered `Pending` JobSteps fo
 This path never runs through Agent Protocol message handling. It stops at durable creation:
 admission into `Running`, scheduling, resource leases, dispatch authorization, and Attempt
 creation are not yet implemented.
+
+## Implemented safe-dispatch evidence inputs
+
+Three independent evidence inputs for the later destructive-dispatch gate exist structurally
+today, without any admission/scheduling/dispatch behavior built on them yet:
+
+- durable hardware confidence is a fourth `EndpointAggregate` dimension, persisted with the
+  Endpoint and initialized to `Consistent` at creation, independently of enrollment approval;
+- an in-process Runtime Presence Registry (`bamep_server::runtime::presence`) tracks currently
+  authenticated Agent Protocol sessions per Endpoint; the real `AgentControlGateway` registers
+  and unregisters sessions against it and it is never persisted;
+- a `TargetRevalidationPort` Port, backed today only by a deterministic in-memory fixture
+  (`bamep_server::adapters::target_revalidation_fixture`), exposes an opaque current
+  target-disk fingerprint per Endpoint, independently of inventory-revision state.
 
 ## Maintenance rule
 

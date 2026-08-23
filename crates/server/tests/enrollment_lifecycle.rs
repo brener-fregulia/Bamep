@@ -143,6 +143,14 @@ async fn identity_state(pool: &PgPool, endpoint_id: EndpointId) -> String {
         .unwrap()
 }
 
+async fn hardware_confidence(pool: &PgPool, endpoint_id: EndpointId) -> String {
+    sqlx::query_scalar("SELECT hardware_confidence::text FROM endpoints WHERE id = $1")
+        .bind(endpoint_id.0)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 async fn lookup_id_for_slot(pool: &PgPool, endpoint_id: EndpointId, slot: &str) -> Option<Vec<u8>> {
     sqlx::query_scalar(
         "SELECT lookup_id FROM endpoint_credential_lookups \
@@ -246,6 +254,10 @@ async fn closed_vocabulary_columns_use_native_postgres_enum_types() {
         "endpoint_identity_state"
     );
     assert_eq!(
+        udt_name(&db.pool, "endpoints", "hardware_confidence").await,
+        "hardware_confidence_state"
+    );
+    assert_eq!(
         udt_name(&db.pool, "domain_events", "event_type").await,
         "domain_event_type"
     );
@@ -288,6 +300,82 @@ async fn first_contact_creates_pending_enrollment_and_persists_lookup_pair() {
 
     let resolved = boot_context_resolved_endpoint(&db.pool, &e1.lookup_id().to_bytes()).await;
     assert_eq!(resolved, Some(endpoint_id.0));
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn first_contact_persists_consistent_hardware_confidence_independently_of_approval() {
+    let db = TestDatabase::setup().await;
+    let (boot_orchestration, enrollment, clock) = build_services(db.pool.clone());
+
+    let e1 = issue_e1(&boot_orchestration, "sim-hwconf-01", clock.now()).await;
+    let RedeemResult::Established { endpoint_id, .. } =
+        enrollment.redeem(&e1.to_wire_value()).await.unwrap()
+    else {
+        panic!("first contact must establish a session");
+    };
+
+    // Established at Endpoint creation, before any operator approval —
+    // never coupled to PendingEnrollment -> Enrolled.
+    assert_eq!(
+        identity_state(&db.pool, endpoint_id).await,
+        "PendingEnrollment"
+    );
+    assert_eq!(
+        hardware_confidence(&db.pool, endpoint_id).await,
+        "Consistent"
+    );
+
+    enrollment
+        .approve_enrollment(
+            endpoint_id,
+            Actor::Operator {
+                label: "wp1-harness".into(),
+            },
+            clock.now(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(identity_state(&db.pool, endpoint_id).await, "Enrolled");
+    assert_eq!(
+        hardware_confidence(&db.pool, endpoint_id).await,
+        "Consistent",
+        "operator approval must not disturb the independent hardware-confidence dimension"
+    );
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn hardware_confidence_survives_a_fresh_pool_instance() {
+    let db = TestDatabase::setup().await;
+    let (boot_orchestration, enrollment, clock) = build_services(db.pool.clone());
+
+    let e1 = issue_e1(&boot_orchestration, "sim-hwconf-durable-01", clock.now()).await;
+    let RedeemResult::Established { endpoint_id, .. } =
+        enrollment.redeem(&e1.to_wire_value()).await.unwrap()
+    else {
+        panic!("first contact must establish a session");
+    };
+
+    // A brand-new pool/repository against the same database, mirroring
+    // `durable_state_survives_a_fresh_pool_instance` — proves durable
+    // persistence rather than an in-process cache.
+    let fresh_pool = PgPool::connect(&db.db_url)
+        .await
+        .expect("reconnect to the same durable database");
+    let fresh_repo = Arc::new(PostgresEndpointRepository::new(fresh_pool));
+    let fetched = fresh_repo
+        .find_by_id(endpoint_id)
+        .await
+        .unwrap()
+        .expect("state committed by the original pool must be visible to a fresh one");
+    assert_eq!(
+        fetched.hardware_confidence,
+        bamep_domain::HardwareConfidence::Consistent
+    );
 
     db.teardown().await;
 }

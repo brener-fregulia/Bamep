@@ -45,9 +45,9 @@ async fn endpoint_only_update_succeeds_while_boot_context_row_remains_locked() {
     // 2. An Endpoint whose complete CurrentBoot points at A.
     let endpoint_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO endpoints (id, inventory_signal, identity_state, created_at, updated_at, \
+        "INSERT INTO endpoints (id, inventory_signal, identity_state, hardware_confidence, created_at, updated_at, \
          current_boot_context_id, current_boot_nonce, trusted_bootstrap_state) \
-         VALUES ($1, $2, 'PendingEnrollment', $3, $3, $4, $5, 'NotEstablished')",
+         VALUES ($1, $2, 'PendingEnrollment', 'Consistent', $3, $3, $4, $5, 'NotEstablished')",
     )
     .bind(endpoint_id)
     .bind(format!("sim-lock-topology-{endpoint_id}"))

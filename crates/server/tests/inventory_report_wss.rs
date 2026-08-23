@@ -38,17 +38,15 @@ fn object(value: Value) -> Map<String, Value> {
     value.as_object().unwrap().clone()
 }
 
-/// The already-implemented Endpoint dimensions that inventory reporting must
-/// never implicitly change: identity/enrollment, credential state/chain, the
-/// authoritative current boot, and trusted-bootstrap state.
-/// Hardware-confidence is not yet implemented and is deliberately not part
-/// of this snapshot.
+/// The Endpoint dimensions that inventory reporting must never implicitly
+/// change: identity/enrollment, credential state/chain, durable hardware
+/// confidence, the authoritative current boot, and trusted-bootstrap state.
 async fn endpoint_dimensions(
     pool: &sqlx::PgPool,
     endpoint_id: uuid::Uuid,
-) -> (String, bool, Vec<u8>, String) {
+) -> (String, bool, String, Vec<u8>, String) {
     sqlx::query_as(
-        "SELECT identity_state::text, c.revoked, e.current_boot_nonce, e.trusted_bootstrap_state::text \
+        "SELECT identity_state::text, c.revoked, e.hardware_confidence::text, e.current_boot_nonce, e.trusted_bootstrap_state::text \
          FROM endpoints e JOIN endpoint_credentials c ON c.endpoint_id = e.id WHERE e.id = $1",
     )
     .bind(endpoint_id)
@@ -215,6 +213,10 @@ async fn inventory_on_change_and_phase_rejection_cross_real_wss_and_survive_relo
     // InventoryReport: the baseline that inventory reporting itself must
     // never implicitly change.
     let dimensions_before = endpoint_dimensions(&db.pool, endpoint_id).await;
+    assert_eq!(
+        dimensions_before.2, "Consistent",
+        "the newly created Endpoint must already carry its Consistent hardware-confidence baseline"
+    );
 
     const MALFORMED_INVENTORY_REPORT: &str = r#"{"type":"InventoryReport","inventory":[]}"#;
 
@@ -253,7 +255,7 @@ async fn inventory_on_change_and_phase_rejection_cross_real_wss_and_survive_relo
     assert_eq!(
         endpoint_dimensions(&db.pool, endpoint_id).await,
         dimensions_before,
-        "the first observed InventoryReport must not change identity/credential/boot/trusted-bootstrap state"
+        "the first observed InventoryReport must not change identity/credential/hardware-confidence/boot/trusted-bootstrap state"
     );
 
     send_inventory_report(&mut client, object(json!({"memory_bytes":8, "cpu":"sim"})))
@@ -274,7 +276,7 @@ async fn inventory_on_change_and_phase_rejection_cross_real_wss_and_survive_relo
     assert_eq!(
         endpoint_dimensions(&db.pool, endpoint_id).await,
         dimensions_before,
-        "an unchanged re-report must not change identity/credential/boot/trusted-bootstrap state"
+        "an unchanged re-report must not change identity/credential/hardware-confidence/boot/trusted-bootstrap state"
     );
 
     send_inventory_report(&mut client, object(json!({"cpu":"sim", "memory_bytes":16})))
@@ -295,7 +297,7 @@ async fn inventory_on_change_and_phase_rejection_cross_real_wss_and_survive_relo
     assert_eq!(
         endpoint_dimensions(&db.pool, endpoint_id).await,
         dimensions_before,
-        "a meaningfully changed inventory report must not change identity/credential/boot/trusted-bootstrap state"
+        "a meaningfully changed inventory report must not change identity/credential/hardware-confidence/boot/trusted-bootstrap state"
     );
 
     client.close(None).await.unwrap();
@@ -361,7 +363,7 @@ async fn inventory_on_change_and_phase_rejection_cross_real_wss_and_survive_relo
     let dimensions_after_reload = endpoint_dimensions(&reloaded_pool, endpoint_id).await;
     assert_eq!(
         dimensions_after_reload, dimensions_before,
-        "PostgreSQL reload must preserve identity/credential/boot/trusted-bootstrap state independent from inventory persistence"
+        "PostgreSQL reload must preserve identity/credential/hardware-confidence/boot/trusted-bootstrap state independent from inventory persistence"
     );
     reloaded_pool.close().await;
     db.teardown().await;

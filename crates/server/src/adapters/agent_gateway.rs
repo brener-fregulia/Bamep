@@ -37,6 +37,7 @@ use crate::application::{
     ApplicationError, BootstrapEvidenceService, EnrollmentService, RedeemResult,
 };
 use crate::ports::{CredentialRedemptionRepository, EndpointRepository};
+use crate::runtime::presence::PresenceRegistry;
 
 /// Agent Protocol v1 currently defines no richer closed `AuthError` reason
 /// taxonomy (`m0-agent-protocol-contract.md` "Runtime credential issuance and
@@ -56,6 +57,23 @@ pub const GENERIC_PROTOCOL_ERROR_MESSAGE: &str = "protocol violation";
 pub struct AuthenticatedSession {
     pub endpoint_id: EndpointId,
     pub session_id: ProtocolId,
+}
+
+/// Reliably unregisters exactly one `(endpoint_id, session_id)` presence
+/// registration on drop — covering the normal `Ok(())` return, every `?`
+/// early-return, and an unwinding panic alike (`m0-stack-and-boundaries-baseline.md`
+/// "Runtime Presence Registry"). Constructed only by
+/// [`AgentControlGateway::run_authenticated_session`].
+struct PresenceGuard {
+    registry: Arc<PresenceRegistry>,
+    endpoint_id: EndpointId,
+    session_id: ProtocolId,
+}
+
+impl Drop for PresenceGuard {
+    fn drop(&mut self) {
+        self.registry.unregister(self.endpoint_id, self.session_id);
+    }
 }
 
 /// Distinguishes an expected Agent Protocol/authentication rejection from a
@@ -99,6 +117,15 @@ pub struct AgentControlGateway<R: EndpointRepository, C: CredentialRedemptionRep
     enrollment: Arc<EnrollmentService<R, C>>,
     bootstrap_evidence: Option<Arc<BootstrapEvidenceService<R>>>,
     inventory: Option<Arc<crate::application::InventoryService>>,
+    /// The Runtime Presence Registry this Gateway's authenticated sessions
+    /// register with/unregister from (`m0-stack-and-boundaries-baseline.md`
+    /// "Runtime Presence Registry"). Owned by the Gateway by default so every
+    /// `AgentControlGateway::new` caller gets working presence tracking
+    /// without opting in; [`Self::with_presence_registry`] lets a caller
+    /// share one `PresenceRegistry` instance across multiple Runtime
+    /// Services (e.g. a future scheduler that must observe the same
+    /// presence facts).
+    presence: Arc<PresenceRegistry>,
 }
 
 impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGateway<R, C> {
@@ -107,6 +134,7 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             enrollment,
             bootstrap_evidence: None,
             inventory: None,
+            presence: Arc::new(PresenceRegistry::new()),
         }
     }
 
@@ -126,6 +154,17 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
         self
     }
 
+    pub fn with_presence_registry(mut self, presence: Arc<PresenceRegistry>) -> Self {
+        self.presence = presence;
+        self
+    }
+
+    /// The shared [`PresenceRegistry`] this Gateway's authenticated sessions
+    /// register with.
+    pub fn presence(&self) -> Arc<PresenceRegistry> {
+        Arc::clone(&self.presence)
+    }
+
     /// Runs the authenticated post-handshake phase on the same WebSocket.
     /// Evidence rejection is deliberately silent and non-terminal.
     pub async fn run_authenticated_session<S>(
@@ -141,6 +180,22 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             .bootstrap_evidence
             .as_ref()
             .ok_or(AgentGatewayError::BootstrapEvidenceServiceNotConfigured)?;
+
+        // Registration happens only here — after the caller has already
+        // confirmed `HandshakeOutcome::Established` and every configuration
+        // precondition above has passed — never for a rejected/failed
+        // authentication. `_presence_guard`'s `Drop` unregisters exactly this
+        // `SessionId` on every exit path below: normal Close/disconnect
+        // (`Ok(())`), a genuine Gateway error (`?`), and an unwinding panic
+        // alike, so cleanup is reliable even on error paths.
+        self.presence
+            .register(session.endpoint_id, session.session_id);
+        let _presence_guard = PresenceGuard {
+            registry: Arc::clone(&self.presence),
+            endpoint_id: session.endpoint_id,
+            session_id: session.session_id,
+        };
+
         loop {
             let Some(frame) = websocket.next().await else {
                 return Ok(());

@@ -23,8 +23,8 @@ async fn insert_endpoint(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
     let now = Utc::now();
     sqlx::query(
-        "INSERT INTO endpoints (id, inventory_signal, identity_state, created_at, updated_at) \
-         VALUES ($1, $2, 'PendingEnrollment', $3, $3)",
+        "INSERT INTO endpoints (id, inventory_signal, identity_state, hardware_confidence, created_at, updated_at) \
+         VALUES ($1, $2, 'PendingEnrollment', 'Consistent', $3, $3)",
     )
     .bind(id)
     .bind(format!("schema-test-{id}"))

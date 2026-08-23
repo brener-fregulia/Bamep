@@ -31,6 +31,17 @@ CREATE TYPE trusted_bootstrap_state AS ENUM (
     'Established'
 );
 
+-- Durable Endpoint hardware-confidence dimension
+-- (m0-endpoint-identity-lifecycle.md "3. Hardware confidence"). No column
+-- DEFAULT is declared: the Domain/Application layer (not PostgreSQL) owns the
+-- `Consistent` initial-baseline semantic, and every insert supplies it
+-- explicitly.
+CREATE TYPE hardware_confidence_state AS ENUM (
+    'Consistent',
+    'LoweredConfidence',
+    'Conflict'
+);
+
 -- Durable Endpoint identity and authoritative current-boot projection.
 -- Inventory is correlation evidence, never authentication or permanent
 -- identity. A NULL current-boot triple represents unknown historical state and
@@ -42,6 +53,7 @@ CREATE TABLE endpoints (
     id UUID PRIMARY KEY,
     inventory_signal TEXT NOT NULL UNIQUE,
     identity_state endpoint_identity_state NOT NULL,
+    hardware_confidence hardware_confidence_state NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     current_boot_context_id BYTEA

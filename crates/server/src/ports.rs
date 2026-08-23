@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use bamep_domain::presented_credential::{CredentialKind, CredentialLookupId};
 use bamep_domain::{
     BootContext, BootContextResolveError, EndpointAggregate, EndpointId, InvalidIdentityTransition,
-    InventoryRevision, InventorySnapshot, Job, JobId, RedeemOutcome, TransitionOutcome,
-    TrustedBootstrapOutcome,
+    InventoryRevision, InventorySnapshot, Job, JobId, RedeemOutcome, TargetFingerprint,
+    TransitionOutcome, TrustedBootstrapOutcome,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -227,4 +227,21 @@ pub trait CredentialRedemptionRepository: Send + Sync {
         lookup_id: &CredentialLookupId,
         decide: RedemptionDecision,
     ) -> Result<RedeemOutcome, RepositoryError>;
+}
+
+/// Independent target-disk revalidation evidence for destructive-operation
+/// precondition 5 (`m0-endpoint-identity-lifecycle.md` "Destructive-operation
+/// authorization preconditions"; `m0-simulator-contract-and-validation-strategy.md`
+/// "Target-disk revalidation fidelity boundary"). Deliberately separate from
+/// [`InventoryRepository`]: the value this Port returns must never be derived
+/// from inventory-revision equality, so a later Work Package's preconditions
+/// 4 and 5 remain independently testable/failable. M1 implementations are
+/// deterministic fixtures only (`crate::adapters::target_revalidation_fixture`)
+/// — no physical disk probe, no PostgreSQL persistence, no Agent Protocol
+/// message.
+pub trait TargetRevalidationPort: Send + Sync {
+    /// The currently observed/revalidated target-disk fingerprint for
+    /// `endpoint_id`, or `None` when no target evidence is currently
+    /// available for it.
+    fn current_target_fingerprint(&self, endpoint_id: EndpointId) -> Option<TargetFingerprint>;
 }

@@ -10,7 +10,7 @@ use bamep_domain::credential::{CredentialChain, CredentialHash, CredentialSlot};
 use bamep_domain::presented_credential::CredentialLookupId;
 use bamep_domain::{
     Actor, BootContext, BootNonce, CurrentBoot, DomainEvent, EndpointAggregate, EndpointId,
-    TransitionOutcome, TrustedBootstrapState,
+    HardwareConfidence, TransitionOutcome, TrustedBootstrapState,
 };
 use sqlx::{Postgres, Row, Transaction};
 
@@ -49,6 +49,38 @@ impl From<PgIdentityState> for bamep_domain::IdentityState {
             PgIdentityState::PendingEnrollment => bamep_domain::IdentityState::PendingEnrollment,
             PgIdentityState::Enrolled => bamep_domain::IdentityState::Enrolled,
             PgIdentityState::Retired => bamep_domain::IdentityState::Retired,
+        }
+    }
+}
+
+/// Adapter-local representation of the `hardware_confidence_state` PostgreSQL
+/// ENUM (`docs/development/persistence.md`, "Closed categorical values").
+/// Domain (`bamep_domain::HardwareConfidence`) stays free of SQLx/PostgreSQL
+/// derives — mapped explicitly to/from Domain below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "hardware_confidence_state")]
+pub(super) enum PgHardwareConfidence {
+    Consistent,
+    LoweredConfidence,
+    Conflict,
+}
+
+impl From<HardwareConfidence> for PgHardwareConfidence {
+    fn from(state: HardwareConfidence) -> Self {
+        match state {
+            HardwareConfidence::Consistent => PgHardwareConfidence::Consistent,
+            HardwareConfidence::LoweredConfidence => PgHardwareConfidence::LoweredConfidence,
+            HardwareConfidence::Conflict => PgHardwareConfidence::Conflict,
+        }
+    }
+}
+
+impl From<PgHardwareConfidence> for HardwareConfidence {
+    fn from(state: PgHardwareConfidence) -> Self {
+        match state {
+            PgHardwareConfidence::Consistent => HardwareConfidence::Consistent,
+            PgHardwareConfidence::LoweredConfidence => HardwareConfidence::LoweredConfidence,
+            PgHardwareConfidence::Conflict => HardwareConfidence::Conflict,
         }
     }
 }
@@ -220,7 +252,7 @@ pub(super) fn lookup_id_from_bytes(bytes: Vec<u8>) -> Result<CredentialLookupId,
 macro_rules! endpoint_select {
     () => {
         r#"
-        SELECT e.id, e.inventory_signal, e.identity_state, e.created_at, e.updated_at,
+        SELECT e.id, e.inventory_signal, e.identity_state, e.hardware_confidence, e.created_at, e.updated_at,
                e.current_boot_context_id, e.current_boot_nonce, e.trusted_bootstrap_state,
                c.predecessor_verifier, c.predecessor_issued_at, c.predecessor_expires_at,
                c.successor_verifier, c.successor_issued_at, c.successor_expires_at, c.revoked,
@@ -277,6 +309,8 @@ fn row_to_aggregate(row: &sqlx::postgres::PgRow) -> Result<EndpointAggregate, Re
     let id: uuid::Uuid = row.try_get("id").map_err(to_backend_err)?;
     let inventory_signal: String = row.try_get("inventory_signal").map_err(to_backend_err)?;
     let identity_state: PgIdentityState = row.try_get("identity_state").map_err(to_backend_err)?;
+    let hardware_confidence: PgHardwareConfidence =
+        row.try_get("hardware_confidence").map_err(to_backend_err)?;
     let created_at = row.try_get("created_at").map_err(to_backend_err)?;
     let updated_at = row.try_get("updated_at").map_err(to_backend_err)?;
     let current_boot = row_to_current_boot(row)?;
@@ -330,6 +364,7 @@ fn row_to_aggregate(row: &sqlx::postgres::PgRow) -> Result<EndpointAggregate, Re
         inventory_signal,
         identity: identity_state.into(),
         credential: CredentialChain::from_parts(predecessor, successor, revoked),
+        hardware_confidence: hardware_confidence.into(),
         current_boot,
         created_at,
         updated_at,
@@ -413,12 +448,13 @@ pub(super) async fn persist_transition(
     sqlx::query(
         r#"
         INSERT INTO endpoints (
-            id, inventory_signal, identity_state, created_at, updated_at,
+            id, inventory_signal, identity_state, hardware_confidence, created_at, updated_at,
             current_boot_context_id, current_boot_nonce, trusted_bootstrap_state
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT (id) DO UPDATE SET
             identity_state = EXCLUDED.identity_state,
+            hardware_confidence = EXCLUDED.hardware_confidence,
             updated_at = EXCLUDED.updated_at,
             current_boot_context_id = EXCLUDED.current_boot_context_id,
             current_boot_nonce = EXCLUDED.current_boot_nonce,
@@ -428,6 +464,7 @@ pub(super) async fn persist_transition(
     .bind(endpoint.id.0)
     .bind(&endpoint.inventory_signal)
     .bind(PgIdentityState::from(endpoint.identity))
+    .bind(PgHardwareConfidence::from(endpoint.hardware_confidence))
     .bind(endpoint.created_at)
     .bind(endpoint.updated_at)
     .bind(current_boot_context_id)

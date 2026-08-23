@@ -18,6 +18,7 @@ use crate::credential::{self, AuthOutcome, CredentialChain};
 use crate::current_boot::{CurrentBoot, TrustedBootstrapState};
 use crate::endpoint::{EndpointAggregate, EndpointId};
 use crate::events::{Actor, AuditRecord, DomainEvent, TransitionOutcome};
+use crate::hardware_confidence::HardwareConfidence;
 use crate::identity::{self, IdentityState, InvalidIdentityTransition};
 use crate::presented_credential::{CredentialKind, PresentedCredential};
 
@@ -145,6 +146,7 @@ pub fn first_contact(
         inventory_signal: context.inventory_signal().to_string(),
         identity: IdentityState::PendingEnrollment,
         credential: chain,
+        hardware_confidence: HardwareConfidence::initial(),
         current_boot: Some(CurrentBoot::new(
             context.boot_context_id().clone(),
             context.boot_nonce(),
@@ -462,6 +464,40 @@ mod tests {
             }
             RedeemOutcome::Rejected => panic!("first contact must be established"),
         }
+    }
+
+    #[test]
+    fn first_contact_initializes_consistent_hardware_confidence_independently_of_other_dimensions()
+    {
+        let (context, e1) = issue_boot_context("mac:AA:BB", now(), Duration::minutes(5));
+        let RedeemOutcome::Established { outcome, .. } = first_contact(
+            &context,
+            &e1,
+            &fresh_runtime(),
+            now(),
+            DEFAULT_CREDENTIAL_TTL,
+        )
+        .unwrap() else {
+            panic!("first contact must be established")
+        };
+
+        assert_eq!(
+            outcome.endpoint.hardware_confidence,
+            crate::HardwareConfidence::Consistent,
+            "a newly created Endpoint must begin at Consistent"
+        );
+        // The Consistent baseline must not imply Enrolled identity or an
+        // established current boot — each remains independent.
+        assert_eq!(outcome.endpoint.identity, IdentityState::PendingEnrollment);
+        assert_eq!(
+            outcome
+                .endpoint
+                .current_boot
+                .as_ref()
+                .unwrap()
+                .trusted_bootstrap(),
+            TrustedBootstrapState::NotEstablished
+        );
     }
 
     #[test]
@@ -1012,6 +1048,42 @@ mod tests {
         assert_eq!(
             approved.endpoint.current_boot, current_boot_before,
             "operator approval must not disturb CurrentBoot"
+        );
+    }
+
+    #[test]
+    fn approve_enrollment_and_revoke_credential_preserve_hardware_confidence() {
+        let (context, e1) = issue_boot_context("mac:AA:BB", now(), Duration::minutes(5));
+        let RedeemOutcome::Established { outcome: first, .. } = first_contact(
+            &context,
+            &e1,
+            &fresh_runtime(),
+            now(),
+            DEFAULT_CREDENTIAL_TTL,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            first.endpoint.hardware_confidence,
+            crate::HardwareConfidence::Consistent
+        );
+
+        let operator = Actor::Operator {
+            label: "wp1-harness".into(),
+        };
+        let approved = approve_enrollment(&first.endpoint, operator, now()).unwrap();
+        assert_eq!(
+            approved.endpoint.hardware_confidence,
+            crate::HardwareConfidence::Consistent,
+            "operator approval must not disturb hardware confidence"
+        );
+
+        let revoked = revoke_credential(&approved.endpoint, now());
+        assert_eq!(
+            revoked.endpoint.hardware_confidence,
+            crate::HardwareConfidence::Consistent,
+            "credential revocation must not disturb hardware confidence"
         );
     }
 

@@ -13,10 +13,12 @@ pub mod credential;
 pub mod current_boot;
 pub mod endpoint;
 pub mod events;
+pub mod hardware_confidence;
 pub mod identity;
 pub mod inventory;
 pub mod job;
 pub mod presented_credential;
+pub mod target_fingerprint;
 pub mod transitions;
 
 pub use bamep_trusted_bootstrap::BootNonce;
@@ -25,6 +27,7 @@ pub use credential::{AuthOutcome, CredentialChain, CredentialDimension, DEFAULT_
 pub use current_boot::{CurrentBoot, TrustedBootstrapState};
 pub use endpoint::{EndpointAggregate, EndpointId};
 pub use events::{Actor, AuditRecord, DomainEvent, TransitionOutcome};
+pub use hardware_confidence::HardwareConfidence;
 pub use identity::{IdentityState, InvalidIdentityTransition};
 pub use inventory::{
     record_inventory_on_change, InventoryRevision, InventoryRevisionChange, InventoryRevisionId,
@@ -33,4 +36,5 @@ pub use inventory::{
 pub use job::{
     create_workflow, EmptyWorkflow, Job, JobId, JobState, JobStep, JobStepId, JobStepState,
 };
+pub use target_fingerprint::TargetFingerprint;
 pub use transitions::{RedeemOutcome, TrustedBootstrapOutcome};
