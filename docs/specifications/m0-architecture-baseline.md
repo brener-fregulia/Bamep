@@ -1,83 +1,61 @@
-# M0 — Architecture Baseline & Simulated Provisioning Contract
+# M0 — Architecture Baseline Completion Record
 
-Status: **Architecture and contract baseline complete; owner-approved.** All M0 internal architectural decisions are resolved: ADR-0001 through ADR-0011 are `Accepted`, and every M0 Specification required to satisfy the "Acceptance criteria" below is `Approved`. The owner has explicitly approved this baseline ("Aprovo formalmente o baseline M0 — Architecture Baseline & Simulated Provisioning Contract"), satisfying acceptance criterion 8; acceptance criteria 1–8 are all satisfied. This describes completion of the M0 architecture/contract phase only — it does not claim that implementation exists, that the first vertical slice has been empirically validated, or that physical Integration Environment work is complete; those remain the explicitly separate post-M0 phases described below and in `docs/development/testing.md`.
+Status: **Completed; historical milestone record.**
 
-## Goal
+M0 closed Bamep's architecture-and-contract phase before implementation. At closure, the
+required M0 decisions/contracts were accepted or approved and the owner explicitly approved the
+baseline.
 
-Transform Discovery into an owner-approved architectural and contract baseline before the first implementation Work Package.
+This record does not claim that implementation, empirical Simulator validation, or physical
+Integration Environment work was complete. Later accepted/superseding decisions remain
+authoritative over this point-in-time record.
 
-## Scope
+## Completion criteria
 
-M0 must resolve or explicitly isolate:
+M0 required:
 
-- product boundary and domain vocabulary;
-- Endpoint identity;
-- Job/JobStep lifecycle;
-- scheduler and resource model;
-- Agent action model;
-- control-plane contract;
-- data-plane contract;
-- persistence strategy;
-- Backend/Agent stack;
-- security and trust model;
-- storage capabilities;
-- Simulator contract;
-- observability and domain-event model;
-- packaging and versioning baseline;
-- testing policy.
+1. persisted product boundary, vocabulary, and non-goals;
+2. blocking architectural decisions accepted or isolated as explicit empirical work;
+3. specified destructive-operation safety invariants;
+4. defined simulated vertical-slice contracts and failure scenarios;
+5. explicit component responsibilities and boundaries;
+6. validation strategy for required behavior;
+7. no required architecture hidden inside future implementation work;
+8. explicit owner approval.
 
-## Out of scope
+These are historical milestone criteria, not a second source of current normative behavior.
 
-- production provisioning implementation;
-- real disk formatting;
-- real Windows installation;
-- WinPE implementation;
-- MikroTik-specific production adapter;
-- final production backup format;
-- ERP;
-- licensing enforcement;
-- multi-site management;
-- HA;
-- Tauri.
+## Successor slice
 
-## Required technical spikes
-
-Questions requiring empirical evidence must become explicit spikes, especially:
-
-- WinPE mechanism;
-- resumable volume/image transfer format;
-- Secure Boot or hardened boot chain when required;
-- driver-provider integrations.
-
-## Acceptance criteria
-
-M0 is complete when:
-
-1. product boundary, vocabulary, and non-goals are persisted;
-2. blocking ADRs are `Accepted` or the unresolved question is isolated in an explicit technical spike;
-3. destructive operations have specified safety invariants;
-4. the simulated vertical slice has defined behavior, contracts, and failure scenarios;
-5. component responsibilities and boundaries are clear;
-6. relevant requirements have a validation strategy;
-7. no required architectural decision is hidden inside a future implementation Work Package;
-8. the owner explicitly approves the baseline.
-
-## First implementation slice after M0
-
-The first implementation vertical slice must work without real hardware:
+The approved first implementation milestone after M0 was the hardware-independent simulated
+vertical slice:
 
 ```text
-Simulated endpoint connects
-→ authenticated/enrolled
-→ inventory reported
-→ job created
-→ scheduler evaluates resources
-→ typed action dispatched
-→ simulated transfer executed
-→ progress/events persisted
-→ disconnect/reconnect handled
-→ job reaches terminal state
-→ Web reflects result
+Simulated Endpoint connects
+-> authenticated/enrolled
+-> inventory reported
+-> Job created
+-> scheduler evaluates resources
+-> typed action dispatched
+-> simulated transfer executed
+-> progress/events persisted
+-> disconnect/reconnect handled
+-> Job reaches terminal state
+-> Web reflects result
 ```
 
-The slice must support a scenario with 20–24 concurrent simulated endpoints.
+Its representative high-density scenario targets **20–24 concurrent Simulated Endpoints**.
+
+Execution and validation of this scope are now owned by
+`docs/specifications/m1-simulated-vertical-slice-and-baseline-validation.md`; Simulator
+fidelity/concurrency semantics are owned by
+`docs/specifications/m0-simulator-contract-and-validation-strategy.md`.
+
+## Authority
+
+This file is not authoritative for detailed current behavior. Use:
+
+- individual M0 Specifications for normative contracts;
+- ADRs for decision rationale/history;
+- `docs/architecture/README.md` for implemented architecture;
+- GitHub Issues/Milestones for execution history and current work.
