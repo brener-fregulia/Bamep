@@ -40,6 +40,16 @@ After that fixture boundary, the Simulator still exercises real Agent Protocol b
 
 The fixture's concrete configuration/file representation is an implementation detail; its security semantics remain owned by the trusted-bootstrap Specification.
 
+## Target-disk revalidation fidelity boundary
+
+M1 does not perform physical disk probing. For Simulator scenarios, the target-disk identity/fingerprint currently revalidated for destructive-operation precondition 5 (`docs/specifications/m0-endpoint-identity-lifecycle.md` "Destructive-operation authorization preconditions") is supplied through a deterministic faked hardware/probing boundary, consistent with the general faked hardware/OS boundary already defined above.
+
+That current target-disk evidence must be independently controllable from `InventoryRevision` state, so Simulator scenarios can prove, separately:
+- destructive-operation precondition 4 fails while target-disk revalidation still matches; and
+- destructive-operation precondition 5 fails while the authorized/current inventory revision still matches.
+
+The concrete Port/API and fixture representation are implementation details for the implementing Work Package, not this Specification. This boundary introduces no production disk/partition/storage-topology model and no new Agent Protocol message. As with the trusted-bootstrap fixture above, it must never be reported as evidence that physical disk probing was validated.
+
 ## Simulated Endpoint contract
 
 A Simulated Endpoint must support configuration sufficient to model at least connection/disconnection/reconnection, latency, throughput, CPU/resource constraints, storage characteristics/pressure, operation duration, injected failures/interruptions, workflow-driven retries, inventory changes, and simulated Agent restart/loss of local action state.

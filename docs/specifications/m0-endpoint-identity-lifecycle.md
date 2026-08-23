@@ -108,9 +108,11 @@ States:
 - **LoweredConfidence** — a meaningful hardware change requires review but does not by itself break identity continuity.
 - **Conflict** — evidence is sufficiently inconsistent that trusted identity continuity cannot be assumed.
 
+**Initial baseline:** a newly created Endpoint begins at `Consistent`. This is the initial hardware baseline only, established at Endpoint creation independently of identity approval — it is not tied to, and does not wait for, the `PendingEnrollment -> Enrolled` transition. The initial value must not imply or establish `Enrolled` identity, `CredentialActive` credential state, current authenticated Agent presence, or trusted current bootstrap; each remains its own independent dimension/precondition.
+
 `LoweredConfidence` permits connection, authentication, credential renewal, inventory, and other non-destructive activity, but blocks destructive execution. `Conflict` blocks destructive execution and also breaks identity continuity for reconnect/renewal.
 
-Returning to `Consistent` requires explicit operator review/confirmation or explicit revalidation; it is never silently rewritten from new observations. Exact thresholds and escalation policy are implementation-time.
+Returning to `Consistent` after a later hardware-confidence change still requires explicit operator review/confirmation or explicit revalidation under this lifecycle; it is never silently rewritten from new observations/inventory. Exact thresholds, comparison algorithms, and escalation policy remain implementation-time and out of scope.
 
 ### 4. Authoritative current boot
 
@@ -161,12 +163,14 @@ Reconnect never implies that an interrupted destructive operation may be replaye
 Before any destructive operation executes, **all seven independent preconditions must hold**. None may be inferred from another:
 
 1. **Trusted persistent Endpoint identity** — identity is `Enrolled`.
-2. **Authenticated current Agent** — credential state is `CredentialActive` for the current authenticated Agent.
+2. **Authenticated current Agent** — the applicable durable credential state is `CredentialActive`, **and** a currently authenticated Agent session/presence fact independently holds for that Endpoint.
 3. **Authorized Job/action** — the specific Job/action is authorized.
 4. **Fresh inventory** — the authorized inventory revision matches the Endpoint's current inventory revision.
 5. **Target-disk revalidation** — target disk/volume identity or fingerprint matches the authorized target immediately before execution.
 6. **Consistent hardware confidence** — state is `Consistent`; both `LoweredConfidence` and `Conflict` fail this gate.
 7. **Trusted current bootstrap** — an authoritative current boot exists and its trusted-bootstrap state is `Established` through independent Server verification.
+
+Precondition 2 composes two independent facts: durable `CredentialActive` does not by itself prove a currently authenticated Agent session is present, and current session presence does not by itself establish credential validity. Current Agent presence is transient runtime state, never persisted as durable Endpoint state and never inferred from durable credential validity alone (`m0-persistence-observability-and-domain-events.md` "Durable versus transient state"; the Runtime Presence Registry responsibility in `m0-stack-and-boundaries-baseline.md`). This Specification does not define the concrete presence-tracking mechanism.
 
 Precondition 7 is independent from credential authentication: a valid Agent credential does not prove that the current boot path was trusted.
 
@@ -206,4 +210,5 @@ Implementations must cover at least:
 - `docs/specifications/m0-agent-protocol-contract.md` — authentication/session wire contract.
 - `docs/specifications/m0-trusted-bootstrap-and-server-fingerprint-contract.md` — trusted-bootstrap verification contract.
 - `docs/specifications/m0-job-lifecycle-and-scheduling.md` — destructive dispatch composition.
-- `docs/specifications/m0-persistence-observability-and-domain-events.md` — atomic persistence and persist-before-send.
+- `docs/specifications/m0-persistence-observability-and-domain-events.md` — atomic persistence, persist-before-send, and the durable/transient state boundary.
+- `docs/specifications/m0-stack-and-boundaries-baseline.md` — Runtime Presence Registry responsibility.
