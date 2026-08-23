@@ -78,6 +78,10 @@ pub enum AgentGatewayError {
     ConnectionClosed,
     #[error("authenticated session requires a configured BootstrapEvidenceService")]
     BootstrapEvidenceServiceNotConfigured,
+    #[error(
+        "authenticated session received InventoryReport without a configured InventoryService"
+    )]
+    InventoryServiceNotConfigured,
     #[error(transparent)]
     Application(#[from] ApplicationError),
 }
@@ -91,6 +95,7 @@ pub enum AgentGatewayError {
 pub struct AgentControlGateway<R: EndpointRepository, C: CredentialRedemptionRepository> {
     enrollment: Arc<EnrollmentService<R, C>>,
     bootstrap_evidence: Option<Arc<BootstrapEvidenceService<R>>>,
+    inventory: Option<Arc<crate::application::InventoryService>>,
 }
 
 impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGateway<R, C> {
@@ -98,7 +103,16 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
         Self {
             enrollment,
             bootstrap_evidence: None,
+            inventory: None,
         }
+    }
+
+    pub fn with_inventory_service(
+        mut self,
+        service: Arc<crate::application::InventoryService>,
+    ) -> Self {
+        self.inventory = Some(service);
+        self
     }
 
     pub fn with_bootstrap_evidence_service(
@@ -152,6 +166,13 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                                     connection_fingerprint,
                                 )
                                 .await?;
+                        }
+                        AgentProtocolMessage::InventoryReport(report) => {
+                            let service = self
+                                .inventory
+                                .as_ref()
+                                .ok_or(AgentGatewayError::InventoryServiceNotConfigured)?;
+                            let _ = service.record(session.endpoint_id, report).await?;
                         }
                         AgentProtocolMessage::ProtocolError(_) => {}
                         AgentProtocolMessage::AuthRequest(_)
@@ -242,7 +263,7 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
         };
 
         let AgentProtocolMessage::AuthRequest(auth_request) = message else {
-            // Known message, wrong phase (e.g. `BootstrapEvidence`,
+            // Known message, wrong phase (e.g. `BootstrapEvidence`, `InventoryReport`,
             // `SessionEstablished`, or `AuthError` sent by the Agent before
             // authentication). Decoding succeeded, so this message_id is
             // trustworthy and is used for correlation.

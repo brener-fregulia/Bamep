@@ -214,6 +214,7 @@ async fn migrations_apply_cleanly_to_a_fresh_database() {
             "endpoint_credential_lookups",
             "endpoint_credentials",
             "endpoints",
+            "inventory_revisions",
         ]
     );
 

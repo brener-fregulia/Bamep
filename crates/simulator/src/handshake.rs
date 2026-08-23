@@ -17,8 +17,9 @@ use tokio_tungstenite::WebSocketStream;
 
 use bamep_agent_protocol::{
     decode, encode, AgentProtocolMessage, AuthErrorMessage, AuthRequestMessage,
-    BootstrapEvidenceMessage, DecodeError, SessionEstablishedMessage,
+    BootstrapEvidenceMessage, DecodeError, InventoryReportMessage, SessionEstablishedMessage,
 };
+use serde_json::{Map, Value};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SimulatorHandshakeError {
@@ -53,6 +54,23 @@ where
     );
     let wire = encode(&AgentProtocolMessage::BootstrapEvidence(evidence))
         .expect("established bootstrap evidence always encodes");
+    websocket
+        .send(Message::text(wire))
+        .await
+        .map_err(SimulatorHandshakeError::Send)
+}
+
+pub async fn send_inventory_report<S>(
+    websocket: &mut WebSocketStream<S>,
+    inventory: Map<String, Value>,
+) -> Result<(), SimulatorHandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let wire = encode(&AgentProtocolMessage::InventoryReport(
+        InventoryReportMessage::new(inventory),
+    ))
+    .expect("an inventory JSON object always encodes");
     websocket
         .send(Message::text(wire))
         .await

@@ -19,7 +19,8 @@ use async_trait::async_trait;
 use bamep_domain::presented_credential::{CredentialKind, CredentialLookupId};
 use bamep_domain::{
     BootContext, BootContextResolveError, EndpointAggregate, EndpointId, InvalidIdentityTransition,
-    RedeemOutcome, TransitionOutcome, TrustedBootstrapOutcome,
+    InventoryRevision, InventorySnapshot, RedeemOutcome, TransitionOutcome,
+    TrustedBootstrapOutcome,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +81,24 @@ pub trait EndpointRepository: Send + Sync {
         id: EndpointId,
         decide: TrustedBootstrapDecision,
     ) -> Result<TrustedBootstrapOutcome, EndpointUpdateError>;
+}
+
+#[async_trait]
+pub trait InventoryRepository: Send + Sync {
+    /// Locks the Endpoint, compares against its durable current revision, and
+    /// atomically commits a changed revision/current pointer/event. Returns
+    /// `None` for a semantically unchanged snapshot.
+    async fn record_inventory(
+        &self,
+        endpoint_id: EndpointId,
+        inventory: InventorySnapshot,
+        recorded_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<InventoryRevision>, EndpointUpdateError>;
+
+    async fn find_current_inventory(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Result<Option<InventoryRevision>, EndpointUpdateError>;
 }
 
 /// Persistence for newly issued `BootContext`s (ADR-0014 point 11

@@ -47,7 +47,9 @@ A Simulated Endpoint must support configuration sufficient to model at least con
 Its behavioral surface includes:
 - **Identity/enrollment** — configurable inventory/correlation evidence and normal Endpoint enrollment/reconnect paths.
 - **Agent session** — real TLS pin verification, `AuthRequest`, `SessionEstablished`, `AuthError`, runtime-credential renewal, and reconnect behavior.
-- **Inventory** — configurable inventory revisions/changes exercising the persistence contract's write-on-change boundary.
+- **Inventory** — configurable snapshots sent as post-session `InventoryReport{inventory}` through
+  the real WSS/Agent Protocol path, exercising first report, unchanged re-report, changed report,
+  and phase-invalid rejection at the persistence contract's write-on-change boundary.
 - **Actions** — typed `ActionDispatch` handling with configurable timing/failure and the full Agent-local action-state vocabulary required by Agent Protocol.
 - **Data plane** — simulated source/target bytes in temporary storage, chunk manifests, interruption/resume, corruption, and source mutation as required by the data-plane Specification.
 

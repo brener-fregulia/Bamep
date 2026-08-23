@@ -10,7 +10,7 @@
 //!
 //! Scope: this checkpoint implements only the WP1 handshake/evidence message
 //! slice required by Issue #17 — `AuthRequest`, `SessionEstablished`,
-//! `AuthError`, `BootstrapEvidence` — plus the common envelope. It carries no
+//! `AuthError`, `BootstrapEvidence`, `InventoryReport` — plus the common envelope. It carries no
 //! transport (no WebSocket/TLS), no Domain dependency, and no Server
 //! dependency: only `bamep-agent-protocol` itself, `serde`, `serde_json`,
 //! `chrono`, `uuid`, and `thiserror`.
@@ -23,6 +23,7 @@ pub use codec::{decode, encode, DecodeError, EncodeError};
 pub use envelope::{Envelope, MessageTimestamp, ProtocolId, ProtocolIdError, ProtocolVersion};
 pub use messages::{
     AgentProtocolMessage, AuthErrorBody, AuthErrorMessage, AuthRequestBody, AuthRequestMessage,
-    BootstrapEvidenceBody, BootstrapEvidenceMessage, LocalBootTrust, ProtocolErrorBody,
-    ProtocolErrorMessage, SessionEstablishedBody, SessionEstablishedMessage,
+    BootstrapEvidenceBody, BootstrapEvidenceMessage, InventoryReportBody, InventoryReportMessage,
+    LocalBootTrust, ProtocolErrorBody, ProtocolErrorMessage, SessionEstablishedBody,
+    SessionEstablishedMessage,
 };

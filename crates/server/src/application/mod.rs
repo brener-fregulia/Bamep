@@ -8,19 +8,19 @@
 
 use std::sync::Arc;
 
-use bamep_agent_protocol::BootstrapEvidenceMessage;
+use bamep_agent_protocol::{BootstrapEvidenceMessage, InventoryReportMessage};
 use bamep_domain::credential::CredentialHash;
 use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_domain::{
     transitions, Actor, BootContext, BootNonce, EndpointId, InvalidIdentityTransition,
-    DEFAULT_CREDENTIAL_TTL,
+    InventoryRevision, InventorySnapshot, DEFAULT_CREDENTIAL_TTL,
 };
 use bamep_trusted_bootstrap::{AcceptedSiteKeys, BootstrapAssertion, ServerCertFingerprint};
 use chrono::{DateTime, Duration, Utc};
 
 use crate::ports::{
     BootContextRepository, CredentialRedemptionRepository, EndpointRepository, EndpointUpdateError,
-    RedemptionDecision, RedemptionTarget, RepositoryError,
+    InventoryRepository, RedemptionDecision, RedemptionTarget, RepositoryError,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +86,39 @@ pub enum RedeemResult {
 pub enum BootstrapEvidenceResult {
     Established,
     Rejected,
+}
+
+pub struct InventoryService {
+    repo: Arc<dyn InventoryRepository>,
+    clock: Arc<dyn Clock>,
+}
+
+impl InventoryService {
+    pub fn new(repo: Arc<dyn InventoryRepository>) -> Self {
+        Self {
+            repo,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    pub fn with_clock(repo: Arc<dyn InventoryRepository>, clock: Arc<dyn Clock>) -> Self {
+        Self { repo, clock }
+    }
+
+    pub async fn record(
+        &self,
+        endpoint_id: EndpointId,
+        report: InventoryReportMessage,
+    ) -> Result<Option<InventoryRevision>, ApplicationError> {
+        self.repo
+            .record_inventory(
+                endpoint_id,
+                InventorySnapshot(report.body.inventory),
+                self.clock.now(),
+            )
+            .await
+            .map_err(ApplicationError::from)
+    }
 }
 
 /// Independently verifies post-session evidence and correlates it to the

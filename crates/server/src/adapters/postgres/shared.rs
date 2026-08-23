@@ -62,6 +62,7 @@ pub(super) enum PgDomainEventType {
     EndpointPendingEnrollment,
     EndpointEnrolled,
     OperatorDecisionRecorded,
+    InventoryRevisionRecorded,
 }
 
 impl From<&DomainEvent> for PgDomainEventType {
@@ -73,6 +74,9 @@ impl From<&DomainEvent> for PgDomainEventType {
             DomainEvent::EndpointEnrolled { .. } => PgDomainEventType::EndpointEnrolled,
             DomainEvent::OperatorDecisionRecorded { .. } => {
                 PgDomainEventType::OperatorDecisionRecorded
+            }
+            DomainEvent::InventoryRevisionRecorded { .. } => {
+                PgDomainEventType::InventoryRevisionRecorded
             }
         }
     }
@@ -160,7 +164,7 @@ fn actor_columns(actor: &Actor) -> (&'static str, Option<&str>) {
 /// `event_type`, `endpoint_id`, `occurred_at`) are already real columns
 /// (ADR-0013 Sec.6: JSONB is for genuinely variable payload, not for hiding
 /// queryable lifecycle/state).
-fn event_payload(event: &DomainEvent) -> serde_json::Value {
+pub(super) fn event_payload(event: &DomainEvent) -> serde_json::Value {
     match event {
         DomainEvent::EndpointPendingEnrollment { .. } | DomainEvent::EndpointEnrolled { .. } => {
             serde_json::json!({})
@@ -175,6 +179,10 @@ fn event_payload(event: &DomainEvent) -> serde_json::Value {
                 "actor_label": actor_label,
             })
         }
+        DomainEvent::InventoryRevisionRecorded {
+            inventory_revision_id,
+            ..
+        } => serde_json::json!({"inventory_revision_id": inventory_revision_id.0}),
     }
 }
 

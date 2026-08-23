@@ -14,6 +14,7 @@ pub mod current_boot;
 pub mod endpoint;
 pub mod events;
 pub mod identity;
+pub mod inventory;
 pub mod presented_credential;
 pub mod transitions;
 
@@ -24,4 +25,8 @@ pub use current_boot::{CurrentBoot, TrustedBootstrapState};
 pub use endpoint::{EndpointAggregate, EndpointId};
 pub use events::{Actor, AuditRecord, DomainEvent, TransitionOutcome};
 pub use identity::{IdentityState, InvalidIdentityTransition};
+pub use inventory::{
+    record_inventory_on_change, InventoryRevision, InventoryRevisionChange, InventoryRevisionId,
+    InventorySnapshot,
+};
 pub use transitions::{RedeemOutcome, TrustedBootstrapOutcome};

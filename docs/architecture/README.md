@@ -48,7 +48,10 @@ The current Simulator/Server slice:
 5. sends retained trusted-bootstrap evidence after session establishment;
 6. evaluates Endpoint identity, credential, BootContext, and trusted-bootstrap state through
    Server Application/Domain logic;
-7. persists durable state through the PostgreSQL Adapter boundary.
+7. accepts post-session opaque `InventoryReport` snapshots and records a Server-owned current
+   inventory revision only on semantic change;
+8. persists durable state and required domain events atomically through the PostgreSQL Adapter
+   boundary.
 
 Production boot-chain inputs are still represented by Simulator fixtures where the physical
 Integration Environment is not implemented. The WSS and Agent Protocol boundary itself is

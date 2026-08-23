@@ -1,7 +1,8 @@
 //! The WP1 handshake/evidence message slice of Agent Protocol v1
 //! (`docs/specifications/m0-agent-protocol-contract.md` "Message types"):
 //! `AuthRequest`, `SessionEstablished`, `AuthError` (Agent Protocol
-//! handshake), and `BootstrapEvidence` (trusted-bootstrap evidence report).
+//! handshake), `BootstrapEvidence` (trusted-bootstrap evidence report), and
+//! `InventoryReport` (opaque observed inventory snapshot).
 //!
 //! Every field beyond the common [`Envelope`] is opaque to this crate:
 //! `credential`, `runtime_credential`, `bootstrap_assertion`, and
@@ -14,6 +15,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::envelope::{Envelope, MessageTimestamp, ProtocolId};
 
@@ -277,6 +279,34 @@ impl BootstrapEvidenceMessage {
 }
 
 // ---------------------------------------------------------------------
+// InventoryReport — Agent -> Server
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InventoryReportBody {
+    /// Opaque structured inventory. Agent Protocol constrains this to a JSON
+    /// object but does not interpret its fields.
+    pub inventory: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InventoryReportMessage {
+    #[serde(flatten)]
+    pub envelope: Envelope,
+    #[serde(flatten)]
+    pub body: InventoryReportBody,
+}
+
+impl InventoryReportMessage {
+    pub fn new(inventory: Map<String, Value>) -> Self {
+        Self {
+            envelope: Envelope::new(),
+            body: InventoryReportBody { inventory },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Top-level message union
 // ---------------------------------------------------------------------
 
@@ -296,6 +326,7 @@ pub enum AgentProtocolMessage {
     SessionEstablished(SessionEstablishedMessage),
     AuthError(AuthErrorMessage),
     BootstrapEvidence(BootstrapEvidenceMessage),
+    InventoryReport(InventoryReportMessage),
     ProtocolError(ProtocolErrorMessage),
 }
 
@@ -306,6 +337,7 @@ impl AgentProtocolMessage {
             AgentProtocolMessage::SessionEstablished(m) => &m.envelope,
             AgentProtocolMessage::AuthError(m) => &m.envelope,
             AgentProtocolMessage::BootstrapEvidence(m) => &m.envelope,
+            AgentProtocolMessage::InventoryReport(m) => &m.envelope,
             AgentProtocolMessage::ProtocolError(m) => &m.envelope,
         }
     }

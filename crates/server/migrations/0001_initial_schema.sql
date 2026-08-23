@@ -12,7 +12,8 @@ CREATE TYPE endpoint_identity_state AS ENUM (
 CREATE TYPE domain_event_type AS ENUM (
     'EndpointPendingEnrollment',
     'EndpointEnrolled',
-    'OperatorDecisionRecorded'
+    'OperatorDecisionRecorded',
+    'InventoryRevisionRecorded'
 );
 
 CREATE TYPE audit_actor_kind AS ENUM (
@@ -48,11 +49,27 @@ CREATE TABLE endpoints (
     current_boot_nonce BYTEA
         CHECK (current_boot_nonce IS NULL OR octet_length(current_boot_nonce) = 32),
     trusted_bootstrap_state trusted_bootstrap_state,
+    current_inventory_revision_id UUID,
     CONSTRAINT endpoints_current_boot_all_or_none CHECK (
         (current_boot_context_id IS NULL AND current_boot_nonce IS NULL AND trusted_bootstrap_state IS NULL)
         OR (current_boot_context_id IS NOT NULL AND current_boot_nonce IS NOT NULL AND trusted_bootstrap_state IS NOT NULL)
     )
 );
+
+-- Opaque observed inventory is retained as JSONB while revision identity,
+-- ownership, ordering time, and the Endpoint current pointer remain
+-- relational and queryable.
+CREATE TABLE inventory_revisions (
+    endpoint_id UUID NOT NULL REFERENCES endpoints (id),
+    revision_id UUID NOT NULL,
+    inventory JSONB NOT NULL CHECK (jsonb_typeof(inventory) = 'object'),
+    recorded_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (endpoint_id, revision_id)
+);
+
+ALTER TABLE endpoints ADD CONSTRAINT endpoints_current_inventory_revision_fk
+    FOREIGN KEY (id, current_inventory_revision_id)
+    REFERENCES inventory_revisions (endpoint_id, revision_id);
 
 -- ADR-0012 bounded runtime-credential chain: one predecessor plus at most one
 -- current unconfirmed successor. Verifiers are one-way opaque byte values;

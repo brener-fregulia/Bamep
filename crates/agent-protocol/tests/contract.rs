@@ -6,7 +6,8 @@
 
 use bamep_agent_protocol::{
     codec, AgentProtocolMessage, AuthErrorMessage, AuthRequestMessage, BootstrapEvidenceMessage,
-    Envelope, LocalBootTrust, ProtocolErrorMessage, ProtocolId, SessionEstablishedMessage,
+    Envelope, InventoryReportMessage, LocalBootTrust, ProtocolErrorMessage, ProtocolId,
+    SessionEstablishedMessage,
 };
 use chrono::Utc;
 use serde_json::Value;
@@ -444,4 +445,54 @@ fn protocol_error_has_normative_flat_wire_shape_and_optional_correlation() {
         codec::decode(&json).unwrap(),
         AgentProtocolMessage::ProtocolError(_)
     ));
+}
+
+#[test]
+fn inventory_report_round_trips_as_an_opaque_json_object() {
+    let inventory = serde_json::json!({
+        "cpu": {"model": "simulated"},
+        "disks": [{"bytes": 1024}],
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let wire = codec::encode(&AgentProtocolMessage::InventoryReport(
+        InventoryReportMessage::new(inventory.clone()),
+    ))
+    .unwrap();
+    let value: Value = serde_json::from_str(&wire).unwrap();
+    assert_eq!(value["type"], "InventoryReport");
+    assert_eq!(value["inventory"], Value::Object(inventory.clone()));
+
+    let AgentProtocolMessage::InventoryReport(decoded) = codec::decode(&wire).unwrap() else {
+        panic!("expected InventoryReport")
+    };
+    assert_eq!(decoded.body.inventory, inventory);
+}
+
+#[test]
+fn inventory_report_ignores_unknown_inner_message_fields() {
+    let envelope = Envelope::new();
+    let json = format!(
+        r#"{{"type":"InventoryReport","message_id":"{}","protocol_version":"1","timestamp":"{}","inventory":{{"cpu":"sim"}},"future_metadata":{{"sequence":7}}}}"#,
+        envelope.message_id,
+        envelope.timestamp.as_datetime().to_rfc3339(),
+    );
+    let AgentProtocolMessage::InventoryReport(decoded) = codec::decode(&json).unwrap() else {
+        panic!("expected InventoryReport")
+    };
+    assert_eq!(decoded.body.inventory["cpu"], "sim");
+}
+
+#[test]
+fn inventory_report_rejects_missing_or_non_object_inventory() {
+    let envelope = Envelope::new();
+    for body in ["", r#","inventory":[1,2,3]"#, r#","inventory":"opaque""#] {
+        let json = format!(
+            r#"{{"type":"InventoryReport","message_id":"{}","protocol_version":"1","timestamp":"{}"{body}}}"#,
+            envelope.message_id,
+            envelope.timestamp.as_datetime().to_rfc3339(),
+        );
+        assert!(codec::decode(&json).is_err(), "must reject: {json}");
+    }
 }

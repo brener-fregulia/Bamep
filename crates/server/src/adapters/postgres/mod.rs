@@ -9,11 +9,13 @@
 
 mod boot_context_repository;
 mod credential_redemption_repository;
+mod inventory_repository;
 mod repository;
 mod shared;
 
 pub use boot_context_repository::PostgresBootContextRepository;
 pub use credential_redemption_repository::PostgresCredentialRedemptionRepository;
+pub use inventory_repository::PostgresInventoryRepository;
 pub use repository::PostgresEndpointRepository;
 
 use sqlx::postgres::PgPoolOptions;

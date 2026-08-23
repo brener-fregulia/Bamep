@@ -28,7 +28,8 @@ pub mod verifier;
 
 pub use bamep_trusted_bootstrap::ServerCertFingerprint;
 pub use handshake::{
-    authenticate, send_bootstrap_evidence, SimulatorHandshakeError, SimulatorHandshakeOutcome,
+    authenticate, send_bootstrap_evidence, send_inventory_report, SimulatorHandshakeError,
+    SimulatorHandshakeOutcome,
 };
 pub use transport::{connect_pinned_wss, SimulatorTransportError};
 pub use trusted_bootstrap::{

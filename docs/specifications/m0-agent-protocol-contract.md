@@ -66,6 +66,21 @@ Rules:
 
 `CredentialActive` and trusted-bootstrap establishment remain independent facts.
 
+## Inventory reporting
+
+After `SessionEstablished`, the Agent may send:
+
+`InventoryReport{inventory}`
+
+`inventory` is a JSON object containing the observed Endpoint inventory snapshot. Agent Protocol
+treats its content as opaque structured data; M1 defines no richer hardware-inventory schema. The
+Agent supplies no revision identifier and receives no acknowledgement. The Server owns semantic
+comparison, durable revision creation, current-revision selection, persistence, and event emission.
+JSON object key ordering is not a change, and reconnect/re-report of a semantically equal parsed
+object creates no new durable revision. Sending this message before `SessionEstablished`, or
+sending a malformed inventory body, is a protocol/phase violation and must not mutate durable
+inventory state.
+
 ## Transfer authorization
 
 After `SessionEstablished` and `ActionAck{outcome: Accepted}` for a data-plane transfer action, the Agent may use:
@@ -115,6 +130,7 @@ For action-scoped messages, `correlation_id` equals the relevant `action_id`. Fo
 - `SessionEstablished{protocol_version, session_id, runtime_credential, credential_expires_at}`
 - `AuthError{reason}`
 - `BootstrapEvidence{boot_nonce, bootstrap_assertion, local_boot_trust: Established}`
+- `InventoryReport{inventory}` — Agent -> Server; post-session observational report.
 - `TransferAuthorizationRequest{transfer_id, proof_public_key}`
 - `TransferAuthorizationGrant{transfer_id, token, expires_at}`
 - `TransferAuthorizationDenied{transfer_id, reason}`

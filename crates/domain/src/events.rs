@@ -13,9 +13,8 @@ pub enum Actor {
 }
 
 /// A durable domain event, per `m0-persistence-observability-and-domain-events.md`
-/// "Domain-event model". Only the three event types WP1 needs from the
-/// illustrative M0 catalog are represented here; the catalog itself remains
-/// extensible.
+/// "Domain-event model". Only event types required by the implemented slice
+/// are represented here; the catalog itself remains extensible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event_type")]
 pub enum DomainEvent {
@@ -36,6 +35,12 @@ pub enum DomainEvent {
         actor: Actor,
         occurred_at: DateTime<Utc>,
     },
+    InventoryRevisionRecorded {
+        event_id: Uuid,
+        endpoint_id: EndpointId,
+        inventory_revision_id: crate::InventoryRevisionId,
+        occurred_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent {
@@ -43,7 +48,8 @@ impl DomainEvent {
         match self {
             DomainEvent::EndpointPendingEnrollment { event_id, .. }
             | DomainEvent::EndpointEnrolled { event_id, .. }
-            | DomainEvent::OperatorDecisionRecorded { event_id, .. } => *event_id,
+            | DomainEvent::OperatorDecisionRecorded { event_id, .. }
+            | DomainEvent::InventoryRevisionRecorded { event_id, .. } => *event_id,
         }
     }
 
@@ -51,7 +57,8 @@ impl DomainEvent {
         match self {
             DomainEvent::EndpointPendingEnrollment { endpoint_id, .. }
             | DomainEvent::EndpointEnrolled { endpoint_id, .. }
-            | DomainEvent::OperatorDecisionRecorded { endpoint_id, .. } => *endpoint_id,
+            | DomainEvent::OperatorDecisionRecorded { endpoint_id, .. }
+            | DomainEvent::InventoryRevisionRecorded { endpoint_id, .. } => *endpoint_id,
         }
     }
 
@@ -59,7 +66,8 @@ impl DomainEvent {
         match self {
             DomainEvent::EndpointPendingEnrollment { occurred_at, .. }
             | DomainEvent::EndpointEnrolled { occurred_at, .. }
-            | DomainEvent::OperatorDecisionRecorded { occurred_at, .. } => *occurred_at,
+            | DomainEvent::OperatorDecisionRecorded { occurred_at, .. }
+            | DomainEvent::InventoryRevisionRecorded { occurred_at, .. } => *occurred_at,
         }
     }
 
@@ -68,6 +76,7 @@ impl DomainEvent {
             DomainEvent::EndpointPendingEnrollment { .. } => "EndpointPendingEnrollment",
             DomainEvent::EndpointEnrolled { .. } => "EndpointEnrolled",
             DomainEvent::OperatorDecisionRecorded { .. } => "OperatorDecisionRecorded",
+            DomainEvent::InventoryRevisionRecorded { .. } => "InventoryRevisionRecorded",
         }
     }
 }
