@@ -26,8 +26,8 @@ use bamep_agent_protocol::{
     ActionDispatchMessage, CancelActionMessage, InventoryReportMessage, ProtocolId,
 };
 use bamep_domain::{
-    ActionEvidence, Actor, BootNonce, CancelAckEvidence, EndpointId, JobId, JobStepId,
-    TargetFingerprint,
+    ActionEvidence, Actor, BootNonce, CancelAckEvidence, EndpointId, FinalDispatchRejection, JobId,
+    JobStepId, TargetFingerprint,
 };
 use bamep_server::adapters::postgres::{
     PostgresBootContextRepository, PostgresCredentialRedemptionRepository,
@@ -77,6 +77,7 @@ fn arbiter() -> Arc<TechnicalResourceArbiter> {
 struct FakeDispatchPort {
     cancel_calls: AtomicUsize,
     fail_next_cancel: Mutex<bool>,
+    last_cancel_action_id: Mutex<Option<ProtocolId>>,
 }
 
 impl FakeDispatchPort {
@@ -88,11 +89,16 @@ impl FakeDispatchPort {
         Arc::new(Self {
             cancel_calls: AtomicUsize::new(0),
             fail_next_cancel: Mutex::new(true),
+            last_cancel_action_id: Mutex::new(None),
         })
     }
 
     fn cancel_call_count(&self) -> usize {
         self.cancel_calls.load(Ordering::SeqCst)
+    }
+
+    fn last_cancel_action_id(&self) -> Option<ProtocolId> {
+        *self.last_cancel_action_id.lock().unwrap()
     }
 }
 
@@ -109,9 +115,10 @@ impl AgentDispatchPort for FakeDispatchPort {
     async fn cancel_action(
         &self,
         _endpoint_id: EndpointId,
-        _cancel: CancelActionMessage,
+        cancel: CancelActionMessage,
     ) -> Result<(), AgentDispatchError> {
         self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_cancel_action_id.lock().unwrap() = Some(cancel.body.action_id);
         let mut fail = self.fail_next_cancel.lock().unwrap();
         if *fail {
             *fail = false;
@@ -1171,6 +1178,314 @@ async fn concurrent_cancellation_request_and_terminal_result_serialize_to_one_ou
         reservations.take(attempt.id),
         None,
         "the reservation must be released exactly once regardless of race outcome"
+    );
+
+    db.teardown().await;
+}
+
+// ---------------------------------------------------------------------
+// Deterministic regression: the missed-candidate race against final
+// dispatch (Issue #27 follow-up "Close the no-candidate race with final
+// dispatch"). A test-local trigger pauses the staged final-dispatch
+// transaction only after it has committed nothing yet but already holds
+// the Job row lock and has inserted the Attempt row — no production hook
+// exists; mirrors `bootstrap_evidence_concurrency.rs`'s technique.
+// ---------------------------------------------------------------------
+
+const DISPATCH_ATTEMPT_BARRIER_KEY: i64 = 27_101;
+
+/// Builds an enrolled, fully-trusted Endpoint with a `Running` Job whose
+/// single JobStep is `PreconditionsSatisfied` — ready for final dispatch,
+/// but with no Attempt yet, mirroring `dispatched_attempt` up to (not
+/// including) `commit_destructive_dispatch`.
+async fn job_ready_for_dispatch(
+    pool: &PgPool,
+    services: &Services,
+    presence: &Arc<PresenceRegistry>,
+    inventory_signal: &str,
+) -> (JobId, JobStepId, EndpointId) {
+    let now = Utc::now();
+    let endpoint_id = enrolled_endpoint(services, inventory_signal, now).await;
+    presence.register(endpoint_id, ProtocolId::generate());
+    establish_trust(pool, endpoint_id).await;
+
+    services
+        .inventory
+        .record(
+            endpoint_id,
+            InventoryReportMessage::new(object(json!({"disk": "a"}))),
+        )
+        .await
+        .unwrap();
+    services
+        .target
+        .set_current_target(endpoint_id, TargetFingerprint::new("disk-a"));
+
+    let job = services.jobs.create_workflow(endpoint_id, 1).await.unwrap();
+    let step_id = job.steps[0].id;
+    services.intents.authorize(job.id, step_id).await.unwrap();
+    services.scheduling.admit(job.id).await.unwrap();
+    services
+        .scheduling
+        .satisfy_current_step_preconditions(job.id, step_id)
+        .await
+        .unwrap();
+
+    (job.id, step_id, endpoint_id)
+}
+
+/// Manually stages exactly the durable effect
+/// `PostgresJobRepository::commit_destructive_dispatch` produces for a
+/// destructive dispatch — lock the Job row, mark the JobStep `Dispatching`,
+/// insert `Attempt{Dispatched}` — inside one transaction this function does
+/// not commit until the whole `INSERT` (including its `AFTER INSERT`
+/// trigger) returns. Used only to control exactly when the Attempt becomes
+/// visible relative to a concurrent `request_cancellation` pass; the real
+/// #25/#26 path is exercised by every other test in this file.
+async fn stage_final_dispatch_attempt(
+    pool: &PgPool,
+    job_id: JobId,
+    step_id: JobStepId,
+) -> (uuid::Uuid, uuid::Uuid) {
+    let attempt_id = uuid::Uuid::new_v4();
+    let action_id = uuid::Uuid::new_v4();
+
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
+        .bind(job_id.0)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE job_steps SET state = 'Dispatching' WHERE id = $1")
+        .bind(step_id.0)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // The `AFTER INSERT` trigger installed by the caller pauses here on
+    // `DISPATCH_ATTEMPT_BARRIER_KEY` — the row exists in this transaction
+    // but is invisible to every other connection until `tx.commit()` below.
+    sqlx::query(
+        "INSERT INTO attempts (id, job_step_id, action_id, state) \
+         VALUES ($1, $2, $3, 'Dispatched')",
+    )
+    .bind(attempt_id)
+    .bind(step_id.0)
+    .bind(action_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    (attempt_id, action_id)
+}
+
+async fn hold_advisory_lock(pool: &PgPool, key: i64) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+    let mut connection = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(key)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    connection
+}
+
+async fn release_advisory_lock(
+    connection: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    key: i64,
+) {
+    let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .fetch_one(&mut **connection)
+        .await
+        .unwrap();
+    assert!(released);
+}
+
+async fn wait_for_advisory_waiter(pool: &PgPool) {
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND database = \
+             (SELECT oid FROM pg_database WHERE datname = current_database()) AND NOT granted",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting >= 1 {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn advisory_waiter_reached(pool: &PgPool) {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_advisory_waiter(pool),
+    )
+    .await
+    .expect("the staged final-dispatch transaction must reach its test-local advisory barrier");
+}
+
+async fn wait_for_two_lock_waiters(pool: &PgPool) {
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() \
+             AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting >= 2 {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn both_operations_are_lock_blocked(pool: &PgPool) {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_two_lock_waiters(pool),
+    )
+    .await
+    .expect("cancellation must be blocked waiting on the Job row lock");
+}
+
+#[tokio::test]
+async fn missed_candidate_race_against_final_dispatch_is_closed_by_the_post_job_lock_rescan() {
+    let db = TestDatabase::setup().await;
+    let services = build_services(db.pool.clone());
+    let presence = Arc::new(PresenceRegistry::new());
+    let (job_id, step_id, _endpoint_id) =
+        job_ready_for_dispatch(&db.pool, &services, &presence, "cancel-missed-candidate").await;
+
+    sqlx::query(
+        "CREATE FUNCTION pause_attempt_insert() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN PERFORM pg_advisory_xact_lock(27101); RETURN NULL; END $$",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER pause_attempt_insert AFTER INSERT ON attempts \
+         FOR EACH ROW EXECUTE FUNCTION pause_attempt_insert()",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // Hold the barrier ourselves first so the staged dispatch transaction's
+    // trigger blocks on it deterministically, exactly like
+    // `bootstrap_evidence_concurrency.rs`'s `hold_advisory_lock` pattern.
+    let mut barrier = hold_advisory_lock(&db.pool, DISPATCH_ATTEMPT_BARRIER_KEY).await;
+
+    let pool_for_dispatch = db.pool.clone();
+    let dispatch_task = tokio::spawn(async move {
+        stage_final_dispatch_attempt(&pool_for_dispatch, job_id, step_id).await
+    });
+    // The staged transaction has locked the Job row, marked the JobStep
+    // `Dispatching`, and inserted Attempt{Dispatched} -- all uncommitted --
+    // and is now paused in the trigger.
+    advisory_waiter_reached(&db.pool).await;
+
+    let reservations = Arc::new(AttemptReservationRegistry::new());
+    let dispatch_port = FakeDispatchPort::new();
+    let cancel_svc = Arc::new(cancellation_service(
+        Arc::clone(&services.job_repo),
+        Arc::clone(&reservations),
+        arbiter(),
+        Arc::clone(&dispatch_port),
+    ));
+    let cancel_task = {
+        let cancel_svc = Arc::clone(&cancel_svc);
+        tokio::spawn(async move { cancel_svc.request(job_id, operator()).await })
+    };
+    // Cancellation's unlocked pre-scan ran while the Attempt was still
+    // invisible (uncommitted) and found no candidate; it is now blocked
+    // waiting for the Job row lock the staged transaction still holds.
+    both_operations_are_lock_blocked(&db.pool).await;
+
+    release_advisory_lock(&mut barrier, DISPATCH_ATTEMPT_BARRIER_KEY).await;
+
+    let (attempt_id, action_id) = dispatch_task.await.unwrap();
+    let cancel_result = cancel_task.await.unwrap().unwrap();
+
+    let CancellationRequestResult::EnteredCancelling { send } = cancel_result else {
+        panic!(
+            "the missed-candidate race must resolve to EnteredCancelling, got {cancel_result:?} \
+             -- CompletedImmediately would mean the now-committed active Attempt was abandoned \
+             without ever receiving CancelAction"
+        );
+    };
+    assert_eq!(send, CancelActionSendOutcome::Sent);
+    assert_eq!(dispatch_port.cancel_call_count(), 1);
+    assert_eq!(
+        dispatch_port.last_cancel_action_id(),
+        Some(ProtocolId::from_uuid(action_id).unwrap()),
+        "CancelAction must use the already-committed Attempt's action_id"
+    );
+
+    assert_eq!(job_state_text(&db.pool, job_id).await, "Cancelling");
+    assert_eq!(attempt_state(&db.pool, attempt_id).await, "Dispatched");
+    let (step_state, _) = job_step_row(&db.pool, step_id).await;
+    assert_eq!(step_state, "Dispatching");
+    assert_eq!(cancellation_audit_count(&db.pool, job_id).await, 1);
+
+    drop(barrier);
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn cancellation_committed_first_then_final_dispatch_cannot_create_a_new_attempt() {
+    let db = TestDatabase::setup().await;
+    let services = build_services(db.pool.clone());
+    let presence = Arc::new(PresenceRegistry::new());
+    let (job_id, step_id, _endpoint_id) =
+        job_ready_for_dispatch(&db.pool, &services, &presence, "cancel-before-dispatch").await;
+
+    let reservations = Arc::new(AttemptReservationRegistry::new());
+    let dispatch_port = FakeDispatchPort::new();
+    let cancel_svc = cancellation_service(
+        Arc::clone(&services.job_repo),
+        Arc::clone(&reservations),
+        arbiter(),
+        Arc::clone(&dispatch_port),
+    );
+
+    // No Attempt exists yet -- the JobStep is only `PreconditionsSatisfied`,
+    // never `Dispatching` -- so cancellation's own decision completes
+    // immediately: `Running -> Cancelled`.
+    let result = cancel_svc.request(job_id, operator()).await.unwrap();
+    assert_eq!(result, CancellationRequestResult::CompletedImmediately);
+    assert_eq!(job_state_text(&db.pool, job_id).await, "Cancelled");
+    assert_eq!(dispatch_port.cancel_call_count(), 0);
+
+    // Reusing the real #25 path unmodified: FinalDispatch must refuse to
+    // create a new Attempt for a Job that is no longer Running.
+    let dispatch_service = FinalDispatchService::new(
+        Arc::clone(&services.job_repo),
+        Arc::clone(&presence),
+        Arc::clone(&services.target) as Arc<dyn TargetRevalidationPort>,
+        arbiter(),
+    );
+    let outcome = dispatch_service
+        .commit_destructive_dispatch(job_id, step_id, network_claims())
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        FinalDispatchResult::Rejected(FinalDispatchRejection::JobNotRunning)
+    ));
+
+    let attempt_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM attempts WHERE job_step_id = $1")
+            .bind(step_id.0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        attempt_count, 0,
+        "no Attempt must ever be created for a Job no longer Running"
     );
 
     db.teardown().await;

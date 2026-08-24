@@ -28,7 +28,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bamep_agent_protocol::{
-    decode, encode, AgentProtocolMessage, CancelAckOutcome, InventoryReportMessage,
+    decode, encode, AgentProtocolMessage, CancelAckOutcome, CancelActionMessage,
+    InventoryReportMessage,
 };
 use bamep_domain::{Actor, Attempt, BootNonce, EndpointId, JobId, JobStepId, TargetFingerprint};
 use bamep_server::adapters::agent_gateway::{AgentControlGateway, HandshakeOutcome};
@@ -762,6 +763,94 @@ async fn unknown_cancel_ack_awaits_reconciliation_without_fabricating_a_terminal
         event_count(&db.pool, session.job_id, "JobCancelled").await,
         0,
         "Unknown never fabricates a terminal outcome"
+    );
+
+    db.teardown().await;
+}
+
+// ---------------------------------------------------------------------
+// Negative proof: the Agent can never initiate Job cancellation (Issue #27
+// follow-up "CancelAck must never initiate Job cancellation").
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn unsolicited_cancel_ack_before_any_cancellation_request_cannot_mutate_the_running_job_over_real_wss(
+) {
+    let db = TestDatabase::setup().await;
+    let (cert_der, key_der) = generate_test_cert("localhost");
+    let issuer = TrustedBootstrapFixtureIssuer::from_seed([0x75; 32]);
+    let harness = build_harness(db.pool.clone(), &issuer);
+
+    let mut session = establish_and_dispatch(
+        &harness.services,
+        &harness.gateway,
+        &harness.outbound,
+        &harness.reservations,
+        &arbiter(),
+        &issuer,
+        cert_der,
+        key_der,
+        "127.0.0.1:0".parse().unwrap(),
+        "wss-cancel-unsolicited",
+    )
+    .await;
+
+    let AgentProtocolMessage::ActionDispatch(dispatch) =
+        recv_agent_message(&mut session.websocket).await
+    else {
+        panic!("expected ActionDispatch")
+    };
+
+    // The Agent locally records the dispatch as Active (so it can answer a
+    // cancel with a genuine `Cancelled`, not `Unknown`) but its resulting
+    // ActionAck is deliberately never transmitted -- the Server never sees
+    // any evidence for this Attempt, and `CancellationService::request` is
+    // never called. `harness.cancellation` is otherwise unused throughout
+    // this test: no operator/internal cancellation request ever happens.
+    let agent =
+        SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::AcceptThenSucceed);
+    let _withheld_ack = agent.handle_dispatch(&dispatch);
+
+    // The Agent sends an unsolicited CancelAck{Cancelled} for the real,
+    // valid action_id -- without ever having received a CancelAction from
+    // the Server. This is exactly the boundary Issue #27 requires: the
+    // Agent can never initiate Job cancellation.
+    let unsolicited_cancel = CancelActionMessage::new(dispatch.body.action_id);
+    let cancel_ack = agent.handle_cancel(&unsolicited_cancel);
+    assert_eq!(cancel_ack.body.outcome, CancelAckOutcome::Cancelled);
+    send_agent_message(
+        &mut session.websocket,
+        AgentProtocolMessage::CancelAck(cancel_ack),
+    )
+    .await;
+
+    session.websocket.close(None).await.unwrap();
+    session.server_task.await.unwrap().unwrap();
+
+    // Nothing durable moved: the Job remains exactly `Running`, the Attempt
+    // remains exactly `Dispatched`, and no event/audit was ever recorded.
+    assert_eq!(
+        attempt_state(&db.pool, session.attempt.id.0).await,
+        "Dispatched",
+        "an unsolicited CancelAck must never mutate the active Attempt"
+    );
+    let (step_state, _) = job_step_row(&db.pool, session.step_id).await;
+    assert_eq!(step_state, "Dispatching");
+    assert_eq!(job_state_text(&db.pool, session.job_id).await, "Running");
+    assert_eq!(
+        event_count(&db.pool, session.job_id, "JobCancelled").await,
+        0
+    );
+    assert_eq!(cancellation_audit_count(&db.pool, session.job_id).await, 0);
+    assert_eq!(
+        terminal_audit_count(&db.pool, session.attempt.id.0).await,
+        0
+    );
+    // The reservation must remain held -- an unsolicited CancelAck must
+    // never release it.
+    assert_eq!(
+        harness.reservations.take(session.attempt.id),
+        Some(session.reservation)
     );
 
     db.teardown().await;

@@ -169,6 +169,16 @@ pub fn apply_cancel_ack(
     evidence: CancelAckEvidence,
     now: DateTime<Utc>,
 ) -> CancelAckOutcome {
+    // `CancelAck` is evidence for an already-requested cancellation, never
+    // the trigger for one: the Agent can never initiate Job cancellation
+    // (Issue #27 "Agent can never initiate cancellation"). Applying any
+    // `CancelAck` outcome — including `Unknown`/`AlreadyCompleted` moving an
+    // Attempt to `AwaitingReconciliation` — while `job.state` is not
+    // `Cancelling` would let an unsolicited Agent message durably mutate a
+    // Job the operator/internal control path never touched.
+    if job.state != JobState::Cancelling {
+        return CancelAckOutcome::NoOp;
+    }
     match evidence {
         CancelAckEvidence::Cancelled => match attempt.state {
             AttemptState::Dispatched
@@ -456,6 +466,40 @@ mod tests {
         let step = job.steps[0].clone();
         let attempt = attempt_for(ids[0], attempt_state);
         (job, step, attempt)
+    }
+
+    #[test]
+    fn cancel_ack_on_a_running_job_never_mutates_regardless_of_evidence_or_attempt_state() {
+        // An unsolicited CancelAck must never itself initiate cancellation:
+        // the Agent can never move a Job out of `Running` on its own (Issue
+        // #27 follow-up "CancelAck must never initiate Job cancellation").
+        let (job, ids) = running_job(1, 0);
+        let step = job.steps[0].clone();
+
+        for evidence in [
+            CancelAckEvidence::Cancelled,
+            CancelAckEvidence::AlreadyCompleted,
+            CancelAckEvidence::CannotCancel,
+            CancelAckEvidence::Unknown,
+        ] {
+            for state in [
+                AttemptState::Dispatched,
+                AttemptState::InProgress,
+                AttemptState::AwaitingReconciliation,
+                AttemptState::Succeeded,
+                AttemptState::Failed,
+                AttemptState::Cancelled,
+                AttemptState::Rejected,
+            ] {
+                let attempt = attempt_for(ids[0], state);
+                let outcome = apply_cancel_ack(&job, &step, &attempt, evidence, now());
+                assert_eq!(
+                    outcome,
+                    CancelAckOutcome::NoOp,
+                    "evidence {evidence:?} attempt state {state:?} must not mutate a Running job"
+                );
+            }
+        }
     }
 
     #[test]

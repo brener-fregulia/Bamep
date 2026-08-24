@@ -831,96 +831,133 @@ impl JobRepository for PostgresJobRepository {
         job_id: JobId,
         decide: RequestCancellationDecision,
     ) -> Result<RequestCancellationResult, RequestCancellationError> {
-        let candidate_rows = sqlx::query(
-            "SELECT a.id AS attempt_id \
-             FROM attempts a \
-             JOIN job_steps js ON js.id = a.job_step_id \
-             WHERE js.job_id = $1 AND js.state = 'Dispatching' \
-               AND a.state IN ('Dispatched', 'InProgress', 'AwaitingReconciliation')",
-        )
-        .bind(job_id.0)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(to_backend_err)?;
-        if candidate_rows.len() > 1 {
-            return Err(RequestCancellationError::Repository(
-                RepositoryError::Backend(
-                    "invariant violation: more than one simultaneously active/uncertain \
-                     attempt for job"
-                        .to_string(),
-                ),
-            ));
-        }
-        let candidate_attempt_id: Option<uuid::Uuid> = match candidate_rows.first() {
-            Some(row) => Some(row.try_get("attempt_id").map_err(to_backend_err)?),
-            None => None,
-        };
+        // Bounds the missed-candidate retry below: a retry only fires when
+        // the post-Job-lock scan observes an Attempt that
+        // `commit_destructive_dispatch` committed between this pass's
+        // unlocked pre-scan and this pass's Job-lock acquisition (Issue #27
+        // follow-up "Close the no-candidate race with final dispatch"). A
+        // workflow admits only one active Attempt at a time, so in practice
+        // this resolves within a single retry; the bound exists only to
+        // fail loudly instead of spinning forever if that invariant is ever
+        // violated.
+        const MAX_PASSES: u8 = 8;
 
-        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
-
-        let active_attempt = if let Some(attempt_id) = candidate_attempt_id {
-            let attempt_row = sqlx::query(
-                "SELECT id, job_step_id, action_id, state FROM attempts WHERE id = $1 FOR UPDATE",
-            )
-            .bind(attempt_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(to_backend_err)?;
-            let Some(attempt_row) = attempt_row else {
+        let mut passes_remaining = MAX_PASSES;
+        let (mut tx, facts) = loop {
+            passes_remaining -= 1;
+            if passes_remaining == 0 {
                 return Err(RequestCancellationError::Repository(
                     RepositoryError::Backend(
-                        "candidate active attempt disappeared under lock".to_string(),
+                        "request_cancellation: exceeded retry budget resolving the active \
+                         Attempt race against final dispatch"
+                            .to_string(),
                     ),
                 ));
-            };
-            let attempt =
-                row_to_attempt(&attempt_row).map_err(RequestCancellationError::Repository)?;
+            }
 
-            sqlx::query("SELECT id FROM job_steps WHERE id = $1 FOR UPDATE")
-                .bind(attempt.job_step_id.0)
+            let candidate_rows = active_attempt_candidate_rows(&self.pool, job_id).await?;
+            let candidate_attempt_id: Option<uuid::Uuid> = match candidate_rows.first() {
+                Some(row) => Some(row.try_get("attempt_id").map_err(to_backend_err)?),
+                None => None,
+            };
+
+            let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+            let active_attempt = if let Some(attempt_id) = candidate_attempt_id {
+                let attempt_row = sqlx::query(
+                    "SELECT id, job_step_id, action_id, state FROM attempts WHERE id = $1 \
+                     FOR UPDATE",
+                )
+                .bind(attempt_id)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(to_backend_err)?;
+                let Some(attempt_row) = attempt_row else {
+                    return Err(RequestCancellationError::Repository(
+                        RepositoryError::Backend(
+                            "candidate active attempt disappeared under lock".to_string(),
+                        ),
+                    ));
+                };
+                let attempt =
+                    row_to_attempt(&attempt_row).map_err(RequestCancellationError::Repository)?;
 
-            // Re-verify under lock — never trust the pre-lock guess: the
-            // Attempt may have independently reached a terminal state
-            // between the unlocked scan and this lock acquisition (Issue
-            // #27 "Lock order / concurrency", case A).
-            matches!(
-                attempt.state,
-                AttemptState::Dispatched
-                    | AttemptState::InProgress
-                    | AttemptState::AwaitingReconciliation
-            )
-            .then_some(attempt)
-        } else {
-            None
-        };
+                sqlx::query("SELECT id FROM job_steps WHERE id = $1 FOR UPDATE")
+                    .bind(attempt.job_step_id.0)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
 
-        let job_row = sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
-            .bind(job_id.0)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(to_backend_err)?;
-        let Some(job_row) = job_row else {
-            tx.rollback().await.map_err(to_backend_err)?;
-            return Err(RequestCancellationError::JobNotFound(job_id));
-        };
-        let endpoint_id: uuid::Uuid = job_row.try_get("endpoint_id").map_err(to_backend_err)?;
-        let job_state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
-        let steps = fetch_job_steps(&mut tx, job_id, true)
-            .await
-            .map_err(RequestCancellationError::Repository)?;
-        let job = Job {
-            id: job_id,
-            endpoint_id: EndpointId(endpoint_id),
-            state: job_state.into(),
-            steps,
-        };
+                // Re-verify under lock — never trust the pre-lock guess: the
+                // Attempt may have independently reached a terminal state
+                // between the unlocked scan and this lock acquisition (Issue
+                // #27 "Lock order / concurrency", case A).
+                matches!(
+                    attempt.state,
+                    AttemptState::Dispatched
+                        | AttemptState::InProgress
+                        | AttemptState::AwaitingReconciliation
+                )
+                .then_some(attempt)
+            } else {
+                None
+            };
 
-        let facts = RequestCancellationLockedFacts {
-            job,
-            active_attempt,
+            let job_row =
+                sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
+                    .bind(job_id.0)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+            let Some(job_row) = job_row else {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Err(RequestCancellationError::JobNotFound(job_id));
+            };
+            let endpoint_id: uuid::Uuid = job_row.try_get("endpoint_id").map_err(to_backend_err)?;
+            let job_state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
+
+            if candidate_attempt_id.is_none() {
+                // We hold the Job lock now, which serializes us against
+                // `commit_destructive_dispatch` (it locks the same Job row
+                // before creating an Attempt). Re-scan within the
+                // transaction: PostgreSQL READ COMMITTED gives this
+                // statement a fresh snapshot, so it can observe an Attempt
+                // that final dispatch committed while this pass waited for
+                // the Job lock — one the unlocked pre-scan above could not
+                // see.
+                let post_lock_rows = active_attempt_candidate_rows(&mut *tx, job_id).await?;
+                if !post_lock_rows.is_empty() {
+                    // An Attempt just became visible. Do not lock it while
+                    // already holding the Job row — that would invert the
+                    // established Attempt -> JobStep -> Job lock order and
+                    // risk a deadlock cycle against
+                    // `commit_destructive_dispatch`. Roll back and retry:
+                    // the next pass's unlocked pre-scan will see this
+                    // now-committed Attempt and take the candidate-found
+                    // branch above, which locks Attempt -> JobStep -> Job
+                    // correctly.
+                    tx.rollback().await.map_err(to_backend_err)?;
+                    continue;
+                }
+            }
+
+            let steps = fetch_job_steps(&mut tx, job_id, true)
+                .await
+                .map_err(RequestCancellationError::Repository)?;
+            let job = Job {
+                id: job_id,
+                endpoint_id: EndpointId(endpoint_id),
+                state: job_state.into(),
+                steps,
+            };
+
+            break (
+                tx,
+                RequestCancellationLockedFacts {
+                    job,
+                    active_attempt,
+                },
+            );
         };
 
         let decided = match decide(facts) {
@@ -1130,6 +1167,46 @@ impl JobRepository for PostgresJobRepository {
             }
         }
     }
+}
+
+/// Scans for the JobStep-current Attempt(s) in `Dispatched`/`InProgress`/
+/// `AwaitingReconciliation` for `job_id`, used by
+/// [`PostgresJobRepository::request_cancellation`] both unlocked (the
+/// initial pre-scan, over `&self.pool`) and, when that pre-scan found no
+/// candidate, again inside the transaction after the Job row lock is held
+/// (over `&mut *tx`) — generic so both callers share one query and one
+/// invariant check. More than one simultaneously active/uncertain Attempt
+/// for a Job is never guessed at — it is an invariant/backend error rather
+/// than an arbitrarily selected candidate (Issue #27 "Active Attempt
+/// selection").
+async fn active_attempt_candidate_rows<'e, E>(
+    executor: E,
+    job_id: JobId,
+) -> Result<Vec<sqlx::postgres::PgRow>, RequestCancellationError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let rows = sqlx::query(
+        "SELECT a.id AS attempt_id \
+         FROM attempts a \
+         JOIN job_steps js ON js.id = a.job_step_id \
+         WHERE js.job_id = $1 AND js.state = 'Dispatching' \
+           AND a.state IN ('Dispatched', 'InProgress', 'AwaitingReconciliation')",
+    )
+    .bind(job_id.0)
+    .fetch_all(executor)
+    .await
+    .map_err(to_backend_err)?;
+    if rows.len() > 1 {
+        return Err(RequestCancellationError::Repository(
+            RepositoryError::Backend(
+                "invariant violation: more than one simultaneously active/uncertain \
+                 attempt for job"
+                    .to_string(),
+            ),
+        ));
+    }
+    Ok(rows)
 }
 
 /// Shared `audit_records` insert used by [`PostgresJobRepository::request_cancellation`]
