@@ -7,8 +7,9 @@
 //! (`m0-endpoint-identity-lifecycle.md` "Destructive-operation authorization
 //! preconditions") into one pure decision: [`evaluate_final_destructive_dispatch`].
 //! Every precondition is checked independently and none is inferred from
-//! another — the returned [`FinalDispatchRejection`] identifies exactly which
-//! one failed, rather than collapsing everything into one opaque boolean.
+//! another — the returned [`FinalDispatchDenial`] identifies exactly which
+//! [`FinalDispatchRejection`] failed, rather than collapsing everything into
+//! one opaque boolean.
 //!
 //! This function performs no I/O: every fact it needs — durable Endpoint/Job
 //! state, the current inventory revision, the current target fingerprint,
@@ -20,9 +21,18 @@
 //!
 //! On success this function returns exactly one fresh [`Attempt`] in
 //! [`AttemptState::Dispatched`] and the candidate `JobStep` advanced to
-//! `Dispatching`. It never sends `ActionDispatch` and never touches
-//! PostgreSQL, the Runtime Presence Registry, or the target-revalidation
-//! Port directly.
+//! `Dispatching`. On failure, this Domain function — not its caller — owns
+//! the exact resulting durable JobStep, when one is required: a
+//! final-revalidation failure under an authoritative `PreconditionsSatisfied`
+//! JobStep carries that JobStep explicitly in `Pending`
+//! ([`FinalDispatchDenial::pending_job_step`]); a structural mismatch (the
+//! JobStep was not, or is no longer, `PreconditionsSatisfied`) carries
+//! `None`, because there is nothing to revert. The caller only persists
+//! whatever this function already decided — it never independently encodes
+//! the lifecycle rule that a revalidation failure means `Pending`.
+//!
+//! This module never sends `ActionDispatch` and never touches PostgreSQL, the
+//! Runtime Presence Registry, or the target-revalidation Port directly.
 
 use crate::attempt::{ActionId, Attempt, AttemptId, AttemptState};
 use crate::hardware_confidence::HardwareConfidence;
@@ -88,8 +98,8 @@ pub struct FinalDispatchOutcome {
 
 /// Every independently identifiable reason
 /// [`evaluate_final_destructive_dispatch`] may reject a candidate JobStep.
-/// None of these represents a state change by itself — the caller decides
-/// what to persist, if anything, using [`FinalDispatchRejection::requires_pending_transition`].
+/// Always carried inside a [`FinalDispatchDenial`], which also states the
+/// exact durable effect (if any) this rejection requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum FinalDispatchRejection {
     /// `step_id` does not identify a JobStep belonging to `job`. Structural:
@@ -153,18 +163,43 @@ pub enum FinalDispatchRejection {
     TrustedBootstrapNotEstablished,
 }
 
-impl FinalDispatchRejection {
-    /// `true` when this rejection is a final-revalidation failure under an
-    /// authoritative `PreconditionsSatisfied` JobStep — the case requiring
-    /// `PreconditionsSatisfied -> Pending`
-    /// (`m0-job-lifecycle-and-scheduling.md` "Final pre-dispatch
-    /// revalidation": "If any required condition fails: ... the JobStep
-    /// returns to `Pending`"). `false` for [`Self::StepNotFound`] and
-    /// [`Self::NotPreconditionsSatisfied`] — a structural mismatch where the
-    /// JobStep was not (or is no longer) `PreconditionsSatisfied` to begin
-    /// with, so there is nothing to revert.
-    pub fn requires_pending_transition(&self) -> bool {
-        !matches!(self, Self::StepNotFound | Self::NotPreconditionsSatisfied)
+/// The complete failure outcome of [`evaluate_final_destructive_dispatch`]:
+/// the typed [`FinalDispatchRejection`] plus the exact durable JobStep result
+/// the caller must persist, when one is required
+/// (`m0-job-lifecycle-and-scheduling.md` "Final pre-dispatch revalidation").
+///
+/// `pending_job_step` is `Some(step)` — `step.state ==
+/// JobStepState::Pending`, every other field unchanged — for a
+/// final-revalidation failure under an authoritative `PreconditionsSatisfied`
+/// JobStep, and `None` for a structural mismatch
+/// ([`FinalDispatchRejection::StepNotFound`] /
+/// [`FinalDispatchRejection::NotPreconditionsSatisfied`]), where the JobStep
+/// was not (or is no longer) `PreconditionsSatisfied` to begin with, so there
+/// is nothing to revert. The caller (`PostgresJobRepository`) persists
+/// exactly this value and never independently decides "revalidation failure
+/// means Pending" itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalDispatchDenial {
+    pub rejection: FinalDispatchRejection,
+    pub pending_job_step: Option<JobStep>,
+}
+
+impl FinalDispatchDenial {
+    fn structural(rejection: FinalDispatchRejection) -> Self {
+        Self {
+            rejection,
+            pending_job_step: None,
+        }
+    }
+
+    fn revalidation_failure(rejection: FinalDispatchRejection, step: &JobStep) -> Self {
+        Self {
+            rejection,
+            pending_job_step: Some(JobStep {
+                state: JobStepState::Pending,
+                ..step.clone()
+            }),
+        }
     }
 }
 
@@ -173,24 +208,34 @@ impl FinalDispatchRejection {
 ///
 /// SUCCESS produces exactly one fresh [`AttemptId`] and [`ActionId`] — always
 /// distinct, always UUID v4 — and the candidate JobStep advanced to
-/// `Dispatching`. FAILURE produces a [`FinalDispatchRejection`] identifying
-/// the first independent precondition checked that did not hold; checks are
+/// `Dispatching`. FAILURE produces a [`FinalDispatchDenial`] identifying the
+/// first independent precondition checked that did not hold, and the exact
+/// durable JobStep result (if any) the caller must persist; checks are
 /// ordered but every one is evaluated against `inputs` alone, never inferred
 /// from another.
 pub fn evaluate_final_destructive_dispatch(
     inputs: &FinalDispatchInputs,
-) -> Result<FinalDispatchOutcome, FinalDispatchRejection> {
+) -> Result<FinalDispatchOutcome, FinalDispatchDenial> {
     let Some(step) = inputs.job.steps.iter().find(|s| s.id == inputs.step_id) else {
-        return Err(FinalDispatchRejection::StepNotFound);
+        return Err(FinalDispatchDenial::structural(
+            FinalDispatchRejection::StepNotFound,
+        ));
     };
     if step.state != JobStepState::PreconditionsSatisfied {
-        return Err(FinalDispatchRejection::NotPreconditionsSatisfied);
+        return Err(FinalDispatchDenial::structural(
+            FinalDispatchRejection::NotPreconditionsSatisfied,
+        ));
     }
 
     // Every rejection from this point on is a final-revalidation failure
-    // under an authoritative PreconditionsSatisfied JobStep.
+    // under an authoritative PreconditionsSatisfied JobStep: this function
+    // itself owns the resulting Pending JobStep, not the caller.
+    let deny = |rejection: FinalDispatchRejection| {
+        FinalDispatchDenial::revalidation_failure(rejection, step)
+    };
+
     if inputs.job.state != JobState::Running {
-        return Err(FinalDispatchRejection::JobNotRunning);
+        return Err(deny(FinalDispatchRejection::JobNotRunning));
     }
     let earlier_steps_all_succeeded = inputs
         .job
@@ -199,35 +244,37 @@ pub fn evaluate_final_destructive_dispatch(
         .filter(|s| s.order < step.order)
         .all(|s| s.state == JobStepState::Succeeded);
     if !earlier_steps_all_succeeded {
-        return Err(FinalDispatchRejection::NotCurrentStep);
+        return Err(deny(FinalDispatchRejection::NotCurrentStep));
     }
     if inputs.existing_active_attempt {
-        return Err(FinalDispatchRejection::ExistingActiveAttempt);
+        return Err(deny(FinalDispatchRejection::ExistingActiveAttempt));
     }
     let Some(intent) = &step.destructive_intent else {
-        return Err(FinalDispatchRejection::NoDestructiveIntent);
+        return Err(deny(FinalDispatchRejection::NoDestructiveIntent));
     };
 
     if !inputs.identity_enrolled {
-        return Err(FinalDispatchRejection::IdentityNotEnrolled);
+        return Err(deny(FinalDispatchRejection::IdentityNotEnrolled));
     }
     if !inputs.credential_active {
-        return Err(FinalDispatchRejection::CredentialNotActive);
+        return Err(deny(FinalDispatchRejection::CredentialNotActive));
     }
     if !inputs.agent_present {
-        return Err(FinalDispatchRejection::AgentNotPresent);
+        return Err(deny(FinalDispatchRejection::AgentNotPresent));
     }
     if inputs.current_inventory_revision_id != Some(intent.authorized_inventory_revision_id) {
-        return Err(FinalDispatchRejection::StaleInventory);
+        return Err(deny(FinalDispatchRejection::StaleInventory));
     }
     if inputs.current_target_fingerprint.as_ref() != Some(&intent.authorized_target_fingerprint) {
-        return Err(FinalDispatchRejection::TargetMismatch);
+        return Err(deny(FinalDispatchRejection::TargetMismatch));
     }
     if inputs.hardware_confidence != HardwareConfidence::Consistent {
-        return Err(FinalDispatchRejection::HardwareConfidenceNotConsistent);
+        return Err(deny(
+            FinalDispatchRejection::HardwareConfidenceNotConsistent,
+        ));
     }
     if !inputs.trusted_bootstrap_established {
-        return Err(FinalDispatchRejection::TrustedBootstrapNotEstablished);
+        return Err(deny(FinalDispatchRejection::TrustedBootstrapNotEstablished));
     }
 
     let attempt = Attempt {
@@ -293,6 +340,38 @@ mod tests {
         }
     }
 
+    /// Asserts `result` is a final-revalidation failure: the expected
+    /// rejection, plus a `pending_job_step` that is exactly `step_id` moved
+    /// to `Pending` — proving the Domain function itself, not the caller,
+    /// decided that durable effect.
+    fn assert_revalidation_failure(
+        result: Result<FinalDispatchOutcome, FinalDispatchDenial>,
+        expected: FinalDispatchRejection,
+        step_id: JobStepId,
+    ) {
+        let denial = result.expect_err("expected a rejection");
+        assert_eq!(denial.rejection, expected);
+        let pending_step = denial
+            .pending_job_step
+            .expect("a final-revalidation failure must supply the Pending JobStep to persist");
+        assert_eq!(pending_step.id, step_id);
+        assert_eq!(pending_step.state, JobStepState::Pending);
+    }
+
+    /// Asserts `result` is a structural mismatch: the expected rejection,
+    /// with no `pending_job_step` — proving there is nothing to persist.
+    fn assert_structural_mismatch(
+        result: Result<FinalDispatchOutcome, FinalDispatchDenial>,
+        expected: FinalDispatchRejection,
+    ) {
+        let denial = result.expect_err("expected a rejection");
+        assert_eq!(denial.rejection, expected);
+        assert!(
+            denial.pending_job_step.is_none(),
+            "a structural mismatch must not supply a JobStep to persist"
+        );
+    }
+
     #[test]
     fn all_preconditions_passing_succeeds_with_one_fresh_attempt_dispatched() {
         let inputs = all_pass_inputs();
@@ -340,9 +419,9 @@ mod tests {
         inputs.current_inventory_revision_id = Some(intent.authorized_inventory_revision_id);
         inputs.current_target_fingerprint = Some(intent.authorized_target_fingerprint);
 
-        assert_eq!(
+        assert_structural_mismatch(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::NotPreconditionsSatisfied)
+            FinalDispatchRejection::NotPreconditionsSatisfied,
         );
     }
 
@@ -350,9 +429,9 @@ mod tests {
     fn an_unknown_step_id_is_rejected_without_side_effects() {
         let mut inputs = all_pass_inputs();
         inputs.step_id = JobStepId::new();
-        assert_eq!(
+        assert_structural_mismatch(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::StepNotFound)
+            FinalDispatchRejection::StepNotFound,
         );
     }
 
@@ -360,9 +439,11 @@ mod tests {
     fn a_job_that_is_no_longer_running_blocks_dispatch() {
         let mut inputs = all_pass_inputs();
         inputs.job.state = JobState::Cancelling;
-        assert_eq!(
+        let step_id = inputs.step_id;
+        assert_revalidation_failure(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::JobNotRunning)
+            FinalDispatchRejection::JobNotRunning,
+            step_id,
         );
     }
 
@@ -370,9 +451,11 @@ mod tests {
     fn an_existing_active_attempt_blocks_another_attempt() {
         let mut inputs = all_pass_inputs();
         inputs.existing_active_attempt = true;
-        assert_eq!(
+        let step_id = inputs.step_id;
+        assert_revalidation_failure(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::ExistingActiveAttempt)
+            FinalDispatchRejection::ExistingActiveAttempt,
+            step_id,
         );
     }
 
@@ -380,9 +463,11 @@ mod tests {
     fn identity_not_enrolled_fails_while_everything_else_passes() {
         let mut inputs = all_pass_inputs();
         inputs.identity_enrolled = false;
-        assert_eq!(
+        let step_id = inputs.step_id;
+        assert_revalidation_failure(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::IdentityNotEnrolled)
+            FinalDispatchRejection::IdentityNotEnrolled,
+            step_id,
         );
     }
 
@@ -391,9 +476,11 @@ mod tests {
         let mut inputs = all_pass_inputs();
         inputs.credential_active = false;
         assert!(inputs.agent_present);
-        assert_eq!(
+        let step_id = inputs.step_id;
+        assert_revalidation_failure(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::CredentialNotActive)
+            FinalDispatchRejection::CredentialNotActive,
+            step_id,
         );
     }
 
@@ -402,9 +489,11 @@ mod tests {
         let mut inputs = all_pass_inputs();
         inputs.agent_present = false;
         assert!(inputs.credential_active);
-        assert_eq!(
+        let step_id = inputs.step_id;
+        assert_revalidation_failure(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::AgentNotPresent)
+            FinalDispatchRejection::AgentNotPresent,
+            step_id,
         );
     }
 
@@ -420,9 +509,10 @@ mod tests {
         inputs.job = job;
         inputs.step_id = step_id;
 
-        assert_eq!(
+        assert_revalidation_failure(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::NoDestructiveIntent)
+            FinalDispatchRejection::NoDestructiveIntent,
+            step_id,
         );
     }
 
@@ -430,9 +520,11 @@ mod tests {
     fn stale_authorized_inventory_fails_while_target_still_matches() {
         let mut inputs = all_pass_inputs();
         inputs.current_inventory_revision_id = Some(InventoryRevisionId(uuid::Uuid::new_v4()));
-        assert_eq!(
+        let step_id = inputs.step_id;
+        assert_revalidation_failure(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::StaleInventory)
+            FinalDispatchRejection::StaleInventory,
+            step_id,
         );
     }
 
@@ -440,9 +532,11 @@ mod tests {
     fn target_mismatch_fails_while_inventory_still_matches() {
         let mut inputs = all_pass_inputs();
         inputs.current_target_fingerprint = Some(TargetFingerprint::new("disk-b"));
-        assert_eq!(
+        let step_id = inputs.step_id;
+        assert_revalidation_failure(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::TargetMismatch)
+            FinalDispatchRejection::TargetMismatch,
+            step_id,
         );
     }
 
@@ -450,9 +544,11 @@ mod tests {
     fn missing_current_inventory_is_treated_as_stale() {
         let mut inputs = all_pass_inputs();
         inputs.current_inventory_revision_id = None;
-        assert_eq!(
+        let step_id = inputs.step_id;
+        assert_revalidation_failure(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::StaleInventory)
+            FinalDispatchRejection::StaleInventory,
+            step_id,
         );
     }
 
@@ -460,9 +556,11 @@ mod tests {
     fn missing_current_target_is_treated_as_mismatch() {
         let mut inputs = all_pass_inputs();
         inputs.current_target_fingerprint = None;
-        assert_eq!(
+        let step_id = inputs.step_id;
+        assert_revalidation_failure(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::TargetMismatch)
+            FinalDispatchRejection::TargetMismatch,
+            step_id,
         );
     }
 
@@ -470,9 +568,11 @@ mod tests {
     fn lowered_confidence_fails() {
         let mut inputs = all_pass_inputs();
         inputs.hardware_confidence = HardwareConfidence::LoweredConfidence;
-        assert_eq!(
+        let step_id = inputs.step_id;
+        assert_revalidation_failure(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::HardwareConfidenceNotConsistent)
+            FinalDispatchRejection::HardwareConfidenceNotConsistent,
+            step_id,
         );
     }
 
@@ -480,9 +580,11 @@ mod tests {
     fn conflict_confidence_fails() {
         let mut inputs = all_pass_inputs();
         inputs.hardware_confidence = HardwareConfidence::Conflict;
-        assert_eq!(
+        let step_id = inputs.step_id;
+        assert_revalidation_failure(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::HardwareConfidenceNotConsistent)
+            FinalDispatchRejection::HardwareConfidenceNotConsistent,
+            step_id,
         );
     }
 
@@ -508,33 +610,11 @@ mod tests {
         );
         assert_eq!(inputs.hardware_confidence, HardwareConfidence::Consistent);
 
-        let err = evaluate_final_destructive_dispatch(&inputs).unwrap_err();
-        assert_eq!(err, FinalDispatchRejection::TrustedBootstrapNotEstablished);
-        assert!(err.requires_pending_transition());
-    }
-
-    #[test]
-    fn structural_rejections_do_not_require_a_pending_transition() {
-        assert!(!FinalDispatchRejection::StepNotFound.requires_pending_transition());
-        assert!(!FinalDispatchRejection::NotPreconditionsSatisfied.requires_pending_transition());
-    }
-
-    #[test]
-    fn revalidation_failures_require_a_pending_transition() {
-        assert!(FinalDispatchRejection::JobNotRunning.requires_pending_transition());
-        assert!(FinalDispatchRejection::NotCurrentStep.requires_pending_transition());
-        assert!(FinalDispatchRejection::ExistingActiveAttempt.requires_pending_transition());
-        assert!(FinalDispatchRejection::NoDestructiveIntent.requires_pending_transition());
-        assert!(FinalDispatchRejection::IdentityNotEnrolled.requires_pending_transition());
-        assert!(FinalDispatchRejection::CredentialNotActive.requires_pending_transition());
-        assert!(FinalDispatchRejection::AgentNotPresent.requires_pending_transition());
-        assert!(FinalDispatchRejection::StaleInventory.requires_pending_transition());
-        assert!(FinalDispatchRejection::TargetMismatch.requires_pending_transition());
-        assert!(
-            FinalDispatchRejection::HardwareConfidenceNotConsistent.requires_pending_transition()
-        );
-        assert!(
-            FinalDispatchRejection::TrustedBootstrapNotEstablished.requires_pending_transition()
+        let step_id = inputs.step_id;
+        assert_revalidation_failure(
+            evaluate_final_destructive_dispatch(&inputs),
+            FinalDispatchRejection::TrustedBootstrapNotEstablished,
+            step_id,
         );
     }
 
@@ -579,9 +659,10 @@ mod tests {
             trusted_bootstrap_established: true,
         };
 
-        assert_eq!(
+        assert_revalidation_failure(
             evaluate_final_destructive_dispatch(&inputs),
-            Err(FinalDispatchRejection::NotCurrentStep)
+            FinalDispatchRejection::NotCurrentStep,
+            second_step_id,
         );
     }
 }

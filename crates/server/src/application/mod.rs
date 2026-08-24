@@ -257,11 +257,11 @@ impl<J: JobRepository> JobService<J> {
 /// The internal Application/harness scheduling control path (Issue #32 "Job
 /// admission and durable Endpoint exclusivity"; "Current ordered JobStep
 /// preliminary eligibility"). Exposes exactly the two narrow M1 scheduling
-/// operations #25 will later compose: admitting a `Pending` Job into
-/// `Running`, and advancing the current eligible `JobStep` to
-/// `PreconditionsSatisfied`. This service does not evaluate the destructive
-/// gate, acquire a technical-resource reservation, or create an Attempt —
-/// those belong to #25.
+/// operations `FinalDispatchService` (Issue #25) later composes: admitting a
+/// `Pending` Job into `Running`, and advancing the current eligible
+/// `JobStep` to `PreconditionsSatisfied`. This service does not evaluate the
+/// destructive gate, acquire a technical-resource reservation, or create an
+/// Attempt — those belong to `FinalDispatchService`.
 pub struct JobSchedulingService<J: JobRepository> {
     repo: Arc<J>,
     clock: Arc<dyn Clock>,
@@ -1164,6 +1164,13 @@ mod tests {
             {
                 unimplemented!("DestructiveIntentService never commits a dispatch")
             }
+
+            async fn find_attempt(
+                &self,
+                _attempt_id: bamep_domain::AttemptId,
+            ) -> Result<Option<bamep_domain::Attempt>, RepositoryError> {
+                unimplemented!("DestructiveIntentService never reads an Attempt")
+            }
         }
 
         /// In-memory `InventoryRepository` fake exposing only a configurable
@@ -1591,17 +1598,34 @@ mod tests {
                         self.audits.lock().unwrap().push(commit.audit);
                         Ok(commit.outcome)
                     }
-                    Err(rejection) => {
-                        if rejection.requires_pending_transition() {
+                    Err(denial) => {
+                        // Mirrors `PostgresJobRepository::commit_destructive_dispatch`:
+                        // persist exactly `denial.pending_job_step`, never
+                        // independently decide "revalidation failure means
+                        // Pending".
+                        if let Some(pending_step) = &denial.pending_job_step {
                             let mut jobs = self.jobs.lock().unwrap();
                             let job = jobs.get_mut(&job_id).unwrap();
                             if let Some(step) = job.steps.iter_mut().find(|s| s.id == step_id) {
-                                step.state = JobStepState::Pending;
+                                step.state = pending_step.state;
                             }
                         }
-                        Err(CommitDestructiveDispatchError::Rejected(rejection))
+                        Err(CommitDestructiveDispatchError::Rejected(denial.rejection))
                     }
                 }
+            }
+
+            async fn find_attempt(
+                &self,
+                attempt_id: bamep_domain::AttemptId,
+            ) -> Result<Option<Attempt>, RepositoryError> {
+                Ok(self
+                    .attempts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|a| a.id == attempt_id)
+                    .cloned())
             }
         }
 

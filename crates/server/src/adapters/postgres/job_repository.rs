@@ -9,8 +9,9 @@
 
 use async_trait::async_trait;
 use bamep_domain::{
-    AttemptState, DestructiveIntent, EndpointId, InventoryRevisionId, Job, JobAdmissionError,
-    JobId, JobState, JobStep, JobStepEligibilityError, JobStepId, JobStepState, TargetFingerprint,
+    Attempt, AttemptId, AttemptState, DestructiveIntent, EndpointId, InventoryRevisionId, Job,
+    JobAdmissionError, JobId, JobState, JobStep, JobStepEligibilityError, JobStepId, JobStepState,
+    TargetFingerprint,
 };
 use sqlx::{PgPool, Row};
 
@@ -133,6 +134,21 @@ impl From<AttemptState> for PgAttemptState {
             AttemptState::Cancelled => PgAttemptState::Cancelled,
             AttemptState::Rejected => PgAttemptState::Rejected,
             AttemptState::Indeterminate => PgAttemptState::Indeterminate,
+        }
+    }
+}
+
+impl From<PgAttemptState> for AttemptState {
+    fn from(state: PgAttemptState) -> Self {
+        match state {
+            PgAttemptState::Dispatched => AttemptState::Dispatched,
+            PgAttemptState::InProgress => AttemptState::InProgress,
+            PgAttemptState::AwaitingReconciliation => AttemptState::AwaitingReconciliation,
+            PgAttemptState::Succeeded => AttemptState::Succeeded,
+            PgAttemptState::Failed => AttemptState::Failed,
+            PgAttemptState::Cancelled => AttemptState::Cancelled,
+            PgAttemptState::Rejected => AttemptState::Rejected,
+            PgAttemptState::Indeterminate => AttemptState::Indeterminate,
         }
     }
 }
@@ -503,9 +519,14 @@ impl JobRepository for PostgresJobRepository {
 
         let commit = match decide(facts) {
             Ok(commit) => commit,
-            Err(rejection) => {
-                if rejection.requires_pending_transition() {
-                    sqlx::query("UPDATE job_steps SET state = 'Pending' WHERE id = $1")
+            Err(denial) => {
+                // The Domain decision itself already decided the exact
+                // durable result, if any — this Adapter persists exactly
+                // `denial.pending_job_step` and never independently encodes
+                // the lifecycle rule "revalidation failure means Pending".
+                if let Some(pending_step) = &denial.pending_job_step {
+                    sqlx::query("UPDATE job_steps SET state = $1 WHERE id = $2")
+                        .bind(PgJobStepState::from(pending_step.state))
                         .bind(step_id.0)
                         .execute(&mut *tx)
                         .await
@@ -514,7 +535,7 @@ impl JobRepository for PostgresJobRepository {
                 } else {
                     tx.rollback().await.map_err(to_backend_err)?;
                 }
-                return Err(CommitDestructiveDispatchError::Rejected(rejection));
+                return Err(CommitDestructiveDispatchError::Rejected(denial.rejection));
             }
         };
 
@@ -559,6 +580,31 @@ impl JobRepository for PostgresJobRepository {
 
         tx.commit().await.map_err(to_backend_err)?;
         Ok(commit.outcome)
+    }
+
+    async fn find_attempt(
+        &self,
+        attempt_id: AttemptId,
+    ) -> Result<Option<Attempt>, RepositoryError> {
+        let row =
+            sqlx::query("SELECT id, job_step_id, action_id, state FROM attempts WHERE id = $1")
+                .bind(attempt_id.0)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(to_backend_err)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let id: uuid::Uuid = row.try_get("id").map_err(to_backend_err)?;
+        let job_step_id: uuid::Uuid = row.try_get("job_step_id").map_err(to_backend_err)?;
+        let action_id: uuid::Uuid = row.try_get("action_id").map_err(to_backend_err)?;
+        let state: PgAttemptState = row.try_get("state").map_err(to_backend_err)?;
+        Ok(Some(Attempt {
+            id: AttemptId(id),
+            job_step_id: JobStepId(job_step_id),
+            action_id: bamep_domain::ActionId(action_id),
+            state: state.into(),
+        }))
     }
 }
 

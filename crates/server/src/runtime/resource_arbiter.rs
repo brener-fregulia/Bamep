@@ -2,9 +2,10 @@
 //! (`m0-job-lifecycle-and-scheduling.md` "Resource leases": "Other
 //! constrained resources are Attempt-scoped, including network, storage
 //! read/write, and CPU/Worker capacity"; Issue #32 "Minimum transient
-//! Attempt-scoped technical-resource arbiter"). #25 will later acquire the
-//! reservations it needs from this arbiter immediately before final dispatch
-//! revalidation; this checkpoint introduces only the arbiter itself.
+//! Attempt-scoped technical-resource arbiter"). `bamep_server::application::FinalDispatchService`
+//! (Issue #25) composes this arbiter, acquiring the reservation it needs
+//! immediately before final dispatch revalidation and releasing it on any
+//! non-success outcome.
 //!
 //! Deterministic in-memory capacity bookkeeping only — never persisted
 //! (`m0-persistence-observability-and-domain-events.md` "Durable versus

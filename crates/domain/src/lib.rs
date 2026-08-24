@@ -31,8 +31,8 @@ pub use current_boot::{CurrentBoot, TrustedBootstrapState};
 pub use endpoint::{EndpointAggregate, EndpointId};
 pub use events::{Actor, AuditRecord, DomainEvent, TransitionOutcome};
 pub use final_dispatch::{
-    evaluate_final_destructive_dispatch, FinalDispatchInputs, FinalDispatchOutcome,
-    FinalDispatchRejection,
+    evaluate_final_destructive_dispatch, FinalDispatchDenial, FinalDispatchInputs,
+    FinalDispatchOutcome, FinalDispatchRejection,
 };
 pub use hardware_confidence::HardwareConfidence;
 pub use identity::{IdentityState, InvalidIdentityTransition};

@@ -18,11 +18,12 @@
 use async_trait::async_trait;
 use bamep_domain::presented_credential::{CredentialKind, CredentialLookupId};
 use bamep_domain::{
-    AuditRecord, BootContext, BootContextResolveError, DestructiveIntent, DestructiveIntentError,
-    EndpointAggregate, EndpointId, FinalDispatchOutcome, FinalDispatchRejection,
-    InvalidIdentityTransition, InventoryRevision, InventoryRevisionId, InventorySnapshot, Job,
-    JobAdmissionError, JobAdmissionOutcome, JobId, JobStep, JobStepEligibilityError, JobStepId,
-    RedeemOutcome, TargetFingerprint, TransitionOutcome, TrustedBootstrapOutcome,
+    Attempt, AttemptId, AuditRecord, BootContext, BootContextResolveError, DestructiveIntent,
+    DestructiveIntentError, EndpointAggregate, EndpointId, FinalDispatchDenial,
+    FinalDispatchOutcome, FinalDispatchRejection, InvalidIdentityTransition, InventoryRevision,
+    InventoryRevisionId, InventorySnapshot, Job, JobAdmissionError, JobAdmissionOutcome, JobId,
+    JobStep, JobStepEligibilityError, JobStepId, RedeemOutcome, TargetFingerprint,
+    TransitionOutcome, TrustedBootstrapOutcome,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -279,17 +280,31 @@ pub trait JobRepository: Send + Sync {
     /// "Atomic persistence"). No `ActionDispatch` is sent by this method or
     /// anything it calls.
     ///
-    /// On `Err`, persists `PreconditionsSatisfied -> Pending` only when
-    /// [`FinalDispatchRejection::requires_pending_transition`] is `true`;
-    /// otherwise (a structural mismatch — the JobStep was not, or is no
-    /// longer, `PreconditionsSatisfied`) nothing is persisted. Never creates
-    /// an Attempt, action correlation, or audit record on any `Err` path.
+    /// On `Err`, persists exactly the `FinalDispatchDenial::pending_job_step`
+    /// the Domain decision returned — `Some(step in Pending)` for a
+    /// final-revalidation failure, `None` (nothing persisted) for a
+    /// structural mismatch (the JobStep was not, or is no longer,
+    /// `PreconditionsSatisfied`). This Adapter never independently decides
+    /// that a revalidation failure means `Pending`; it only persists the
+    /// state the Domain decision already supplied. Never creates an Attempt,
+    /// action correlation, or audit record on any `Err` path.
     async fn commit_destructive_dispatch(
         &self,
         job_id: JobId,
         step_id: JobStepId,
         decide: FinalDispatchDecision,
     ) -> Result<FinalDispatchOutcome, CommitDestructiveDispatchError>;
+
+    /// Read-only lookup of one persisted `Attempt` by its Server Domain
+    /// identity (Issue #25 correction: persistence reload must reconstruct
+    /// the committed Attempt/action correlation through this Port, not
+    /// through raw SQL in a test). Returns `None` when no `Attempt` with
+    /// `attempt_id` has ever been committed. Does not imply Agent receipt or
+    /// execution — reload/reconstruction proves durable persistence only.
+    /// This is deliberately the narrowest read this correction requires; it
+    /// does not introduce #26/#28 querying/reconciliation APIs.
+    async fn find_attempt(&self, attempt_id: AttemptId)
+        -> Result<Option<Attempt>, RepositoryError>;
 }
 
 /// Durable facts read under lock immediately before the final destructive-
@@ -329,8 +344,7 @@ pub struct FinalDispatchLockedFacts {
 /// obtaining "now" only once invoked, i.e. after every lock is held), and the
 /// Adapter persists the result atomically in the same transaction.
 pub type FinalDispatchDecision = Box<
-    dyn FnOnce(FinalDispatchLockedFacts) -> Result<FinalDispatchCommit, FinalDispatchRejection>
-        + Send,
+    dyn FnOnce(FinalDispatchLockedFacts) -> Result<FinalDispatchCommit, FinalDispatchDenial> + Send,
 >;
 
 /// A successful [`FinalDispatchDecision`] result: the Domain outcome plus the
@@ -352,9 +366,8 @@ pub enum CommitDestructiveDispatchError {
     JobNotFound(JobId),
     /// Final revalidation rejected the candidate JobStep
     /// (`bamep_domain::FinalDispatchRejection`). The caller's Job/JobStep
-    /// durable state reflects whatever
-    /// [`FinalDispatchRejection::requires_pending_transition`] required —
-    /// this is not itself a repository failure.
+    /// durable state reflects exactly the `FinalDispatchDenial` the Domain
+    /// decision returned — this is not itself a repository failure.
     #[error("final dispatch was not authorized: {0}")]
     Rejected(FinalDispatchRejection),
     #[error(transparent)]

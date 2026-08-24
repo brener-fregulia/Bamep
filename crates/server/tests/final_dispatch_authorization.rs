@@ -32,7 +32,7 @@ use bamep_server::application::{
 use bamep_server::ports::{InventoryRepository, JobRepository, TargetRevalidationPort};
 use bamep_server::runtime::presence::PresenceRegistry;
 use bamep_server::runtime::resource_arbiter::{
-    ResourceClaim, ResourceKind, TechnicalResourceArbiter,
+    InsufficientCapacity, ResourceClaim, ResourceKind, TechnicalResourceArbiter,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Map, Value};
@@ -325,10 +325,18 @@ async fn reload_reconstructs_the_committed_attempt_and_dispatching_step() {
     assert_eq!(reloaded_job.steps[0].state, JobStepState::Dispatching);
 
     // Reload proves durable persistence only — never Agent receipt/execution.
-    let reloaded_attempt = attempt_row(&reloaded_pool, step_id).await;
-    assert_eq!(reloaded_attempt.id, outcome.attempt.id.0);
-    assert_eq!(reloaded_attempt.action_id, outcome.attempt.action_id.0);
-    assert_eq!(reloaded_attempt.state, "Dispatched");
+    // The authoritative reconstruction proof goes through the JobRepository
+    // read boundary (`find_attempt`), not raw SQL — raw SQL remains only for
+    // independent persistence/count assertions elsewhere in this file.
+    let reloaded_attempt = reloaded_repo
+        .find_attempt(outcome.attempt.id)
+        .await
+        .unwrap()
+        .expect("the committed Attempt must survive reload");
+    assert_eq!(reloaded_attempt.id, outcome.attempt.id);
+    assert_eq!(reloaded_attempt.job_step_id, step_id);
+    assert_eq!(reloaded_attempt.action_id, outcome.attempt.action_id);
+    assert_eq!(reloaded_attempt.state, AttemptState::Dispatched);
 
     reloaded_pool.close().await;
     db.teardown().await;
@@ -398,19 +406,30 @@ async fn concurrent_dispatch_commitment_exactly_one_wins() {
 
     let repo_a = Arc::new(PostgresJobRepository::new(db.pool.clone()));
     let repo_b = Arc::new(PostgresJobRepository::new(db.pool.clone()));
-    let arbiter_a = arbiter();
-    let arbiter_b = arbiter();
+    // A SHARED arbiter with capacity 2 and a 1-unit claim per call, rather
+    // than separate arbiters with slack capacity: with separate arbiters (or
+    // one arbiter with capacity far above what either call claims), a later
+    // `acquire` succeeding proves nothing about whether the loser's specific
+    // reservation was released, since spare capacity would let it succeed
+    // either way. With a shared 2-unit arbiter, both calls can acquire their
+    // 1-unit claim concurrently (so the DB row lock alone decides the race,
+    // not resource contention), and the post-race capacity is then an exact,
+    // deterministic function of whether the loser's unit was released.
+    let shared_arbiter = Arc::new(TechnicalResourceArbiter::new([(
+        ResourceKind::new("network"),
+        2,
+    )]));
     let svc_a = FinalDispatchService::new(
         repo_a,
         Arc::clone(&presence),
         Arc::clone(&services.target) as Arc<dyn TargetRevalidationPort>,
-        Arc::clone(&arbiter_a),
+        Arc::clone(&shared_arbiter),
     );
     let svc_b = FinalDispatchService::new(
         repo_b,
         Arc::clone(&presence),
         Arc::clone(&services.target) as Arc<dyn TargetRevalidationPort>,
-        Arc::clone(&arbiter_b),
+        Arc::clone(&shared_arbiter),
     );
 
     let (result_a, result_b) = tokio::join!(
@@ -446,14 +465,29 @@ async fn concurrent_dispatch_commitment_exactly_one_wins() {
     assert_eq!(audit_count_for_step(&db.pool, step_id).await, 1);
     assert_eq!(job_step_state(&db.pool, step_id).await, "Dispatching");
 
-    // Both arbiters must end up with full capacity available again: the
-    // winner's reservation stays held on its own arbiter but is explicitly
-    // released here to prove capacity accounting is exact, and the loser's
-    // reservation must already have been released automatically.
-    assert!(
-        arbiter_b.acquire(network_claims()).is_ok(),
-        "the loser's reservation must have been released"
+    // Deterministic reservation-release proof: exactly one unit (the
+    // winner's) must remain reserved. A 1-unit probe must still fit — proving
+    // the loser's unit was actually released, not merely that unrelated
+    // slack capacity existed — and a second probe must then fail, since both
+    // units of the shared 2-unit arbiter are now accounted for.
+    let probe = shared_arbiter
+        .acquire(network_claims())
+        .expect("one more 1-unit claim must fit: the loser's reservation was released");
+    assert_eq!(
+        shared_arbiter.acquire(network_claims()),
+        Err(InsufficientCapacity),
+        "capacity must now be fully exhausted by the winner's reservation plus this probe"
     );
+    shared_arbiter.release(probe);
+
+    let winner_reservation = outcomes
+        .into_iter()
+        .find_map(|r| match r {
+            FinalDispatchResult::Committed { reservation, .. } => Some(reservation),
+            _ => None,
+        })
+        .expect("exactly one commitment must have succeeded");
+    shared_arbiter.release(winner_reservation);
 
     db.teardown().await;
 }
