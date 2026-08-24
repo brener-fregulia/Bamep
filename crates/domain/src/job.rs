@@ -82,6 +82,20 @@ pub enum JobStepState {
     Cancelled,
 }
 
+/// The Domain-owned minimum durable failure-reason vocabulary for a
+/// `JobStep` reaching `Failed` (`m0-job-lifecycle-and-scheduling.md`
+/// "JobStep lifecycle": "`Dispatching -> Failed` ... use `ExecutionFailed`,
+/// `DispatchRejected`, or `ReconciliationIndeterminate`"). Issue #26 produces
+/// only the first two; `ReconciliationIndeterminate` belongs to #28 and is
+/// intentionally not represented here yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobStepFailureReason {
+    /// `ActionAck{Rejected}` — the Agent never executed the action.
+    DispatchRejected,
+    /// `ActionResult{Failed}` — the Agent executed the action and it failed.
+    ExecutionFailed,
+}
+
 /// The durable destructive-operation authorization snapshot for one JobStep
 /// (Issue #31 "Persist simulated destructive JobStep intent";
 /// `docs/specifications/m0-endpoint-identity-lifecycle.md` "Destructive-
@@ -132,6 +146,11 @@ pub struct JobStep {
     /// operation — not introduced here — would be required to replace an
     /// already-attached intent.
     pub destructive_intent: Option<DestructiveIntent>,
+    /// `Some` only once this JobStep reaches `Failed` through normal Agent
+    /// action evidence (Issue #26); `None` at every other state, including
+    /// every state [`create_workflow`] and [`satisfy_preliminary_preconditions`]
+    /// ever produce.
+    pub failure_reason: Option<JobStepFailureReason>,
 }
 
 /// One workflow targeting one Endpoint, composed of an ordered sequence of
@@ -174,6 +193,7 @@ pub fn create_workflow(endpoint_id: EndpointId, step_count: usize) -> Result<Job
             order: order as i32,
             state: JobStepState::Pending,
             destructive_intent: None,
+            failure_reason: None,
         })
         .collect();
     Ok(Job {

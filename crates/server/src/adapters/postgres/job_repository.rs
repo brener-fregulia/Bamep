@@ -9,9 +9,9 @@
 
 use async_trait::async_trait;
 use bamep_domain::{
-    Attempt, AttemptId, AttemptState, DestructiveIntent, EndpointId, InventoryRevisionId, Job,
-    JobAdmissionError, JobId, JobState, JobStep, JobStepEligibilityError, JobStepId, JobStepState,
-    TargetFingerprint,
+    ActionId, Attempt, AttemptId, AttemptState, DestructiveIntent, EndpointId, InventoryRevisionId,
+    Job, JobAdmissionError, JobId, JobState, JobStep, JobStepEligibilityError,
+    JobStepFailureReason, JobStepId, JobStepState, TargetFingerprint,
 };
 use sqlx::{PgPool, Row};
 
@@ -20,10 +20,12 @@ use super::shared::{
     PgIdentityState,
 };
 use crate::ports::{
-    AdmitJobDecision, AdmitJobError, AuthorizeDestructiveIntentDecision,
-    AuthorizeDestructiveIntentError, CommitDestructiveDispatchError, CreateWorkflowError,
-    FinalDispatchDecision, FinalDispatchLockedFacts, JobRepository, RepositoryError,
-    SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError,
+    ActionEvidenceLockedFacts, AdmitJobDecision, AdmitJobError, ApplyActionEvidenceDecision,
+    ApplyActionEvidenceDecisionOutcome, ApplyActionEvidenceError, ApplyActionEvidenceResult,
+    AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError,
+    CommitDestructiveDispatchError, CreateWorkflowError, FinalDispatchDecision,
+    FinalDispatchLockedFacts, JobRepository, RepositoryError, SatisfyStepPreconditionsDecision,
+    SatisfyStepPreconditionsError,
 };
 
 /// Adapter-local representation of the `job_state` PostgreSQL ENUM
@@ -100,6 +102,34 @@ impl From<PgJobStepState> for JobStepState {
             PgJobStepState::Succeeded => JobStepState::Succeeded,
             PgJobStepState::Failed => JobStepState::Failed,
             PgJobStepState::Cancelled => JobStepState::Cancelled,
+        }
+    }
+}
+
+/// Adapter-local representation of the `job_step_failure_reason` PostgreSQL
+/// ENUM (Issue #26). Domain (`bamep_domain::JobStepFailureReason`) stays free
+/// of SQLx/PostgreSQL derives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "job_step_failure_reason")]
+enum PgJobStepFailureReason {
+    DispatchRejected,
+    ExecutionFailed,
+}
+
+impl From<JobStepFailureReason> for PgJobStepFailureReason {
+    fn from(reason: JobStepFailureReason) -> Self {
+        match reason {
+            JobStepFailureReason::DispatchRejected => PgJobStepFailureReason::DispatchRejected,
+            JobStepFailureReason::ExecutionFailed => PgJobStepFailureReason::ExecutionFailed,
+        }
+    }
+}
+
+impl From<PgJobStepFailureReason> for JobStepFailureReason {
+    fn from(reason: PgJobStepFailureReason) -> Self {
+        match reason {
+            PgJobStepFailureReason::DispatchRejected => JobStepFailureReason::DispatchRejected,
+            PgJobStepFailureReason::ExecutionFailed => JobStepFailureReason::ExecutionFailed,
         }
     }
 }
@@ -226,7 +256,7 @@ impl JobRepository for PostgresJobRepository {
 
         let step_rows = sqlx::query(
             "SELECT id, job_id, step_order, state, \
-                    authorized_inventory_revision_id, authorized_target_fingerprint \
+                    authorized_inventory_revision_id, authorized_target_fingerprint, failure_reason \
              FROM job_steps WHERE job_id = $1 ORDER BY step_order ASC",
         )
         .bind(id.0)
@@ -257,7 +287,7 @@ impl JobRepository for PostgresJobRepository {
 
         let row = sqlx::query(
             "SELECT id, job_id, step_order, state, \
-                    authorized_inventory_revision_id, authorized_target_fingerprint \
+                    authorized_inventory_revision_id, authorized_target_fingerprint, failure_reason \
              FROM job_steps WHERE id = $1 AND job_id = $2 FOR UPDATE",
         )
         .bind(step_id.0)
@@ -592,20 +622,190 @@ impl JobRepository for PostgresJobRepository {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(to_backend_err)?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let id: uuid::Uuid = row.try_get("id").map_err(to_backend_err)?;
-        let job_step_id: uuid::Uuid = row.try_get("job_step_id").map_err(to_backend_err)?;
-        let action_id: uuid::Uuid = row.try_get("action_id").map_err(to_backend_err)?;
-        let state: PgAttemptState = row.try_get("state").map_err(to_backend_err)?;
-        Ok(Some(Attempt {
-            id: AttemptId(id),
-            job_step_id: JobStepId(job_step_id),
-            action_id: bamep_domain::ActionId(action_id),
-            state: state.into(),
-        }))
+        row.as_ref().map(row_to_attempt).transpose()
     }
+
+    /// See the Port doc for the full lock/decide/persist contract. Lock order
+    /// is exactly Attempt -> JobStep -> Job, matching the Port's stated
+    /// contract; `find_job`/`fetch_job_steps` are not reused here because
+    /// this method must lock the owning `job_steps` row *before* the `jobs`
+    /// row, whereas every other method in this file only ever needs to lock
+    /// `jobs` first.
+    async fn apply_action_evidence(
+        &self,
+        action_id: ActionId,
+        authenticated_endpoint_id: EndpointId,
+        decide: ApplyActionEvidenceDecision,
+    ) -> Result<ApplyActionEvidenceResult, ApplyActionEvidenceError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        let attempt_row = sqlx::query(
+            "SELECT id, job_step_id, action_id, state FROM attempts WHERE action_id = $1 FOR UPDATE",
+        )
+        .bind(action_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+        let Some(attempt_row) = attempt_row else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(ApplyActionEvidenceError::UnknownAction);
+        };
+        let attempt = row_to_attempt(&attempt_row)?;
+
+        let step_row = sqlx::query(
+            "SELECT id, job_id, step_order, state, \
+                    authorized_inventory_revision_id, authorized_target_fingerprint, failure_reason \
+             FROM job_steps WHERE id = $1 FOR UPDATE",
+        )
+        .bind(attempt.job_step_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+        let Some(step_row) = step_row else {
+            return Err(ApplyActionEvidenceError::Repository(
+                RepositoryError::Backend(
+                    "attempt references a job_step that no longer exists".to_string(),
+                ),
+            ));
+        };
+        let job_step = row_to_job_step(&step_row)?;
+
+        let job_row = sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_step.job_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+        let Some(job_row) = job_row else {
+            return Err(ApplyActionEvidenceError::Repository(
+                RepositoryError::Backend(
+                    "job_step references a job that no longer exists".to_string(),
+                ),
+            ));
+        };
+        let job_endpoint_id: uuid::Uuid = job_row.try_get("endpoint_id").map_err(to_backend_err)?;
+        let job_state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
+        let steps = fetch_job_steps(&mut tx, job_step.job_id, true)
+            .await
+            .map_err(ApplyActionEvidenceError::Repository)?;
+        let job = Job {
+            id: job_step.job_id,
+            endpoint_id: EndpointId(job_endpoint_id),
+            state: job_state.into(),
+            steps,
+        };
+
+        // Never distinguish "unknown action_id" from "known action_id
+        // belonging to another Endpoint" — both roll back identically and
+        // return the same generic error (`m0-agent-protocol-contract.md`;
+        // Issue #26 "Authenticated Endpoint correlation").
+        if job.endpoint_id != authenticated_endpoint_id {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(ApplyActionEvidenceError::UnknownAction);
+        }
+
+        let facts = ActionEvidenceLockedFacts {
+            job,
+            job_step,
+            attempt,
+        };
+
+        match decide(facts) {
+            ApplyActionEvidenceDecisionOutcome::NoOp => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(ApplyActionEvidenceResult::NoOp)
+            }
+            ApplyActionEvidenceDecisionOutcome::Conflict => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(ApplyActionEvidenceResult::Conflict)
+            }
+            ApplyActionEvidenceDecisionOutcome::Applied(commit) => {
+                let applied = commit.outcome;
+
+                sqlx::query("UPDATE attempts SET state = $1 WHERE id = $2")
+                    .bind(PgAttemptState::from(applied.attempt.state))
+                    .bind(applied.attempt.id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+
+                sqlx::query("UPDATE job_steps SET state = $1, failure_reason = $2 WHERE id = $3")
+                    .bind(PgJobStepState::from(applied.job_step.state))
+                    .bind(
+                        applied
+                            .job_step
+                            .failure_reason
+                            .map(PgJobStepFailureReason::from),
+                    )
+                    .bind(applied.job_step.id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+
+                sqlx::query("UPDATE jobs SET state = $1 WHERE id = $2")
+                    .bind(PgJobState::from(applied.job.state))
+                    .bind(applied.job.id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+
+                for event in &applied.events {
+                    sqlx::query(
+                        "INSERT INTO domain_events \
+                         (event_id, event_type, event_version, endpoint_id, job_id, job_step_id, occurred_at, payload) \
+                         VALUES ($1, $2, 1, $3, $4, $5, $6, $7)",
+                    )
+                    .bind(event.event_id())
+                    .bind(PgDomainEventType::from(event))
+                    .bind(event.endpoint_id().0)
+                    .bind(event.job_id().map(|id| id.0))
+                    .bind(event.job_step_id().map(|id| id.0))
+                    .bind(event.occurred_at())
+                    .bind(event_payload(event))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+                }
+
+                if let Some(audit) = &commit.audit {
+                    sqlx::query(
+                        "INSERT INTO audit_records \
+                         (audit_id, endpoint_id, actor_kind, actor_label, occurred_at, detail, \
+                          job_id, job_step_id, attempt_id, action_id) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                    )
+                    .bind(audit.audit_id)
+                    .bind(audit.endpoint_id.0)
+                    .bind(PgAuditActorKind::from(&audit.actor))
+                    .bind(actor_label(&audit.actor))
+                    .bind(audit.occurred_at)
+                    .bind(&audit.detail)
+                    .bind(audit.job_id.map(|id| id.0))
+                    .bind(audit.job_step_id.map(|id| id.0))
+                    .bind(audit.attempt_id.map(|id| id.0))
+                    .bind(audit.action_id.map(|id| id.0))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+                }
+
+                tx.commit().await.map_err(to_backend_err)?;
+                Ok(ApplyActionEvidenceResult::Applied(applied))
+            }
+        }
+    }
+}
+
+fn row_to_attempt(row: &sqlx::postgres::PgRow) -> Result<Attempt, RepositoryError> {
+    let id: uuid::Uuid = row.try_get("id").map_err(to_backend_err)?;
+    let job_step_id: uuid::Uuid = row.try_get("job_step_id").map_err(to_backend_err)?;
+    let action_id: uuid::Uuid = row.try_get("action_id").map_err(to_backend_err)?;
+    let state: PgAttemptState = row.try_get("state").map_err(to_backend_err)?;
+    Ok(Attempt {
+        id: AttemptId(id),
+        job_step_id: JobStepId(job_step_id),
+        action_id: ActionId(action_id),
+        state: state.into(),
+    })
 }
 
 /// Reads every `JobStep` for `job_id`, ordered, within `tx`. `lock` rows
@@ -618,10 +818,10 @@ async fn fetch_job_steps(
     lock: bool,
 ) -> Result<Vec<JobStep>, RepositoryError> {
     const UNLOCKED: &str = "SELECT id, job_id, step_order, state, \
-         authorized_inventory_revision_id, authorized_target_fingerprint \
+         authorized_inventory_revision_id, authorized_target_fingerprint, failure_reason \
          FROM job_steps WHERE job_id = $1 ORDER BY step_order ASC";
     const LOCKED: &str = "SELECT id, job_id, step_order, state, \
-         authorized_inventory_revision_id, authorized_target_fingerprint \
+         authorized_inventory_revision_id, authorized_target_fingerprint, failure_reason \
          FROM job_steps WHERE job_id = $1 ORDER BY step_order ASC FOR UPDATE";
 
     let step_rows = sqlx::query(if lock { LOCKED } else { UNLOCKED })
@@ -660,6 +860,8 @@ fn row_to_job_step(row: &sqlx::postgres::PgRow) -> Result<JobStep, RepositoryErr
             ))
         }
     };
+    let failure_reason: Option<PgJobStepFailureReason> =
+        row.try_get("failure_reason").map_err(to_backend_err)?;
 
     Ok(JobStep {
         id: JobStepId(step_id),
@@ -667,5 +869,6 @@ fn row_to_job_step(row: &sqlx::postgres::PgRow) -> Result<JobStep, RepositoryErr
         order,
         state: step_state.into(),
         destructive_intent,
+        failure_reason: failure_reason.map(Into::into),
     })
 }

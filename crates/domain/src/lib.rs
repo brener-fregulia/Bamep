@@ -8,6 +8,7 @@
 //! state plus the domain events/audit record it requires, leaving
 //! persistence entirely to the `server` crate's Adapters.
 
+pub mod action_evidence;
 pub mod attempt;
 pub mod boot_context;
 pub mod credential;
@@ -23,6 +24,9 @@ pub mod presented_credential;
 pub mod target_fingerprint;
 pub mod transitions;
 
+pub use action_evidence::{
+    apply_action_evidence, ActionEvidence, ActionEvidenceApplied, ActionEvidenceOutcome,
+};
 pub use attempt::{ActionId, Attempt, AttemptId, AttemptState};
 pub use bamep_trusted_bootstrap::BootNonce;
 pub use boot_context::{BootContext, BootContextResolveError};
@@ -43,8 +47,8 @@ pub use inventory::{
 pub use job::{
     admit_job, authorize_destructive_intent, create_workflow, satisfy_preliminary_preconditions,
     DestructiveIntent, DestructiveIntentError, EmptyWorkflow, Job, JobAdmissionError,
-    JobAdmissionOutcome, JobId, JobState, JobStep, JobStepEligibilityError, JobStepId,
-    JobStepState,
+    JobAdmissionOutcome, JobId, JobState, JobStep, JobStepEligibilityError, JobStepFailureReason,
+    JobStepId, JobStepState,
 };
 pub use target_fingerprint::TargetFingerprint;
 pub use transitions::{RedeemOutcome, TrustedBootstrapOutcome};

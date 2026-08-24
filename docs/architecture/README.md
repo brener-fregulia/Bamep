@@ -142,6 +142,43 @@ introduced for this commitment.
 This path never sends `ActionDispatch` and never opens an Agent Protocol/WebSocket connection —
 transmission of the already-committed Attempt remains unimplemented.
 
+## Implemented normal typed-action dispatch and evidence completion
+
+A structurally separate transient outbound-delivery Runtime Service,
+`bamep_server::runtime::outbound_sessions::OutboundSessionDirectory`, tracks the most recently
+registered live authenticated `SessionId` per Endpoint and its bounded outbound command channel
+(`OutboundCommand`), independently of `PresenceRegistry`. `AgentControlGateway`'s authenticated-
+session task registers/unregisters the same exact `SessionId` in both registries on every exit
+path, splits its owned WebSocket into read/write halves, and runs one `tokio::select!` loop
+serving inbound Agent Protocol frames and outbound `OutboundCommand`s from the same task — the
+sole serialized writer of that session's socket. `OutboundSessionDirectory` implements the
+`bamep_server::ports::AgentDispatchPort` Port; Application depends on that Port, never on
+`tokio-tungstenite` directly.
+
+`bamep_server::application::ActionDispatchService` registers a transient
+`bamep_server::runtime::reservation_registry::AttemptReservationRegistry` mapping
+(`AttemptId -> ReservationId`, composing #32's `TechnicalResourceArbiter`) before transmitting
+`ActionDispatch` for the single M1 concrete action (`bamep.m1.simulated-execution`, version `1`,
+closed empty `parameters`), converting the committed `Attempt.action_id`'s exact UUID into the
+Agent Protocol wire identity without generating a replacement.
+
+`bamep_server::application::ActionEvidenceService` applies inbound `ActionAck`/`ActionResult`
+evidence: it locks Attempt -> JobStep -> Job (in that order) through
+`PostgresJobRepository::apply_action_evidence`, calls the pure Domain decision
+`bamep_domain::apply_action_evidence` (`bamep-domain`'s `action_evidence` module), and — on an
+`Applied` outcome — persists the resulting Attempt/JobStep/Job state, the required
+`JobStepFailed`/`JobFailed`/`JobSucceeded` domain events, and (for a terminal outcome) one audit
+record, all atomically. Only after that commit does it remove the Attempt's reservation mapping
+exactly once and release it through the arbiter. Duplicate/delayed/conflicting evidence is
+resolved by the Domain decision into `NoOp` (idempotent, matches already-committed state) or
+`Conflict` (ignored, never overwrites a different already-committed terminal outcome) — the
+Adapter persists nothing for either. `ActionProgress` never reaches this service: the Gateway
+treats it as transient advisory metadata only.
+
+`AgentControlGateway` correlates every inbound `ActionAck`/`ActionResult` to the authenticated
+Endpoint of the session it arrived on; an unknown `action_id` and one belonging to another
+Endpoint's Job both resolve identically, so the Server never reveals which case occurred.
+
 ## Maintenance rule
 
 Update this directory only for durable structure visible in implemented code. Do not copy

@@ -14,7 +14,10 @@ CREATE TYPE domain_event_type AS ENUM (
     'EndpointEnrolled',
     'OperatorDecisionRecorded',
     'InventoryRevisionRecorded',
-    'JobStarted'
+    'JobStarted',
+    'JobSucceeded',
+    'JobFailed',
+    'JobStepFailed'
 );
 
 CREATE TYPE audit_actor_kind AS ENUM (
@@ -104,9 +107,11 @@ CREATE TABLE endpoint_credentials (
 
 -- Domain-event envelope fields remain queryable columns; payload contains only
 -- the event-type-specific remainder. job_id is nullable because only
--- Job-scoped events (currently JobStarted, Issue #32) carry it; every other
--- event type currently implemented is Endpoint-scoped only. Its FK is added
--- below, once the `jobs` table this table is declared ahead of exists —
+-- Job-scoped events (currently JobStarted/JobSucceeded/JobFailed/
+-- JobStepFailed, Issues #32/#26) carry it; every other event type currently
+-- implemented is Endpoint-scoped only. job_step_id is nullable further still
+-- — only JobStepFailed (Issue #26) carries it. Their FKs are added below,
+-- once the `jobs`/`job_steps` tables this table is declared ahead of exist —
 -- mirroring `endpoints_current_inventory_revision_fk` above.
 CREATE TABLE domain_events (
     event_id UUID PRIMARY KEY,
@@ -114,6 +119,7 @@ CREATE TABLE domain_events (
     event_version INTEGER NOT NULL DEFAULT 1,
     endpoint_id UUID NOT NULL REFERENCES endpoints (id),
     job_id UUID,
+    job_step_id UUID,
     occurred_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
 );
@@ -245,6 +251,15 @@ CREATE UNIQUE INDEX jobs_active_endpoint_exclusivity
 -- later explicit lifecycle/authorization operation would be required to
 -- replace one). A later scheduling/dispatch Work Package consumes/revalidates
 -- this snapshot; it does not attach it.
+-- The Domain-owned minimum durable JobStep failure-reason vocabulary
+-- (m0-job-lifecycle-and-scheduling.md "JobStep lifecycle"; Issue #26).
+-- 'ReconciliationIndeterminate' belongs to #28 and is intentionally not
+-- represented here yet.
+CREATE TYPE job_step_failure_reason AS ENUM (
+    'DispatchRejected',
+    'ExecutionFailed'
+);
+
 CREATE TABLE job_steps (
     id UUID PRIMARY KEY,
     job_id UUID NOT NULL REFERENCES jobs (id),
@@ -252,6 +267,9 @@ CREATE TABLE job_steps (
     state job_step_state NOT NULL,
     authorized_inventory_revision_id UUID,
     authorized_target_fingerprint TEXT,
+    -- Set exactly once a JobStep reaches Failed through normal Agent action
+    -- evidence (Issue #26); NULL at every other state.
+    failure_reason job_step_failure_reason,
     UNIQUE (job_id, step_order),
     CONSTRAINT job_steps_destructive_intent_all_or_none CHECK (
         (authorized_inventory_revision_id IS NULL AND authorized_target_fingerprint IS NULL)
@@ -299,3 +317,8 @@ ALTER TABLE audit_records ADD CONSTRAINT audit_records_attempt_id_fk
     FOREIGN KEY (attempt_id) REFERENCES attempts (id);
 
 CREATE INDEX idx_audit_records_job_step_id ON audit_records (job_step_id);
+
+ALTER TABLE domain_events ADD CONSTRAINT domain_events_job_step_id_fk
+    FOREIGN KEY (job_step_id) REFERENCES job_steps (id);
+
+CREATE INDEX idx_domain_events_job_step_id ON domain_events (job_step_id);

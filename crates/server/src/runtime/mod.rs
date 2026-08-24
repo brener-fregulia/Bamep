@@ -4,5 +4,7 @@
 //! (persistence and protocol transports) and `application` (Domain
 //! orchestration).
 
+pub mod outbound_sessions;
 pub mod presence;
+pub mod reservation_registry;
 pub mod resource_arbiter;

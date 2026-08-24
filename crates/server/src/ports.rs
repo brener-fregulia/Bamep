@@ -18,12 +18,12 @@
 use async_trait::async_trait;
 use bamep_domain::presented_credential::{CredentialKind, CredentialLookupId};
 use bamep_domain::{
-    Attempt, AttemptId, AuditRecord, BootContext, BootContextResolveError, DestructiveIntent,
-    DestructiveIntentError, EndpointAggregate, EndpointId, FinalDispatchDenial,
-    FinalDispatchOutcome, FinalDispatchRejection, InvalidIdentityTransition, InventoryRevision,
-    InventoryRevisionId, InventorySnapshot, Job, JobAdmissionError, JobAdmissionOutcome, JobId,
-    JobStep, JobStepEligibilityError, JobStepId, RedeemOutcome, TargetFingerprint,
-    TransitionOutcome, TrustedBootstrapOutcome,
+    ActionEvidenceApplied, ActionId, Attempt, AttemptId, AuditRecord, BootContext,
+    BootContextResolveError, DestructiveIntent, DestructiveIntentError, EndpointAggregate,
+    EndpointId, FinalDispatchDenial, FinalDispatchOutcome, FinalDispatchRejection,
+    InvalidIdentityTransition, InventoryRevision, InventoryRevisionId, InventorySnapshot, Job,
+    JobAdmissionError, JobAdmissionOutcome, JobId, JobStep, JobStepEligibilityError, JobStepId,
+    RedeemOutcome, TargetFingerprint, TransitionOutcome, TrustedBootstrapOutcome,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -305,6 +305,98 @@ pub trait JobRepository: Send + Sync {
     /// does not introduce #26/#28 querying/reconciliation APIs.
     async fn find_attempt(&self, attempt_id: AttemptId)
         -> Result<Option<Attempt>, RepositoryError>;
+
+    /// Resolves `action_id` to its owning Attempt/JobStep/Job, locks all
+    /// three in that stable order, verifies the owning Job targets
+    /// `authenticated_endpoint_id`, invokes `decide` with the freshly locked
+    /// [`ActionEvidenceLockedFacts`], and — only for
+    /// [`ApplyActionEvidenceDecisionOutcome::Applied`] — atomically persists
+    /// the returned [`ActionEvidenceCommit`]'s Attempt/JobStep/Job state,
+    /// required events, and (for a terminal outcome) required audit record
+    /// in the same transaction (Issue #26 "PostgreSQL evidence application").
+    ///
+    /// An unknown `action_id`, or a known `action_id` whose owning Job
+    /// targets a different Endpoint, is
+    /// [`ApplyActionEvidenceError::UnknownAction`] in both cases — this
+    /// method never distinguishes the two outcomes, so a caller can never
+    /// learn whether a foreign/unknown `action_id` exists
+    /// (`m0-agent-protocol-contract.md`; Issue #26 "Authenticated Endpoint
+    /// correlation"). `decide` is never invoked in that case.
+    async fn apply_action_evidence(
+        &self,
+        action_id: ActionId,
+        authenticated_endpoint_id: EndpointId,
+        decide: ApplyActionEvidenceDecision,
+    ) -> Result<ApplyActionEvidenceResult, ApplyActionEvidenceError>;
+}
+
+/// Durable facts read under lock immediately before one normal Agent action
+/// evidence decision (Issue #26 "PostgreSQL evidence application"): the
+/// current Attempt, its owning JobStep, and the owning Job (including every
+/// ordered JobStep, needed to decide whether a `Succeeded` JobStep completes
+/// the Job) — locked in that stable order (Attempt -> JobStep -> Job).
+pub struct ActionEvidenceLockedFacts {
+    pub job: Job,
+    pub job_step: JobStep,
+    pub attempt: Attempt,
+}
+
+/// A pure decision over freshly locked [`ActionEvidenceLockedFacts`],
+/// mirroring [`FinalDispatchDecision`]: the Adapter locks and reads current
+/// state, this closure decides (calling
+/// `bamep_domain::apply_action_evidence` and, only for a terminal outcome,
+/// constructing the required [`AuditRecord`] — mirroring how
+/// `FinalDispatchDecision` builds [`FinalDispatchCommit`]'s audit), and the
+/// Adapter persists the result atomically in the same transaction.
+pub type ApplyActionEvidenceDecision =
+    Box<dyn FnOnce(ActionEvidenceLockedFacts) -> ApplyActionEvidenceDecisionOutcome + Send>;
+
+/// A successful [`ApplyActionEvidenceDecision`] "Applied" result: the Domain
+/// outcome plus the immutable terminal [`AuditRecord`] that must commit
+/// atomically alongside it when `outcome.terminal` is `true` — `None` when
+/// `outcome.terminal` is `false` (the `AckAccepted` `Dispatched ->
+/// InProgress` transition, which requires no audit record).
+pub struct ActionEvidenceCommit {
+    pub outcome: ActionEvidenceApplied,
+    pub audit: Option<AuditRecord>,
+}
+
+/// The three outcomes [`ApplyActionEvidenceDecision`] may produce, mirroring
+/// `bamep_domain::ActionEvidenceOutcome` at the Application boundary (the
+/// `Applied` case additionally carries the audit record Domain itself never
+/// constructs). Crosses one evidence application at a time, never a hot
+/// per-message path (`ActionProgress`, the actually high-frequency message,
+/// never reaches this type at all), mirroring
+/// `bamep_domain::action_evidence::ActionEvidenceOutcome`'s identical
+/// allowance.
+#[allow(clippy::large_enum_variant)]
+pub enum ApplyActionEvidenceDecisionOutcome {
+    Applied(ActionEvidenceCommit),
+    NoOp,
+    Conflict,
+}
+
+/// The result of [`JobRepository::apply_action_evidence`] after successful
+/// resolution/locking/correlation — mirrors [`ApplyActionEvidenceDecisionOutcome`]
+/// without the audit record, which is a persistence-only concern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum ApplyActionEvidenceResult {
+    Applied(ActionEvidenceApplied),
+    NoOp,
+    Conflict,
+}
+
+/// Errors from [`JobRepository::apply_action_evidence`].
+#[derive(Debug, thiserror::Error)]
+pub enum ApplyActionEvidenceError {
+    /// Unknown `action_id`, or a known `action_id` belonging to a Job that
+    /// does not target the authenticated Endpoint — deliberately one
+    /// generic value so a caller can never learn which case occurred.
+    #[error("unknown action")]
+    UnknownAction,
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
 }
 
 /// Durable facts read under lock immediately before the final destructive-
@@ -483,4 +575,45 @@ pub trait TargetRevalidationPort: Send + Sync {
     /// `endpoint_id`, or `None` when no target evidence is currently
     /// available for it.
     fn current_target_fingerprint(&self, endpoint_id: EndpointId) -> Option<TargetFingerprint>;
+}
+
+/// Outbound authenticated-session `ActionDispatch` delivery (Issue #26
+/// "Outbound authenticated session delivery"). Application depends on this
+/// Port, never on `tokio-tungstenite`/WebSocket types directly
+/// (`m0-stack-and-boundaries-baseline.md` "Dependency constraints").
+///
+/// A successful [`dispatch_action`](Self::dispatch_action) means only that
+/// the local transport accepted the frame for the selected authenticated
+/// session — never Agent receipt, `ActionAck`, execution, or success. The
+/// concrete Runtime Service implementing this Port
+/// (`crate::runtime::outbound_sessions::OutboundSessionDirectory`) selects
+/// exactly one live session per Endpoint (the most recently registered),
+/// never fans out, and never falls back to another overlapping session after
+/// one send attempt.
+#[async_trait]
+pub trait AgentDispatchPort: Send + Sync {
+    async fn dispatch_action(
+        &self,
+        endpoint_id: EndpointId,
+        dispatch: bamep_agent_protocol::ActionDispatchMessage,
+    ) -> Result<(), AgentDispatchError>;
+}
+
+/// Errors from [`AgentDispatchPort::dispatch_action`]. None of these prove
+/// non-delivery, execution failure, or Agent non-receipt — they only
+/// describe why the local transport could not accept the frame at all
+/// (`m0-agent-protocol-contract.md` "Idempotency, retry, and uncertain
+/// delivery": "Failure to receive `ActionAck` is an uncertain delivery
+/// outcome"). The caller must leave the Attempt durably `Dispatched` on any
+/// of these — #26 never creates another Attempt, marks the Attempt
+/// terminal, or redispatches merely because of a send failure; #28 owns
+/// subsequent uncertain-delivery reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AgentDispatchError {
+    #[error("no authenticated session is currently registered for this endpoint")]
+    NoSession,
+    #[error("the authenticated session's outbound channel is gone")]
+    ChannelClosed,
+    #[error("the local websocket send failed")]
+    SendFailed,
 }

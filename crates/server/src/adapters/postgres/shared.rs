@@ -96,6 +96,9 @@ pub(super) enum PgDomainEventType {
     OperatorDecisionRecorded,
     InventoryRevisionRecorded,
     JobStarted,
+    JobSucceeded,
+    JobFailed,
+    JobStepFailed,
 }
 
 impl From<&DomainEvent> for PgDomainEventType {
@@ -112,6 +115,9 @@ impl From<&DomainEvent> for PgDomainEventType {
                 PgDomainEventType::InventoryRevisionRecorded
             }
             DomainEvent::JobStarted { .. } => PgDomainEventType::JobStarted,
+            DomainEvent::JobSucceeded { .. } => PgDomainEventType::JobSucceeded,
+            DomainEvent::JobFailed { .. } => PgDomainEventType::JobFailed,
+            DomainEvent::JobStepFailed { .. } => PgDomainEventType::JobStepFailed,
         }
     }
 }
@@ -217,7 +223,13 @@ pub(super) fn event_payload(event: &DomainEvent) -> serde_json::Value {
             inventory_revision_id,
             ..
         } => serde_json::json!({"inventory_revision_id": inventory_revision_id.0}),
-        DomainEvent::JobStarted { .. } => serde_json::json!({}),
+        DomainEvent::JobStarted { .. }
+        | DomainEvent::JobSucceeded { .. }
+        | DomainEvent::JobFailed { .. } => serde_json::json!({}),
+        // job_step_id itself is a queryable `domain_events.job_step_id`
+        // column (`event_payload`'s caller binds it separately), so the
+        // payload here carries no additional event-specific remainder.
+        DomainEvent::JobStepFailed { .. } => serde_json::json!({}),
     }
 }
 

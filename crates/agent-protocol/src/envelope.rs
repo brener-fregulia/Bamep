@@ -199,6 +199,45 @@ impl<'de> Deserialize<'de> for MessageTimestamp {
     }
 }
 
+/// Rejects a value outside `0..=100`
+/// (`docs/specifications/m0-agent-protocol-contract.md` "ActionProgress
+/// fields": "`percent` is an integer in `0..=100`").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("percent must be in 0..=100")]
+pub struct PercentOutOfRange;
+
+/// `ActionProgress.percent`: an integer in `0..=100`, enforced on
+/// construction and on wire input alike — deserializing an out-of-range value
+/// fails explicitly rather than silently clamping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Percent(u8);
+
+impl Percent {
+    pub fn new(value: u8) -> Result<Self, PercentOutOfRange> {
+        if value > 100 {
+            return Err(PercentOutOfRange);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn value(self) -> u8 {
+        self.0
+    }
+}
+
+impl Serialize for Percent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Percent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = u8::deserialize(deserializer)?;
+        Percent::new(raw).map_err(D::Error::custom)
+    }
+}
+
 /// Fields common to every Agent Protocol v1 message, flattened into each
 /// concrete message struct rather than nested under a `"envelope"` key on
 /// the wire (`m0-agent-protocol-contract.md` "Message envelope").

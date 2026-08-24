@@ -54,6 +54,35 @@ pub enum DomainEvent {
         endpoint_id: EndpointId,
         occurred_at: DateTime<Utc>,
     },
+    /// Emitted exactly once when a `Job` enters `Succeeded`
+    /// (`m0-persistence-observability-and-domain-events.md` "Required M1
+    /// normal-terminal Job/JobStep events"; Issue #26).
+    JobSucceeded {
+        event_id: Uuid,
+        job_id: JobId,
+        endpoint_id: EndpointId,
+        occurred_at: DateTime<Utc>,
+    },
+    /// Emitted exactly once when a `Job` enters `Failed`
+    /// (`m0-persistence-observability-and-domain-events.md` "Required M1
+    /// normal-terminal Job/JobStep events"; Issue #26).
+    JobFailed {
+        event_id: Uuid,
+        job_id: JobId,
+        endpoint_id: EndpointId,
+        occurred_at: DateTime<Utc>,
+    },
+    /// Emitted exactly once when a `JobStep` enters `Failed`
+    /// (`m0-persistence-observability-and-domain-events.md` "Required M1
+    /// normal-terminal Job/JobStep events"; Issue #26). `job_step_id` is the
+    /// narrow additional correlation this event requires beyond `job_id`.
+    JobStepFailed {
+        event_id: Uuid,
+        job_id: JobId,
+        job_step_id: JobStepId,
+        endpoint_id: EndpointId,
+        occurred_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent {
@@ -63,7 +92,10 @@ impl DomainEvent {
             | DomainEvent::EndpointEnrolled { event_id, .. }
             | DomainEvent::OperatorDecisionRecorded { event_id, .. }
             | DomainEvent::InventoryRevisionRecorded { event_id, .. }
-            | DomainEvent::JobStarted { event_id, .. } => *event_id,
+            | DomainEvent::JobStarted { event_id, .. }
+            | DomainEvent::JobSucceeded { event_id, .. }
+            | DomainEvent::JobFailed { event_id, .. }
+            | DomainEvent::JobStepFailed { event_id, .. } => *event_id,
         }
     }
 
@@ -73,7 +105,10 @@ impl DomainEvent {
             | DomainEvent::EndpointEnrolled { endpoint_id, .. }
             | DomainEvent::OperatorDecisionRecorded { endpoint_id, .. }
             | DomainEvent::InventoryRevisionRecorded { endpoint_id, .. }
-            | DomainEvent::JobStarted { endpoint_id, .. } => *endpoint_id,
+            | DomainEvent::JobStarted { endpoint_id, .. }
+            | DomainEvent::JobSucceeded { endpoint_id, .. }
+            | DomainEvent::JobFailed { endpoint_id, .. }
+            | DomainEvent::JobStepFailed { endpoint_id, .. } => *endpoint_id,
         }
     }
 
@@ -83,7 +118,31 @@ impl DomainEvent {
             | DomainEvent::EndpointEnrolled { occurred_at, .. }
             | DomainEvent::OperatorDecisionRecorded { occurred_at, .. }
             | DomainEvent::InventoryRevisionRecorded { occurred_at, .. }
-            | DomainEvent::JobStarted { occurred_at, .. } => *occurred_at,
+            | DomainEvent::JobStarted { occurred_at, .. }
+            | DomainEvent::JobSucceeded { occurred_at, .. }
+            | DomainEvent::JobFailed { occurred_at, .. }
+            | DomainEvent::JobStepFailed { occurred_at, .. } => *occurred_at,
+        }
+    }
+
+    /// The owning `JobId`, for the Job-scoped event types (Issue #26).
+    /// Endpoint-only event types have no Job correlation.
+    pub fn job_id(&self) -> Option<JobId> {
+        match self {
+            DomainEvent::JobStarted { job_id, .. }
+            | DomainEvent::JobSucceeded { job_id, .. }
+            | DomainEvent::JobFailed { job_id, .. }
+            | DomainEvent::JobStepFailed { job_id, .. } => Some(*job_id),
+            _ => None,
+        }
+    }
+
+    /// The owning `JobStepId`, for the JobStep-scoped event types (Issue
+    /// #26). Every other event type has no JobStep correlation.
+    pub fn job_step_id(&self) -> Option<crate::job::JobStepId> {
+        match self {
+            DomainEvent::JobStepFailed { job_step_id, .. } => Some(*job_step_id),
+            _ => None,
         }
     }
 
@@ -94,6 +153,9 @@ impl DomainEvent {
             DomainEvent::OperatorDecisionRecorded { .. } => "OperatorDecisionRecorded",
             DomainEvent::InventoryRevisionRecorded { .. } => "InventoryRevisionRecorded",
             DomainEvent::JobStarted { .. } => "JobStarted",
+            DomainEvent::JobSucceeded { .. } => "JobSucceeded",
+            DomainEvent::JobFailed { .. } => "JobFailed",
+            DomainEvent::JobStepFailed { .. } => "JobStepFailed",
         }
     }
 }

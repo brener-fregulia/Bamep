@@ -17,7 +17,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::envelope::{Envelope, MessageTimestamp, ProtocolId};
+use crate::envelope::{Envelope, MessageTimestamp, Percent, ProtocolId};
 
 // ---------------------------------------------------------------------
 // AuthRequest — Agent -> Server
@@ -308,6 +308,289 @@ impl InventoryReportMessage {
 }
 
 // ---------------------------------------------------------------------
+// ActionDispatch — Server -> Agent
+// ---------------------------------------------------------------------
+
+/// `ActionDispatch{action_id, action_type, action_version, parameters,
+/// retry_of?}` (`m0-agent-protocol-contract.md` "Message types", "Action
+/// field contract"). `action_type`/`parameters` schemas are owned by the
+/// Specification introducing the concrete `action_type` — this crate treats
+/// both as opaque. `retry_of`, when present, is a UUID v4 `action_id`
+/// referencing the action being retried; Issue #26 never sets it (it creates
+/// no retry) but the field is represented so the generic wire shape is
+/// already complete for a later retry-issuing Work Package.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionDispatchBody {
+    pub action_id: ProtocolId,
+    pub action_type: String,
+    pub action_version: String,
+    pub parameters: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<ProtocolId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionDispatchMessage {
+    #[serde(flatten)]
+    pub envelope: Envelope,
+    #[serde(flatten)]
+    pub body: ActionDispatchBody,
+}
+
+impl ActionDispatchMessage {
+    /// A fresh envelope whose `correlation_id` is always `action_id`
+    /// (`m0-agent-protocol-contract.md` "Message envelope": "Every
+    /// action-scoped message MUST have `correlation_id` equal to its
+    /// relevant `action_id`") — there is no way to construct this message
+    /// without that correlation already set.
+    pub fn new(
+        action_id: ProtocolId,
+        action_type: impl Into<String>,
+        action_version: impl Into<String>,
+        parameters: Map<String, Value>,
+    ) -> Self {
+        Self {
+            envelope: Envelope::new().with_correlation_id(action_id),
+            body: ActionDispatchBody {
+                action_id,
+                action_type: action_type.into(),
+                action_version: action_version.into(),
+                parameters,
+                retry_of: None,
+            },
+        }
+    }
+
+    /// `retry_of` must differ from this message's own `action_id`
+    /// (`m0-agent-protocol-contract.md` "Action field contract") — callers
+    /// constructing a genuine retry are responsible for that distinctness;
+    /// this crate does not itself own retry policy.
+    pub fn with_retry_of(mut self, retry_of: ProtocolId) -> Self {
+        self.body.retry_of = Some(retry_of);
+        self
+    }
+}
+
+// ---------------------------------------------------------------------
+// ActionAck — Agent -> Server
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActionAckOutcome {
+    Accepted,
+    Rejected,
+}
+
+/// `ActionAck.error` diagnostic shape (`m0-agent-protocol-contract.md`
+/// "ActionAck diagnostic shape"): present only for `outcome: Rejected`.
+/// `code` is a non-empty stable diagnostic string owned by the Specification
+/// that owns the concrete `action_type`; this crate does not interpret it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionAckError {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl ActionAckError {
+    pub fn new(code: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: None,
+        }
+    }
+
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionAckBody {
+    pub action_id: ProtocolId,
+    pub outcome: ActionAckOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ActionAckError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionAckMessage {
+    #[serde(flatten)]
+    pub envelope: Envelope,
+    #[serde(flatten)]
+    pub body: ActionAckBody,
+}
+
+impl ActionAckMessage {
+    /// `outcome: Accepted` — `error` is always absent, never `null`
+    /// (`m0-agent-protocol-contract.md` "ActionAck diagnostic shape":
+    /// "absent when `outcome: Accepted`").
+    pub fn accepted(action_id: ProtocolId) -> Self {
+        Self {
+            envelope: Envelope::new().with_correlation_id(action_id),
+            body: ActionAckBody {
+                action_id,
+                outcome: ActionAckOutcome::Accepted,
+                error: None,
+            },
+        }
+    }
+
+    /// `outcome: Rejected` — `error` is always present.
+    pub fn rejected(action_id: ProtocolId, error: ActionAckError) -> Self {
+        Self {
+            envelope: Envelope::new().with_correlation_id(action_id),
+            body: ActionAckBody {
+                action_id,
+                outcome: ActionAckOutcome::Rejected,
+                error: Some(error),
+            },
+        }
+    }
+
+    /// Re-emits this already-constructed Ack under a fresh `message_id`
+    /// (`m0-agent-protocol-contract.md` "Message envelope": "`message_id` is
+    /// a fresh UUID v4 for every message transmission, including when
+    /// retained semantic evidence ... is resent"). `correlation_id`
+    /// (`action_id`) and every body field are preserved exactly.
+    pub fn with_fresh_message_id(mut self) -> Self {
+        self.envelope.message_id = ProtocolId::generate();
+        self.envelope.timestamp = MessageTimestamp::now();
+        self
+    }
+}
+
+// ---------------------------------------------------------------------
+// ActionProgress — Agent -> Server
+// ---------------------------------------------------------------------
+
+/// Rejects an `ActionProgress` with every field absent
+/// (`m0-agent-protocol-contract.md` "ActionProgress fields": "at least one of
+/// `percent`, `bytes_processed`, `eta` must be present").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("ActionProgress requires at least one of percent, bytes_processed, eta")]
+pub struct EmptyActionProgress;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionProgressBody {
+    pub action_id: ProtocolId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<Percent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_processed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eta: Option<MessageTimestamp>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionProgressMessage {
+    #[serde(flatten)]
+    pub envelope: Envelope,
+    #[serde(flatten)]
+    pub body: ActionProgressBody,
+}
+
+impl ActionProgressMessage {
+    /// Generic constructor over the full field set the Specification allows
+    /// — rejects the all-absent case explicitly rather than constructing a
+    /// message with no reportable evidence at all.
+    pub fn new(
+        action_id: ProtocolId,
+        percent: Option<Percent>,
+        bytes_processed: Option<u64>,
+        eta: Option<MessageTimestamp>,
+    ) -> Result<Self, EmptyActionProgress> {
+        if percent.is_none() && bytes_processed.is_none() && eta.is_none() {
+            return Err(EmptyActionProgress);
+        }
+        Ok(Self {
+            envelope: Envelope::new().with_correlation_id(action_id),
+            body: ActionProgressBody {
+                action_id,
+                percent,
+                bytes_processed,
+                eta,
+            },
+        })
+    }
+
+    /// The M1 `bamep.m1.simulated-execution` action reports `percent` only
+    /// (`m1-simulated-vertical-slice-and-baseline-validation.md` RF-004).
+    pub fn percent(action_id: ProtocolId, percent: Percent) -> Self {
+        Self::new(action_id, Some(percent), None, None)
+            .expect("percent is always present, so this can never be empty")
+    }
+
+    /// Re-emits this Progress under a fresh `message_id`, exactly like
+    /// [`ActionAckMessage::with_fresh_message_id`].
+    pub fn with_fresh_message_id(mut self) -> Self {
+        self.envelope.message_id = ProtocolId::generate();
+        self.envelope.timestamp = MessageTimestamp::now();
+        self
+    }
+}
+
+// ---------------------------------------------------------------------
+// ActionResult — Agent -> Server
+// ---------------------------------------------------------------------
+
+/// `ActionResult.outcome` uses only the terminal execution values
+/// (`m0-agent-protocol-contract.md` "Agent-action state vocabulary").
+/// `CancelAction`/`CancelAck` are owned by Issue #27; Issue #26 handles only
+/// `Succeeded`/`Failed` normal execution, but `Cancelled` is structurally
+/// required here because it is already part of the closed generic
+/// `ActionResult.outcome` vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActionResultOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionResultBody {
+    pub action_id: ProtocolId,
+    pub outcome: ActionResultOutcome,
+    /// `detail` schema is owned by the Specification that owns the concrete
+    /// `action_type`; this crate treats it as opaque.
+    pub detail: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionResultMessage {
+    #[serde(flatten)]
+    pub envelope: Envelope,
+    #[serde(flatten)]
+    pub body: ActionResultBody,
+}
+
+impl ActionResultMessage {
+    pub fn new(
+        action_id: ProtocolId,
+        outcome: ActionResultOutcome,
+        detail: Map<String, Value>,
+    ) -> Self {
+        Self {
+            envelope: Envelope::new().with_correlation_id(action_id),
+            body: ActionResultBody {
+                action_id,
+                outcome,
+                detail,
+            },
+        }
+    }
+
+    /// Re-emits this already-committed Result under a fresh `message_id`,
+    /// exactly like [`ActionAckMessage::with_fresh_message_id`].
+    pub fn with_fresh_message_id(mut self) -> Self {
+        self.envelope.message_id = ProtocolId::generate();
+        self.envelope.timestamp = MessageTimestamp::now();
+        self
+    }
+}
+
+// ---------------------------------------------------------------------
 // Top-level message union
 // ---------------------------------------------------------------------
 
@@ -328,6 +611,10 @@ pub enum AgentProtocolMessage {
     AuthError(AuthErrorMessage),
     BootstrapEvidence(BootstrapEvidenceMessage),
     InventoryReport(InventoryReportMessage),
+    ActionDispatch(ActionDispatchMessage),
+    ActionAck(ActionAckMessage),
+    ActionProgress(ActionProgressMessage),
+    ActionResult(ActionResultMessage),
     ProtocolError(ProtocolErrorMessage),
 }
 
@@ -339,6 +626,10 @@ impl AgentProtocolMessage {
             AgentProtocolMessage::AuthError(m) => &m.envelope,
             AgentProtocolMessage::BootstrapEvidence(m) => &m.envelope,
             AgentProtocolMessage::InventoryReport(m) => &m.envelope,
+            AgentProtocolMessage::ActionDispatch(m) => &m.envelope,
+            AgentProtocolMessage::ActionAck(m) => &m.envelope,
+            AgentProtocolMessage::ActionProgress(m) => &m.envelope,
+            AgentProtocolMessage::ActionResult(m) => &m.envelope,
             AgentProtocolMessage::ProtocolError(m) => &m.envelope,
         }
     }

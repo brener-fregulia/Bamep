@@ -9,31 +9,46 @@
 
 use std::sync::Arc;
 
-use bamep_agent_protocol::{BootstrapEvidenceMessage, InventoryReportMessage};
+use bamep_agent_protocol::{
+    ActionDispatchMessage, BootstrapEvidenceMessage, InventoryReportMessage, ProtocolId,
+};
 use bamep_domain::credential::{CredentialDimension, CredentialHash};
 use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_domain::{
-    evaluate_final_destructive_dispatch, transitions, Actor, AuditRecord, BootContext, BootNonce,
-    DestructiveIntent, EmptyWorkflow, EndpointId, FinalDispatchInputs, FinalDispatchOutcome,
-    FinalDispatchRejection, IdentityState, InvalidIdentityTransition, InventoryRevision,
-    InventorySnapshot, Job, JobId, JobStepId, TrustedBootstrapState, DEFAULT_CREDENTIAL_TTL,
+    evaluate_final_destructive_dispatch, transitions, ActionEvidence, ActionEvidenceOutcome,
+    ActionId, Actor, Attempt, AuditRecord, BootContext, BootNonce, DestructiveIntent,
+    EmptyWorkflow, EndpointId, FinalDispatchInputs, FinalDispatchOutcome, FinalDispatchRejection,
+    IdentityState, InvalidIdentityTransition, InventoryRevision, InventorySnapshot, Job, JobId,
+    JobStepId, TrustedBootstrapState, DEFAULT_CREDENTIAL_TTL,
 };
 use bamep_trusted_bootstrap::{AcceptedSiteKeys, BootstrapAssertion, ServerCertFingerprint};
 use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
 use crate::ports::{
-    AdmitJobDecision, AdmitJobError, AuthorizeDestructiveIntentDecision,
-    AuthorizeDestructiveIntentError, BootContextRepository, CommitDestructiveDispatchError,
-    CreateWorkflowError, CredentialRedemptionRepository, EndpointRepository, EndpointUpdateError,
-    FinalDispatchCommit, FinalDispatchDecision, FinalDispatchLockedFacts, InventoryRepository,
-    JobRepository, RedemptionDecision, RedemptionTarget, RepositoryError,
-    SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError, TargetRevalidationPort,
+    ActionEvidenceCommit, ActionEvidenceLockedFacts, AdmitJobDecision, AdmitJobError,
+    AgentDispatchError, AgentDispatchPort, ApplyActionEvidenceDecision,
+    ApplyActionEvidenceDecisionOutcome, ApplyActionEvidenceError, ApplyActionEvidenceResult,
+    AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError, BootContextRepository,
+    CommitDestructiveDispatchError, CreateWorkflowError, CredentialRedemptionRepository,
+    EndpointRepository, EndpointUpdateError, FinalDispatchCommit, FinalDispatchDecision,
+    FinalDispatchLockedFacts, InventoryRepository, JobRepository, RedemptionDecision,
+    RedemptionTarget, RepositoryError, SatisfyStepPreconditionsDecision,
+    SatisfyStepPreconditionsError, TargetRevalidationPort,
 };
 use crate::runtime::presence::PresenceRegistry;
+use crate::runtime::reservation_registry::AttemptReservationRegistry;
 use crate::runtime::resource_arbiter::{
     InsufficientCapacity, ReservationId, ResourceClaim, TechnicalResourceArbiter,
 };
+
+/// The single M1 Simulator-only concrete typed action
+/// (`m1-simulated-vertical-slice-and-baseline-validation.md` RF-004;
+/// `m0-agent-protocol-contract.md` "concrete `action_type` definitions
+/// belong to the Specifications that introduce those operations"). The v1
+/// `parameters` schema is closed and empty.
+pub const M1_SIMULATED_EXECUTION_ACTION_TYPE: &str = "bamep.m1.simulated-execution";
+pub const M1_SIMULATED_EXECUTION_ACTION_VERSION: &str = "1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplicationError {
@@ -65,6 +80,13 @@ pub enum ApplicationError {
     NoCurrentInventory(EndpointId),
     #[error("endpoint {0:?} has no current target fingerprint")]
     NoCurrentTarget(EndpointId),
+    /// An unknown `action_id`, or a known `action_id` belonging to a Job
+    /// that does not target the authenticated Endpoint — deliberately one
+    /// generic value so a caller can never learn which case occurred
+    /// (`m0-agent-protocol-contract.md`; Issue #26 "Authenticated Endpoint
+    /// correlation").
+    #[error("unknown action")]
+    UnknownAction,
     #[error(transparent)]
     InvalidTransition(#[from] InvalidIdentityTransition),
     #[error(transparent)]
@@ -106,6 +128,15 @@ impl From<EndpointUpdateError> for ApplicationError {
             EndpointUpdateError::NotFound(id) => ApplicationError::EndpointNotFound(id),
             EndpointUpdateError::InvalidTransition(e) => ApplicationError::InvalidTransition(e),
             EndpointUpdateError::Repository(e) => ApplicationError::Repository(e),
+        }
+    }
+}
+
+impl From<ApplyActionEvidenceError> for ApplicationError {
+    fn from(err: ApplyActionEvidenceError) -> Self {
+        match err {
+            ApplyActionEvidenceError::UnknownAction => ApplicationError::UnknownAction,
+            ApplyActionEvidenceError::Repository(e) => ApplicationError::Repository(e),
         }
     }
 }
@@ -583,6 +614,197 @@ impl<J: JobRepository> FinalDispatchService<J> {
                 Err(ApplicationError::Repository(e))
             }
         }
+    }
+}
+
+/// Outcome of [`ActionDispatchService::dispatch`]: whether the local
+/// transport accepted the `ActionDispatch` frame, or why it did not. Neither
+/// variant implies Agent receipt/execution
+/// (`m0-agent-protocol-contract.md`; Issue #26 "Send failure boundary").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionDispatchOutcome {
+    Sent,
+    SendFailed(AgentDispatchError),
+}
+
+/// Transmits a durably committed `Attempt{Dispatched}` exactly once over the
+/// selected real authenticated WSS session, using the exact persisted
+/// `action_id` (Issue #26 "Exact action_id reuse", "Outbound authenticated
+/// session delivery"). Composes [`AttemptReservationRegistry`] (registers the
+/// transient `AttemptId -> ReservationId` mapping *before* dispatch becomes
+/// reachable — `m0-job-lifecycle-and-scheduling.md`; "Reservation ownership")
+/// and [`AgentDispatchPort`] (the transport boundary; never a
+/// tungstenite/WebSocket type). Never creates an Attempt, never generates a
+/// replacement `action_id`, and never falls back/redispatches on failure —
+/// on any [`AgentDispatchError`] the Attempt simply remains durably
+/// `Dispatched`; #28 owns subsequent uncertain-delivery reconciliation.
+pub struct ActionDispatchService {
+    reservations: Arc<AttemptReservationRegistry>,
+    transport: Arc<dyn AgentDispatchPort>,
+}
+
+impl ActionDispatchService {
+    pub fn new(
+        reservations: Arc<AttemptReservationRegistry>,
+        transport: Arc<dyn AgentDispatchPort>,
+    ) -> Self {
+        Self {
+            reservations,
+            transport,
+        }
+    }
+
+    /// Registers `attempt.id -> reservation` first — unconditionally, even
+    /// when the subsequent transmission attempt fails — so the reservation
+    /// remains discoverable through [`AttemptReservationRegistry`] for
+    /// whatever normal terminal evidence (or #28 reconciliation) eventually
+    /// resolves this Attempt. Constructs `ActionDispatch` for the single M1
+    /// concrete action, converting `attempt.action_id`'s exact persisted
+    /// UUID into `ProtocolId` — never generating a replacement identity.
+    pub async fn dispatch(
+        &self,
+        endpoint_id: EndpointId,
+        attempt: Attempt,
+        reservation: ReservationId,
+    ) -> ActionDispatchOutcome {
+        self.reservations.register(attempt.id, reservation);
+
+        let action_id = ProtocolId::from_uuid(attempt.action_id.0)
+            .expect("a Domain ActionId is always a valid UUID v4");
+        let dispatch = ActionDispatchMessage::new(
+            action_id,
+            M1_SIMULATED_EXECUTION_ACTION_TYPE,
+            M1_SIMULATED_EXECUTION_ACTION_VERSION,
+            serde_json::Map::new(),
+        );
+
+        match self.transport.dispatch_action(endpoint_id, dispatch).await {
+            Ok(()) => ActionDispatchOutcome::Sent,
+            Err(e) => ActionDispatchOutcome::SendFailed(e),
+        }
+    }
+}
+
+/// Applies normal connected-session Agent action evidence
+/// (`ActionAck{Accepted|Rejected}`, `ActionResult{Succeeded|Failed}`) to a
+/// durable Attempt/JobStep/Job (Issue #26 "PostgreSQL evidence application",
+/// "Server-side idempotency"). Composes the pure Domain decision
+/// (`bamep_domain::apply_action_evidence`) with
+/// [`JobRepository::apply_action_evidence`]'s lock/decide/persist boundary,
+/// and — only for a terminal outcome, and only once, no matter how many
+/// duplicate/concurrent terminal evidence attempts observe the same already-
+/// committed outcome — removes the Attempt's reservation mapping and
+/// releases it through [`TechnicalResourceArbiter`].
+///
+/// Takes `Arc<dyn JobRepository>` rather than being generic over a concrete
+/// repository type, mirroring [`InventoryService`]: this keeps
+/// `AgentControlGateway` (which owns an instance of this service) from
+/// needing a third repository-type generic parameter merely to route
+/// `ActionAck`/`ActionResult`.
+pub struct ActionEvidenceService {
+    repo: Arc<dyn JobRepository>,
+    reservations: Arc<AttemptReservationRegistry>,
+    arbiter: Arc<TechnicalResourceArbiter>,
+    clock: Arc<dyn Clock>,
+}
+
+impl ActionEvidenceService {
+    pub fn new(
+        repo: Arc<dyn JobRepository>,
+        reservations: Arc<AttemptReservationRegistry>,
+        arbiter: Arc<TechnicalResourceArbiter>,
+    ) -> Self {
+        Self::with_clock(repo, reservations, arbiter, Arc::new(SystemClock))
+    }
+
+    pub fn with_clock(
+        repo: Arc<dyn JobRepository>,
+        reservations: Arc<AttemptReservationRegistry>,
+        arbiter: Arc<TechnicalResourceArbiter>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            repo,
+            reservations,
+            arbiter,
+            clock,
+        }
+    }
+
+    /// Applies `evidence` for `action_id`, correlated to
+    /// `authenticated_endpoint_id` (the Endpoint whose authenticated session
+    /// this evidence arrived on — Issue #26 "Authenticated Endpoint
+    /// correlation"). An unknown `action_id`, or one belonging to another
+    /// Endpoint's Job, is [`ApplicationError::UnknownAction`] in both cases.
+    pub async fn apply(
+        &self,
+        action_id: ProtocolId,
+        authenticated_endpoint_id: EndpointId,
+        evidence: ActionEvidence,
+    ) -> Result<ApplyActionEvidenceResult, ApplicationError> {
+        let domain_action_id = ActionId(action_id.as_uuid());
+        let clock = Arc::clone(&self.clock);
+
+        let decide: ApplyActionEvidenceDecision = Box::new(
+            move |facts: ActionEvidenceLockedFacts| {
+                let now = clock.now();
+                let endpoint_id = facts.job.endpoint_id;
+                let job_id = facts.job.id;
+                match bamep_domain::apply_action_evidence(
+                    &facts.job,
+                    &facts.job_step,
+                    &facts.attempt,
+                    evidence,
+                    now,
+                ) {
+                    ActionEvidenceOutcome::NoOp => ApplyActionEvidenceDecisionOutcome::NoOp,
+                    ActionEvidenceOutcome::Conflict => ApplyActionEvidenceDecisionOutcome::Conflict,
+                    ActionEvidenceOutcome::Applied(applied) => {
+                        let audit = applied.terminal.then(|| AuditRecord {
+                        audit_id: Uuid::new_v4(),
+                        endpoint_id,
+                        actor: Actor::System,
+                        occurred_at: now,
+                        detail: format!(
+                            "attempt {:?} action {:?} reached terminal state {:?} for job_step {:?}",
+                            applied.attempt.id,
+                            applied.attempt.action_id,
+                            applied.attempt.state,
+                            applied.job_step.id
+                        ),
+                        job_id: Some(job_id),
+                        job_step_id: Some(applied.job_step.id),
+                        attempt_id: Some(applied.attempt.id),
+                        action_id: Some(applied.attempt.action_id),
+                    });
+                        ApplyActionEvidenceDecisionOutcome::Applied(ActionEvidenceCommit {
+                            outcome: applied,
+                            audit,
+                        })
+                    }
+                }
+            },
+        );
+
+        let result = self
+            .repo
+            .apply_action_evidence(domain_action_id, authenticated_endpoint_id, decide)
+            .await?;
+
+        if let ApplyActionEvidenceResult::Applied(applied) = &result {
+            if applied.terminal {
+                // Remove the mapping exactly once — only the successful
+                // remover releases through the arbiter, so duplicate/
+                // concurrent terminal evidence can never double-release
+                // (`m0-job-lifecycle-and-scheduling.md`; Issue #26
+                // "Attempt reservation registry").
+                if let Some(reservation) = self.reservations.take(applied.attempt.id) {
+                    self.arbiter.release(reservation);
+                }
+            }
+        }
+
+        Ok(result)
     }
 }
 
@@ -1171,6 +1393,18 @@ mod tests {
             ) -> Result<Option<bamep_domain::Attempt>, RepositoryError> {
                 unimplemented!("DestructiveIntentService never reads an Attempt")
             }
+
+            async fn apply_action_evidence(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+                _decide: crate::ports::ApplyActionEvidenceDecision,
+            ) -> Result<
+                crate::ports::ApplyActionEvidenceResult,
+                crate::ports::ApplyActionEvidenceError,
+            > {
+                unimplemented!("DestructiveIntentService never applies action evidence")
+            }
         }
 
         /// In-memory `InventoryRepository` fake exposing only a configurable
@@ -1626,6 +1860,18 @@ mod tests {
                     .iter()
                     .find(|a| a.id == attempt_id)
                     .cloned())
+            }
+
+            async fn apply_action_evidence(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+                _decide: crate::ports::ApplyActionEvidenceDecision,
+            ) -> Result<
+                crate::ports::ApplyActionEvidenceResult,
+                crate::ports::ApplyActionEvidenceError,
+            > {
+                unimplemented!("FinalDispatchService tests never apply action evidence")
             }
         }
 

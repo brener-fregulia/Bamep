@@ -21,10 +21,16 @@ pub mod envelope;
 pub mod messages;
 
 pub use codec::{decode, encode, DecodeError, EncodeError};
-pub use envelope::{Envelope, MessageTimestamp, ProtocolId, ProtocolIdError, ProtocolVersion};
+pub use envelope::{
+    Envelope, MessageTimestamp, Percent, PercentOutOfRange, ProtocolId, ProtocolIdError,
+    ProtocolVersion,
+};
 pub use messages::{
-    AgentProtocolMessage, AuthErrorBody, AuthErrorMessage, AuthRequestBody, AuthRequestMessage,
-    BootstrapEvidenceBody, BootstrapEvidenceMessage, InventoryReportBody, InventoryReportMessage,
+    ActionAckBody, ActionAckError, ActionAckMessage, ActionAckOutcome, ActionDispatchBody,
+    ActionDispatchMessage, ActionProgressBody, ActionProgressMessage, ActionResultBody,
+    ActionResultMessage, ActionResultOutcome, AgentProtocolMessage, AuthErrorBody,
+    AuthErrorMessage, AuthRequestBody, AuthRequestMessage, BootstrapEvidenceBody,
+    BootstrapEvidenceMessage, EmptyActionProgress, InventoryReportBody, InventoryReportMessage,
     LocalBootTrust, ProtocolErrorBody, ProtocolErrorMessage, SessionEstablishedBody,
     SessionEstablishedMessage,
 };
