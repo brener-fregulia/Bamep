@@ -109,7 +109,7 @@ Every message contains:
 - `timestamp` — RFC 3339 / ISO 8601 UTC string;
 - `correlation_id` — optional.
 
-Every action-scoped message (`ActionDispatch`, `ActionAck`, `ActionProgress`, `ActionResult`) MUST have `correlation_id` equal to its `action_id`. For a non-action `ProtocolError`, it may identify the offending `message_id`.
+Every action-scoped message MUST have `correlation_id` equal to its relevant `action_id`. This is a protocol-wide rule covering every action-scoped message type, including `ActionDispatch`, `ActionAck`, `ActionProgress`, `ActionResult`, `CancelAction`, `CancelAck`, `StatusQuery`, and `StatusReport`; Issue #26 currently implements only `ActionDispatch`/`ActionAck`/`ActionProgress`/`ActionResult`, but that implementation scope does not narrow the rule itself. For a non-action `ProtocolError`, it may identify the offending `message_id`.
 
 `message_id` is a fresh UUID v4 for every message transmission, including when retained semantic evidence (for example, a stored `ActionResult`) is resent or re-emitted in response to a duplicate. `action_id` — not `message_id` — is the field that carries duplicate/idempotency meaning.
 

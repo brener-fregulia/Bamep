@@ -33,7 +33,8 @@ Simulated Endpoint connects
 -> scheduler evaluates resources
 -> typed action dispatched
 -> simulated transfer executed
--> progress/events persisted
+-> progress observed
+-> durable state/events persisted
 -> disconnect/reconnect handled
 -> Job reaches terminal state
 -> Web reflects result
