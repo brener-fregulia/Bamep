@@ -863,6 +863,7 @@ impl JobRepository for PostgresJobRepository {
 
             let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
 
+            let mut candidate_went_stale = false;
             let active_attempt = if let Some(attempt_id) = candidate_attempt_id {
                 let attempt_row = sqlx::query(
                     "SELECT id, job_step_id, action_id, state FROM attempts WHERE id = $1 \
@@ -882,26 +883,48 @@ impl JobRepository for PostgresJobRepository {
                 let attempt =
                     row_to_attempt(&attempt_row).map_err(RequestCancellationError::Repository)?;
 
-                sqlx::query("SELECT id FROM job_steps WHERE id = $1 FOR UPDATE")
-                    .bind(attempt.job_step_id.0)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(to_backend_err)?;
-
                 // Re-verify under lock — never trust the pre-lock guess: the
                 // Attempt may have independently reached a terminal state
                 // between the unlocked scan and this lock acquisition (Issue
                 // #27 "Lock order / concurrency", case A).
-                matches!(
+                let still_active = matches!(
                     attempt.state,
                     AttemptState::Dispatched
                         | AttemptState::InProgress
                         | AttemptState::AwaitingReconciliation
-                )
-                .then_some(attempt)
+                );
+
+                if still_active {
+                    sqlx::query("SELECT id FROM job_steps WHERE id = $1 FOR UPDATE")
+                        .bind(attempt.job_step_id.0)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(to_backend_err)?;
+                    Some(attempt)
+                } else {
+                    // The candidate reached a terminal state before we
+                    // locked it. Never lock its now-irrelevant JobStep, and
+                    // never let its absence stand in for "no candidate
+                    // exists": another JobStep may meanwhile have gained its
+                    // own active Attempt while this Job stayed Running
+                    // (Issue #27 follow-up "A found candidate can become
+                    // stale"). Roll back and retry the outer loop instead of
+                    // continuing toward the Job decision with
+                    // `active_attempt = None` on stale grounds — the next
+                    // pass's fresh pre-scan will find that newer Attempt if
+                    // one exists, or correctly fall through to the
+                    // no-candidate path below.
+                    candidate_went_stale = true;
+                    None
+                }
             } else {
                 None
             };
+
+            if candidate_went_stale {
+                tx.rollback().await.map_err(to_backend_err)?;
+                continue;
+            }
 
             let job_row =
                 sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
@@ -916,8 +939,12 @@ impl JobRepository for PostgresJobRepository {
             let endpoint_id: uuid::Uuid = job_row.try_get("endpoint_id").map_err(to_backend_err)?;
             let job_state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
 
-            if candidate_attempt_id.is_none() {
-                // We hold the Job lock now, which serializes us against
+            if active_attempt.is_none() {
+                // No validated active/uncertain Attempt survived candidate
+                // resolution above (there was never a candidate, or it went
+                // stale and this pass already retried on that path — so
+                // reaching here always means genuinely none). We hold the
+                // Job lock now, which serializes us against
                 // `commit_destructive_dispatch` (it locks the same Job row
                 // before creating an Attempt). Re-scan within the
                 // transaction: PostgreSQL READ COMMITTED gives this

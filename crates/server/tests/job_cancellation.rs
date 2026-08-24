@@ -1326,7 +1326,7 @@ async fn advisory_waiter_reached(pool: &PgPool) {
     .expect("the staged final-dispatch transaction must reach its test-local advisory barrier");
 }
 
-async fn wait_for_two_lock_waiters(pool: &PgPool) {
+async fn wait_for_n_lock_waiters(pool: &PgPool, n: i64) {
     loop {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() \
@@ -1335,11 +1335,15 @@ async fn wait_for_two_lock_waiters(pool: &PgPool) {
         .fetch_one(pool)
         .await
         .unwrap();
-        if waiting >= 2 {
+        if waiting >= n {
             return;
         }
         tokio::task::yield_now().await;
     }
+}
+
+async fn wait_for_two_lock_waiters(pool: &PgPool) {
+    wait_for_n_lock_waiters(pool, 2).await;
 }
 
 async fn both_operations_are_lock_blocked(pool: &PgPool) {
@@ -1349,6 +1353,18 @@ async fn both_operations_are_lock_blocked(pool: &PgPool) {
     )
     .await
     .expect("cancellation must be blocked waiting on the Job row lock");
+}
+
+/// Waits until at least `n` backends are simultaneously blocked on some lock
+/// (advisory or row), bounded by a generous timeout so a broken barrier
+/// fails loudly instead of hanging the suite.
+async fn lock_waiters_reach(pool: &PgPool, n: i64) {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_n_lock_waiters(pool, n),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("expected at least {n} concurrent operations blocked on a lock"));
 }
 
 #[tokio::test]
@@ -1488,5 +1504,174 @@ async fn cancellation_committed_first_then_final_dispatch_cannot_create_a_new_at
         "no Attempt must ever be created for a Job no longer Running"
     );
 
+    db.teardown().await;
+}
+
+// ---------------------------------------------------------------------
+// Deterministic regression: a found pre-scan candidate can go stale before
+// cancellation locks it (Issue #27 follow-up "A found candidate can become
+// stale"). A second JobStep's real Attempt must still be recognized as the
+// cancellation target instead of the stale candidate's absence standing in
+// for "no active Attempt exists".
+// ---------------------------------------------------------------------
+
+const ATTEMPT_SUCCEEDED_BARRIER_KEY: i64 = 27_102;
+
+#[tokio::test]
+async fn stale_precan_candidate_retries_and_finds_the_next_steps_attempt() {
+    let db = TestDatabase::setup().await;
+    let services = build_services(db.pool.clone());
+    let presence = Arc::new(PresenceRegistry::new());
+    let (job_id, step_ids, endpoint_id, attempt_a, reservation_a) =
+        dispatched_attempt(&db.pool, &services, &presence, "cancel-stale-candidate", 2).await;
+    let step_a = step_ids[0];
+    let step_b = step_ids[1];
+
+    // Trigger 1: pauses the real evidence-application transaction right
+    // after it durably updates Attempt A to `Succeeded` (still uncommitted
+    // -- `apply_action_evidence` already locked Attempt A / JobStep A / Job
+    // FOR UPDATE earlier in the same transaction, and keeps holding all
+    // three throughout this pause).
+    sqlx::query(
+        "CREATE FUNCTION pause_attempt_succeeded() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.state = 'Succeeded' THEN PERFORM pg_advisory_xact_lock(27102); END IF; \
+         RETURN NULL; END $$",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER pause_attempt_succeeded AFTER UPDATE ON attempts \
+         FOR EACH ROW EXECUTE FUNCTION pause_attempt_succeeded()",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // Trigger 2: pauses a staged final-dispatch transaction for Step B
+    // right after it inserts Attempt B, exactly like
+    // `missed_candidate_race_against_final_dispatch_is_closed_by_the_post_job_lock_rescan`.
+    sqlx::query(
+        "CREATE FUNCTION pause_attempt_insert() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN PERFORM pg_advisory_xact_lock(27101); RETURN NULL; END $$",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER pause_attempt_insert AFTER INSERT ON attempts \
+         FOR EACH ROW EXECUTE FUNCTION pause_attempt_insert()",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let reservations = Arc::new(AttemptReservationRegistry::new());
+    reservations.register(attempt_a.id, reservation_a);
+    let evidence_svc = Arc::new(evidence_service(
+        Arc::clone(&services.job_repo),
+        Arc::clone(&reservations),
+        arbiter(),
+    ));
+
+    // Phase 1: pause evidence-application for Attempt A right after it
+    // updates Attempt A to `Succeeded`, still holding the Attempt A /
+    // JobStep A / Job locks, uncommitted.
+    let mut succeeded_barrier = hold_advisory_lock(&db.pool, ATTEMPT_SUCCEEDED_BARRIER_KEY).await;
+    let action_id_a = ProtocolId::from_uuid(attempt_a.action_id.0).unwrap();
+    let evidence_task = {
+        let evidence_svc = Arc::clone(&evidence_svc);
+        tokio::spawn(async move {
+            evidence_svc
+                .apply(action_id_a, endpoint_id, ActionEvidence::ResultSucceeded)
+                .await
+        })
+    };
+    advisory_waiter_reached(&db.pool).await;
+
+    // Cancellation's unlocked pre-scan now runs while Attempt A is still
+    // visible as `Dispatched` (evidence-application's update above is not
+    // yet committed) -- it finds Attempt A as its candidate, then blocks
+    // trying to lock it.
+    let dispatch_port = FakeDispatchPort::new();
+    let cancel_svc = Arc::new(cancellation_service(
+        Arc::clone(&services.job_repo),
+        Arc::clone(&reservations),
+        arbiter(),
+        Arc::clone(&dispatch_port),
+    ));
+    let cancel_task = {
+        let cancel_svc = Arc::clone(&cancel_svc);
+        tokio::spawn(async move { cancel_svc.request(job_id, operator()).await })
+    };
+    lock_waiters_reach(&db.pool, 2).await;
+
+    // Phase 2: while Attempt A's terminal transition is still held open (so
+    // it still holds the Job row lock), start staging Attempt B's dispatch.
+    // Its Job-lock request queues behind evidence-application's, making it
+    // strictly first in that lock's wait queue -- ahead of any Job-lock
+    // request cancellation might make once Attempt A goes stale.
+    let mut inserted_barrier = hold_advisory_lock(&db.pool, DISPATCH_ATTEMPT_BARRIER_KEY).await;
+    let pool_for_dispatch = db.pool.clone();
+    let dispatch_b_task = tokio::spawn(async move {
+        stage_final_dispatch_attempt(&pool_for_dispatch, job_id, step_b).await
+    });
+    lock_waiters_reach(&db.pool, 3).await;
+
+    // Release Attempt A's terminal transition: it commits (Attempt A ->
+    // Succeeded, JobStep A -> Succeeded, Job stays Running). This is what
+    // both cancellation's blocked Attempt-A-lock request and the staged
+    // Step-B dispatch's blocked Job-lock request were waiting on.
+    release_advisory_lock(&mut succeeded_barrier, ATTEMPT_SUCCEEDED_BARRIER_KEY).await;
+    let evidence_result = evidence_task.await.unwrap().unwrap();
+    assert!(matches!(
+        evidence_result,
+        ApplyActionEvidenceResult::Applied(_)
+    ));
+
+    // The staged Step-B dispatch was first in the Job-lock queue, so it
+    // proceeds now (marks JobStep B `Dispatching`, inserts Attempt B) and
+    // pauses again, uncommitted, still holding the Job lock -- forcing
+    // cancellation to block on the Job lock too, whether it got there
+    // straight after examining the now-stale Attempt A (the pre-fix bug)
+    // or via a stale-candidate retry (the fix).
+    lock_waiters_reach(&db.pool, 2).await;
+    release_advisory_lock(&mut inserted_barrier, DISPATCH_ATTEMPT_BARRIER_KEY).await;
+
+    let (attempt_b_id, action_b_id) = dispatch_b_task.await.unwrap();
+    let cancel_result = cancel_task.await.unwrap().unwrap();
+
+    let CancellationRequestResult::EnteredCancelling { send } = cancel_result else {
+        panic!(
+            "a stale pre-scan candidate must never stand in for \"no active Attempt\" -- got \
+             {cancel_result:?}, expected EnteredCancelling targeting Attempt B"
+        );
+    };
+    assert_eq!(send, CancelActionSendOutcome::Sent);
+    assert_eq!(dispatch_port.cancel_call_count(), 1);
+    assert_eq!(
+        dispatch_port.last_cancel_action_id(),
+        Some(ProtocolId::from_uuid(action_b_id).unwrap()),
+        "CancelAction must target Attempt B's exact action_id, never the stale Attempt A"
+    );
+
+    assert_eq!(job_state_text(&db.pool, job_id).await, "Cancelling");
+    assert_eq!(attempt_state(&db.pool, attempt_b_id).await, "Dispatched");
+    let (step_b_state, _) = job_step_row(&db.pool, step_b).await;
+    assert_eq!(step_b_state, "Dispatching");
+    // Attempt A / JobStep A preserved exactly as evidence left them --
+    // cancellation never overwrites an already-resolved terminal Attempt.
+    assert_eq!(attempt_state(&db.pool, attempt_a.id.0).await, "Succeeded");
+    let (step_a_state, _) = job_step_row(&db.pool, step_a).await;
+    assert_eq!(step_a_state, "Succeeded");
+    assert_eq!(
+        event_count(&db.pool, job_id, "JobCancelled").await,
+        0,
+        "no immediate JobCancelled outcome may ever be committed for this race"
+    );
+    assert_eq!(cancellation_audit_count(&db.pool, job_id).await, 1);
+
+    drop(succeeded_barrier);
+    drop(inserted_barrier);
     db.teardown().await;
 }
