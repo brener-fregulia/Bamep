@@ -111,6 +111,7 @@ States: `Dispatched`, `InProgress`, `AwaitingReconciliation`, `Succeeded`, `Fail
 Transitions:
 - `Dispatched -> InProgress` — `ActionAck{Accepted}`.
 - `Dispatched -> Rejected` — `ActionAck{Rejected}`.
+- `Dispatched -> Succeeded | Failed` — matching terminal `ActionResult` received without an observed `ActionAck{Accepted}`.
 - `Dispatched -> AwaitingReconciliation` — expected acknowledgment does not arrive.
 - `InProgress -> Succeeded | Failed` — matching `ActionResult`.
 - `InProgress -> Cancelled` — authoritative cancellation result.
@@ -121,6 +122,21 @@ Transitions:
 - `Succeeded`, `Failed`, `Cancelled`, `Rejected`, and `Indeterminate` are terminal.
 
 One `StatusReport{Unknown}` does not automatically produce `Indeterminate`. `Indeterminate` never means success, failure, cancellation, or proof that execution did not occur.
+
+A correctly authenticated and correlated terminal `ActionResult` is stronger authoritative execution evidence than the absence of an observed `ActionAck{Accepted}`; the `Dispatched -> Succeeded | Failed` transition covers a lost or delayed `Accepted` Ack followed by authoritative terminal evidence and does not require a synthetic persisted `InProgress` step first. It must not be modeled as automatic retry, a fabricated receipt, blind redispatch, or implicit failure inferred merely from a missing Ack. The normal `Dispatched -> InProgress -> Succeeded | Failed` path remains equally legitimate.
+
+## Duplicate and delayed evidence
+
+`action_id` is the domain/protocol idempotency key. While an Attempt's current authoritative state remains known — no connection loss or restart involved — the Server:
+
+- treats a duplicate `ActionAck{Accepted}` against an Attempt already `InProgress` as a no-op;
+- treats matching duplicate terminal evidence against an Attempt already committed to that same terminal outcome as a no-op;
+- never lets a delayed `ActionAck` regress an Attempt past an already-committed authoritative terminal outcome;
+- never lets `ActionProgress` regress or reopen a terminal Attempt;
+- never overwrites an already-committed authoritative terminal outcome with conflicting terminal evidence;
+- never creates a second Attempt from duplicate or delayed evidence.
+
+This governs evidence handling while current authoritative state exists. Connection loss, restart, and uncertain-delivery recovery remain the Reconciliation contract below.
 
 ## Agent Protocol mapping
 

@@ -121,6 +121,45 @@ A Job/JobStep/Attempt is created through an internal Simulator/harness path, sch
 persisted-before-send, dispatched through typed Agent Protocol actions, reconciled across
 disconnect/Server restart, and reaches the correct terminal state.
 
+M1 introduces one concrete Simulator-only typed action, owned here under
+`m0-agent-protocol-contract.md`'s rule that concrete action types belong to the
+Specification that introduces them:
+
+```text
+action_type: "bamep.m1.simulated-execution"
+action_version: "1"
+parameters: {}
+```
+
+The v1 `parameters` schema is closed and empty. The action exists only to validate normal
+M1 orchestration/execution: it has no physical hardware effect, performs no disk operation,
+no provisioning, and no data-plane transfer, and exposes no arbitrary command/shell
+execution. Execution outcome is never requested through action parameters; deterministic
+Simulator scenario configuration instead controls accept-then-succeed, accept-then-fail,
+reject, duplicate evidence, and delayed evidence.
+
+For this action, `ActionAck{Rejected}.error.code` is one of the following closed values,
+used only as needed to express the behavior above:
+
+- `UNSUPPORTED_ACTION`;
+- `UNSUPPORTED_ACTION_VERSION`;
+- `INVALID_PARAMETERS`;
+- `ACTION_NOT_AVAILABLE`.
+
+`ActionResult.detail` is minimal and deterministic:
+
+- `Succeeded` — `{ "code": "SIMULATED_COMPLETION" }`;
+- `Failed` — `{ "code": "SIMULATED_FAILURE" }`.
+
+`Cancelled` remains part of the generic Agent Protocol vocabulary; Issue #27 owns its
+action-specific handling for this action.
+
+The Simulator emits `ActionProgress` for this action using only `percent`, with a
+deterministic example progression of `0`, `50`, `100`. This is action-specific Simulator
+behavior, not a universal Agent Protocol requirement; generic wire shape, correlation, and
+idempotency rules for `ActionDispatch`, `ActionAck`, `ActionProgress`, and `ActionResult`
+remain owned by `m0-agent-protocol-contract.md`.
+
 The complete **seven** destructive-operation preconditions owned by
 `m0-endpoint-identity-lifecycle.md` are implemented and tested at deterministic small scale.
 

@@ -109,7 +109,9 @@ Every message contains:
 - `timestamp` — RFC 3339 / ISO 8601 UTC string;
 - `correlation_id` — optional.
 
-For action-scoped messages, `correlation_id` equals the relevant `action_id`. For a non-action `ProtocolError`, it may identify the offending `message_id`.
+Every action-scoped message (`ActionDispatch`, `ActionAck`, `ActionProgress`, `ActionResult`) MUST have `correlation_id` equal to its `action_id`. For a non-action `ProtocolError`, it may identify the offending `message_id`.
+
+`message_id` is a fresh UUID v4 for every message transmission, including when retained semantic evidence (for example, a stored `ActionResult`) is resent or re-emitted in response to a duplicate. `action_id` — not `message_id` — is the field that carries duplicate/idempotency meaning.
 
 ## Agent-action state vocabulary
 
@@ -146,6 +148,45 @@ For action-scoped messages, `correlation_id` equals the relevant `action_id`. Fo
 - `ProtocolError{code, message, correlation_id?}` — either direction, for a post-handshake protocol violation. Whether it closes the WebSocket is implementation policy unless a future safety requirement states otherwise.
 
 Concrete `action_type` definitions belong to the Specifications that introduce those operations. Unknown or malformed action types are rejected; the Agent never best-effort interprets them or exposes generic command execution.
+
+## Action field contract
+
+For `ActionDispatch{action_id, action_type, action_version, parameters, retry_of?}`:
+
+- `action_version` is wire type `string`; the concrete set of values a given `action_type` supports is owned by the Specification that owns that `action_type`;
+- `parameters` is a JSON object; its concrete schema is owned by the Specification that owns the `action_type`;
+- `retry_of`, when present, is a UUID v4 `action_id` referencing the action being retried and must differ from the message's own `action_id`; retry policy (when a retry is authorized) remains owned by `m0-job-lifecycle-and-scheduling.md`.
+
+For `ActionResult{action_id, outcome, detail}`, `detail` is a JSON object; its concrete schema is owned by the Specification that owns the `action_type`.
+
+## ActionAck diagnostic shape
+
+`ActionAck.error` is present when `outcome: Rejected` and absent when `outcome: Accepted`:
+
+```text
+error: {
+    code: string,
+    message?: string
+}
+```
+
+- `code` is a non-empty stable diagnostic string;
+- `message`, when present, is non-empty;
+- diagnostics must not expose secrets, stack traces, or sensitive internals;
+- rejection semantics are authoritative through `outcome: Rejected` itself, not through interpreting arbitrary `code`/`message` text;
+- Agent Protocol defines only this structural shape; concrete closed `code` catalogs belong to the Specification that owns the concrete `action_type`.
+
+## ActionProgress fields
+
+`ActionProgress` is advisory/transient metadata. It never advances Attempt lifecycle state and carries no authority over it.
+
+- at least one of `percent`, `bytes_processed`, `eta` must be present;
+- `percent` is an integer in `0..=100`;
+- `bytes_processed` is a non-negative integer; it is a generic optional field with no transfer-specific semantics defined here;
+- `eta` is an RFC 3339 / ISO 8601 UTC timestamp;
+- absent fields are omitted, never sent as `null`;
+- delayed or duplicated progress need not be monotonic;
+- progress received after an Attempt's terminal state has no authority to reopen or regress that state.
 
 ## Idempotency, retry, and uncertain delivery
 

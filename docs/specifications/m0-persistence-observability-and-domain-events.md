@@ -67,6 +67,21 @@ Representative catalog:
 
 Events are emitted from the underlying transition, not reconstructed from observations.
 
+### Required M1 normal-terminal Job/JobStep events
+
+For the M1 normal Job/JobStep/Attempt execution path, the following are required, not
+merely representative:
+
+- `JobSucceeded` when Job enters `Succeeded`;
+- `JobFailed` when Job enters `Failed`;
+- `JobStepFailed` when JobStep enters `Failed`.
+
+No event is required merely because `ActionAck{Accepted}` was observed, an Attempt enters
+`InProgress`, `ActionProgress` was observed, an Attempt succeeds, or a JobStep succeeds.
+`ActionAckAccepted`, `AttemptStarted`, `AttemptSucceeded`, and `JobStepSucceeded` are
+deliberately not defined events. This is deliberate, not an omission: events remain
+coarse-grained domain facts, not raw protocol history.
+
 ### Event envelope
 
 Every durable event carries at least:
@@ -204,6 +219,14 @@ Destructive execution additionally requires durable auditability of:
 The dispatch-commitment audit record proves the Server durably authorized/committed the
 dispatch; it does **not** prove network transmission, receipt, or execution. Agent-side
 knowledge comes from Agent Protocol evidence and resulting Attempt state.
+
+For a destructive Attempt, the required terminal audit record for a known authoritative
+outcome (`Rejected`, `Succeeded`, or `Failed`) commits atomically with the durable
+Attempt/JobStep/Job terminal state that outcome affects. That audit represents known Server
+state derived from authenticated Agent Protocol evidence; it does not prove more than that
+evidence establishes. No audit record is required merely for an `ActionAck{Accepted}`, an
+`ActionProgress` tick, or a duplicate message; `ActionProgress` remains
+transient/high-frequency by default.
 
 Required audit records participate in the same atomic transaction as their transition/event.
 
