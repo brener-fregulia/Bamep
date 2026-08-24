@@ -10,16 +10,18 @@
 use std::sync::Arc;
 
 use bamep_agent_protocol::{
-    ActionDispatchMessage, BootstrapEvidenceMessage, InventoryReportMessage, ProtocolId,
+    ActionDispatchMessage, BootstrapEvidenceMessage, CancelActionMessage, InventoryReportMessage,
+    ProtocolId,
 };
 use bamep_domain::credential::{CredentialDimension, CredentialHash};
 use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_domain::{
     evaluate_final_destructive_dispatch, transitions, ActionEvidence, ActionEvidenceOutcome,
-    ActionId, Actor, Attempt, AttemptState, AuditRecord, BootContext, BootNonce, DestructiveIntent,
-    EmptyWorkflow, EndpointId, FinalDispatchInputs, FinalDispatchOutcome, FinalDispatchRejection,
-    IdentityState, InvalidIdentityTransition, InventoryRevision, InventorySnapshot, Job, JobId,
-    JobStepId, TrustedBootstrapState, DEFAULT_CREDENTIAL_TTL,
+    ActionId, Actor, Attempt, AttemptState, AuditRecord, BootContext, BootNonce, CancelAckEvidence,
+    CancellationRequestOutcome, DestructiveIntent, EmptyWorkflow, EndpointId, FinalDispatchInputs,
+    FinalDispatchOutcome, FinalDispatchRejection, IdentityState, InvalidIdentityTransition,
+    InventoryRevision, InventorySnapshot, Job, JobId, JobStepId, TrustedBootstrapState,
+    DEFAULT_CREDENTIAL_TTL,
 };
 use bamep_trusted_bootstrap::{AcceptedSiteKeys, BootstrapAssertion, ServerCertFingerprint};
 use chrono::{DateTime, Duration, Utc};
@@ -29,12 +31,15 @@ use crate::ports::{
     ActionEvidenceCommit, ActionEvidenceLockedFacts, AdmitJobDecision, AdmitJobError,
     AgentDispatchError, AgentDispatchPort, ApplyActionEvidenceDecision,
     ApplyActionEvidenceDecisionOutcome, ApplyActionEvidenceError, ApplyActionEvidenceResult,
+    ApplyCancelAckDecision, ApplyCancelAckDecisionOutcome, ApplyCancelAckResult,
     AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError, BootContextRepository,
-    CommitDestructiveDispatchError, CreateWorkflowError, CredentialRedemptionRepository,
-    EndpointRepository, EndpointUpdateError, FinalDispatchCommit, FinalDispatchDecision,
-    FinalDispatchLockedFacts, InventoryRepository, JobRepository, RedemptionDecision,
-    RedemptionTarget, RepositoryError, SatisfyStepPreconditionsDecision,
-    SatisfyStepPreconditionsError, TargetRevalidationPort,
+    CancelAckCommit, CancellationRequestDecided, CommitDestructiveDispatchError,
+    CreateWorkflowError, CredentialRedemptionRepository, EndpointRepository, EndpointUpdateError,
+    FinalDispatchCommit, FinalDispatchDecision, FinalDispatchLockedFacts, InventoryRepository,
+    JobRepository, RedemptionDecision, RedemptionTarget, RepositoryError,
+    RequestCancellationDecision, RequestCancellationError, RequestCancellationLockedFacts,
+    RequestCancellationResult, SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError,
+    TargetRevalidationPort,
 };
 use crate::runtime::presence::PresenceRegistry;
 use crate::runtime::reservation_registry::{AttemptReservationRegistry, RegistrationOutcome};
@@ -84,6 +89,10 @@ pub enum ApplicationError {
     JobNotEligibleForAdmission(JobId),
     #[error("job {0:?} is not Running")]
     JobNotRunning(JobId),
+    /// `job.state` was `Pending` — out of this WP's ACTIVE-Job-cancellation
+    /// scope (Issue #27).
+    #[error("job {0:?} is not eligible for a cancellation request")]
+    JobNotEligibleForCancellation(JobId),
     /// The target Endpoint already has another active Job — the losing side
     /// of a same-Endpoint admission race
     /// (`m0-job-lifecycle-and-scheduling.md` "Resource leases"). The caller's
@@ -159,6 +168,18 @@ impl From<ApplyActionEvidenceError> for ApplicationError {
         match err {
             ApplyActionEvidenceError::UnknownAction => ApplicationError::UnknownAction,
             ApplyActionEvidenceError::Repository(e) => ApplicationError::Repository(e),
+        }
+    }
+}
+
+impl From<RequestCancellationError> for ApplicationError {
+    fn from(err: RequestCancellationError) -> Self {
+        match err {
+            RequestCancellationError::JobNotFound(id) => ApplicationError::JobNotFound(id),
+            RequestCancellationError::NotEligible(id) => {
+                ApplicationError::JobNotEligibleForCancellation(id)
+            }
+            RequestCancellationError::Repository(e) => ApplicationError::Repository(e),
         }
     }
 }
@@ -881,6 +902,272 @@ impl ActionEvidenceService {
     }
 }
 
+/// Outcome of [`CancellationService::request`]'s attempt to transmit
+/// `CancelAction`, mirroring [`ActionDispatchOutcome`]'s send-result
+/// distinction. Neither variant implies Agent receipt/execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelActionSendOutcome {
+    Sent,
+    SendFailed(AgentDispatchError),
+}
+
+/// Outcome of [`CancellationService::request`], mirroring
+/// [`crate::ports::RequestCancellationResult`] with the `CancelAction` send
+/// outcome attached for the case that requires one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancellationRequestResult {
+    /// `Running -> Cancelling` committed durably; `send` reports whether the
+    /// subsequent `CancelAction` transmission attempt succeeded locally. A
+    /// [`CancelActionSendOutcome::SendFailed`] never causes a second
+    /// automatic send by this WP — #28 owns subsequent uncertain-delivery
+    /// reconciliation (`m0-job-lifecycle-and-scheduling.md`; Issue #27
+    /// "Request idempotency / send-once").
+    EnteredCancelling { send: CancelActionSendOutcome },
+    /// `Running -> Cancelled` committed durably without sending
+    /// `CancelAction` — no active/uncertain Attempt existed.
+    CompletedImmediately,
+    /// The Job was already `Cancelling` — idempotent no-op, no repeated
+    /// send.
+    AlreadyCancelling,
+    /// The Job was already terminal — no-op.
+    AlreadyTerminal,
+}
+
+/// The operator/internal Job-cancellation control path (Issue #27 "[WP]
+/// Execute Job cancellation end to end"). Two structurally distinct
+/// responsibilities share this one service instance:
+///
+/// - [`Self::request`] — the durable cancellation-request path. Callers of
+///   this method must be structurally separate from Agent Protocol message
+///   handling, mirroring [`EnrollmentService::approve_enrollment`]'s
+///   separation requirement: the Agent must never be able to initiate Job
+///   cancellation. An in-process test/development harness, a future
+///   Administrative API handler, or a CLI may call this — never
+///   `AgentControlGateway`'s inbound message loop.
+/// - [`Self::apply_cancel_ack`] — inbound `CancelAck` evidence application,
+///   invoked only by `AgentControlGateway`.
+///
+/// Composes [`AttemptReservationRegistry`]/[`TechnicalResourceArbiter`]
+/// exactly like [`ActionEvidenceService`] (the same transient reservation
+/// mapping #26 already registered — cancellation never creates a new one),
+/// and [`AgentDispatchPort`] for `CancelAction` transmission, reusing the
+/// same outbound session path #26's [`ActionDispatchService`] uses.
+pub struct CancellationService {
+    repo: Arc<dyn JobRepository>,
+    reservations: Arc<AttemptReservationRegistry>,
+    arbiter: Arc<TechnicalResourceArbiter>,
+    dispatch: Arc<dyn AgentDispatchPort>,
+    clock: Arc<dyn Clock>,
+}
+
+impl CancellationService {
+    pub fn new(
+        repo: Arc<dyn JobRepository>,
+        reservations: Arc<AttemptReservationRegistry>,
+        arbiter: Arc<TechnicalResourceArbiter>,
+        dispatch: Arc<dyn AgentDispatchPort>,
+    ) -> Self {
+        Self::with_clock(repo, reservations, arbiter, dispatch, Arc::new(SystemClock))
+    }
+
+    pub fn with_clock(
+        repo: Arc<dyn JobRepository>,
+        reservations: Arc<AttemptReservationRegistry>,
+        arbiter: Arc<TechnicalResourceArbiter>,
+        dispatch: Arc<dyn AgentDispatchPort>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            repo,
+            reservations,
+            arbiter,
+            dispatch,
+            clock,
+        }
+    }
+
+    /// Requests cancellation of `job_id` on behalf of `operator`
+    /// (`m0-job-lifecycle-and-scheduling.md` "Job lifecycle"; Issue #27
+    /// "Durable cancellation request"). Persist-before-send: the durable
+    /// `Running -> Cancelling` (or immediate `-> Cancelled`) transition plus
+    /// its required operator cancellation audit commit atomically first;
+    /// only after that commit does this method attempt `CancelAction`
+    /// transmission, and only for the `EnteredCancelling` outcome.
+    pub async fn request(
+        &self,
+        job_id: JobId,
+        operator: Actor,
+    ) -> Result<CancellationRequestResult, ApplicationError> {
+        let now = self.clock.now();
+        let audit_actor = operator;
+        let decide: RequestCancellationDecision =
+            Box::new(move |facts: RequestCancellationLockedFacts| {
+                let outcome = bamep_domain::request_cancellation(
+                    &facts.job,
+                    facts.active_attempt.as_ref(),
+                    now,
+                )?;
+                Ok(match outcome {
+                    CancellationRequestOutcome::EnteredCancelling {
+                        job,
+                        attempt_id,
+                        action_id,
+                    } => {
+                        let audit = AuditRecord {
+                            audit_id: Uuid::new_v4(),
+                            endpoint_id: job.endpoint_id,
+                            actor: audit_actor,
+                            occurred_at: now,
+                            detail: format!(
+                                "operator cancellation requested for job {:?}; attempt {:?} \
+                                 action {:?} remains active",
+                                job.id, attempt_id, action_id
+                            ),
+                            job_id: Some(job.id),
+                            job_step_id: None,
+                            attempt_id: Some(attempt_id),
+                            action_id: Some(action_id),
+                        };
+                        CancellationRequestDecided::EnteredCancelling {
+                            job,
+                            attempt_id,
+                            action_id,
+                            audit,
+                        }
+                    }
+                    CancellationRequestOutcome::CompletedImmediately { job, event } => {
+                        let audit = AuditRecord {
+                            audit_id: Uuid::new_v4(),
+                            endpoint_id: job.endpoint_id,
+                            actor: audit_actor,
+                            occurred_at: now,
+                            detail: format!(
+                                "operator cancellation completed immediately for job {:?} \
+                                 (no active attempt)",
+                                job.id
+                            ),
+                            job_id: Some(job.id),
+                            job_step_id: None,
+                            attempt_id: None,
+                            action_id: None,
+                        };
+                        CancellationRequestDecided::CompletedImmediately { job, event, audit }
+                    }
+                    CancellationRequestOutcome::AlreadyCancelling => {
+                        CancellationRequestDecided::AlreadyCancelling
+                    }
+                    CancellationRequestOutcome::AlreadyTerminal => {
+                        CancellationRequestDecided::AlreadyTerminal
+                    }
+                })
+            });
+
+        let result = self.repo.request_cancellation(job_id, decide).await?;
+
+        Ok(match result {
+            RequestCancellationResult::EnteredCancelling {
+                action_id,
+                endpoint_id,
+                ..
+            } => {
+                let protocol_action_id = ProtocolId::from_uuid(action_id.0)
+                    .expect("a Domain ActionId is always a valid UUID v4");
+                let cancel = CancelActionMessage::new(protocol_action_id);
+                let send = match self.dispatch.cancel_action(endpoint_id, cancel).await {
+                    Ok(()) => CancelActionSendOutcome::Sent,
+                    Err(e) => CancelActionSendOutcome::SendFailed(e),
+                };
+                CancellationRequestResult::EnteredCancelling { send }
+            }
+            RequestCancellationResult::CompletedImmediately => {
+                CancellationRequestResult::CompletedImmediately
+            }
+            RequestCancellationResult::AlreadyCancelling => {
+                CancellationRequestResult::AlreadyCancelling
+            }
+            RequestCancellationResult::AlreadyTerminal => {
+                CancellationRequestResult::AlreadyTerminal
+            }
+        })
+    }
+
+    /// Applies `CancelAck` evidence for `action_id`, correlated to
+    /// `authenticated_endpoint_id` (Issue #27 "CancelAck handling"). Invoked
+    /// only by `AgentControlGateway`'s inbound Agent Protocol message loop.
+    /// An unknown `action_id`, or one belonging to another Endpoint's Job, is
+    /// [`ApplicationError::UnknownAction`] in both cases, mirroring
+    /// [`ActionEvidenceService::apply`].
+    pub async fn apply_cancel_ack(
+        &self,
+        action_id: ProtocolId,
+        authenticated_endpoint_id: EndpointId,
+        evidence: CancelAckEvidence,
+    ) -> Result<ApplyCancelAckResult, ApplicationError> {
+        let domain_action_id = ActionId(action_id.as_uuid());
+        let clock = Arc::clone(&self.clock);
+
+        let decide: ApplyCancelAckDecision = Box::new(move |facts: ActionEvidenceLockedFacts| {
+            let now = clock.now();
+            let endpoint_id = facts.job.endpoint_id;
+            let job_id = facts.job.id;
+            match bamep_domain::apply_cancel_ack(
+                &facts.job,
+                &facts.job_step,
+                &facts.attempt,
+                evidence,
+                now,
+            ) {
+                bamep_domain::CancelAckOutcome::NoOp => ApplyCancelAckDecisionOutcome::NoOp,
+                bamep_domain::CancelAckOutcome::Applied(applied) => {
+                    let audit = applied.terminal.then(|| AuditRecord {
+                        audit_id: Uuid::new_v4(),
+                        endpoint_id,
+                        actor: Actor::System,
+                        occurred_at: now,
+                        detail: format!(
+                            "attempt {:?} action {:?} reached terminal state {:?} for job_step \
+                             {:?} via cancellation evidence",
+                            applied.attempt.id,
+                            applied.attempt.action_id,
+                            applied.attempt.state,
+                            applied.job_step.id
+                        ),
+                        job_id: Some(job_id),
+                        job_step_id: Some(applied.job_step.id),
+                        attempt_id: Some(applied.attempt.id),
+                        action_id: Some(applied.attempt.action_id),
+                    });
+                    ApplyCancelAckDecisionOutcome::Applied(CancelAckCommit {
+                        outcome: applied,
+                        audit,
+                    })
+                }
+            }
+        });
+
+        let result = self
+            .repo
+            .apply_cancel_ack(domain_action_id, authenticated_endpoint_id, decide)
+            .await?;
+
+        if let ApplyCancelAckResult::Applied(applied) = &result {
+            if applied.terminal {
+                // Remove the mapping exactly once — mirrors
+                // `ActionEvidenceService::apply`'s identical exactly-once
+                // release guarantee. A no-op when the reservation was
+                // already released by an earlier terminal outcome (e.g. the
+                // Attempt independently reached Succeeded/Failed before this
+                // CancelAck arrived).
+                if let Some(reservation) = self.reservations.take(applied.attempt.id) {
+                    self.arbiter.release(reservation);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
 /// Independently verifies post-session evidence and correlates it to the
 /// authoritative CurrentBoot under the Endpoint lock.
 pub struct BootstrapEvidenceService<R: EndpointRepository> {
@@ -1486,6 +1773,27 @@ mod tests {
             ) -> Result<bool, RepositoryError> {
                 unimplemented!("DestructiveIntentService never correlates ActionProgress")
             }
+
+            async fn request_cancellation(
+                &self,
+                _job_id: JobId,
+                _decide: crate::ports::RequestCancellationDecision,
+            ) -> Result<
+                crate::ports::RequestCancellationResult,
+                crate::ports::RequestCancellationError,
+            > {
+                unimplemented!("DestructiveIntentService never requests cancellation")
+            }
+
+            async fn apply_cancel_ack(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+                _decide: crate::ports::ApplyCancelAckDecision,
+            ) -> Result<crate::ports::ApplyCancelAckResult, crate::ports::ApplyActionEvidenceError>
+            {
+                unimplemented!("DestructiveIntentService never applies CancelAck evidence")
+            }
         }
 
         /// In-memory `InventoryRepository` fake exposing only a configurable
@@ -1961,6 +2269,27 @@ mod tests {
                 _authenticated_endpoint_id: EndpointId,
             ) -> Result<bool, RepositoryError> {
                 unimplemented!("FinalDispatchService tests never correlate ActionProgress")
+            }
+
+            async fn request_cancellation(
+                &self,
+                _job_id: JobId,
+                _decide: crate::ports::RequestCancellationDecision,
+            ) -> Result<
+                crate::ports::RequestCancellationResult,
+                crate::ports::RequestCancellationError,
+            > {
+                unimplemented!("FinalDispatchService tests never request cancellation")
+            }
+
+            async fn apply_cancel_ack(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+                _decide: crate::ports::ApplyCancelAckDecision,
+            ) -> Result<crate::ports::ApplyCancelAckResult, crate::ports::ApplyActionEvidenceError>
+            {
+                unimplemented!("FinalDispatchService tests never apply CancelAck evidence")
             }
         }
 
@@ -2467,6 +2796,14 @@ mod tests {
                     return Err(AgentDispatchError::SendFailed);
                 }
                 Ok(())
+            }
+
+            async fn cancel_action(
+                &self,
+                _endpoint_id: EndpointId,
+                _cancel: bamep_agent_protocol::CancelActionMessage,
+            ) -> Result<(), AgentDispatchError> {
+                unimplemented!("ActionDispatchService tests never send CancelAction")
             }
         }
 

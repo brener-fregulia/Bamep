@@ -30,7 +30,8 @@ pub use messages::{
     ActionDispatchBody, ActionDispatchMessage, ActionProgressBody, ActionProgressMessage,
     ActionResultBody, ActionResultMessage, ActionResultOutcome, AgentProtocolMessage,
     AuthErrorBody, AuthErrorMessage, AuthRequestBody, AuthRequestMessage, BootstrapEvidenceBody,
-    BootstrapEvidenceMessage, EmptyActionProgress, InventoryReportBody, InventoryReportMessage,
+    BootstrapEvidenceMessage, CancelAckBody, CancelAckMessage, CancelAckOutcome, CancelActionBody,
+    CancelActionMessage, EmptyActionProgress, InventoryReportBody, InventoryReportMessage,
     LocalBootTrust, ProtocolErrorBody, ProtocolErrorMessage, SessionEstablishedBody,
     SessionEstablishedMessage,
 };

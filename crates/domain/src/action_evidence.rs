@@ -160,8 +160,12 @@ pub fn apply_action_evidence(
 
 /// Shared terminal-failure shape for `ActionAck{Rejected}` and
 /// `ActionResult{Failed}`: Attempt -> `attempt_state`, current JobStep ->
-/// `Failed{reason}`, owning Job -> `Failed`, `JobStepFailed` + `JobFailed`
-/// atomically.
+/// `Failed{reason}`, `JobStepFailed` always emitted. When `job` is not
+/// `Cancelling`, owning Job -> `Failed` with `JobFailed`. When `job` is
+/// already `Cancelling` (Issue #27 "Normal action evidence while Job is
+/// Cancelling"), cancellation intent already owns the workflow outcome: Job
+/// -> `Cancelled` with `JobCancelled` instead — `JobFailed` is never emitted
+/// for a Job that reaches its authoritative terminal state `Cancelled`.
 fn terminal_failure(
     job: &Job,
     job_step: &JobStep,
@@ -175,8 +179,13 @@ fn terminal_failure(
         failure_reason: Some(reason),
         ..job_step.clone()
     };
-    let failed_job = Job {
-        state: JobState::Failed,
+    let cancelling = job.state == JobState::Cancelling;
+    let final_job = Job {
+        state: if cancelling {
+            JobState::Cancelled
+        } else {
+            JobState::Failed
+        },
         steps: replace_step(&job.steps, &failed_step),
         ..job.clone()
     };
@@ -187,11 +196,20 @@ fn terminal_failure(
         endpoint_id: job.endpoint_id,
         occurred_at: now,
     };
-    let job_failed = DomainEvent::JobFailed {
-        event_id: Uuid::new_v4(),
-        job_id: job.id,
-        endpoint_id: job.endpoint_id,
-        occurred_at: now,
+    let job_terminal_event = if cancelling {
+        DomainEvent::JobCancelled {
+            event_id: Uuid::new_v4(),
+            job_id: job.id,
+            endpoint_id: job.endpoint_id,
+            occurred_at: now,
+        }
+    } else {
+        DomainEvent::JobFailed {
+            event_id: Uuid::new_v4(),
+            job_id: job.id,
+            endpoint_id: job.endpoint_id,
+            occurred_at: now,
+        }
     };
     ActionEvidenceApplied {
         attempt: Attempt {
@@ -199,17 +217,23 @@ fn terminal_failure(
             ..*attempt
         },
         job_step: failed_step,
-        job: failed_job,
-        events: vec![job_step_failed, job_failed],
+        job: final_job,
+        events: vec![job_step_failed, job_terminal_event],
         terminal: true,
     }
 }
 
 /// `ActionResult{Succeeded}`: Attempt -> `Succeeded`, current JobStep ->
-/// `Succeeded`. If every ordered JobStep is now `Succeeded`, Job ->
-/// `Succeeded` with `JobSucceeded`; otherwise Job remains `Running` and
-/// retains Job-scoped Endpoint exclusivity. #26 never automatically
-/// schedules/dispatches a later JobStep merely because this one succeeded.
+/// `Succeeded`. When `job` is not `Cancelling`: if every ordered JobStep is
+/// now `Succeeded`, Job -> `Succeeded` with `JobSucceeded`; otherwise Job
+/// remains `Running` and retains Job-scoped Endpoint exclusivity. #26 never
+/// automatically schedules/dispatches a later JobStep merely because this one
+/// succeeded. When `job` is already `Cancelling` (Issue #27 "Normal action
+/// evidence while Job is Cancelling"), the execution result is preserved on
+/// the Attempt/JobStep, but cancellation intent already owns the workflow
+/// outcome: Job -> `Cancelled` with `JobCancelled` regardless of remaining
+/// JobSteps — no further JobStep is ever scheduled and `JobSucceeded` is
+/// never emitted for a Job that reaches `Cancelled`.
 fn terminal_success(
     job: &Job,
     job_step: &JobStep,
@@ -221,21 +245,31 @@ fn terminal_success(
         ..job_step.clone()
     };
     let updated_steps = replace_step(&job.steps, &succeeded_step);
-    let every_step_succeeded = updated_steps
-        .iter()
-        .all(|s| s.state == JobStepState::Succeeded);
 
     let mut events = Vec::new();
-    let job_state = if every_step_succeeded {
-        events.push(DomainEvent::JobSucceeded {
+    let job_state = if job.state == JobState::Cancelling {
+        events.push(DomainEvent::JobCancelled {
             event_id: Uuid::new_v4(),
             job_id: job.id,
             endpoint_id: job.endpoint_id,
             occurred_at: now,
         });
-        JobState::Succeeded
+        JobState::Cancelled
     } else {
-        JobState::Running
+        let every_step_succeeded = updated_steps
+            .iter()
+            .all(|s| s.state == JobStepState::Succeeded);
+        if every_step_succeeded {
+            events.push(DomainEvent::JobSucceeded {
+                event_id: Uuid::new_v4(),
+                job_id: job.id,
+                endpoint_id: job.endpoint_id,
+                occurred_at: now,
+            });
+            JobState::Succeeded
+        } else {
+            JobState::Running
+        }
     };
 
     ActionEvidenceApplied {
@@ -582,6 +616,150 @@ mod tests {
         let outcome =
             apply_action_evidence(&job, &step, &attempt, ActionEvidence::ResultFailed, now());
         assert_eq!(outcome, ActionEvidenceOutcome::NoOp);
+    }
+
+    // -- Issue #27: normal evidence while Job is Cancelling ---------------
+
+    fn cancelling_job(step_count: usize, dispatching_index: usize) -> (Job, Vec<JobStepId>) {
+        let (mut job, ids) = running_job(step_count, dispatching_index);
+        job.state = JobState::Cancelling;
+        (job, ids)
+    }
+
+    #[test]
+    fn accepted_while_cancelling_moves_to_in_progress_without_cancelling_the_cancellation() {
+        let (job, ids) = cancelling_job(1, 0);
+        let step = job.steps[0].clone();
+        let attempt = dispatched_attempt(ids[0]);
+
+        let outcome =
+            apply_action_evidence(&job, &step, &attempt, ActionEvidence::AckAccepted, now());
+
+        let ActionEvidenceOutcome::Applied(applied) = outcome else {
+            panic!("expected Applied")
+        };
+        assert_eq!(applied.attempt.state, AttemptState::InProgress);
+        assert_eq!(applied.job.state, JobState::Cancelling);
+        assert_eq!(applied.job_step.state, JobStepState::Dispatching);
+        assert!(applied.events.is_empty());
+        assert!(!applied.terminal, "no terminal event/audit/release");
+    }
+
+    #[test]
+    fn rejected_while_cancelling_preserves_rejected_semantics_but_job_ends_cancelled() {
+        let (job, ids) = cancelling_job(1, 0);
+        let step = job.steps[0].clone();
+        let attempt = dispatched_attempt(ids[0]);
+
+        let outcome =
+            apply_action_evidence(&job, &step, &attempt, ActionEvidence::AckRejected, now());
+
+        let ActionEvidenceOutcome::Applied(applied) = outcome else {
+            panic!("expected Applied")
+        };
+        assert_eq!(applied.attempt.state, AttemptState::Rejected);
+        assert_eq!(applied.job_step.state, JobStepState::Failed);
+        assert_eq!(
+            applied.job_step.failure_reason,
+            Some(JobStepFailureReason::DispatchRejected)
+        );
+        assert_eq!(
+            applied.job.state,
+            JobState::Cancelled,
+            "never JobState::Failed"
+        );
+        assert!(applied.terminal);
+        assert_eq!(applied.events.len(), 2);
+        assert!(applied
+            .events
+            .iter()
+            .any(|e| e.event_type() == "JobStepFailed"));
+        assert!(
+            applied
+                .events
+                .iter()
+                .any(|e| e.event_type() == "JobCancelled"),
+            "JobCancelled must be emitted, never JobFailed"
+        );
+        assert!(!applied.events.iter().any(|e| e.event_type() == "JobFailed"));
+    }
+
+    #[test]
+    fn succeeded_while_cancelling_preserves_success_semantics_but_job_ends_cancelled() {
+        // Even the FINAL step succeeding must never reach JobState::Succeeded
+        // or emit JobSucceeded while cancellation intent is authoritative.
+        let (job, ids) = cancelling_job(1, 0);
+        let step = job.steps[0].clone();
+        let attempt = dispatched_attempt(ids[0]);
+
+        let outcome = apply_action_evidence(
+            &job,
+            &step,
+            &attempt,
+            ActionEvidence::ResultSucceeded,
+            now(),
+        );
+
+        let ActionEvidenceOutcome::Applied(applied) = outcome else {
+            panic!("expected Applied")
+        };
+        assert_eq!(applied.attempt.state, AttemptState::Succeeded);
+        assert_eq!(applied.job_step.state, JobStepState::Succeeded);
+        assert_eq!(applied.job.state, JobState::Cancelled);
+        assert!(applied.terminal);
+        assert_eq!(applied.events.len(), 1);
+        assert_eq!(applied.events[0].event_type(), "JobCancelled");
+    }
+
+    #[test]
+    fn succeeded_on_a_non_final_step_while_cancelling_still_ends_the_job_cancelled() {
+        let (job, ids) = cancelling_job(2, 0);
+        let step = job.steps[0].clone();
+        let attempt = dispatched_attempt(ids[0]);
+
+        let outcome = apply_action_evidence(
+            &job,
+            &step,
+            &attempt,
+            ActionEvidence::ResultSucceeded,
+            now(),
+        );
+
+        let ActionEvidenceOutcome::Applied(applied) = outcome else {
+            panic!("expected Applied")
+        };
+        assert_eq!(applied.job.state, JobState::Cancelled);
+        assert_eq!(applied.events.len(), 1);
+        assert_eq!(applied.events[0].event_type(), "JobCancelled");
+        // No later JobStep is scheduled/advanced.
+        assert_eq!(applied.job.steps[1].state, JobStepState::Pending);
+    }
+
+    #[test]
+    fn failed_while_cancelling_preserves_failed_semantics_but_job_ends_cancelled() {
+        let (job, ids) = cancelling_job(1, 0);
+        let step = job.steps[0].clone();
+        let attempt = dispatched_attempt(ids[0]);
+
+        let outcome =
+            apply_action_evidence(&job, &step, &attempt, ActionEvidence::ResultFailed, now());
+
+        let ActionEvidenceOutcome::Applied(applied) = outcome else {
+            panic!("expected Applied")
+        };
+        assert_eq!(applied.attempt.state, AttemptState::Failed);
+        assert_eq!(applied.job_step.state, JobStepState::Failed);
+        assert_eq!(
+            applied.job_step.failure_reason,
+            Some(JobStepFailureReason::ExecutionFailed)
+        );
+        assert_eq!(applied.job.state, JobState::Cancelled);
+        assert!(applied.terminal);
+        assert!(applied
+            .events
+            .iter()
+            .any(|e| e.event_type() == "JobCancelled"),);
+        assert!(!applied.events.iter().any(|e| e.event_type() == "JobFailed"));
     }
 
     #[test]

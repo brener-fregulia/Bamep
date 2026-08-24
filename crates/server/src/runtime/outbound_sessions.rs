@@ -23,7 +23,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use bamep_agent_protocol::{ActionDispatchMessage, AgentProtocolMessage, ProtocolId};
+use bamep_agent_protocol::{
+    ActionDispatchMessage, AgentProtocolMessage, CancelActionMessage, ProtocolId,
+};
 use bamep_domain::EndpointId;
 use tokio::sync::{mpsc, oneshot};
 
@@ -139,12 +141,16 @@ impl OutboundSessionDirectory {
     }
 }
 
-#[async_trait]
-impl AgentDispatchPort for OutboundSessionDirectory {
-    async fn dispatch_action(
+impl OutboundSessionDirectory {
+    /// Shared send path for [`AgentDispatchPort::dispatch_action`] and
+    /// [`AgentDispatchPort::cancel_action`]: selects the most-recently-
+    /// registered live session for `endpoint_id` (no fan-out, no fallback
+    /// after one send attempt) and enqueues `message` onto its outbound
+    /// channel.
+    async fn send(
         &self,
         endpoint_id: EndpointId,
-        dispatch: ActionDispatchMessage,
+        message: AgentProtocolMessage,
     ) -> Result<(), AgentDispatchError> {
         let sender = {
             let inner = self
@@ -166,7 +172,7 @@ impl AgentDispatchPort for OutboundSessionDirectory {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = OutboundCommand::Send {
-            message: AgentProtocolMessage::ActionDispatch(dispatch),
+            message,
             ack: ack_tx,
         };
         if sender.send(command).await.is_err() {
@@ -177,6 +183,27 @@ impl AgentDispatchPort for OutboundSessionDirectory {
             Ok(Err(())) => Err(AgentDispatchError::SendFailed),
             Err(_) => Err(AgentDispatchError::ChannelClosed),
         }
+    }
+}
+
+#[async_trait]
+impl AgentDispatchPort for OutboundSessionDirectory {
+    async fn dispatch_action(
+        &self,
+        endpoint_id: EndpointId,
+        dispatch: ActionDispatchMessage,
+    ) -> Result<(), AgentDispatchError> {
+        self.send(endpoint_id, AgentProtocolMessage::ActionDispatch(dispatch))
+            .await
+    }
+
+    async fn cancel_action(
+        &self,
+        endpoint_id: EndpointId,
+        cancel: CancelActionMessage,
+    ) -> Result<(), AgentDispatchError> {
+        self.send(endpoint_id, AgentProtocolMessage::CancelAction(cancel))
+            .await
     }
 }
 

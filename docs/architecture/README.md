@@ -179,6 +179,47 @@ treats it as transient advisory metadata only.
 Endpoint of the session it arrived on; an unknown `action_id` and one belonging to another
 Endpoint's Job both resolve identically, so the Server never reveals which case occurred.
 
+## Implemented Job cancellation
+
+`bamep_agent_protocol` adds `CancelAction{action_id}` (Server -> Agent) and
+`CancelAck{action_id, outcome}` (Agent -> Server, `Cancelled | AlreadyCompleted | CannotCancel |
+Unknown`) to `AgentProtocolMessage`, both carrying `correlation_id == action_id` and never a
+replacement action identity.
+
+`bamep_server::application::CancellationService` holds two structurally distinct
+responsibilities on one shared instance:
+
+- `request` — the internal operator/harness cancellation-request control path (never callable
+  from inbound Agent Protocol handling). It locks the target Job and, when one currently exists,
+  the JobStep-current Attempt in `Dispatched`/`InProgress`/`AwaitingReconciliation`, in the same
+  Attempt -> JobStep -> Job order `apply_action_evidence` already uses
+  (`PostgresJobRepository::request_cancellation`), then calls the pure Domain decision
+  `bamep_domain::request_cancellation`. `Running` with an active Attempt commits `Cancelling` plus
+  an immutable operator cancellation audit; `Running` with none commits `Cancelled` directly plus
+  one `JobCancelled` event and the audit. Only after that transaction commits does it attempt
+  `CancelAction` transmission, reusing `OutboundSessionDirectory`/`AgentDispatchPort::cancel_action`
+  — the same outbound session path `ActionDispatchService` uses. A repeated request against an
+  already-`Cancelling` Job is a persisted no-op: the durable `Running -> Cancelling` transition
+  itself is the send-once gate, so no separate dedup registry is needed.
+- `apply_cancel_ack` — inbound `CancelAck` evidence, invoked only by `AgentControlGateway`. It
+  locks Attempt -> JobStep -> Job by `action_id`, exactly like `apply_action_evidence`, and calls
+  the pure Domain decision `bamep_domain::apply_cancel_ack`. `Cancelled` against an active/
+  uncertain Attempt commits Attempt/JobStep `Cancelled`, Job `Cancelled`, and one `JobCancelled`
+  event. `Unknown`/`AlreadyCompleted` against `Dispatched`/`InProgress` commit
+  `AwaitingReconciliation` with no event. `CannotCancel` never mutates state. On any terminal
+  outcome it removes the Attempt's reservation mapping exactly once and releases it through the
+  arbiter, exactly like `ActionEvidenceService`.
+
+`bamep_domain::apply_action_evidence` (the same function `ActionEvidenceService` calls) now reads
+the owning Job's current state to decide the terminal Job outcome: normal `ActionAck{Rejected}`/
+`ActionResult{Succeeded|Failed}` evidence arriving while the Job is already `Cancelling` still
+preserves the Attempt/JobStep result exactly, but resolves the Job to `Cancelled` with
+`JobCancelled` instead of `Failed`/`Succeeded` with `JobFailed`/`JobSucceeded` — no JobStep is ever
+scheduled past that point. This is the same lock/read/decide/persist transaction
+`apply_action_evidence` already used before #27; no new lock order was introduced, so a
+concurrent cancellation request and terminal evidence commitment for the same Attempt serialize
+through the existing Attempt -> JobStep -> Job ordering rather than racing under a competing one.
+
 ## Maintenance rule
 
 Update this directory only for durable structure visible in implemented code. Do not copy

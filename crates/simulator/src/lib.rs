@@ -29,7 +29,9 @@ pub mod transport;
 pub mod trusted_bootstrap;
 pub mod verifier;
 
-pub use action::{ScenarioOutcome, SimulatedActionAgent, M1_ACTION_TYPE, M1_ACTION_VERSION};
+pub use action::{
+    CancelBehavior, ScenarioOutcome, SimulatedActionAgent, M1_ACTION_TYPE, M1_ACTION_VERSION,
+};
 pub use bamep_trusted_bootstrap::ServerCertFingerprint;
 pub use handshake::{
     authenticate, send_bootstrap_evidence, send_inventory_report, SimulatorHandshakeError,

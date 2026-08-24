@@ -685,6 +685,87 @@ impl ActionResultMessage {
 }
 
 // ---------------------------------------------------------------------
+// CancelAction — Server -> Agent
+// ---------------------------------------------------------------------
+
+/// `CancelAction{action_id}` (`m0-agent-protocol-contract.md` "Message
+/// types"). `action_id` is always the exact existing action identity being
+/// cancelled — Issue #27 never generates a replacement action identity for a
+/// cancellation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelActionBody {
+    pub action_id: ProtocolId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelActionMessage {
+    #[serde(flatten)]
+    pub envelope: Envelope,
+    #[serde(flatten)]
+    pub body: CancelActionBody,
+}
+
+impl CancelActionMessage {
+    /// A fresh envelope whose `correlation_id` is always `action_id`, exactly
+    /// like [`ActionDispatchMessage::new`].
+    pub fn new(action_id: ProtocolId) -> Self {
+        Self {
+            envelope: Envelope::new().with_correlation_id(action_id),
+            body: CancelActionBody { action_id },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// CancelAck — Agent -> Server
+// ---------------------------------------------------------------------
+
+/// `CancelAck.outcome` (`m0-agent-protocol-contract.md` "Message types"):
+/// `CannotCancel` means the Agent knows the action but cannot stop it;
+/// `Unknown` means no authoritative local state exists — never "not
+/// executed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CancelAckOutcome {
+    Cancelled,
+    AlreadyCompleted,
+    CannotCancel,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelAckBody {
+    pub action_id: ProtocolId,
+    pub outcome: CancelAckOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelAckMessage {
+    #[serde(flatten)]
+    pub envelope: Envelope,
+    #[serde(flatten)]
+    pub body: CancelAckBody,
+}
+
+impl CancelAckMessage {
+    pub fn new(action_id: ProtocolId, outcome: CancelAckOutcome) -> Self {
+        Self {
+            envelope: Envelope::new().with_correlation_id(action_id),
+            body: CancelAckBody { action_id, outcome },
+        }
+    }
+
+    /// Re-emits this already-constructed Ack under a fresh `message_id`,
+    /// exactly like [`ActionAckMessage::with_fresh_message_id`] — used for
+    /// Agent-side idempotency when a known already-cancelled `action_id`
+    /// receives another `CancelAction`.
+    pub fn with_fresh_message_id(mut self) -> Self {
+        self.envelope.message_id = ProtocolId::generate();
+        self.envelope.timestamp = MessageTimestamp::now();
+        self
+    }
+}
+
+// ---------------------------------------------------------------------
 // Top-level message union
 // ---------------------------------------------------------------------
 
@@ -709,6 +790,8 @@ pub enum AgentProtocolMessage {
     ActionAck(ActionAckMessage),
     ActionProgress(ActionProgressMessage),
     ActionResult(ActionResultMessage),
+    CancelAction(CancelActionMessage),
+    CancelAck(CancelAckMessage),
     ProtocolError(ProtocolErrorMessage),
 }
 
@@ -724,6 +807,8 @@ impl AgentProtocolMessage {
             AgentProtocolMessage::ActionAck(m) => &m.envelope,
             AgentProtocolMessage::ActionProgress(m) => &m.envelope,
             AgentProtocolMessage::ActionResult(m) => &m.envelope,
+            AgentProtocolMessage::CancelAction(m) => &m.envelope,
+            AgentProtocolMessage::CancelAck(m) => &m.envelope,
             AgentProtocolMessage::ProtocolError(m) => &m.envelope,
         }
     }

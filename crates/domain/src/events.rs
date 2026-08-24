@@ -83,6 +83,18 @@ pub enum DomainEvent {
         endpoint_id: EndpointId,
         occurred_at: DateTime<Utc>,
     },
+    /// Emitted exactly once when a `Job` enters `Cancelled`
+    /// (`m0-persistence-observability-and-domain-events.md` "Domain events":
+    /// "`JobCancelled` | Job reaches matching terminal state"; Issue #27).
+    /// Neither `JobCancelling` nor per-Attempt/per-JobStep cancellation
+    /// events are defined — this coarse-grained Job-terminal fact is the
+    /// only one the persistence contract requires.
+    JobCancelled {
+        event_id: Uuid,
+        job_id: JobId,
+        endpoint_id: EndpointId,
+        occurred_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent {
@@ -95,7 +107,8 @@ impl DomainEvent {
             | DomainEvent::JobStarted { event_id, .. }
             | DomainEvent::JobSucceeded { event_id, .. }
             | DomainEvent::JobFailed { event_id, .. }
-            | DomainEvent::JobStepFailed { event_id, .. } => *event_id,
+            | DomainEvent::JobStepFailed { event_id, .. }
+            | DomainEvent::JobCancelled { event_id, .. } => *event_id,
         }
     }
 
@@ -108,7 +121,8 @@ impl DomainEvent {
             | DomainEvent::JobStarted { endpoint_id, .. }
             | DomainEvent::JobSucceeded { endpoint_id, .. }
             | DomainEvent::JobFailed { endpoint_id, .. }
-            | DomainEvent::JobStepFailed { endpoint_id, .. } => *endpoint_id,
+            | DomainEvent::JobStepFailed { endpoint_id, .. }
+            | DomainEvent::JobCancelled { endpoint_id, .. } => *endpoint_id,
         }
     }
 
@@ -121,18 +135,20 @@ impl DomainEvent {
             | DomainEvent::JobStarted { occurred_at, .. }
             | DomainEvent::JobSucceeded { occurred_at, .. }
             | DomainEvent::JobFailed { occurred_at, .. }
-            | DomainEvent::JobStepFailed { occurred_at, .. } => *occurred_at,
+            | DomainEvent::JobStepFailed { occurred_at, .. }
+            | DomainEvent::JobCancelled { occurred_at, .. } => *occurred_at,
         }
     }
 
-    /// The owning `JobId`, for the Job-scoped event types (Issue #26).
+    /// The owning `JobId`, for the Job-scoped event types (Issue #26/#27).
     /// Endpoint-only event types have no Job correlation.
     pub fn job_id(&self) -> Option<JobId> {
         match self {
             DomainEvent::JobStarted { job_id, .. }
             | DomainEvent::JobSucceeded { job_id, .. }
             | DomainEvent::JobFailed { job_id, .. }
-            | DomainEvent::JobStepFailed { job_id, .. } => Some(*job_id),
+            | DomainEvent::JobStepFailed { job_id, .. }
+            | DomainEvent::JobCancelled { job_id, .. } => Some(*job_id),
             _ => None,
         }
     }
@@ -156,6 +172,7 @@ impl DomainEvent {
             DomainEvent::JobSucceeded { .. } => "JobSucceeded",
             DomainEvent::JobFailed { .. } => "JobFailed",
             DomainEvent::JobStepFailed { .. } => "JobStepFailed",
+            DomainEvent::JobCancelled { .. } => "JobCancelled",
         }
     }
 }

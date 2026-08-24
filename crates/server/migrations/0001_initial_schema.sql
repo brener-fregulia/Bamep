@@ -17,7 +17,8 @@ CREATE TYPE domain_event_type AS ENUM (
     'JobStarted',
     'JobSucceeded',
     'JobFailed',
-    'JobStepFailed'
+    'JobStepFailed',
+    'JobCancelled'
 );
 
 CREATE TYPE audit_actor_kind AS ENUM (

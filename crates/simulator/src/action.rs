@@ -21,7 +21,8 @@ use std::sync::Mutex;
 
 use bamep_agent_protocol::{
     ActionAckError, ActionAckMessage, ActionDispatchMessage, ActionProgressMessage,
-    ActionResultMessage, ActionResultOutcome, AgentProtocolMessage, Percent, ProtocolId,
+    ActionResultMessage, ActionResultOutcome, AgentProtocolMessage, CancelAckMessage,
+    CancelAckOutcome, CancelActionMessage, Percent, ProtocolId,
 };
 use serde_json::{Map, Value};
 
@@ -83,6 +84,18 @@ enum LocalActionState {
         content: DispatchContent,
         ack: ActionAckMessage,
     },
+    /// Locally cancelled via [`SimulatedActionAgent::handle_cancel`] (Issue
+    /// #27 "Agent / Simulator cancellation state"). Retains the original
+    /// `ActionAck{Accepted}` (re-emitted for a duplicate `ActionDispatch`,
+    /// mirroring the `Active` case one more level of local history back) and
+    /// the exact `CancelAck{Cancelled}` a duplicate `CancelAction` re-emits,
+    /// under a fresh `message_id`, without a second cancellation/execution
+    /// effect.
+    Cancelled {
+        content: DispatchContent,
+        ack: ActionAckMessage,
+        cancel_ack: CancelAckMessage,
+    },
 }
 
 impl LocalActionState {
@@ -90,9 +103,26 @@ impl LocalActionState {
         match self {
             LocalActionState::Active { content, .. }
             | LocalActionState::Completed { content, .. }
-            | LocalActionState::Rejected { content, .. } => content,
+            | LocalActionState::Rejected { content, .. }
+            | LocalActionState::Cancelled { content, .. } => content,
         }
     }
+}
+
+/// Deterministic per-`action_id` cancellation behavior for a
+/// [`SimulatedActionAgent`] (Issue #27 "Agent / Simulator cancellation
+/// state"). Configured per-action, or falls back to a per-agent default,
+/// exactly like [`ScenarioOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CancelBehavior {
+    /// A `CancelAction` against a `KNOWN ACTIVE` action_id stops simulated
+    /// execution and returns `CancelAck{Cancelled}`.
+    #[default]
+    Cancellable,
+    /// A `CancelAction` against a `KNOWN ACTIVE` action_id leaves execution
+    /// untouched (a later explicit `run_configured_scenario` call still
+    /// proceeds normally) and returns `CancelAck{CannotCancel}`.
+    CannotCancel,
 }
 
 /// The Simulated Agent's own typed-action participant: local `action_id`
@@ -102,6 +132,8 @@ impl LocalActionState {
 pub struct SimulatedActionAgent {
     scenarios: Mutex<HashMap<ProtocolId, ScenarioOutcome>>,
     default_scenario: Mutex<Option<ScenarioOutcome>>,
+    cancel_behaviors: Mutex<HashMap<ProtocolId, CancelBehavior>>,
+    default_cancel_behavior: Mutex<CancelBehavior>,
     state: Mutex<HashMap<ProtocolId, LocalActionState>>,
 }
 
@@ -121,6 +153,23 @@ impl SimulatedActionAgent {
     /// overriding the default for it alone.
     pub fn configure(&self, action_id: ProtocolId, scenario: ScenarioOutcome) {
         self.scenarios.lock().unwrap().insert(action_id, scenario);
+    }
+
+    /// Sets the [`CancelBehavior`] used for any `action_id` not individually
+    /// configured via [`Self::configure_cancel_behavior`] (Issue #27). The
+    /// unconfigured default is [`CancelBehavior::Cancellable`].
+    pub fn with_default_cancel_behavior(self, behavior: CancelBehavior) -> Self {
+        *self.default_cancel_behavior.lock().unwrap() = behavior;
+        self
+    }
+
+    /// Configures the deterministic [`CancelBehavior`] for one specific
+    /// `action_id`, overriding the default for it alone.
+    pub fn configure_cancel_behavior(&self, action_id: ProtocolId, behavior: CancelBehavior) {
+        self.cancel_behaviors
+            .lock()
+            .unwrap()
+            .insert(action_id, behavior);
     }
 
     /// Decides the response to one `ActionDispatch`: exactly the
@@ -158,7 +207,9 @@ impl SimulatedActionAgent {
                 ))];
             }
             return match existing {
-                LocalActionState::Active { ack, .. } | LocalActionState::Rejected { ack, .. } => {
+                LocalActionState::Active { ack, .. }
+                | LocalActionState::Rejected { ack, .. }
+                | LocalActionState::Cancelled { ack, .. } => {
                     vec![AgentProtocolMessage::ActionAck(
                         ack.clone().with_fresh_message_id(),
                     )]
@@ -275,6 +326,66 @@ impl SimulatedActionAgent {
         );
         messages.push(AgentProtocolMessage::ActionResult(result));
         Some(messages)
+    }
+
+    /// Decides the response to one `CancelAction` (Issue #27 "Agent /
+    /// Simulator cancellation state"):
+    ///
+    /// - `UNKNOWN` `action_id` -> `CancelAck{Unknown}`;
+    /// - `KNOWN COMPLETED` (a terminal `ActionResult` or `ActionAck{Rejected}`
+    ///   was already retained) -> `CancelAck{AlreadyCompleted}`, preserving
+    ///   the retained terminal result;
+    /// - `KNOWN already-cancelled` -> re-emits the retained
+    ///   `CancelAck{Cancelled}` with a fresh `message_id`, no second
+    ///   cancellation/execution effect;
+    /// - `KNOWN ACTIVE` + [`CancelBehavior::Cancellable`] -> stops simulated
+    ///   execution (a later `run_configured_scenario` call becomes a no-op,
+    ///   since the record is no longer `Active`) and retains
+    ///   `CancelAck{Cancelled}`;
+    /// - `KNOWN ACTIVE` + [`CancelBehavior::CannotCancel`] -> retains active
+    ///   execution untouched and returns `CancelAck{CannotCancel}`; a later
+    ///   explicit `run_configured_scenario` call still proceeds normally.
+    pub fn handle_cancel(&self, cancel: &CancelActionMessage) -> CancelAckMessage {
+        let action_id = cancel.body.action_id;
+        let mut state = self.state.lock().unwrap();
+
+        let (content, original_ack, behavior) = match state.get(&action_id) {
+            None => return CancelAckMessage::new(action_id, CancelAckOutcome::Unknown),
+            Some(LocalActionState::Completed { .. }) | Some(LocalActionState::Rejected { .. }) => {
+                return CancelAckMessage::new(action_id, CancelAckOutcome::AlreadyCompleted);
+            }
+            Some(LocalActionState::Cancelled { cancel_ack, .. }) => {
+                return cancel_ack.clone().with_fresh_message_id();
+            }
+            Some(LocalActionState::Active { content, ack }) => {
+                let behavior = self
+                    .cancel_behaviors
+                    .lock()
+                    .unwrap()
+                    .get(&action_id)
+                    .copied()
+                    .unwrap_or(*self.default_cancel_behavior.lock().unwrap());
+                (content.clone(), ack.clone(), behavior)
+            }
+        };
+
+        match behavior {
+            CancelBehavior::CannotCancel => {
+                CancelAckMessage::new(action_id, CancelAckOutcome::CannotCancel)
+            }
+            CancelBehavior::Cancellable => {
+                let cancel_ack = CancelAckMessage::new(action_id, CancelAckOutcome::Cancelled);
+                state.insert(
+                    action_id,
+                    LocalActionState::Cancelled {
+                        content,
+                        ack: original_ack,
+                        cancel_ack: cancel_ack.clone(),
+                    },
+                );
+                cancel_ack
+            }
+        }
     }
 
     fn reject_and_record(
@@ -504,6 +615,102 @@ mod tests {
             ack.body.error.as_ref().unwrap().code,
             "UNSUPPORTED_ACTION_VERSION"
         );
+    }
+
+    // -- Issue #27: CancelAction handling ----------------------------------
+
+    fn cancel(action_id: ProtocolId) -> CancelActionMessage {
+        CancelActionMessage::new(action_id)
+    }
+
+    #[test]
+    fn cancel_against_unknown_action_id_returns_unknown() {
+        let agent = SimulatedActionAgent::new();
+        let ack = agent.handle_cancel(&cancel(ProtocolId::generate()));
+        assert_eq!(ack.body.outcome, CancelAckOutcome::Unknown);
+    }
+
+    #[test]
+    fn cancel_against_a_known_active_cancellable_action_stops_execution() {
+        let agent =
+            SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::AcceptThenSucceed);
+        let action_id = ProtocolId::generate();
+        agent.handle_dispatch(&dispatch(action_id));
+
+        let ack = agent.handle_cancel(&cancel(action_id));
+        assert_eq!(ack.body.outcome, CancelAckOutcome::Cancelled);
+        assert!(
+            agent.run_configured_scenario(action_id).is_none(),
+            "a cancelled action_id is no longer Active, so execution never proceeds"
+        );
+    }
+
+    #[test]
+    fn duplicate_cancel_against_an_already_cancelled_action_re_emits_with_fresh_message_id() {
+        let agent =
+            SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::AcceptThenSucceed);
+        let action_id = ProtocolId::generate();
+        agent.handle_dispatch(&dispatch(action_id));
+
+        let first = agent.handle_cancel(&cancel(action_id));
+        let second = agent.handle_cancel(&cancel(action_id));
+        assert_eq!(first.body.outcome, CancelAckOutcome::Cancelled);
+        assert_eq!(second.body.outcome, CancelAckOutcome::Cancelled);
+        assert_ne!(first.envelope.message_id, second.envelope.message_id);
+    }
+
+    #[test]
+    fn cancel_against_a_known_active_cannot_cancel_action_leaves_execution_untouched() {
+        let agent =
+            SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::AcceptThenSucceed);
+        let action_id = ProtocolId::generate();
+        agent.handle_dispatch(&dispatch(action_id));
+        agent.configure_cancel_behavior(action_id, CancelBehavior::CannotCancel);
+
+        let ack = agent.handle_cancel(&cancel(action_id));
+        assert_eq!(ack.body.outcome, CancelAckOutcome::CannotCancel);
+
+        // A later normal ActionResult may still be emitted.
+        let rest = agent.run_configured_scenario(action_id).unwrap();
+        assert_eq!(
+            outcomes(&rest),
+            vec!["Progress", "Progress", "Progress", "Result:Succeeded"]
+        );
+    }
+
+    #[test]
+    fn cancel_against_a_known_completed_action_reports_already_completed() {
+        let agent =
+            SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::AcceptThenSucceed);
+        let action_id = ProtocolId::generate();
+        agent.handle_dispatch(&dispatch(action_id));
+        agent.run_configured_scenario(action_id).unwrap();
+
+        let ack = agent.handle_cancel(&cancel(action_id));
+        assert_eq!(ack.body.outcome, CancelAckOutcome::AlreadyCompleted);
+    }
+
+    #[test]
+    fn cancel_against_a_known_rejected_action_reports_already_completed() {
+        let agent = SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::Reject);
+        let action_id = ProtocolId::generate();
+        agent.handle_dispatch(&dispatch(action_id));
+
+        let ack = agent.handle_cancel(&cancel(action_id));
+        assert_eq!(ack.body.outcome, CancelAckOutcome::AlreadyCompleted);
+    }
+
+    #[test]
+    fn per_action_cancel_behavior_overrides_the_default() {
+        let agent = SimulatedActionAgent::new()
+            .with_default_scenario(ScenarioOutcome::AcceptThenSucceed)
+            .with_default_cancel_behavior(CancelBehavior::CannotCancel);
+        let action_id = ProtocolId::generate();
+        agent.handle_dispatch(&dispatch(action_id));
+        agent.configure_cancel_behavior(action_id, CancelBehavior::Cancellable);
+
+        let ack = agent.handle_cancel(&cancel(action_id));
+        assert_eq!(ack.body.outcome, CancelAckOutcome::Cancelled);
     }
 
     #[test]

@@ -35,14 +35,15 @@ use tokio_tungstenite::WebSocketStream;
 use bamep_agent_protocol::{
     decode, encode, ActionAckMessage, ActionAckOutcome, ActionProgressMessage, ActionResultMessage,
     ActionResultOutcome, AgentProtocolMessage, AuthErrorMessage, AuthRequestMessage,
-    MessageTimestamp, ProtocolErrorMessage, ProtocolId, SessionEstablishedMessage,
+    CancelAckMessage, CancelAckOutcome, MessageTimestamp, ProtocolErrorMessage, ProtocolId,
+    SessionEstablishedMessage,
 };
-use bamep_domain::{ActionEvidence, EndpointId};
+use bamep_domain::{ActionEvidence, CancelAckEvidence, EndpointId};
 use bamep_trusted_bootstrap::ServerCertFingerprint;
 
 use crate::application::{
-    ActionEvidenceService, ApplicationError, BootstrapEvidenceService, EnrollmentService,
-    RedeemResult,
+    ActionEvidenceService, ApplicationError, BootstrapEvidenceService, CancellationService,
+    EnrollmentService, RedeemResult,
 };
 use crate::ports::{CredentialRedemptionRepository, EndpointRepository};
 use crate::runtime::outbound_sessions::{
@@ -130,6 +131,8 @@ pub enum AgentGatewayError {
          ActionEvidenceService"
     )]
     ActionEvidenceServiceNotConfigured,
+    #[error("authenticated session received CancelAck without a configured CancellationService")]
+    CancellationServiceNotConfigured,
     #[error(transparent)]
     Application(#[from] ApplicationError),
 }
@@ -161,6 +164,12 @@ pub struct AgentControlGateway<R: EndpointRepository, C: CredentialRedemptionRep
     bootstrap_evidence: Option<Arc<BootstrapEvidenceService<R>>>,
     inventory: Option<Arc<crate::application::InventoryService>>,
     action_evidence: Option<Arc<ActionEvidenceService>>,
+    /// Applies inbound `CancelAck` evidence (Issue #27 "CancelAck
+    /// handling"). Deliberately never used for the operator/internal
+    /// cancellation-request control path — that path
+    /// (`CancellationService::request`) must remain structurally separate
+    /// from this inbound Agent Protocol message loop.
+    cancellation: Option<Arc<CancellationService>>,
     /// The Runtime Presence Registry this Gateway's authenticated sessions
     /// register with/unregister from (`m0-stack-and-boundaries-baseline.md`
     /// "Runtime Presence Registry"). Owned by the Gateway by default so every
@@ -185,6 +194,7 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             bootstrap_evidence: None,
             inventory: None,
             action_evidence: None,
+            cancellation: None,
             presence: Arc::new(PresenceRegistry::new()),
             outbound_sessions: Arc::new(OutboundSessionDirectory::new()),
         }
@@ -208,6 +218,11 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
 
     pub fn with_action_evidence_service(mut self, service: Arc<ActionEvidenceService>) -> Self {
         self.action_evidence = Some(service);
+        self
+    }
+
+    pub fn with_cancellation_service(mut self, service: Arc<CancellationService>) -> Self {
+        self.cancellation = Some(service);
         self
     }
 
@@ -346,13 +361,21 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                                     )
                                     .await?;
                                 }
+                                AgentProtocolMessage::CancelAck(ack) => {
+                                    self.handle_cancel_ack(&mut write, session.endpoint_id, ack)
+                                        .await?;
+                                }
                                 AgentProtocolMessage::ProtocolError(_) => {}
                                 AgentProtocolMessage::AuthRequest(_)
                                 | AgentProtocolMessage::SessionEstablished(_)
                                 | AgentProtocolMessage::AuthError(_)
-                                | AgentProtocolMessage::ActionDispatch(_) => {
-                                    // `ActionDispatch` is Server -> Agent
-                                    // only; the Agent must never send it.
+                                | AgentProtocolMessage::ActionDispatch(_)
+                                | AgentProtocolMessage::CancelAction(_) => {
+                                    // `ActionDispatch`/`CancelAction` are
+                                    // Server -> Agent only; the Agent must
+                                    // never send either — in particular, the
+                                    // Agent must never be able to initiate
+                                    // Job cancellation.
                                     self.send_protocol_error(&mut write, Some(id)).await?;
                                 }
                             }
@@ -439,6 +462,40 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             .ok_or(AgentGatewayError::ActionEvidenceServiceNotConfigured)?;
         match service
             .apply(result.body.action_id, endpoint_id, evidence)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(ApplicationError::UnknownAction) => Ok(()),
+            Err(e) => Err(AgentGatewayError::Application(e)),
+        }
+    }
+
+    /// Validates the protocol-wide `correlation_id == action_id` rule, then
+    /// applies the evidence through [`CancellationService`] (Issue #27
+    /// "CancelAck handling"). Unknown/foreign `action_id` is deliberately
+    /// silent and non-terminal, mirroring [`Self::handle_action_ack`].
+    async fn handle_cancel_ack<W: MessageSink>(
+        &self,
+        write: &mut W,
+        endpoint_id: EndpointId,
+        ack: CancelAckMessage,
+    ) -> Result<(), AgentGatewayError> {
+        let message_id = ack.envelope.message_id;
+        if ack.envelope.correlation_id != Some(ack.body.action_id) {
+            return self.send_protocol_error(write, Some(message_id)).await;
+        }
+        let service = self
+            .cancellation
+            .as_ref()
+            .ok_or(AgentGatewayError::CancellationServiceNotConfigured)?;
+        let evidence = match ack.body.outcome {
+            CancelAckOutcome::Cancelled => CancelAckEvidence::Cancelled,
+            CancelAckOutcome::AlreadyCompleted => CancelAckEvidence::AlreadyCompleted,
+            CancelAckOutcome::CannotCancel => CancelAckEvidence::CannotCancel,
+            CancelAckOutcome::Unknown => CancelAckEvidence::Unknown,
+        };
+        match service
+            .apply_cancel_ack(ack.body.action_id, endpoint_id, evidence)
             .await
         {
             Ok(_) => Ok(()),

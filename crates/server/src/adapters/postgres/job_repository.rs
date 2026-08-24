@@ -22,10 +22,12 @@ use super::shared::{
 use crate::ports::{
     ActionEvidenceLockedFacts, AdmitJobDecision, AdmitJobError, ApplyActionEvidenceDecision,
     ApplyActionEvidenceDecisionOutcome, ApplyActionEvidenceError, ApplyActionEvidenceResult,
+    ApplyCancelAckDecision, ApplyCancelAckDecisionOutcome, ApplyCancelAckResult,
     AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError,
-    CommitDestructiveDispatchError, CreateWorkflowError, FinalDispatchDecision,
-    FinalDispatchLockedFacts, JobRepository, RepositoryError, SatisfyStepPreconditionsDecision,
-    SatisfyStepPreconditionsError,
+    CancellationRequestDecided, CommitDestructiveDispatchError, CreateWorkflowError,
+    FinalDispatchDecision, FinalDispatchLockedFacts, JobRepository, RepositoryError,
+    RequestCancellationDecision, RequestCancellationError, RequestCancellationLockedFacts,
+    RequestCancellationResult, SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError,
 };
 
 /// Adapter-local representation of the `job_state` PostgreSQL ENUM
@@ -816,6 +818,346 @@ impl JobRepository for PostgresJobRepository {
         .map_err(to_backend_err)?;
         Ok(targets)
     }
+
+    /// See the Port doc for the full lock/decide/persist contract. Lock
+    /// order preserves Attempt -> JobStep -> Job (Issue #27 "Lock order /
+    /// concurrency"): an unlocked pre-scan identifies at most one candidate
+    /// active/uncertain Attempt (more than one is an invariant/backend
+    /// error), then locks are acquired Attempt -> JobStep -> Job, and the
+    /// candidate's freshly-locked state is re-verified before `decide` runs
+    /// — never trusting the pre-lock guess.
+    async fn request_cancellation(
+        &self,
+        job_id: JobId,
+        decide: RequestCancellationDecision,
+    ) -> Result<RequestCancellationResult, RequestCancellationError> {
+        let candidate_rows = sqlx::query(
+            "SELECT a.id AS attempt_id \
+             FROM attempts a \
+             JOIN job_steps js ON js.id = a.job_step_id \
+             WHERE js.job_id = $1 AND js.state = 'Dispatching' \
+               AND a.state IN ('Dispatched', 'InProgress', 'AwaitingReconciliation')",
+        )
+        .bind(job_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(to_backend_err)?;
+        if candidate_rows.len() > 1 {
+            return Err(RequestCancellationError::Repository(
+                RepositoryError::Backend(
+                    "invariant violation: more than one simultaneously active/uncertain \
+                     attempt for job"
+                        .to_string(),
+                ),
+            ));
+        }
+        let candidate_attempt_id: Option<uuid::Uuid> = match candidate_rows.first() {
+            Some(row) => Some(row.try_get("attempt_id").map_err(to_backend_err)?),
+            None => None,
+        };
+
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        let active_attempt = if let Some(attempt_id) = candidate_attempt_id {
+            let attempt_row = sqlx::query(
+                "SELECT id, job_step_id, action_id, state FROM attempts WHERE id = $1 FOR UPDATE",
+            )
+            .bind(attempt_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+            let Some(attempt_row) = attempt_row else {
+                return Err(RequestCancellationError::Repository(
+                    RepositoryError::Backend(
+                        "candidate active attempt disappeared under lock".to_string(),
+                    ),
+                ));
+            };
+            let attempt =
+                row_to_attempt(&attempt_row).map_err(RequestCancellationError::Repository)?;
+
+            sqlx::query("SELECT id FROM job_steps WHERE id = $1 FOR UPDATE")
+                .bind(attempt.job_step_id.0)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(to_backend_err)?;
+
+            // Re-verify under lock — never trust the pre-lock guess: the
+            // Attempt may have independently reached a terminal state
+            // between the unlocked scan and this lock acquisition (Issue
+            // #27 "Lock order / concurrency", case A).
+            matches!(
+                attempt.state,
+                AttemptState::Dispatched
+                    | AttemptState::InProgress
+                    | AttemptState::AwaitingReconciliation
+            )
+            .then_some(attempt)
+        } else {
+            None
+        };
+
+        let job_row = sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+        let Some(job_row) = job_row else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(RequestCancellationError::JobNotFound(job_id));
+        };
+        let endpoint_id: uuid::Uuid = job_row.try_get("endpoint_id").map_err(to_backend_err)?;
+        let job_state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
+        let steps = fetch_job_steps(&mut tx, job_id, true)
+            .await
+            .map_err(RequestCancellationError::Repository)?;
+        let job = Job {
+            id: job_id,
+            endpoint_id: EndpointId(endpoint_id),
+            state: job_state.into(),
+            steps,
+        };
+
+        let facts = RequestCancellationLockedFacts {
+            job,
+            active_attempt,
+        };
+
+        let decided = match decide(facts) {
+            Ok(decided) => decided,
+            Err(bamep_domain::CancellationRequestError::NotEligible) => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Err(RequestCancellationError::NotEligible(job_id));
+            }
+        };
+
+        match decided {
+            CancellationRequestDecided::EnteredCancelling {
+                job,
+                attempt_id,
+                action_id,
+                audit,
+            } => {
+                sqlx::query("UPDATE jobs SET state = $1 WHERE id = $2")
+                    .bind(PgJobState::from(job.state))
+                    .bind(job_id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+                insert_audit_record(&mut tx, &audit).await?;
+                tx.commit().await.map_err(to_backend_err)?;
+                Ok(RequestCancellationResult::EnteredCancelling {
+                    attempt_id,
+                    action_id,
+                    endpoint_id: job.endpoint_id,
+                })
+            }
+            CancellationRequestDecided::CompletedImmediately { job, event, audit } => {
+                sqlx::query("UPDATE jobs SET state = $1 WHERE id = $2")
+                    .bind(PgJobState::from(job.state))
+                    .bind(job_id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+                sqlx::query(
+                    "INSERT INTO domain_events \
+                     (event_id, event_type, event_version, endpoint_id, job_id, occurred_at, payload) \
+                     VALUES ($1, $2, 1, $3, $4, $5, $6)",
+                )
+                .bind(event.event_id())
+                .bind(PgDomainEventType::from(&event))
+                .bind(event.endpoint_id().0)
+                .bind(job_id.0)
+                .bind(event.occurred_at())
+                .bind(event_payload(&event))
+                .execute(&mut *tx)
+                .await
+                .map_err(to_backend_err)?;
+                insert_audit_record(&mut tx, &audit).await?;
+                tx.commit().await.map_err(to_backend_err)?;
+                Ok(RequestCancellationResult::CompletedImmediately)
+            }
+            CancellationRequestDecided::AlreadyCancelling => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(RequestCancellationResult::AlreadyCancelling)
+            }
+            CancellationRequestDecided::AlreadyTerminal => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(RequestCancellationResult::AlreadyTerminal)
+            }
+        }
+    }
+
+    /// See the Port doc. Lock order and correlation mirror
+    /// `apply_action_evidence` exactly: Attempt -> JobStep -> Job by
+    /// `action_id`, verifying the owning Job targets
+    /// `authenticated_endpoint_id`.
+    async fn apply_cancel_ack(
+        &self,
+        action_id: ActionId,
+        authenticated_endpoint_id: EndpointId,
+        decide: ApplyCancelAckDecision,
+    ) -> Result<ApplyCancelAckResult, ApplyActionEvidenceError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        let attempt_row = sqlx::query(
+            "SELECT id, job_step_id, action_id, state FROM attempts WHERE action_id = $1 FOR UPDATE",
+        )
+        .bind(action_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+        let Some(attempt_row) = attempt_row else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(ApplyActionEvidenceError::UnknownAction);
+        };
+        let attempt = row_to_attempt(&attempt_row)?;
+
+        let step_row = sqlx::query(
+            "SELECT id, job_id, step_order, state, \
+                    authorized_inventory_revision_id, authorized_target_fingerprint, failure_reason \
+             FROM job_steps WHERE id = $1 FOR UPDATE",
+        )
+        .bind(attempt.job_step_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+        let Some(step_row) = step_row else {
+            return Err(ApplyActionEvidenceError::Repository(
+                RepositoryError::Backend(
+                    "attempt references a job_step that no longer exists".to_string(),
+                ),
+            ));
+        };
+        let job_step = row_to_job_step(&step_row)?;
+
+        let job_row = sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_step.job_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+        let Some(job_row) = job_row else {
+            return Err(ApplyActionEvidenceError::Repository(
+                RepositoryError::Backend(
+                    "job_step references a job that no longer exists".to_string(),
+                ),
+            ));
+        };
+        let job_endpoint_id: uuid::Uuid = job_row.try_get("endpoint_id").map_err(to_backend_err)?;
+        let job_state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
+        let steps = fetch_job_steps(&mut tx, job_step.job_id, true)
+            .await
+            .map_err(ApplyActionEvidenceError::Repository)?;
+        let job = Job {
+            id: job_step.job_id,
+            endpoint_id: EndpointId(job_endpoint_id),
+            state: job_state.into(),
+            steps,
+        };
+
+        if job.endpoint_id != authenticated_endpoint_id {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(ApplyActionEvidenceError::UnknownAction);
+        }
+
+        let facts = ActionEvidenceLockedFacts {
+            job,
+            job_step,
+            attempt,
+        };
+
+        match decide(facts) {
+            ApplyCancelAckDecisionOutcome::NoOp => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(ApplyCancelAckResult::NoOp)
+            }
+            ApplyCancelAckDecisionOutcome::Applied(commit) => {
+                let applied = commit.outcome;
+
+                sqlx::query("UPDATE attempts SET state = $1 WHERE id = $2")
+                    .bind(PgAttemptState::from(applied.attempt.state))
+                    .bind(applied.attempt.id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+
+                sqlx::query("UPDATE job_steps SET state = $1, failure_reason = $2 WHERE id = $3")
+                    .bind(PgJobStepState::from(applied.job_step.state))
+                    .bind(
+                        applied
+                            .job_step
+                            .failure_reason
+                            .map(PgJobStepFailureReason::from),
+                    )
+                    .bind(applied.job_step.id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+
+                sqlx::query("UPDATE jobs SET state = $1 WHERE id = $2")
+                    .bind(PgJobState::from(applied.job.state))
+                    .bind(applied.job.id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+
+                for event in &applied.events {
+                    sqlx::query(
+                        "INSERT INTO domain_events \
+                         (event_id, event_type, event_version, endpoint_id, job_id, job_step_id, occurred_at, payload) \
+                         VALUES ($1, $2, 1, $3, $4, $5, $6, $7)",
+                    )
+                    .bind(event.event_id())
+                    .bind(PgDomainEventType::from(event))
+                    .bind(event.endpoint_id().0)
+                    .bind(event.job_id().map(|id| id.0))
+                    .bind(event.job_step_id().map(|id| id.0))
+                    .bind(event.occurred_at())
+                    .bind(event_payload(event))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+                }
+
+                if let Some(audit) = &commit.audit {
+                    insert_audit_record(&mut tx, audit)
+                        .await
+                        .map_err(ApplyActionEvidenceError::Repository)?;
+                }
+
+                tx.commit().await.map_err(to_backend_err)?;
+                Ok(ApplyCancelAckResult::Applied(applied))
+            }
+        }
+    }
+}
+
+/// Shared `audit_records` insert used by [`PostgresJobRepository::request_cancellation`]
+/// and [`PostgresJobRepository::apply_cancel_ack`].
+async fn insert_audit_record(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    audit: &bamep_domain::AuditRecord,
+) -> Result<(), RepositoryError> {
+    sqlx::query(
+        "INSERT INTO audit_records \
+         (audit_id, endpoint_id, actor_kind, actor_label, occurred_at, detail, \
+          job_id, job_step_id, attempt_id, action_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(audit.audit_id)
+    .bind(audit.endpoint_id.0)
+    .bind(PgAuditActorKind::from(&audit.actor))
+    .bind(actor_label(&audit.actor))
+    .bind(audit.occurred_at)
+    .bind(&audit.detail)
+    .bind(audit.job_id.map(|id| id.0))
+    .bind(audit.job_step_id.map(|id| id.0))
+    .bind(audit.attempt_id.map(|id| id.0))
+    .bind(audit.action_id.map(|id| id.0))
+    .execute(&mut **tx)
+    .await
+    .map_err(to_backend_err)?;
+    Ok(())
 }
 
 fn row_to_attempt(row: &sqlx::postgres::PgRow) -> Result<Attempt, RepositoryError> {

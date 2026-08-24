@@ -19,11 +19,12 @@ use async_trait::async_trait;
 use bamep_domain::presented_credential::{CredentialKind, CredentialLookupId};
 use bamep_domain::{
     ActionEvidenceApplied, ActionId, Attempt, AttemptId, AuditRecord, BootContext,
-    BootContextResolveError, DestructiveIntent, DestructiveIntentError, EndpointAggregate,
-    EndpointId, FinalDispatchDenial, FinalDispatchOutcome, FinalDispatchRejection,
-    InvalidIdentityTransition, InventoryRevision, InventoryRevisionId, InventorySnapshot, Job,
-    JobAdmissionError, JobAdmissionOutcome, JobId, JobStep, JobStepEligibilityError, JobStepId,
-    RedeemOutcome, TargetFingerprint, TransitionOutcome, TrustedBootstrapOutcome,
+    BootContextResolveError, CancelAckApplied, CancellationRequestError, DestructiveIntent,
+    DestructiveIntentError, EndpointAggregate, EndpointId, FinalDispatchDenial,
+    FinalDispatchOutcome, FinalDispatchRejection, InvalidIdentityTransition, InventoryRevision,
+    InventoryRevisionId, InventorySnapshot, Job, JobAdmissionError, JobAdmissionOutcome, JobId,
+    JobStep, JobStepEligibilityError, JobStepId, RedeemOutcome, TargetFingerprint,
+    TransitionOutcome, TrustedBootstrapOutcome,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -345,6 +346,160 @@ pub trait JobRepository: Send + Sync {
         action_id: ActionId,
         authenticated_endpoint_id: EndpointId,
     ) -> Result<bool, RepositoryError>;
+
+    /// Locks exactly the `Job` identified by `job_id` (including its current
+    /// ordered `JobStep`s) and — when one currently exists — the JobStep-
+    /// current Attempt in `Dispatched`/`InProgress`/`AwaitingReconciliation`,
+    /// under the same Attempt -> JobStep -> Job lock order
+    /// [`Self::apply_action_evidence`] uses (Issue #27 "Lock order /
+    /// concurrency": "Do NOT introduce a competing Job -> Attempt lock
+    /// cycle"), invokes `decide` with that freshly-read
+    /// [`RequestCancellationLockedFacts`], and — only for
+    /// [`CancellationRequestDecided::EnteredCancelling`] /
+    /// [`CancellationRequestDecided::CompletedImmediately`] — atomically
+    /// persists the returned Job state, required domain event (for
+    /// `CompletedImmediately`), and required operator cancellation audit in
+    /// the same transaction.
+    ///
+    /// More than one simultaneously active/uncertain Attempt for `job_id` is
+    /// never guessed at — it is an invariant/backend error
+    /// ([`RepositoryError::Backend`]) rather than an arbitrarily selected
+    /// candidate (Issue #27 "Active Attempt selection").
+    async fn request_cancellation(
+        &self,
+        job_id: JobId,
+        decide: RequestCancellationDecision,
+    ) -> Result<RequestCancellationResult, RequestCancellationError>;
+
+    /// Resolves `action_id` to its owning Attempt/JobStep/Job, locks all
+    /// three in the same Attempt -> JobStep -> Job order
+    /// [`Self::apply_action_evidence`] uses, verifies the owning Job targets
+    /// `authenticated_endpoint_id`, invokes `decide` with the freshly locked
+    /// [`ActionEvidenceLockedFacts`], and — only for
+    /// [`ApplyCancelAckDecisionOutcome::Applied`] — atomically persists the
+    /// returned [`CancelAckCommit`]'s Attempt/JobStep/Job state, required
+    /// `JobCancelled` event, and (for a terminal outcome) required audit
+    /// record in the same transaction (Issue #27 "CancelAck handling").
+    ///
+    /// Mirrors [`Self::apply_action_evidence`]'s non-enumeration contract: an
+    /// unknown `action_id`, or a known `action_id` whose owning Job targets a
+    /// different Endpoint, is [`ApplyActionEvidenceError::UnknownAction`] in
+    /// both cases.
+    async fn apply_cancel_ack(
+        &self,
+        action_id: ActionId,
+        authenticated_endpoint_id: EndpointId,
+        decide: ApplyCancelAckDecision,
+    ) -> Result<ApplyCancelAckResult, ApplyActionEvidenceError>;
+}
+
+/// Durable facts read under lock immediately before one cancellation-request
+/// decision (Issue #27 "Durable cancellation request"): the current Job
+/// (including every ordered JobStep) and — when one currently exists — the
+/// JobStep-current Attempt in `Dispatched`/`InProgress`/`AwaitingReconciliation`.
+pub struct RequestCancellationLockedFacts {
+    pub job: Job,
+    pub active_attempt: Option<Attempt>,
+}
+
+/// A pure decision over freshly locked [`RequestCancellationLockedFacts`],
+/// mirroring [`FinalDispatchDecision`]/[`ApplyActionEvidenceDecision`]: the
+/// Adapter locks and reads current state, this closure decides (calling
+/// `bamep_domain::request_cancellation` and, for a mutating outcome,
+/// constructing the required operator cancellation [`AuditRecord`] — Domain
+/// itself never constructs one), and the Adapter persists the result
+/// atomically in the same transaction.
+pub type RequestCancellationDecision = Box<
+    dyn FnOnce(
+            RequestCancellationLockedFacts,
+        ) -> Result<CancellationRequestDecided, CancellationRequestError>
+        + Send,
+>;
+
+/// The Application-level decision [`RequestCancellationDecision`] returns,
+/// mirroring `bamep_domain::CancellationRequestOutcome` with the required
+/// [`AuditRecord`] attached for the two mutating cases.
+pub enum CancellationRequestDecided {
+    EnteredCancelling {
+        job: Job,
+        attempt_id: AttemptId,
+        action_id: ActionId,
+        audit: AuditRecord,
+    },
+    CompletedImmediately {
+        job: Job,
+        event: bamep_domain::DomainEvent,
+        audit: AuditRecord,
+    },
+    AlreadyCancelling,
+    AlreadyTerminal,
+}
+
+/// The result of [`JobRepository::request_cancellation`] after successful
+/// resolution/locking, mirroring [`CancellationRequestDecided`] without the
+/// audit record (a persistence-only concern). `EnteredCancelling` carries
+/// only what the Application-level `CancelAction` send needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestCancellationResult {
+    EnteredCancelling {
+        attempt_id: AttemptId,
+        action_id: ActionId,
+        endpoint_id: EndpointId,
+    },
+    CompletedImmediately,
+    AlreadyCancelling,
+    AlreadyTerminal,
+}
+
+/// Errors from [`JobRepository::request_cancellation`].
+#[derive(Debug, thiserror::Error)]
+pub enum RequestCancellationError {
+    #[error("job {0:?} not found")]
+    JobNotFound(JobId),
+    /// `job.state` was `Pending` — out of this WP's ACTIVE-Job-cancellation
+    /// scope (`bamep_domain::CancellationRequestError::NotEligible`).
+    #[error("job {0:?} is not eligible for a cancellation request")]
+    NotEligible(JobId),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
+/// A pure decision over freshly locked [`ActionEvidenceLockedFacts`] for
+/// `CancelAck` evidence, mirroring [`ApplyActionEvidenceDecision`]: the
+/// Adapter locks and reads current state, this closure decides (calling
+/// `bamep_domain::apply_cancel_ack` and, only for a terminal outcome,
+/// constructing the required [`AuditRecord`]), and the Adapter persists the
+/// result atomically in the same transaction.
+pub type ApplyCancelAckDecision =
+    Box<dyn FnOnce(ActionEvidenceLockedFacts) -> ApplyCancelAckDecisionOutcome + Send>;
+
+/// A successful [`ApplyCancelAckDecision`] "Applied" result: the Domain
+/// outcome plus the immutable terminal [`AuditRecord`] that must commit
+/// atomically alongside it when `outcome.terminal` is `true` — `None`
+/// otherwise, mirroring [`ActionEvidenceCommit`].
+pub struct CancelAckCommit {
+    pub outcome: CancelAckApplied,
+    pub audit: Option<AuditRecord>,
+}
+
+/// The two outcomes [`ApplyCancelAckDecision`] may produce, mirroring
+/// `bamep_domain::CancelAckOutcome` at the Application boundary. Unlike
+/// [`ApplyActionEvidenceDecisionOutcome`] there is no `Conflict` variant —
+/// see `bamep_domain::cancellation` module docs.
+#[allow(clippy::large_enum_variant)]
+pub enum ApplyCancelAckDecisionOutcome {
+    Applied(CancelAckCommit),
+    NoOp,
+}
+
+/// The result of [`JobRepository::apply_cancel_ack`] after successful
+/// resolution/locking/correlation — mirrors [`ApplyCancelAckDecisionOutcome`]
+/// without the audit record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum ApplyCancelAckResult {
+    Applied(CancelAckApplied),
+    NoOp,
 }
 
 /// Durable facts read under lock immediately before one normal Agent action
@@ -613,6 +768,17 @@ pub trait AgentDispatchPort: Send + Sync {
         &self,
         endpoint_id: EndpointId,
         dispatch: bamep_agent_protocol::ActionDispatchMessage,
+    ) -> Result<(), AgentDispatchError>;
+
+    /// Transmits `CancelAction{action_id}` for the already-existing action —
+    /// never a replacement identity (Issue #27 "Reuse the existing outbound
+    /// session path"). A successful return means only that the local
+    /// transport accepted the frame, exactly like
+    /// [`Self::dispatch_action`]'s identical caveat.
+    async fn cancel_action(
+        &self,
+        endpoint_id: EndpointId,
+        cancel: bamep_agent_protocol::CancelActionMessage,
     ) -> Result<(), AgentDispatchError>;
 }
 
