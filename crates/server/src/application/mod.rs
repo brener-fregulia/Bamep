@@ -16,7 +16,7 @@ use bamep_domain::credential::{CredentialDimension, CredentialHash};
 use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_domain::{
     evaluate_final_destructive_dispatch, transitions, ActionEvidence, ActionEvidenceOutcome,
-    ActionId, Actor, Attempt, AuditRecord, BootContext, BootNonce, DestructiveIntent,
+    ActionId, Actor, Attempt, AttemptState, AuditRecord, BootContext, BootNonce, DestructiveIntent,
     EmptyWorkflow, EndpointId, FinalDispatchInputs, FinalDispatchOutcome, FinalDispatchRejection,
     IdentityState, InvalidIdentityTransition, InventoryRevision, InventorySnapshot, Job, JobId,
     JobStepId, TrustedBootstrapState, DEFAULT_CREDENTIAL_TTL,
@@ -37,7 +37,7 @@ use crate::ports::{
     SatisfyStepPreconditionsError, TargetRevalidationPort,
 };
 use crate::runtime::presence::PresenceRegistry;
-use crate::runtime::reservation_registry::AttemptReservationRegistry;
+use crate::runtime::reservation_registry::{AttemptReservationRegistry, RegistrationOutcome};
 use crate::runtime::resource_arbiter::{
     InsufficientCapacity, ReservationId, ResourceClaim, TechnicalResourceArbiter,
 };
@@ -49,6 +49,28 @@ use crate::runtime::resource_arbiter::{
 /// `parameters` schema is closed and empty.
 pub const M1_SIMULATED_EXECUTION_ACTION_TYPE: &str = "bamep.m1.simulated-execution";
 pub const M1_SIMULATED_EXECUTION_ACTION_VERSION: &str = "1";
+
+/// `ActionResult.detail`'s exact normative shape for the single M1 concrete
+/// action (`m1-simulated-vertical-slice-and-baseline-validation.md` RF-004;
+/// Issue #26 "Action wire contract enforcement"). `detail`'s schema is
+/// otherwise opaque to `bamep_agent_protocol` — it is owned by the
+/// Specification that owns the concrete `action_type`, so this check lives
+/// here, in Application, rather than in the wire crate. Only `detail.code` is
+/// required to exactly match; unrecognized extra fields are tolerated
+/// (forward compatibility, mirroring the rest of the wire contract).
+/// `ActionResultOutcome::Cancelled` never matches — #26 never applies
+/// evidence for it (#27 owns `Cancelled`).
+pub fn m1_result_detail_matches(
+    outcome: bamep_agent_protocol::ActionResultOutcome,
+    detail: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let expected_code = match outcome {
+        bamep_agent_protocol::ActionResultOutcome::Succeeded => "SIMULATED_COMPLETION",
+        bamep_agent_protocol::ActionResultOutcome::Failed => "SIMULATED_FAILURE",
+        bamep_agent_protocol::ActionResultOutcome::Cancelled => return false,
+    };
+    detail.get("code").and_then(|v| v.as_str()) == Some(expected_code)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplicationError {
@@ -618,13 +640,26 @@ impl<J: JobRepository> FinalDispatchService<J> {
 }
 
 /// Outcome of [`ActionDispatchService::dispatch`]: whether the local
-/// transport accepted the `ActionDispatch` frame, or why it did not. Neither
-/// variant implies Agent receipt/execution
-/// (`m0-agent-protocol-contract.md`; Issue #26 "Send failure boundary").
+/// transport accepted the `ActionDispatch` frame, or why it did not, or why
+/// no send was attempted at all. Neither `Sent` nor `SendFailed` implies
+/// Agent receipt/execution (`m0-agent-protocol-contract.md`; Issue #26 "Send
+/// failure boundary").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionDispatchOutcome {
     Sent,
     SendFailed(AgentDispatchError),
+    /// This exact `attempt.id` was already registered in
+    /// [`AttemptReservationRegistry`] by a prior call — a repeated
+    /// Application call for an already-dispatched Attempt (e.g. a duplicate
+    /// scheduling trigger). No send was attempted; the original reservation
+    /// mapping is untouched (Issue #26 correction "Prevent a second
+    /// server-side dispatch attempt").
+    AlreadyDispatched,
+    /// `attempt.state` was not [`AttemptState::Dispatched`] — a stale or
+    /// terminal Attempt object must never be used to construct a fresh
+    /// `ActionDispatch`. No mapping was registered and no send was
+    /// attempted.
+    NotDispatchable,
 }
 
 /// Transmits a durably committed `Attempt{Dispatched}` exactly once over the
@@ -654,20 +689,37 @@ impl ActionDispatchService {
         }
     }
 
-    /// Registers `attempt.id -> reservation` first — unconditionally, even
-    /// when the subsequent transmission attempt fails — so the reservation
-    /// remains discoverable through [`AttemptReservationRegistry`] for
-    /// whatever normal terminal evidence (or #28 reconciliation) eventually
-    /// resolves this Attempt. Constructs `ActionDispatch` for the single M1
-    /// concrete action, converting `attempt.action_id`'s exact persisted
-    /// UUID into `ProtocolId` — never generating a replacement identity.
+    /// Guards against constructing a fresh `ActionDispatch` from a stale or
+    /// terminal Attempt object, then registers `attempt.id -> reservation` —
+    /// only sending when this call is the one that actually establishes that
+    /// mapping. A second call for an already-registered `attempt.id` (e.g. a
+    /// repeated Application trigger for the same already-committed Attempt)
+    /// never sends again, regardless of whether the first call's send
+    /// itself succeeded or failed — a first send failure still leaves the
+    /// mapping registered, so it still refuses to resend
+    /// (`m0-job-lifecycle-and-scheduling.md` "Reservation ownership"; Issue
+    /// #26 correction "Prevent a second server-side dispatch attempt"). The
+    /// reservation is never released merely because a send failed or was
+    /// refused — #28 owns uncertain-delivery reconciliation. Constructs
+    /// `ActionDispatch` for the single M1 concrete action, converting
+    /// `attempt.action_id`'s exact persisted UUID into `ProtocolId` — never
+    /// generating a replacement identity.
     pub async fn dispatch(
         &self,
         endpoint_id: EndpointId,
         attempt: Attempt,
         reservation: ReservationId,
     ) -> ActionDispatchOutcome {
-        self.reservations.register(attempt.id, reservation);
+        if attempt.state != AttemptState::Dispatched {
+            return ActionDispatchOutcome::NotDispatchable;
+        }
+
+        match self.reservations.register(attempt.id, reservation) {
+            RegistrationOutcome::AlreadyRegistered => {
+                return ActionDispatchOutcome::AlreadyDispatched
+            }
+            RegistrationOutcome::Registered => {}
+        }
 
         let action_id = ProtocolId::from_uuid(attempt.action_id.0)
             .expect("a Domain ActionId is always a valid UUID v4");
@@ -805,6 +857,27 @@ impl ActionEvidenceService {
         }
 
         Ok(result)
+    }
+
+    /// Read-only `ActionProgress` correlation check (Issue #26 "Correlate
+    /// ActionProgress to the authenticated Endpoint"): reports whether
+    /// `action_id` belongs to an Attempt whose Job targets
+    /// `authenticated_endpoint_id`. Never mutates lifecycle state, never
+    /// persists anything — `ActionProgress` is transient advisory metadata,
+    /// so this deliberately never reaches [`Self::apply`]'s lock/decide/
+    /// persist boundary. An unknown or foreign `action_id` both report
+    /// `false`, mirroring [`Self::apply`]'s identical non-enumeration
+    /// policy for `UnknownAction`.
+    pub async fn action_belongs_to_endpoint(
+        &self,
+        action_id: ProtocolId,
+        authenticated_endpoint_id: EndpointId,
+    ) -> Result<bool, ApplicationError> {
+        let domain_action_id = ActionId(action_id.as_uuid());
+        Ok(self
+            .repo
+            .action_targets_endpoint(domain_action_id, authenticated_endpoint_id)
+            .await?)
     }
 }
 
@@ -1405,6 +1478,14 @@ mod tests {
             > {
                 unimplemented!("DestructiveIntentService never applies action evidence")
             }
+
+            async fn action_targets_endpoint(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+            ) -> Result<bool, RepositoryError> {
+                unimplemented!("DestructiveIntentService never correlates ActionProgress")
+            }
         }
 
         /// In-memory `InventoryRepository` fake exposing only a configurable
@@ -1873,6 +1954,14 @@ mod tests {
             > {
                 unimplemented!("FinalDispatchService tests never apply action evidence")
             }
+
+            async fn action_targets_endpoint(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+            ) -> Result<bool, RepositoryError> {
+                unimplemented!("FinalDispatchService tests never correlate ActionProgress")
+            }
         }
 
         fn intent(
@@ -2326,6 +2415,201 @@ mod tests {
                 arbiter.release(reservation);
             }
             assert!(arbiter.acquire(claims()).is_ok());
+        }
+    }
+
+    mod action_dispatch_service {
+        use super::*;
+        use crate::ports::AgentDispatchError;
+        use crate::runtime::resource_arbiter::ResourceKind;
+        use bamep_domain::{ActionId, AttemptId, JobStepId};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// In-memory `AgentDispatchPort` fake that counts calls and can be
+        /// configured to fail exactly once — enough to prove
+        /// `ActionDispatchService`'s registration guard without any real
+        /// transport (`crates/server/tests/action_dispatch_wss.rs` covers the
+        /// real-WSS path).
+        #[derive(Default)]
+        struct FakeDispatchPort {
+            calls: AtomicUsize,
+            fail_next: Mutex<bool>,
+        }
+
+        impl FakeDispatchPort {
+            fn new() -> Self {
+                Self::default()
+            }
+
+            fn failing_once() -> Self {
+                Self {
+                    calls: AtomicUsize::new(0),
+                    fail_next: Mutex::new(true),
+                }
+            }
+
+            fn call_count(&self) -> usize {
+                self.calls.load(Ordering::SeqCst)
+            }
+        }
+
+        #[async_trait]
+        impl AgentDispatchPort for FakeDispatchPort {
+            async fn dispatch_action(
+                &self,
+                _endpoint_id: EndpointId,
+                _dispatch: ActionDispatchMessage,
+            ) -> Result<(), AgentDispatchError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut fail = self.fail_next.lock().unwrap();
+                if *fail {
+                    *fail = false;
+                    return Err(AgentDispatchError::SendFailed);
+                }
+                Ok(())
+            }
+        }
+
+        fn dispatched_attempt() -> Attempt {
+            Attempt {
+                id: AttemptId::new(),
+                job_step_id: JobStepId::new(),
+                action_id: ActionId::new(),
+                state: AttemptState::Dispatched,
+            }
+        }
+
+        fn arbiter() -> TechnicalResourceArbiter {
+            TechnicalResourceArbiter::new([(ResourceKind::new("network"), 10)])
+        }
+
+        fn reservation(arbiter: &TechnicalResourceArbiter) -> ReservationId {
+            arbiter
+                .acquire(vec![ResourceClaim::new(ResourceKind::new("network"), 1)])
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn first_dispatch_sends_and_registers_the_reservation() {
+            let reservations = Arc::new(AttemptReservationRegistry::new());
+            let transport = Arc::new(FakeDispatchPort::new());
+            let svc = ActionDispatchService::new(
+                Arc::clone(&reservations),
+                Arc::clone(&transport) as Arc<dyn AgentDispatchPort>,
+            );
+            let arbiter = arbiter();
+            let res = reservation(&arbiter);
+            let attempt = dispatched_attempt();
+
+            let outcome = svc.dispatch(EndpointId::new(), attempt, res).await;
+
+            assert_eq!(outcome, ActionDispatchOutcome::Sent);
+            assert_eq!(transport.call_count(), 1);
+            assert_eq!(reservations.take(attempt.id), Some(res));
+        }
+
+        #[tokio::test]
+        async fn repeated_call_for_the_same_attempt_sends_nothing() {
+            let reservations = Arc::new(AttemptReservationRegistry::new());
+            let transport = Arc::new(FakeDispatchPort::new());
+            let svc = ActionDispatchService::new(
+                Arc::clone(&reservations),
+                Arc::clone(&transport) as Arc<dyn AgentDispatchPort>,
+            );
+            let arbiter = arbiter();
+            let first_reservation = reservation(&arbiter);
+            let attempt = dispatched_attempt();
+
+            let first = svc
+                .dispatch(EndpointId::new(), attempt, first_reservation)
+                .await;
+            assert_eq!(first, ActionDispatchOutcome::Sent);
+
+            let second_reservation = reservation(&arbiter);
+            let second = svc
+                .dispatch(EndpointId::new(), attempt, second_reservation)
+                .await;
+
+            assert_eq!(second, ActionDispatchOutcome::AlreadyDispatched);
+            assert_eq!(
+                transport.call_count(),
+                1,
+                "the transport must not be invoked a second time"
+            );
+            assert_eq!(
+                reservations.take(attempt.id),
+                Some(first_reservation),
+                "the original reservation must remain the mapping, never replaced"
+            );
+        }
+
+        #[tokio::test]
+        async fn repeated_call_after_first_send_failed_still_sends_nothing() {
+            let reservations = Arc::new(AttemptReservationRegistry::new());
+            let transport = Arc::new(FakeDispatchPort::failing_once());
+            let svc = ActionDispatchService::new(
+                Arc::clone(&reservations),
+                Arc::clone(&transport) as Arc<dyn AgentDispatchPort>,
+            );
+            let arbiter = arbiter();
+            let first_reservation = reservation(&arbiter);
+            let attempt = dispatched_attempt();
+
+            let first = svc
+                .dispatch(EndpointId::new(), attempt, first_reservation)
+                .await;
+            assert_eq!(
+                first,
+                ActionDispatchOutcome::SendFailed(AgentDispatchError::SendFailed)
+            );
+            assert_eq!(transport.call_count(), 1);
+
+            let second_reservation = reservation(&arbiter);
+            let second = svc
+                .dispatch(EndpointId::new(), attempt, second_reservation)
+                .await;
+
+            assert_eq!(
+                second,
+                ActionDispatchOutcome::AlreadyDispatched,
+                "a first send failure must still refuse a second send attempt"
+            );
+            assert_eq!(
+                transport.call_count(),
+                1,
+                "the failed first send must never be retried by a second call"
+            );
+            assert_eq!(
+                reservations.take(attempt.id),
+                Some(first_reservation),
+                "the reservation must remain registered after a send failure, not released"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_non_dispatched_attempt_is_rejected_without_registering_or_sending() {
+            let reservations = Arc::new(AttemptReservationRegistry::new());
+            let transport = Arc::new(FakeDispatchPort::new());
+            let svc = ActionDispatchService::new(
+                Arc::clone(&reservations),
+                Arc::clone(&transport) as Arc<dyn AgentDispatchPort>,
+            );
+            let arbiter = arbiter();
+            let res = reservation(&arbiter);
+            let attempt = Attempt {
+                state: AttemptState::Succeeded,
+                ..dispatched_attempt()
+            };
+
+            let outcome = svc.dispatch(EndpointId::new(), attempt, res).await;
+
+            assert_eq!(outcome, ActionDispatchOutcome::NotDispatchable);
+            assert_eq!(transport.call_count(), 0);
+            assert_eq!(
+                reservations.take(attempt.id),
+                None,
+                "no mapping must be registered for a non-Dispatched attempt"
+            );
         }
     }
 }

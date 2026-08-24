@@ -58,11 +58,16 @@ pub fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
 
 #[derive(Default)]
 struct Inner {
-    /// The most-recently-registered live `SessionId` per Endpoint — exactly
-    /// the session `dispatch_action` selects
-    /// (`m0-job-lifecycle-and-scheduling.md`; Issue #26: "choose the most
-    /// recently registered authenticated session").
-    most_recent_session: HashMap<EndpointId, ProtocolId>,
+    /// Every currently-live (registered, not yet unregistered) `SessionId`
+    /// per Endpoint, oldest to newest — the last entry is exactly the session
+    /// `dispatch_action` selects (`m0-job-lifecycle-and-scheduling.md`; Issue
+    /// #26: "choose the most recently registered authenticated session").
+    /// Kept as an ordered list, not a single pointer, so that when the
+    /// currently-selected newest session unregisters, an older session that
+    /// is still live becomes selectable again — this is not fallback after a
+    /// send attempt, only correct selection before one ever begins (Issue
+    /// #26 correction "Fix overlapping live-session selection").
+    live_sessions: HashMap<EndpointId, Vec<ProtocolId>>,
     channels: HashMap<ProtocolId, OutboundSender>,
 }
 
@@ -77,14 +82,18 @@ impl OutboundSessionDirectory {
         Self::default()
     }
 
-    /// Registers `session_id`'s outbound sender for `endpoint_id`, and makes
-    /// it the Endpoint's most-recently-registered live session. Idempotent
-    /// for the exact same `(endpoint_id, session_id, sender)` triple;
-    /// registering a second session for the same Endpoint simply replaces
-    /// which session is currently selected — the older session's own
-    /// channel entry remains until its own `unregister` call, so it can
-    /// still be explicitly unregistered later, but it is never selected by
-    /// [`AgentDispatchPort::dispatch_action`] again once superseded.
+    /// Registers `session_id`'s outbound sender for `endpoint_id`, and marks
+    /// it the newest currently-live session — the one
+    /// [`AgentDispatchPort::dispatch_action`] selects. Idempotent for the
+    /// exact same `(endpoint_id, session_id, sender)` triple; registering a
+    /// second session for the same Endpoint simply changes which session is
+    /// currently selected — an older session's own channel entry remains
+    /// until its own `unregister` call, so it can still be explicitly
+    /// unregistered later. If that older session is still live when the
+    /// newer one unregisters, it becomes selectable again (Issue #26
+    /// correction "Fix overlapping live-session selection") — this is
+    /// distinct from ever falling back to it *after* a send attempt has
+    /// begun through the newer one, which never happens.
     pub fn register(
         &self,
         endpoint_id: EndpointId,
@@ -96,25 +105,36 @@ impl OutboundSessionDirectory {
             .lock()
             .expect("outbound session directory lock poisoned");
         inner.channels.insert(session_id, sender);
-        inner.most_recent_session.insert(endpoint_id, session_id);
+        let sessions = inner.live_sessions.entry(endpoint_id).or_default();
+        if !sessions.contains(&session_id) {
+            sessions.push(session_id);
+        }
     }
 
-    /// Unregisters exactly `session_id`'s channel. The Endpoint's
-    /// most-recent-session pointer is cleared only when it still points at
-    /// this exact `session_id` — an older, already-superseded session's exit
-    /// must never erase a newer session's registration
+    /// Unregisters exactly `session_id`'s channel and removes it from
+    /// `endpoint_id`'s live-session list, wherever in that list it currently
+    /// sits — an older, already-superseded session's exit must never erase a
+    /// newer session's registration, and a newer session's exit must reveal
+    /// whichever older session is still live, if any
     /// (`m0-job-lifecycle-and-scheduling.md`; Issue #26: "no fallback send
-    /// through another overlapping session after one send attempt").
-    /// Idempotent: unregistering an unknown/already-removed `session_id` is
-    /// a safe no-op.
+    /// through another overlapping session after one send attempt" — a rule
+    /// about not retrying a send that already began, not about which
+    /// still-live session is selectable before one does). Idempotent:
+    /// unregistering an unknown/already-removed `session_id` is a safe
+    /// no-op.
     pub fn unregister(&self, endpoint_id: EndpointId, session_id: ProtocolId) {
         let mut inner = self
             .inner
             .lock()
             .expect("outbound session directory lock poisoned");
         inner.channels.remove(&session_id);
-        if inner.most_recent_session.get(&endpoint_id) == Some(&session_id) {
-            inner.most_recent_session.remove(&endpoint_id);
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            inner.live_sessions.entry(endpoint_id)
+        {
+            entry.get_mut().retain(|s| *s != session_id);
+            if entry.get().is_empty() {
+                entry.remove();
+            }
         }
     }
 }
@@ -132,8 +152,9 @@ impl AgentDispatchPort for OutboundSessionDirectory {
                 .lock()
                 .expect("outbound session directory lock poisoned");
             let session_id = inner
-                .most_recent_session
+                .live_sessions
                 .get(&endpoint_id)
+                .and_then(|sessions| sessions.last())
                 .copied()
                 .ok_or(AgentDispatchError::NoSession)?;
             inner
@@ -232,6 +253,60 @@ mod tests {
             async move { directory.dispatch_action(endpoint_id, dispatch()).await }
         });
         let OutboundCommand::Send { ack, .. } = rx_b.recv().await.expect("B must still receive");
+        ack.send(Ok(())).unwrap();
+        send_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn newer_session_unregistering_reveals_a_still_live_older_session() {
+        // B is selected while A and B are both live; B disconnects before
+        // any dispatch was attempted through it — A must become selectable
+        // again. This is not fallback (no send through B was ever
+        // attempted), only correct selection among currently-live sessions.
+        let directory = Arc::new(OutboundSessionDirectory::new());
+        let endpoint_id = endpoint();
+        let (tx_a, mut rx_a) = outbound_channel();
+        let (tx_b, _rx_b) = outbound_channel();
+        let session_a = ProtocolId::generate();
+        let session_b = ProtocolId::generate();
+        directory.register(endpoint_id, session_a, tx_a);
+        directory.register(endpoint_id, session_b, tx_b);
+
+        directory.unregister(endpoint_id, session_b);
+
+        let send_task = tokio::spawn({
+            let directory = Arc::clone(&directory);
+            async move { directory.dispatch_action(endpoint_id, dispatch()).await }
+        });
+        let OutboundCommand::Send { ack, .. } = rx_a
+            .recv()
+            .await
+            .expect("A (still live, now the newest remaining session) must receive the command");
+        ack.send(Ok(())).unwrap();
+        send_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn older_session_unregistering_while_newer_remains_live_never_disturbs_the_newer() {
+        let directory = Arc::new(OutboundSessionDirectory::new());
+        let endpoint_id = endpoint();
+        let (tx_a, _rx_a) = outbound_channel();
+        let (tx_b, mut rx_b) = outbound_channel();
+        let session_a = ProtocolId::generate();
+        let session_b = ProtocolId::generate();
+        directory.register(endpoint_id, session_a, tx_a);
+        directory.register(endpoint_id, session_b, tx_b);
+
+        directory.unregister(endpoint_id, session_a);
+
+        let send_task = tokio::spawn({
+            let directory = Arc::clone(&directory);
+            async move { directory.dispatch_action(endpoint_id, dispatch()).await }
+        });
+        let OutboundCommand::Send { ack, .. } = rx_b
+            .recv()
+            .await
+            .expect("B must remain selected, undisturbed by A's unrelated exit");
         ack.send(Ok(())).unwrap();
         send_task.await.unwrap().unwrap();
     }

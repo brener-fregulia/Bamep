@@ -26,10 +26,10 @@ pub use envelope::{
     ProtocolVersion,
 };
 pub use messages::{
-    ActionAckBody, ActionAckError, ActionAckMessage, ActionAckOutcome, ActionDispatchBody,
-    ActionDispatchMessage, ActionProgressBody, ActionProgressMessage, ActionResultBody,
-    ActionResultMessage, ActionResultOutcome, AgentProtocolMessage, AuthErrorBody,
-    AuthErrorMessage, AuthRequestBody, AuthRequestMessage, BootstrapEvidenceBody,
+    ActionAckBody, ActionAckContractError, ActionAckError, ActionAckMessage, ActionAckOutcome,
+    ActionDispatchBody, ActionDispatchMessage, ActionProgressBody, ActionProgressMessage,
+    ActionResultBody, ActionResultMessage, ActionResultOutcome, AgentProtocolMessage,
+    AuthErrorBody, AuthErrorMessage, AuthRequestBody, AuthRequestMessage, BootstrapEvidenceBody,
     BootstrapEvidenceMessage, EmptyActionProgress, InventoryReportBody, InventoryReportMessage,
     LocalBootTrust, ProtocolErrorBody, ProtocolErrorMessage, SessionEstablishedBody,
     SessionEstablishedMessage,

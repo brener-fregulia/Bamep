@@ -328,6 +328,23 @@ pub trait JobRepository: Send + Sync {
         authenticated_endpoint_id: EndpointId,
         decide: ApplyActionEvidenceDecision,
     ) -> Result<ApplyActionEvidenceResult, ApplyActionEvidenceError>;
+
+    /// Read-only correlation check for `ActionProgress` (Issue #26
+    /// "Correlate ActionProgress to the authenticated Endpoint"): resolves
+    /// `action_id` to its owning Attempt -> JobStep -> Job and reports
+    /// whether that Job targets `authenticated_endpoint_id`. Unlike
+    /// [`Self::apply_action_evidence`], this never locks, decides, or
+    /// persists anything — a plain read, since `ActionProgress` is transient
+    /// advisory metadata that must never reach a lifecycle transition. An
+    /// unknown `action_id` and a known `action_id` belonging to another
+    /// Endpoint's Job both report `false` — this method never distinguishes
+    /// the two, mirroring `apply_action_evidence`'s identical non-enumeration
+    /// policy.
+    async fn action_targets_endpoint(
+        &self,
+        action_id: ActionId,
+        authenticated_endpoint_id: EndpointId,
+    ) -> Result<bool, RepositoryError>;
 }
 
 /// Durable facts read under lock immediately before one normal Agent action

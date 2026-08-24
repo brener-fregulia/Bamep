@@ -130,6 +130,66 @@ fn action_ack_rejected_with_message_round_trips() {
     }
 }
 
+/// Builds a raw `ActionAck` wire JSON value with the given `outcome`/`error`
+/// fragment injected verbatim, for tests that must express wire-invalid
+/// shapes no constructor can produce.
+fn raw_action_ack(action_id: ProtocolId, outcome: &str, error_fragment: &str) -> String {
+    let envelope = bamep_agent_protocol::Envelope::new();
+    format!(
+        r#"{{"type":"ActionAck","message_id":"{}","protocol_version":"1","timestamp":"{}","correlation_id":"{}","action_id":"{}","outcome":"{}"{}}}"#,
+        envelope.message_id,
+        envelope.timestamp.as_datetime().to_rfc3339(),
+        action_id,
+        action_id,
+        outcome,
+        error_fragment,
+    )
+}
+
+#[test]
+fn action_ack_accepted_with_error_is_rejected_on_decode() {
+    let action_id = ProtocolId::generate();
+    let json = raw_action_ack(action_id, "Accepted", r#","error":{"code":"SOME_CODE"}"#);
+    assert!(
+        codec::decode(&json).is_err(),
+        "Accepted must never carry error, even on the wire"
+    );
+}
+
+#[test]
+fn action_ack_rejected_without_error_is_rejected_on_decode() {
+    let action_id = ProtocolId::generate();
+    let json = raw_action_ack(action_id, "Rejected", "");
+    assert!(
+        codec::decode(&json).is_err(),
+        "Rejected must always carry error, even on the wire"
+    );
+}
+
+#[test]
+fn action_ack_rejected_with_empty_error_code_is_rejected_on_decode() {
+    let action_id = ProtocolId::generate();
+    let json = raw_action_ack(action_id, "Rejected", r#","error":{"code":""}"#);
+    assert!(
+        codec::decode(&json).is_err(),
+        "error.code must be non-empty"
+    );
+}
+
+#[test]
+fn action_ack_rejected_with_empty_error_message_is_rejected_on_decode() {
+    let action_id = ProtocolId::generate();
+    let json = raw_action_ack(
+        action_id,
+        "Rejected",
+        r#","error":{"code":"SOME_CODE","message":""}"#,
+    );
+    assert!(
+        codec::decode(&json).is_err(),
+        "error.message, when present, must be non-empty"
+    );
+}
+
 #[test]
 fn action_ack_re_emission_gets_a_fresh_message_id_but_preserves_correlation_and_body() {
     let action_id = ProtocolId::generate();
@@ -188,6 +248,26 @@ fn action_progress_requires_at_least_one_field() {
     let action_id = ProtocolId::generate();
     assert!(ActionProgressMessage::new(action_id, None, None, None).is_err());
     assert!(ActionProgressMessage::new(action_id, None, Some(1024), None).is_ok());
+}
+
+#[test]
+fn action_progress_with_every_field_absent_is_rejected_on_the_wire_too() {
+    // Not only the constructor: a derived Deserialize alone would happily
+    // accept `{percent, bytes_processed, eta}` all absent on untrusted wire
+    // input, since every field is individually optional.
+    let envelope = bamep_agent_protocol::Envelope::new();
+    let action_id = ProtocolId::generate();
+    let json = format!(
+        r#"{{"type":"ActionProgress","message_id":"{}","protocol_version":"1","timestamp":"{}","correlation_id":"{}","action_id":"{}"}}"#,
+        envelope.message_id,
+        envelope.timestamp.as_datetime().to_rfc3339(),
+        action_id,
+        action_id,
+    );
+    assert!(
+        codec::decode(&json).is_err(),
+        "a wire ActionProgress with every field absent must be rejected explicitly"
+    );
 }
 
 #[test]

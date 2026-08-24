@@ -690,6 +690,60 @@ async fn evidence_belonging_to_another_endpoint_is_indistinguishable_from_unknow
     db.teardown().await;
 }
 
+/// Issue #26 correction "Correlate ActionProgress to the authenticated
+/// Endpoint": `ActionEvidenceService::action_belongs_to_endpoint` is the
+/// minimum read/check boundary `AgentControlGateway::handle_action_progress`
+/// uses. Proves the three cases directly at the Application/Postgres
+/// boundary — known+matching, unknown, known+foreign — without any
+/// WebSocket, and proves the check itself is a plain read: it never mutates
+/// the Attempt/JobStep/Job it correlates against.
+#[tokio::test]
+async fn action_belongs_to_endpoint_reports_true_only_for_the_owning_endpoint() {
+    let db = TestDatabase::setup().await;
+    let services = build_services(db.pool.clone());
+    let presence = Arc::new(PresenceRegistry::new());
+    let (_job_id, _step_ids, endpoint_id, attempt, _reservation) = dispatched_attempt(
+        &db.pool,
+        &services,
+        &presence,
+        "action-progress-correlate",
+        1,
+    )
+    .await;
+    let other_endpoint_id =
+        enrolled_endpoint(&services, "action-progress-correlate-other", Utc::now()).await;
+    let svc = evidence_service(
+        Arc::clone(&services.job_repo),
+        Arc::new(AttemptReservationRegistry::new()),
+        arbiter(),
+    );
+    let action_id = ProtocolId::from_uuid(attempt.action_id.0).unwrap();
+
+    assert!(
+        svc.action_belongs_to_endpoint(action_id, endpoint_id)
+            .await
+            .unwrap(),
+        "a known action_id belonging to this Endpoint's Job must report true"
+    );
+    assert!(
+        !svc.action_belongs_to_endpoint(action_id, other_endpoint_id)
+            .await
+            .unwrap(),
+        "a known action_id belonging to ANOTHER Endpoint's Job must report false"
+    );
+    assert!(
+        !svc.action_belongs_to_endpoint(ProtocolId::generate(), endpoint_id)
+            .await
+            .unwrap(),
+        "an unknown action_id must report false"
+    );
+
+    // A plain read: the Attempt is untouched by any of the checks above.
+    assert_eq!(attempt_state(&db.pool, attempt.id.0).await, "Dispatched");
+
+    db.teardown().await;
+}
+
 #[tokio::test]
 async fn concurrent_terminal_evidence_produces_exactly_one_authoritative_commit_and_release() {
     let db = TestDatabase::setup().await;

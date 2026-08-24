@@ -793,6 +793,29 @@ impl JobRepository for PostgresJobRepository {
             }
         }
     }
+
+    /// A plain, unlocked read — no transaction, no `FOR UPDATE`, nothing
+    /// persisted. See the Port doc for the non-enumeration contract.
+    async fn action_targets_endpoint(
+        &self,
+        action_id: ActionId,
+        authenticated_endpoint_id: EndpointId,
+    ) -> Result<bool, RepositoryError> {
+        let targets: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM attempts \
+                JOIN job_steps ON job_steps.id = attempts.job_step_id \
+                JOIN jobs ON jobs.id = job_steps.job_id \
+                WHERE attempts.action_id = $1 AND jobs.endpoint_id = $2 \
+             )",
+        )
+        .bind(action_id.0)
+        .bind(authenticated_endpoint_id.0)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(to_backend_err)?;
+        Ok(targets)
+    }
 }
 
 fn row_to_attempt(row: &sqlx::postgres::PgRow) -> Result<Attempt, RepositoryError> {

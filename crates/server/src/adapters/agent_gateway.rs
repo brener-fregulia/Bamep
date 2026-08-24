@@ -33,9 +33,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use bamep_agent_protocol::{
-    decode, encode, ActionAckMessage, ActionAckOutcome, ActionResultMessage, ActionResultOutcome,
-    AgentProtocolMessage, AuthErrorMessage, AuthRequestMessage, MessageTimestamp,
-    ProtocolErrorMessage, ProtocolId, SessionEstablishedMessage,
+    decode, encode, ActionAckMessage, ActionAckOutcome, ActionProgressMessage, ActionResultMessage,
+    ActionResultOutcome, AgentProtocolMessage, AuthErrorMessage, AuthRequestMessage,
+    MessageTimestamp, ProtocolErrorMessage, ProtocolId, SessionEstablishedMessage,
 };
 use bamep_domain::{ActionEvidence, EndpointId};
 use bamep_trusted_bootstrap::ServerCertFingerprint;
@@ -70,39 +70,31 @@ pub struct AuthenticatedSession {
     pub session_id: ProtocolId,
 }
 
-/// Reliably unregisters exactly one `(endpoint_id, session_id)` presence
-/// registration on drop — covering the normal `Ok(())` return, every `?`
-/// early-return, and an unwinding panic alike (`m0-stack-and-boundaries-baseline.md`
-/// "Runtime Presence Registry"). Constructed only by
-/// [`AgentControlGateway::run_authenticated_session`].
-struct PresenceGuard {
-    registry: Arc<PresenceRegistry>,
+/// Reliably unregisters exactly one `(endpoint_id, session_id)` from both the
+/// Runtime Presence Registry and the [`OutboundSessionDirectory`] on drop —
+/// covering the normal `Ok(())` return, every `?` early-return, and an
+/// unwinding panic alike. A single combined guard, not two separate ones, so
+/// the required shutdown order (Issue #26 correction "Make presence mean
+/// outbound-ready for this session": presence removed first, outbound
+/// delivery removed second) is enforced structurally by this one `Drop` impl
+/// rather than by relying on two guards being declared in the right order —
+/// the registries themselves remain fully separate: this type owns no
+/// registry logic of its own, it only sequences two existing `unregister`
+/// calls. Constructed only by [`AgentControlGateway::run_authenticated_session`],
+/// after both registrations have already happened (in the required outbound-
+/// then-presence startup order).
+struct SessionLifecycleGuard {
+    presence: Arc<PresenceRegistry>,
+    outbound_sessions: Arc<OutboundSessionDirectory>,
     endpoint_id: EndpointId,
     session_id: ProtocolId,
 }
 
-impl Drop for PresenceGuard {
+impl Drop for SessionLifecycleGuard {
     fn drop(&mut self) {
-        self.registry.unregister(self.endpoint_id, self.session_id);
-    }
-}
-
-/// Reliably unregisters exactly one `(endpoint_id, session_id)` outbound
-/// session-delivery registration on drop, exactly like [`PresenceGuard`] but
-/// against the separate [`OutboundSessionDirectory`]
-/// (`m0-job-lifecycle-and-scheduling.md`; Issue #26 "Session registration /
-/// cleanup": "Cleanup must unregister that exact SessionId from both on
-/// every exit path"). Deliberately its own guard type, not merged with
-/// [`PresenceGuard`] — the two registries remain separate responsibilities.
-struct OutboundSessionGuard {
-    directory: Arc<OutboundSessionDirectory>,
-    endpoint_id: EndpointId,
-    session_id: ProtocolId,
-}
-
-impl Drop for OutboundSessionGuard {
-    fn drop(&mut self) {
-        self.directory.unregister(self.endpoint_id, self.session_id);
+        self.presence.unregister(self.endpoint_id, self.session_id);
+        self.outbound_sessions
+            .unregister(self.endpoint_id, self.session_id);
     }
 }
 
@@ -274,23 +266,27 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
         // Registration happens only here — after the caller has already
         // confirmed `HandshakeOutcome::Established` and every configuration
         // precondition above has passed — never for a rejected/failed
-        // authentication. Both guards unregister exactly this `SessionId`
-        // from their respective registry on every exit path below: normal
-        // Close/disconnect (`Ok(())`), a genuine Gateway error (`?`), and an
-        // unwinding panic alike.
-        self.presence
-            .register(session.endpoint_id, session.session_id);
-        let _presence_guard = PresenceGuard {
-            registry: Arc::clone(&self.presence),
-            endpoint_id: session.endpoint_id,
-            session_id: session.session_id,
-        };
-
+        // authentication. `SessionLifecycleGuard` reliably unregisters this
+        // exact `SessionId` from both registries, in the required order, on
+        // every exit path below: normal Close/disconnect (`Ok(())`), a
+        // genuine Gateway error (`?`), and an unwinding panic alike.
+        //
+        // Ordering is deliberate (Issue #26 correction "Make presence mean
+        // outbound-ready for this session"): outbound delivery registers
+        // FIRST, presence SECOND, so #25's final-dispatch gate can never
+        // observe presence for a session that is not yet outbound-ready.
+        // `SessionLifecycleGuard::drop` unregisters presence first and
+        // outbound delivery second — no new final-dispatch gate can pass
+        // based on a session whose outbound delivery has already
+        // disappeared.
         let (outbound_tx, mut outbound_rx) = outbound_channel();
         self.outbound_sessions
             .register(session.endpoint_id, session.session_id, outbound_tx);
-        let _outbound_guard = OutboundSessionGuard {
-            directory: Arc::clone(&self.outbound_sessions),
+        self.presence
+            .register(session.endpoint_id, session.session_id);
+        let _lifecycle_guard = SessionLifecycleGuard {
+            presence: Arc::clone(&self.presence),
+            outbound_sessions: Arc::clone(&self.outbound_sessions),
             endpoint_id: session.endpoint_id,
             session_id: session.session_id,
         };
@@ -342,18 +338,13 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                                         .await?;
                                 }
                                 AgentProtocolMessage::ActionProgress(progress) => {
-                                    // Transient/advisory only — never
-                                    // persisted, never mutates Attempt/
-                                    // JobStep/Job lifecycle state
-                                    // (`m0-agent-protocol-contract.md`
-                                    // "ActionProgress fields"). Still
-                                    // enforced for the protocol-wide
-                                    // correlation rule.
-                                    if progress.envelope.correlation_id
-                                        != Some(progress.body.action_id)
-                                    {
-                                        self.send_protocol_error(&mut write, Some(id)).await?;
-                                    }
+                                    self.handle_action_progress(
+                                        &mut write,
+                                        session.endpoint_id,
+                                        id,
+                                        progress,
+                                    )
+                                    .await?;
                                 }
                                 AgentProtocolMessage::ProtocolError(_) => {}
                                 AgentProtocolMessage::AuthRequest(_)
@@ -433,6 +424,15 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             ActionResultOutcome::Failed => ActionEvidence::ResultFailed,
             ActionResultOutcome::Cancelled => return Ok(()),
         };
+        // Enforce the M1 concrete action's exact terminal `detail` shape
+        // before this evidence ever reaches a durable decision — malformed/
+        // incompatible detail must never cause a durable terminal transition
+        // (Issue #26 "Action wire contract enforcement"). `detail`'s schema
+        // is otherwise opaque to Agent Protocol; this check is intentionally
+        // Application-level, not codec-level.
+        if !crate::application::m1_result_detail_matches(result.body.outcome, &result.body.detail) {
+            return self.send_protocol_error(write, Some(message_id)).await;
+        }
         let service = self
             .action_evidence
             .as_ref()
@@ -445,6 +445,39 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             Err(ApplicationError::UnknownAction) => Ok(()),
             Err(e) => Err(AgentGatewayError::Application(e)),
         }
+    }
+
+    /// Transient/advisory only — never persisted, never mutates Attempt/
+    /// JobStep/Job lifecycle state (`m0-agent-protocol-contract.md`
+    /// "ActionProgress fields"). Still enforced for two correlation rules:
+    /// self-correlation (`correlation_id == action_id`) and — Issue #26
+    /// "Correlate ActionProgress to the authenticated Endpoint" — that
+    /// `action_id` actually belongs to an Attempt whose Job targets this
+    /// authenticated Endpoint. Both violations respond identically with a
+    /// generic `ProtocolError`; this method never distinguishes a
+    /// self-correlation violation from an unknown/foreign `action_id`, and
+    /// never creates a PostgreSQL progress row (there is none to create).
+    async fn handle_action_progress<W: MessageSink>(
+        &self,
+        write: &mut W,
+        endpoint_id: EndpointId,
+        message_id: ProtocolId,
+        progress: ActionProgressMessage,
+    ) -> Result<(), AgentGatewayError> {
+        if progress.envelope.correlation_id != Some(progress.body.action_id) {
+            return self.send_protocol_error(write, Some(message_id)).await;
+        }
+        let service = self
+            .action_evidence
+            .as_ref()
+            .ok_or(AgentGatewayError::ActionEvidenceServiceNotConfigured)?;
+        let belongs = service
+            .action_belongs_to_endpoint(progress.body.action_id, endpoint_id)
+            .await?;
+        if !belongs {
+            return self.send_protocol_error(write, Some(message_id)).await;
+        }
+        Ok(())
     }
 
     async fn send_protocol_error<W: MessageSink>(
@@ -610,5 +643,68 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             .await
             .map_err(AgentGatewayError::Send)?;
         Ok(HandshakeOutcome::Rejected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ports::AgentDispatchPort;
+    use bamep_agent_protocol::ActionDispatchMessage;
+
+    /// Component-level regression proof for `SessionLifecycleGuard::drop`:
+    /// dropping it removes this exact `SessionId` from BOTH registries, not
+    /// only one — guarding against a future edit accidentally dropping one
+    /// of the two `unregister` calls. `drop`'s two statements execute
+    /// sequentially, single-threaded, with no `.await` between them, so the
+    /// presence-then-outbound *order* this correction requires is guaranteed
+    /// by ordinary Rust control flow (visible by reading the two-line `drop`
+    /// body above) rather than something a black-box runtime test could
+    /// observe without sleeps/instrumentation — there is no async gap for an
+    /// external observer to ever see an in-between state.
+    #[tokio::test]
+    async fn dropping_the_lifecycle_guard_unregisters_both_registries() {
+        let presence = Arc::new(PresenceRegistry::new());
+        let outbound_sessions = Arc::new(OutboundSessionDirectory::new());
+        let endpoint_id = EndpointId::new();
+        let session_id = ProtocolId::generate();
+
+        presence.register(endpoint_id, session_id);
+        let (tx, _rx) = outbound_channel();
+        outbound_sessions.register(endpoint_id, session_id, tx);
+        assert!(presence.is_present(endpoint_id));
+
+        let guard = SessionLifecycleGuard {
+            presence: Arc::clone(&presence),
+            outbound_sessions: Arc::clone(&outbound_sessions),
+            endpoint_id,
+            session_id,
+        };
+        drop(guard);
+
+        assert!(
+            !presence.is_present(endpoint_id),
+            "drop must remove presence"
+        );
+        // No direct "is registered" query exists on OutboundSessionDirectory
+        // beyond `AgentDispatchPort::dispatch_action` itself — checking that
+        // it now reports `NoSession` is the Port-level proof that outbound
+        // delivery was also removed.
+        let dispatch_result = outbound_sessions
+            .dispatch_action(
+                endpoint_id,
+                ActionDispatchMessage::new(
+                    ProtocolId::generate(),
+                    "bamep.m1.simulated-execution",
+                    "1",
+                    serde_json::Map::new(),
+                ),
+            )
+            .await;
+        assert_eq!(
+            dispatch_result,
+            Err(crate::ports::AgentDispatchError::NoSession),
+            "drop must also remove the outbound delivery registration"
+        );
     }
 }

@@ -447,6 +447,21 @@ async fn normal_success_over_real_wss_then_duplicate_terminal_evidence_is_ignore
     )
     .await;
 
+    // Delayed/duplicate ActionProgress after the terminal outcome already
+    // committed — must never create a durable Attempt/JobStep/Job mutation,
+    // event, or audit; the terminal outcome remains authoritative (Issue #26
+    // correction "Correlate ActionProgress to the authenticated Endpoint").
+    let AgentProtocolMessage::ActionProgress(delayed_progress_source) = &scenario_messages[1]
+    else {
+        panic!("expected the scenario's second message to be ActionProgress")
+    };
+    let delayed_progress = delayed_progress_source.clone().with_fresh_message_id();
+    send_agent_message(
+        &mut session.websocket,
+        AgentProtocolMessage::ActionProgress(delayed_progress),
+    )
+    .await;
+
     // Give the server task's select! loop a chance to process every frame
     // already written to the socket before we start asserting DB state —
     // achieved deterministically below by closing the connection and
@@ -464,7 +479,8 @@ async fn normal_success_over_real_wss_then_duplicate_terminal_evidence_is_ignore
     assert_eq!(
         terminal_audit_count(&db.pool, session.attempt.id.0).await,
         1,
-        "the delayed duplicate ActionResult and the delayed Ack must not create a second audit"
+        "the delayed duplicate ActionResult, the delayed Ack, and the delayed \
+         ActionProgress must not create a second audit"
     );
 
     // The reservation must have been released exactly once — never twice by
@@ -610,6 +626,219 @@ async fn dispatch_rejection_over_real_wss() {
     assert_eq!(step_state, "Failed");
     assert_eq!(failure_reason.as_deref(), Some("DispatchRejected"));
     assert_eq!(job_state_text(&db.pool, session.job_id).await, "Failed");
+
+    db.teardown().await;
+}
+
+/// Issue #26 correction "Complete the real-WSS duplicate/delayed proof",
+/// scenario A: the exact same `ActionDispatch` frame crosses the real wire to
+/// the Simulated Agent twice. Simulated by writing it a second time directly
+/// through the real `OutboundSessionDirectory` transport Port, bypassing
+/// `ActionDispatchService`'s own registration guard entirely — that guard
+/// (this same correction, scenario "Prevent a second server-side dispatch
+/// attempt") already proves the Server itself never re-sends; this test is
+/// deliberately an Agent-side idempotency/contract proof only, exercising the
+/// path a resend from outside normal Server scheduling (e.g. a future #28
+/// reconciliation resend) would take.
+#[tokio::test]
+async fn duplicate_action_dispatch_over_real_wss_executes_once_and_creates_no_second_attempt() {
+    let db = TestDatabase::setup().await;
+    let services = build_services(db.pool.clone());
+    let (cert_der, key_der) = generate_test_cert("localhost");
+    let issuer = TrustedBootstrapFixtureIssuer::from_seed([0x64; 32]);
+    let outbound = Arc::new(OutboundSessionDirectory::new());
+    let reservations = Arc::new(AttemptReservationRegistry::new());
+    let evidence_service = Arc::new(ActionEvidenceService::new(
+        Arc::clone(&services.job_repo) as Arc<dyn JobRepository>,
+        Arc::clone(&reservations),
+        arbiter(),
+    ));
+    let gateway = Arc::new(
+        Gateway::new(Arc::clone(&services.enrollment))
+            .with_bootstrap_evidence_service(Arc::new(
+                bamep_server::application::BootstrapEvidenceService::new(
+                    Arc::new(PostgresEndpointRepository::new(db.pool.clone())),
+                    bamep_trusted_bootstrap::AcceptedSiteKeys::single(issuer.public_key()),
+                ),
+            ))
+            .with_outbound_session_directory(Arc::clone(&outbound))
+            .with_action_evidence_service(Arc::clone(&evidence_service)),
+    );
+
+    let mut session = establish_and_dispatch(
+        &services,
+        &gateway,
+        &outbound,
+        &reservations,
+        &arbiter(),
+        &issuer,
+        cert_der,
+        key_der,
+        "127.0.0.1:0".parse().unwrap(),
+        "wss-action-duplicate-dispatch",
+    )
+    .await;
+
+    let AgentProtocolMessage::ActionDispatch(dispatch) =
+        recv_agent_message(&mut session.websocket).await
+    else {
+        panic!("expected ActionDispatch")
+    };
+
+    let agent =
+        SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::AcceptThenSucceed);
+    for message in agent.handle_dispatch(&dispatch) {
+        send_agent_message(&mut session.websocket, message).await;
+    }
+    for message in agent
+        .run_configured_scenario(dispatch.body.action_id)
+        .unwrap()
+    {
+        send_agent_message(&mut session.websocket, message).await;
+    }
+
+    // The exact same frame crosses the wire again, after the Agent already
+    // completed it.
+    outbound
+        .dispatch_action(session.endpoint_id, dispatch.clone())
+        .await
+        .expect("duplicate frame accepted by the local transport");
+    let AgentProtocolMessage::ActionDispatch(duplicate_dispatch) =
+        recv_agent_message(&mut session.websocket).await
+    else {
+        panic!("expected the duplicate ActionDispatch frame")
+    };
+    assert_eq!(duplicate_dispatch.body.action_id, dispatch.body.action_id);
+
+    // Already Completed: the Agent re-emits the retained ActionResult under
+    // a fresh message_id, without re-executing.
+    let duplicate_response = agent.handle_dispatch(&duplicate_dispatch);
+    let [AgentProtocolMessage::ActionResult(duplicate_result)] = duplicate_response.as_slice()
+    else {
+        panic!("expected exactly one retained ActionResult to be re-emitted")
+    };
+    assert_eq!(duplicate_result.body.action_id, dispatch.body.action_id);
+    assert_eq!(
+        duplicate_result.body.outcome,
+        bamep_agent_protocol::ActionResultOutcome::Succeeded
+    );
+    send_agent_message(
+        &mut session.websocket,
+        AgentProtocolMessage::ActionResult(duplicate_result.clone()),
+    )
+    .await;
+
+    session.websocket.close(None).await.unwrap();
+    session.server_task.await.unwrap().unwrap();
+
+    assert_eq!(
+        attempt_state(&db.pool, session.attempt.id.0).await,
+        "Succeeded"
+    );
+    let attempt_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM attempts WHERE job_step_id = $1")
+            .bind(session.step_id.0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(attempt_count, 1, "no second Server Attempt must exist");
+    assert_eq!(
+        terminal_audit_count(&db.pool, session.attempt.id.0).await,
+        1,
+        "the duplicate ActionDispatch's re-emitted ActionResult must not create a second audit"
+    );
+
+    db.teardown().await;
+}
+
+/// Issue #26 correction "Enforce the action wire contract on untrusted
+/// input": malformed/incompatible `ActionResult.detail` for the concrete M1
+/// action must never cause a durable terminal transition, even though
+/// `detail` decodes as a structurally valid JSON object (the wire-invalid
+/// shapes `bamep-agent-protocol`'s codec itself now rejects — `ActionAck`
+/// outcome/error mismatches, an all-absent `ActionProgress` — are covered by
+/// `crates/agent-protocol/tests/action_contract.rs`; this is the one
+/// contract check that is Application-level, not codec-level, since
+/// `detail`'s schema is owned by the Specification that owns the concrete
+/// `action_type`).
+#[tokio::test]
+async fn malformed_action_result_detail_never_causes_a_durable_terminal_transition() {
+    let db = TestDatabase::setup().await;
+    let services = build_services(db.pool.clone());
+    let (cert_der, key_der) = generate_test_cert("localhost");
+    let issuer = TrustedBootstrapFixtureIssuer::from_seed([0x65; 32]);
+    let outbound = Arc::new(OutboundSessionDirectory::new());
+    let reservations = Arc::new(AttemptReservationRegistry::new());
+    let evidence_service = Arc::new(ActionEvidenceService::new(
+        Arc::clone(&services.job_repo) as Arc<dyn JobRepository>,
+        Arc::clone(&reservations),
+        arbiter(),
+    ));
+    let gateway = Arc::new(
+        Gateway::new(Arc::clone(&services.enrollment))
+            .with_bootstrap_evidence_service(Arc::new(
+                bamep_server::application::BootstrapEvidenceService::new(
+                    Arc::new(PostgresEndpointRepository::new(db.pool.clone())),
+                    bamep_trusted_bootstrap::AcceptedSiteKeys::single(issuer.public_key()),
+                ),
+            ))
+            .with_outbound_session_directory(Arc::clone(&outbound))
+            .with_action_evidence_service(Arc::clone(&evidence_service)),
+    );
+
+    let mut session = establish_and_dispatch(
+        &services,
+        &gateway,
+        &outbound,
+        &reservations,
+        &arbiter(),
+        &issuer,
+        cert_der,
+        key_der,
+        "127.0.0.1:0".parse().unwrap(),
+        "wss-action-malformed-detail",
+    )
+    .await;
+
+    let AgentProtocolMessage::ActionDispatch(dispatch) =
+        recv_agent_message(&mut session.websocket).await
+    else {
+        panic!("expected ActionDispatch")
+    };
+    let action_id = dispatch.body.action_id;
+
+    let bogus_detail = object(json!({"code": "NOT_THE_NORMATIVE_M1_CODE"}));
+    let bogus_result = bamep_agent_protocol::ActionResultMessage::new(
+        action_id,
+        bamep_agent_protocol::ActionResultOutcome::Succeeded,
+        bogus_detail,
+    );
+    send_agent_message(
+        &mut session.websocket,
+        AgentProtocolMessage::ActionResult(bogus_result),
+    )
+    .await;
+    let AgentProtocolMessage::ProtocolError(error) =
+        recv_agent_message(&mut session.websocket).await
+    else {
+        panic!("expected a ProtocolError response for the malformed detail")
+    };
+    assert_eq!(error.body.code, "GENERIC");
+
+    session.websocket.close(None).await.unwrap();
+    session.server_task.await.unwrap().unwrap();
+
+    assert_eq!(
+        attempt_state(&db.pool, session.attempt.id.0).await,
+        "Dispatched",
+        "malformed detail must never cause a durable terminal transition"
+    );
+    let (step_state, _) = job_step_row(&db.pool, session.step_id).await;
+    assert_eq!(step_state, "Dispatching");
+    assert_eq!(
+        terminal_audit_count(&db.pool, session.attempt.id.0).await,
+        0
+    );
 
     db.teardown().await;
 }

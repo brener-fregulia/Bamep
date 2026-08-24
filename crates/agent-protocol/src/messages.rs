@@ -14,7 +14,7 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 use crate::envelope::{Envelope, MessageTimestamp, Percent, ProtocolId};
@@ -381,11 +381,29 @@ pub enum ActionAckOutcome {
     Rejected,
 }
 
+/// Rejects a wire-invalid `ActionAck`/`ActionAckError` combination
+/// (`m0-agent-protocol-contract.md` "ActionAck diagnostic shape"): a derived
+/// `Deserialize` alone would accept several invalid forms — `Accepted`
+/// carrying `error`, `Rejected` carrying no `error`, or an `error` with an
+/// empty `code`/`message` — that our own constructors never produce but
+/// untrusted wire input is not guaranteed to avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ActionAckContractError {
+    #[error("ActionAck.error.code must be non-empty")]
+    EmptyErrorCode,
+    #[error("ActionAck.error.message, when present, must be non-empty")]
+    EmptyErrorMessage,
+    #[error("ActionAck{{outcome: Accepted}} must never carry error")]
+    AcceptedWithError,
+    #[error("ActionAck{{outcome: Rejected}} must always carry error")]
+    RejectedWithoutError,
+}
+
 /// `ActionAck.error` diagnostic shape (`m0-agent-protocol-contract.md`
 /// "ActionAck diagnostic shape"): present only for `outcome: Rejected`.
 /// `code` is a non-empty stable diagnostic string owned by the Specification
 /// that owns the concrete `action_type`; this crate does not interpret it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ActionAckError {
     pub code: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -406,12 +424,63 @@ impl ActionAckError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for ActionAckError {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            code: String,
+            #[serde(default)]
+            message: Option<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.code.is_empty() {
+            return Err(D::Error::custom(ActionAckContractError::EmptyErrorCode));
+        }
+        if raw.message.as_deref() == Some("") {
+            return Err(D::Error::custom(ActionAckContractError::EmptyErrorMessage));
+        }
+        Ok(Self {
+            code: raw.code,
+            message: raw.message,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ActionAckBody {
     pub action_id: ProtocolId,
     pub outcome: ActionAckOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ActionAckError>,
+}
+
+impl<'de> Deserialize<'de> for ActionAckBody {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            action_id: ProtocolId,
+            outcome: ActionAckOutcome,
+            #[serde(default)]
+            error: Option<ActionAckError>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        match (raw.outcome, &raw.error) {
+            (ActionAckOutcome::Accepted, Some(_)) => {
+                return Err(D::Error::custom(ActionAckContractError::AcceptedWithError))
+            }
+            (ActionAckOutcome::Rejected, None) => {
+                return Err(D::Error::custom(
+                    ActionAckContractError::RejectedWithoutError,
+                ))
+            }
+            (ActionAckOutcome::Accepted, None) | (ActionAckOutcome::Rejected, Some(_)) => {}
+        }
+        Ok(Self {
+            action_id: raw.action_id,
+            outcome: raw.outcome,
+            error: raw.error,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -472,7 +541,7 @@ impl ActionAckMessage {
 #[error("ActionProgress requires at least one of percent, bytes_processed, eta")]
 pub struct EmptyActionProgress;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ActionProgressBody {
     pub action_id: ProtocolId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -481,6 +550,31 @@ pub struct ActionProgressBody {
     pub bytes_processed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eta: Option<MessageTimestamp>,
+}
+
+impl<'de> Deserialize<'de> for ActionProgressBody {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            action_id: ProtocolId,
+            #[serde(default)]
+            percent: Option<Percent>,
+            #[serde(default)]
+            bytes_processed: Option<u64>,
+            #[serde(default)]
+            eta: Option<MessageTimestamp>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.percent.is_none() && raw.bytes_processed.is_none() && raw.eta.is_none() {
+            return Err(D::Error::custom(EmptyActionProgress));
+        }
+        Ok(Self {
+            action_id: raw.action_id,
+            percent: raw.percent,
+            bytes_processed: raw.bytes_processed,
+            eta: raw.eta,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

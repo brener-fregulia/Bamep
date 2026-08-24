@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use bamep_agent_protocol::{
     decode, encode, AgentProtocolMessage, AuthRequestMessage, BootstrapEvidenceMessage, Envelope,
-    InventoryReportMessage, ProtocolErrorMessage, ProtocolVersion,
+    InventoryReportMessage, ProtocolErrorMessage, ProtocolId, ProtocolVersion,
 };
 use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_server::adapters::agent_gateway::{
@@ -188,6 +188,30 @@ async fn authenticated_session_reports_wire_violations_but_keeps_invalid_evidenc
             .await
     });
 
+    // Wire-invalid ActionAck/ActionProgress shapes (Issue #26 correction
+    // "Enforce the action wire contract on untrusted input"): these are
+    // rejected by `bamep_agent_protocol`'s own `Deserialize` before the
+    // Gateway ever matches on a known variant, exactly like the other
+    // malformed/unknown frames this test already proves — a decode failure,
+    // never a trustworthy correlation_id.
+    let action_id = ProtocolId::generate();
+    let envelope1 = Envelope::new();
+    let malformed_action_ack = format!(
+        r#"{{"type":"ActionAck","message_id":"{}","protocol_version":"1","timestamp":"{}","correlation_id":"{}","action_id":"{}","outcome":"Rejected"}}"#,
+        envelope1.message_id,
+        envelope1.timestamp.as_datetime().to_rfc3339(),
+        action_id,
+        action_id,
+    );
+    let envelope2 = Envelope::new();
+    let malformed_action_progress = format!(
+        r#"{{"type":"ActionProgress","message_id":"{}","protocol_version":"1","timestamp":"{}","correlation_id":"{}","action_id":"{}"}}"#,
+        envelope2.message_id,
+        envelope2.timestamp.as_datetime().to_rfc3339(),
+        action_id,
+        action_id,
+    );
+
     for frame in [
         Message::text("{"),
         Message::text(
@@ -200,6 +224,8 @@ async fn authenticated_session_reports_wire_violations_but_keeps_invalid_evidenc
             )))
             .unwrap(),
         ),
+        Message::text(malformed_action_ack),
+        Message::text(malformed_action_progress),
     ] {
         client_ws.send(frame).await.unwrap();
         let AgentProtocolMessage::ProtocolError(error) = recv_message(&mut client_ws).await else {

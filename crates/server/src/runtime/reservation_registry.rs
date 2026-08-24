@@ -18,12 +18,30 @@
 //! Deliberately not in `adapters` — this registry never touches WebSocket/
 //! transport infrastructure at all.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use bamep_domain::AttemptId;
 
 use super::resource_arbiter::ReservationId;
+
+/// Outcome of [`AttemptReservationRegistry::register`]: whether this call
+/// actually established the mapping, or found one already present (Issue #26
+/// correction "Prevent a second server-side dispatch attempt"). Distinct from
+/// silently overwriting/reporting success unconditionally — a caller
+/// (`ActionDispatchService::dispatch`) uses this to decide whether it may
+/// send at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationOutcome {
+    /// No mapping existed for this `AttemptId`; `reservation_id` is now
+    /// registered.
+    Registered,
+    /// A mapping already existed for this `AttemptId` — never overwritten,
+    /// never released by this call. The original `ReservationId` remains the
+    /// mapping.
+    AlreadyRegistered,
+}
 
 #[derive(Default)]
 pub struct AttemptReservationRegistry {
@@ -35,16 +53,34 @@ impl AttemptReservationRegistry {
         Self::default()
     }
 
-    /// Registers `reservation_id` for `attempt_id`. Must happen before
-    /// outbound dispatch becomes reachable for that Attempt
-    /// (`m0-job-lifecycle-and-scheduling.md`; Issue #26: "register the
-    /// mapping immediately after #25 returns the committed Attempt/
-    /// reservation and before outbound dispatch becomes reachable").
-    pub fn register(&self, attempt_id: AttemptId, reservation_id: ReservationId) {
-        self.reservations
+    /// Registers `reservation_id` for `attempt_id` — but only when no mapping
+    /// already exists for it. Must happen before outbound dispatch becomes
+    /// reachable for that Attempt (`m0-job-lifecycle-and-scheduling.md`;
+    /// Issue #26: "register the mapping immediately after #25 returns the
+    /// committed Attempt/reservation and before outbound dispatch becomes
+    /// reachable"). Never overwrites an existing mapping — an
+    /// already-registered `attempt_id` returns
+    /// [`RegistrationOutcome::AlreadyRegistered`] and leaves the original
+    /// `ReservationId` untouched, so a repeated registration attempt (e.g. a
+    /// second Application call for an already-dispatched Attempt) can never
+    /// leak ownership of the first reservation.
+    pub fn register(
+        &self,
+        attempt_id: AttemptId,
+        reservation_id: ReservationId,
+    ) -> RegistrationOutcome {
+        match self
+            .reservations
             .lock()
             .expect("attempt reservation registry lock poisoned")
-            .insert(attempt_id, reservation_id);
+            .entry(attempt_id)
+        {
+            Entry::Occupied(_) => RegistrationOutcome::AlreadyRegistered,
+            Entry::Vacant(slot) => {
+                slot.insert(reservation_id);
+                RegistrationOutcome::Registered
+            }
+        }
     }
 
     /// Removes and returns the reservation registered for `attempt_id`,
@@ -88,6 +124,34 @@ mod tests {
     fn take_on_an_unknown_attempt_id_is_a_safe_no_op() {
         let registry = AttemptReservationRegistry::new();
         assert_eq!(registry.take(AttemptId::new()), None);
+    }
+
+    #[test]
+    fn a_second_register_for_the_same_attempt_never_overwrites_the_first() {
+        let registry = AttemptReservationRegistry::new();
+        let arbiter = TechnicalResourceArbiter::new([(ResourceKind::new("network"), 10)]);
+        let attempt_id = AttemptId::new();
+        let first = arbiter
+            .acquire(vec![ResourceClaim::new(ResourceKind::new("network"), 5)])
+            .unwrap();
+        let second = arbiter
+            .acquire(vec![ResourceClaim::new(ResourceKind::new("network"), 5)])
+            .unwrap();
+
+        assert_eq!(
+            registry.register(attempt_id, first),
+            RegistrationOutcome::Registered
+        );
+        assert_eq!(
+            registry.register(attempt_id, second),
+            RegistrationOutcome::AlreadyRegistered,
+            "a repeated registration for the same attempt_id must never overwrite"
+        );
+        assert_eq!(
+            registry.take(attempt_id),
+            Some(first),
+            "the original reservation must remain the mapping"
+        );
     }
 
     #[test]
