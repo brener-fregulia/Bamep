@@ -93,6 +93,10 @@ pub enum ApplicationError {
     /// scope (Issue #27).
     #[error("job {0:?} is not eligible for a cancellation request")]
     JobNotEligibleForCancellation(JobId),
+    /// [`crate::ports::CloseIndeterminateError::NoUncertainAttempt`] — no
+    /// Attempt for this Job is currently `AwaitingReconciliation`.
+    #[error("job {0:?} has no attempt currently awaiting reconciliation")]
+    JobHasNoUncertainAttempt(JobId),
     /// The target Endpoint already has another active Job — the losing side
     /// of a same-Endpoint admission race
     /// (`m0-job-lifecycle-and-scheduling.md` "Resource leases"). The caller's
@@ -1168,6 +1172,310 @@ impl CancellationService {
     }
 }
 
+/// Outcome of [`ReconciliationService::reconcile_on_session_start`]'s attempt
+/// to transmit `StatusQuery`, mirroring [`ActionDispatchOutcome`]/
+/// [`CancelActionSendOutcome`]'s send-result distinction. Neither `Sent` nor
+/// `SendFailed` implies Agent receipt/response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusQuerySendOutcome {
+    /// No Attempt for this Endpoint is currently `AwaitingReconciliation` —
+    /// nothing to query.
+    NoneNeeded,
+    Sent,
+    SendFailed(AgentDispatchError),
+}
+
+/// Uncertain-execution reconciliation (Issue #28 "[WP] Reconcile interrupted
+/// Attempts safely"; `m0-job-lifecycle-and-scheduling.md` "Reconciliation").
+/// Five structurally distinct responsibilities share this one service
+/// instance, mirroring [`CancellationService`]'s split between its inbound-
+/// evidence and operator-control-path methods:
+///
+/// - [`Self::mark_endpoint_uncertain`] — connection-loss trigger. Called by
+///   `AgentControlGateway` when an authenticated session for an Endpoint
+///   ends (`m0-job-lifecycle-and-scheduling.md` "Attempt lifecycle":
+///   "connection loss ... while `Dispatched` or `InProgress`").
+/// - [`Self::reconcile_on_startup`] — Server-restart recovery. Called once,
+///   before any Agent session is accepted, by the Runtime harness/test
+///   standing in for Server startup (Issue #28 "Server restart": "Do NOT
+///   require an Agent to already be connected at Server startup").
+/// - [`Self::reconcile_on_session_start`] — issues `StatusQuery` for any
+///   `AwaitingReconciliation` Attempt once a valid authenticated session
+///   (re-)establishes for its Endpoint. Called by `AgentControlGateway`
+///   immediately after registering outbound delivery/presence, before the
+///   authenticated message loop begins.
+/// - [`Self::apply_status_report`] — inbound `StatusReport` evidence
+///   application, invoked only by `AgentControlGateway`.
+/// - [`Self::close_indeterminate`] — the explicit reconciliation-close
+///   control path. Callers of this method must be structurally separate
+///   from Agent Protocol message handling, mirroring
+///   [`CancellationService::request`]'s identical separation requirement:
+///   the Agent can never decide `Attempt -> Indeterminate` on its own.
+///
+/// Composes [`AttemptReservationRegistry`]/[`TechnicalResourceArbiter`]
+/// exactly like [`ActionEvidenceService`]/[`CancellationService`] — entering
+/// `AwaitingReconciliation` itself never releases the transient reservation
+/// (only a later authoritative terminal outcome does); duplicate/delayed
+/// terminal reconciliation evidence can never double-release, and the
+/// mapping's absence after a Server restart (a fresh, empty in-memory
+/// registry) is a safe no-op release, never a correctness problem for the
+/// durable Attempt lifecycle.
+pub struct ReconciliationService {
+    repo: Arc<dyn JobRepository>,
+    reservations: Arc<AttemptReservationRegistry>,
+    arbiter: Arc<TechnicalResourceArbiter>,
+    dispatch: Arc<dyn AgentDispatchPort>,
+    clock: Arc<dyn Clock>,
+}
+
+impl ReconciliationService {
+    pub fn new(
+        repo: Arc<dyn JobRepository>,
+        reservations: Arc<AttemptReservationRegistry>,
+        arbiter: Arc<TechnicalResourceArbiter>,
+        dispatch: Arc<dyn AgentDispatchPort>,
+    ) -> Self {
+        Self::with_clock(repo, reservations, arbiter, dispatch, Arc::new(SystemClock))
+    }
+
+    pub fn with_clock(
+        repo: Arc<dyn JobRepository>,
+        reservations: Arc<AttemptReservationRegistry>,
+        arbiter: Arc<TechnicalResourceArbiter>,
+        dispatch: Arc<dyn AgentDispatchPort>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            repo,
+            reservations,
+            arbiter,
+            dispatch,
+            clock,
+        }
+    }
+
+    /// The single reusable Domain decide-closure every uncertain-entry
+    /// operation below shares (`bamep_domain::mark_awaiting_reconciliation`
+    /// captures no call-specific context — see [`crate::ports::MarkUncertainDecision`]
+    /// docs).
+    fn mark_uncertain_decision() -> crate::ports::MarkUncertainDecision {
+        Box::new(bamep_domain::mark_awaiting_reconciliation)
+    }
+
+    /// Connection-loss trigger: marks `endpoint_id`'s current active Attempt
+    /// (if any, and if currently `Dispatched`/`InProgress`)
+    /// `AwaitingReconciliation`. A safe no-op when no eligible Attempt
+    /// exists. Never touches any other Endpoint's Attempts.
+    pub async fn mark_endpoint_uncertain(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Result<Option<bamep_domain::AttemptId>, ApplicationError> {
+        Ok(self
+            .repo
+            .mark_endpoint_active_attempt_uncertain(endpoint_id, Self::mark_uncertain_decision())
+            .await?)
+    }
+
+    /// Server-restart recovery: moves every currently `Dispatched`/
+    /// `InProgress` Attempt, across every Endpoint, to
+    /// `AwaitingReconciliation`. Never redispatches, never creates a second
+    /// Attempt, never sends anything.
+    pub async fn reconcile_on_startup(
+        &self,
+    ) -> Result<Vec<bamep_domain::AttemptId>, ApplicationError> {
+        Ok(self
+            .repo
+            .reconcile_all_active_attempts_on_startup(Self::mark_uncertain_decision())
+            .await?)
+    }
+
+    /// Issues `StatusQuery{action_id}` for `endpoint_id`'s current
+    /// `AwaitingReconciliation` Attempt, if any, over the now-live
+    /// authenticated outbound session — never a fresh `ActionDispatch`, never
+    /// a replacement `action_id` (Issue #28 "Outbound status query"). Called
+    /// once a valid authenticated session (re-)establishes, whether after
+    /// ordinary reconnect or after Server restart.
+    pub async fn reconcile_on_session_start(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Result<StatusQuerySendOutcome, ApplicationError> {
+        let Some(action_id) = self.repo.find_reconciliation_candidate(endpoint_id).await? else {
+            return Ok(StatusQuerySendOutcome::NoneNeeded);
+        };
+        let protocol_action_id = ProtocolId::from_uuid(action_id.0)
+            .expect("a Domain ActionId is always a valid UUID v4");
+        let query = bamep_agent_protocol::StatusQueryMessage::new(protocol_action_id);
+        Ok(match self.dispatch.status_query(endpoint_id, query).await {
+            Ok(()) => StatusQuerySendOutcome::Sent,
+            Err(e) => StatusQuerySendOutcome::SendFailed(e),
+        })
+    }
+
+    /// Applies `evidence` for `action_id`, correlated to
+    /// `authenticated_endpoint_id`, exactly mirroring
+    /// [`ActionEvidenceService::apply`]'s Endpoint-correlation and terminal-
+    /// reservation-release behavior. Only ever mutates an Attempt currently
+    /// `AwaitingReconciliation` — `bamep_domain::apply_status_report` is the
+    /// sole owner of that decision.
+    pub async fn apply_status_report(
+        &self,
+        action_id: ProtocolId,
+        authenticated_endpoint_id: EndpointId,
+        evidence: bamep_domain::StatusReportEvidence,
+    ) -> Result<crate::ports::ApplyReconciliationResult, ApplicationError> {
+        let domain_action_id = ActionId(action_id.as_uuid());
+        let clock = Arc::clone(&self.clock);
+
+        let decide: crate::ports::ApplyReconciliationDecision =
+            Box::new(move |facts: ActionEvidenceLockedFacts| {
+                let now = clock.now();
+                let endpoint_id = facts.job.endpoint_id;
+                let job_id = facts.job.id;
+                match bamep_domain::apply_status_report(
+                    &facts.job,
+                    &facts.job_step,
+                    &facts.attempt,
+                    evidence,
+                    now,
+                ) {
+                    bamep_domain::ReconciliationOutcome::NoOp => {
+                        crate::ports::ApplyReconciliationDecisionOutcome::NoOp
+                    }
+                    bamep_domain::ReconciliationOutcome::Applied(applied) => {
+                        let audit = applied.terminal.then(|| AuditRecord {
+                            audit_id: Uuid::new_v4(),
+                            endpoint_id,
+                            actor: Actor::System,
+                            occurred_at: now,
+                            detail: format!(
+                                "attempt {:?} action {:?} reached terminal state {:?} for \
+                                 job_step {:?} via reconciliation evidence",
+                                applied.attempt.id,
+                                applied.attempt.action_id,
+                                applied.attempt.state,
+                                applied.job_step.id
+                            ),
+                            job_id: Some(job_id),
+                            job_step_id: Some(applied.job_step.id),
+                            attempt_id: Some(applied.attempt.id),
+                            action_id: Some(applied.attempt.action_id),
+                        });
+                        crate::ports::ApplyReconciliationDecisionOutcome::Applied(
+                            crate::ports::ReconciliationCommit {
+                                outcome: applied,
+                                audit,
+                            },
+                        )
+                    }
+                }
+            });
+
+        let result = self
+            .repo
+            .apply_status_report(domain_action_id, authenticated_endpoint_id, decide)
+            .await?;
+
+        if let crate::ports::ApplyReconciliationResult::Applied(applied) = &result {
+            if applied.terminal {
+                if let Some(reservation) = self.reservations.take(applied.attempt.id) {
+                    self.arbiter.release(reservation);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// The explicit reconciliation-close control path (Issue #28 "Explicit
+    /// Indeterminate closure"). Persist-before-audit-together: the durable
+    /// `Attempt -> Indeterminate` transition, the required
+    /// `AttemptIndeterminate`/`JobStepFailed`/Job-terminal events, and the
+    /// required operator-decision audit commit atomically. Idempotent:
+    /// repeated closure never duplicates evidence.
+    pub async fn close_indeterminate(
+        &self,
+        job_id: JobId,
+        operator: Actor,
+    ) -> Result<crate::ports::CloseIndeterminateResult, ApplicationError> {
+        let now = self.clock.now();
+        let audit_actor = operator;
+
+        let decide: crate::ports::CloseIndeterminateDecision =
+            Box::new(move |facts: ActionEvidenceLockedFacts| {
+                let endpoint_id = facts.job.endpoint_id;
+                let job_id = facts.job.id;
+                match bamep_domain::close_indeterminate(
+                    &facts.job,
+                    &facts.job_step,
+                    &facts.attempt,
+                    now,
+                ) {
+                    bamep_domain::CloseIndeterminateOutcome::AlreadyIndeterminate => {
+                        crate::ports::CloseIndeterminateDecisionOutcome::AlreadyIndeterminate
+                    }
+                    bamep_domain::CloseIndeterminateOutcome::NotEligible => {
+                        crate::ports::CloseIndeterminateDecisionOutcome::NotEligible
+                    }
+                    bamep_domain::CloseIndeterminateOutcome::Applied(applied) => {
+                        let audit = AuditRecord {
+                            audit_id: Uuid::new_v4(),
+                            endpoint_id,
+                            actor: audit_actor,
+                            occurred_at: now,
+                            detail: format!(
+                                "operator closed attempt {:?} action {:?} Indeterminate for \
+                                 job_step {:?} (job {:?}): authoritative execution outcome \
+                                 could not be established",
+                                applied.attempt.id,
+                                applied.attempt.action_id,
+                                applied.job_step.id,
+                                job_id
+                            ),
+                            job_id: Some(job_id),
+                            job_step_id: Some(applied.job_step.id),
+                            attempt_id: Some(applied.attempt.id),
+                            action_id: Some(applied.attempt.action_id),
+                        };
+                        crate::ports::CloseIndeterminateDecisionOutcome::Applied(
+                            crate::ports::CloseIndeterminateCommit {
+                                outcome: applied,
+                                audit,
+                            },
+                        )
+                    }
+                }
+            });
+
+        let result = self.repo.close_indeterminate(job_id, decide).await?;
+
+        if let crate::ports::CloseIndeterminateResult::Applied(applied) = &result {
+            // `Indeterminate` is always terminal — release exactly once,
+            // mirroring `ActionEvidenceService`/`CancellationService`. A
+            // no-op when the transient mapping no longer exists (e.g. after
+            // a Server restart).
+            if let Some(reservation) = self.reservations.take(applied.attempt.id) {
+                self.arbiter.release(reservation);
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+impl From<crate::ports::CloseIndeterminateError> for ApplicationError {
+    fn from(err: crate::ports::CloseIndeterminateError) -> Self {
+        match err {
+            crate::ports::CloseIndeterminateError::JobNotFound(id) => {
+                ApplicationError::JobNotFound(id)
+            }
+            crate::ports::CloseIndeterminateError::NoUncertainAttempt(id) => {
+                ApplicationError::JobHasNoUncertainAttempt(id)
+            }
+            crate::ports::CloseIndeterminateError::Repository(e) => ApplicationError::Repository(e),
+        }
+    }
+}
+
 /// Independently verifies post-session evidence and correlates it to the
 /// authoritative CurrentBoot under the Endpoint lock.
 pub struct BootstrapEvidenceService<R: EndpointRepository> {
@@ -1794,6 +2102,49 @@ mod tests {
             {
                 unimplemented!("DestructiveIntentService never applies CancelAck evidence")
             }
+
+            async fn mark_endpoint_active_attempt_uncertain(
+                &self,
+                _endpoint_id: EndpointId,
+                _decide: crate::ports::MarkUncertainDecision,
+            ) -> Result<Option<bamep_domain::AttemptId>, RepositoryError> {
+                unimplemented!("DestructiveIntentService never reconciles Attempts")
+            }
+
+            async fn reconcile_all_active_attempts_on_startup(
+                &self,
+                _decide: crate::ports::MarkUncertainDecision,
+            ) -> Result<Vec<bamep_domain::AttemptId>, RepositoryError> {
+                unimplemented!("DestructiveIntentService never reconciles Attempts")
+            }
+
+            async fn find_reconciliation_candidate(
+                &self,
+                _endpoint_id: EndpointId,
+            ) -> Result<Option<bamep_domain::ActionId>, RepositoryError> {
+                unimplemented!("DestructiveIntentService never reconciles Attempts")
+            }
+
+            async fn apply_status_report(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+                _decide: crate::ports::ApplyReconciliationDecision,
+            ) -> Result<
+                crate::ports::ApplyReconciliationResult,
+                crate::ports::ApplyActionEvidenceError,
+            > {
+                unimplemented!("DestructiveIntentService never applies StatusReport evidence")
+            }
+
+            async fn close_indeterminate(
+                &self,
+                _job_id: JobId,
+                _decide: crate::ports::CloseIndeterminateDecision,
+            ) -> Result<crate::ports::CloseIndeterminateResult, crate::ports::CloseIndeterminateError>
+            {
+                unimplemented!("DestructiveIntentService never closes Indeterminate")
+            }
         }
 
         /// In-memory `InventoryRepository` fake exposing only a configurable
@@ -2290,6 +2641,49 @@ mod tests {
             ) -> Result<crate::ports::ApplyCancelAckResult, crate::ports::ApplyActionEvidenceError>
             {
                 unimplemented!("FinalDispatchService tests never apply CancelAck evidence")
+            }
+
+            async fn mark_endpoint_active_attempt_uncertain(
+                &self,
+                _endpoint_id: EndpointId,
+                _decide: crate::ports::MarkUncertainDecision,
+            ) -> Result<Option<bamep_domain::AttemptId>, RepositoryError> {
+                unimplemented!("FinalDispatchService tests never reconcile Attempts")
+            }
+
+            async fn reconcile_all_active_attempts_on_startup(
+                &self,
+                _decide: crate::ports::MarkUncertainDecision,
+            ) -> Result<Vec<bamep_domain::AttemptId>, RepositoryError> {
+                unimplemented!("FinalDispatchService tests never reconcile Attempts")
+            }
+
+            async fn find_reconciliation_candidate(
+                &self,
+                _endpoint_id: EndpointId,
+            ) -> Result<Option<bamep_domain::ActionId>, RepositoryError> {
+                unimplemented!("FinalDispatchService tests never reconcile Attempts")
+            }
+
+            async fn apply_status_report(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+                _decide: crate::ports::ApplyReconciliationDecision,
+            ) -> Result<
+                crate::ports::ApplyReconciliationResult,
+                crate::ports::ApplyActionEvidenceError,
+            > {
+                unimplemented!("FinalDispatchService tests never apply StatusReport evidence")
+            }
+
+            async fn close_indeterminate(
+                &self,
+                _job_id: JobId,
+                _decide: crate::ports::CloseIndeterminateDecision,
+            ) -> Result<crate::ports::CloseIndeterminateResult, crate::ports::CloseIndeterminateError>
+            {
+                unimplemented!("FinalDispatchService tests never close Indeterminate")
             }
         }
 
@@ -2804,6 +3198,14 @@ mod tests {
                 _cancel: bamep_agent_protocol::CancelActionMessage,
             ) -> Result<(), AgentDispatchError> {
                 unimplemented!("ActionDispatchService tests never send CancelAction")
+            }
+
+            async fn status_query(
+                &self,
+                _endpoint_id: EndpointId,
+                _query: bamep_agent_protocol::StatusQueryMessage,
+            ) -> Result<(), AgentDispatchError> {
+                unimplemented!("ActionDispatchService tests never send StatusQuery")
             }
         }
 

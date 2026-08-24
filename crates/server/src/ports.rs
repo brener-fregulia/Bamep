@@ -23,8 +23,8 @@ use bamep_domain::{
     DestructiveIntentError, EndpointAggregate, EndpointId, FinalDispatchDenial,
     FinalDispatchOutcome, FinalDispatchRejection, InvalidIdentityTransition, InventoryRevision,
     InventoryRevisionId, InventorySnapshot, Job, JobAdmissionError, JobAdmissionOutcome, JobId,
-    JobStep, JobStepEligibilityError, JobStepId, RedeemOutcome, TargetFingerprint,
-    TransitionOutcome, TrustedBootstrapOutcome,
+    JobStep, JobStepEligibilityError, JobStepId, ReconciliationApplied, RedeemOutcome,
+    TargetFingerprint, TransitionOutcome, TrustedBootstrapOutcome,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -391,6 +391,192 @@ pub trait JobRepository: Send + Sync {
         authenticated_endpoint_id: EndpointId,
         decide: ApplyCancelAckDecision,
     ) -> Result<ApplyCancelAckResult, ApplyActionEvidenceError>;
+
+    /// Locks `endpoint_id`'s current `Running`/`Cancelling` Job's
+    /// JobStep-current Attempt (if any), invokes `decide` with it, and —
+    /// only when `decide` returns `Some` — atomically persists the resulting
+    /// state (Issue #28 "Connection loss"). No event or audit is required
+    /// for this transition (`m0-persistence-observability-and-domain-events.md`
+    /// "Domain events" never lists one for entering `AwaitingReconciliation`).
+    /// Returns the reconciled `AttemptId`, or `None` when no eligible
+    /// candidate exists (no active Job, or its Attempt is already
+    /// `AwaitingReconciliation`/terminal). Never mutates an unrelated
+    /// Endpoint's Attempts.
+    async fn mark_endpoint_active_attempt_uncertain(
+        &self,
+        endpoint_id: EndpointId,
+        decide: MarkUncertainDecision,
+    ) -> Result<Option<AttemptId>, RepositoryError>;
+
+    /// Server-restart recovery (Issue #28 "Server restart"): locks and
+    /// invokes `decide` against every currently `Dispatched`/`InProgress`
+    /// Attempt, across every Endpoint, and atomically persists every `Some`
+    /// result (`m0-job-lifecycle-and-scheduling.md` "Reconciliation": "On
+    /// Server restart: persisted `Dispatched` and `InProgress` Attempts
+    /// become `AwaitingReconciliation`"). No event or audit is required.
+    /// Returns every reconciled `AttemptId`. Never creates a second Attempt
+    /// and never sends anything — sending `StatusQuery` happens only once the
+    /// relevant Agent session re-establishes, through
+    /// [`Self::find_reconciliation_candidate`].
+    async fn reconcile_all_active_attempts_on_startup(
+        &self,
+        decide: MarkUncertainDecision,
+    ) -> Result<Vec<AttemptId>, RepositoryError>;
+
+    /// Read-only lookup (no lock, no mutation) of `endpoint_id`'s current
+    /// `AwaitingReconciliation` Attempt, if any — used only to decide whether
+    /// to issue `StatusQuery{action_id}` once a valid authenticated session
+    /// (re-)establishes for this Endpoint (Issue #28 "Reconciliation").
+    /// `None` when no Attempt for this Endpoint is currently
+    /// `AwaitingReconciliation`.
+    async fn find_reconciliation_candidate(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Result<Option<ActionId>, RepositoryError>;
+
+    /// Resolves `action_id` to its owning Attempt/JobStep/Job, locks all
+    /// three in the same Attempt -> JobStep -> Job order
+    /// [`Self::apply_action_evidence`] uses, verifies the owning Job targets
+    /// `authenticated_endpoint_id`, invokes `decide` with the freshly locked
+    /// [`ActionEvidenceLockedFacts`], and — only for
+    /// [`ApplyReconciliationDecisionOutcome::Applied`] — atomically persists
+    /// the returned [`ReconciliationCommit`]'s Attempt/JobStep/Job state,
+    /// required events, and (for a terminal outcome) required audit record in
+    /// the same transaction (Issue #28 "Gateway": inbound `StatusReport`
+    /// evidence application). Mirrors [`Self::apply_action_evidence`]'s
+    /// non-enumeration contract: an unknown `action_id`, or a known
+    /// `action_id` whose owning Job targets a different Endpoint, is
+    /// [`ApplyActionEvidenceError::UnknownAction`] in both cases.
+    async fn apply_status_report(
+        &self,
+        action_id: ActionId,
+        authenticated_endpoint_id: EndpointId,
+        decide: ApplyReconciliationDecision,
+    ) -> Result<ApplyReconciliationResult, ApplyActionEvidenceError>;
+
+    /// Locates `job_id`'s current `AwaitingReconciliation` Attempt (at most
+    /// one can ever exist, by the same JobStep-current-Attempt invariant
+    /// every other locking method in this trait already relies on), locks it
+    /// with its owning JobStep/Job in the same Attempt -> JobStep -> Job
+    /// order, invokes `decide` with the freshly locked
+    /// [`ActionEvidenceLockedFacts`], and — only for
+    /// [`ApplyReconciliationDecisionOutcome::Applied`] — atomically persists
+    /// the returned [`ReconciliationCommit`]'s Attempt/JobStep/Job state, the
+    /// required `AttemptIndeterminate`/`JobStepFailed`/Job-terminal events,
+    /// and the required operator-decision audit record in the same
+    /// transaction (Issue #28 "Explicit Indeterminate closure"). Structurally
+    /// separate from [`Self::apply_status_report`]: only an explicit
+    /// operator/internal control path calls this — the Agent can never reach
+    /// `Indeterminate` on its own.
+    async fn close_indeterminate(
+        &self,
+        job_id: JobId,
+        decide: CloseIndeterminateDecision,
+    ) -> Result<CloseIndeterminateResult, CloseIndeterminateError>;
+}
+
+/// A pure decision over one freshly locked, currently `Dispatched`/
+/// `InProgress` [`Attempt`], producing the `AwaitingReconciliation` result to
+/// persist, or `None` when the Attempt no longer qualifies by the time it is
+/// locked (`bamep_domain::mark_awaiting_reconciliation`; Issue #28
+/// "Connection loss", "Server restart"). Unlike every other decide-closure
+/// in this trait, this one is `Fn`, not `FnOnce`: it captures no
+/// call-specific context (no clock, no audit, no Cancelling-composition
+/// judgment — entering `AwaitingReconciliation` requires none of those), so
+/// the same closure instance is reused across every candidate Attempt
+/// [`JobRepository::reconcile_all_active_attempts_on_startup`] locks.
+pub type MarkUncertainDecision = Box<dyn Fn(&Attempt) -> Option<Attempt> + Send + Sync>;
+
+/// Durable facts read under lock immediately before one `StatusReport`/
+/// explicit-Indeterminate reconciliation decision — identical shape to
+/// [`ActionEvidenceLockedFacts`], reused directly rather than duplicated.
+pub type ReconciliationLockedFacts = ActionEvidenceLockedFacts;
+
+/// A pure decision over freshly locked [`ReconciliationLockedFacts`],
+/// mirroring [`ApplyActionEvidenceDecision`]/[`ApplyCancelAckDecision`]: the
+/// Adapter locks and reads current state, this closure decides (calling
+/// `bamep_domain::apply_status_report` or `bamep_domain::close_indeterminate`
+/// and, only for a terminal outcome, constructing the required
+/// [`AuditRecord`]), and the Adapter persists the result atomically in the
+/// same transaction.
+pub type ApplyReconciliationDecision =
+    Box<dyn FnOnce(ReconciliationLockedFacts) -> ApplyReconciliationDecisionOutcome + Send>;
+
+pub type CloseIndeterminateDecision =
+    Box<dyn FnOnce(ReconciliationLockedFacts) -> CloseIndeterminateDecisionOutcome + Send>;
+
+/// A successful reconciliation "Applied" result: the Domain outcome plus the
+/// immutable terminal [`AuditRecord`] that must commit atomically alongside
+/// it when `outcome.terminal` is `true` — `None` when `outcome.terminal` is
+/// `false` (the `Accepted`/`Running` recovery to `InProgress`), mirroring
+/// [`ActionEvidenceCommit`]/[`CancelAckCommit`].
+pub struct ReconciliationCommit {
+    pub outcome: ReconciliationApplied,
+    pub audit: Option<AuditRecord>,
+}
+
+/// The two outcomes [`ApplyReconciliationDecision`] may produce, mirroring
+/// `bamep_domain::ReconciliationOutcome` at the Application boundary. No
+/// `Conflict` variant — see `bamep_domain::reconciliation` module docs.
+#[allow(clippy::large_enum_variant)]
+pub enum ApplyReconciliationDecisionOutcome {
+    Applied(ReconciliationCommit),
+    NoOp,
+}
+
+/// The result of [`JobRepository::apply_status_report`] after successful
+/// resolution/locking/correlation — mirrors
+/// [`ApplyReconciliationDecisionOutcome`] without the audit record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum ApplyReconciliationResult {
+    Applied(ReconciliationApplied),
+    NoOp,
+}
+
+/// A successful [`CloseIndeterminateDecision`] "Applied" result: the Domain
+/// outcome plus the required operator-decision [`AuditRecord`], which always
+/// commits atomically alongside it — closing `Indeterminate` is always a
+/// terminal, always-audited transition
+/// (`m0-persistence-observability-and-domain-events.md` "Auditability":
+/// "closing an Attempt `Indeterminate`" is a required safety-relevant
+/// operator decision).
+pub struct CloseIndeterminateCommit {
+    pub outcome: ReconciliationApplied,
+    pub audit: AuditRecord,
+}
+
+/// The three outcomes [`CloseIndeterminateDecision`] may produce, mirroring
+/// `bamep_domain::CloseIndeterminateOutcome` at the Application boundary.
+#[allow(clippy::large_enum_variant)]
+pub enum CloseIndeterminateDecisionOutcome {
+    Applied(CloseIndeterminateCommit),
+    AlreadyIndeterminate,
+    NotEligible,
+}
+
+/// The result of [`JobRepository::close_indeterminate`] after successful
+/// resolution/locking — mirrors [`CloseIndeterminateDecisionOutcome`] without
+/// the audit record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum CloseIndeterminateResult {
+    Applied(ReconciliationApplied),
+    AlreadyIndeterminate,
+    NotEligible,
+}
+
+/// Errors from [`JobRepository::close_indeterminate`].
+#[derive(Debug, thiserror::Error)]
+pub enum CloseIndeterminateError {
+    #[error("job {0:?} not found")]
+    JobNotFound(JobId),
+    /// No Attempt for `job_id` is currently `AwaitingReconciliation` (and
+    /// none is `Indeterminate` either) — there is nothing to close.
+    #[error("job {0:?} has no attempt currently awaiting reconciliation")]
+    NoUncertainAttempt(JobId),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
 }
 
 /// Durable facts read under lock immediately before one cancellation-request
@@ -779,6 +965,17 @@ pub trait AgentDispatchPort: Send + Sync {
         &self,
         endpoint_id: EndpointId,
         cancel: bamep_agent_protocol::CancelActionMessage,
+    ) -> Result<(), AgentDispatchError>;
+
+    /// Transmits `StatusQuery{action_id}` for the already-existing
+    /// `AwaitingReconciliation` action — never a replacement identity and
+    /// never an `ActionDispatch` retry (Issue #28 "Outbound status query").
+    /// A successful return means only that the local transport accepted the
+    /// frame, exactly like [`Self::dispatch_action`]'s identical caveat.
+    async fn status_query(
+        &self,
+        endpoint_id: EndpointId,
+        query: bamep_agent_protocol::StatusQueryMessage,
     ) -> Result<(), AgentDispatchError>;
 }
 

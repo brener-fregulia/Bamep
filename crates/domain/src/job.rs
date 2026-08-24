@@ -85,15 +85,18 @@ pub enum JobStepState {
 /// The Domain-owned minimum durable failure-reason vocabulary for a
 /// `JobStep` reaching `Failed` (`m0-job-lifecycle-and-scheduling.md`
 /// "JobStep lifecycle": "`Dispatching -> Failed` ... use `ExecutionFailed`,
-/// `DispatchRejected`, or `ReconciliationIndeterminate`"). Issue #26 produces
-/// only the first two; `ReconciliationIndeterminate` belongs to #28 and is
-/// intentionally not represented here yet.
+/// `DispatchRejected`, or `ReconciliationIndeterminate`").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobStepFailureReason {
     /// `ActionAck{Rejected}` — the Agent never executed the action.
     DispatchRejected,
     /// `ActionResult{Failed}` — the Agent executed the action and it failed.
     ExecutionFailed,
+    /// An explicit reconciliation decision closed the current Attempt
+    /// `Indeterminate` — the authoritative execution outcome could not be
+    /// established (Issue #28; `m0-job-lifecycle-and-scheduling.md` "Attempt
+    /// lifecycle").
+    ReconciliationIndeterminate,
 }
 
 /// The durable destructive-operation authorization snapshot for one JobStep

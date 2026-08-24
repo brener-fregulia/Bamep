@@ -95,6 +95,19 @@ pub enum DomainEvent {
         endpoint_id: EndpointId,
         occurred_at: DateTime<Utc>,
     },
+    /// Emitted exactly once when an `Attempt` is closed `Indeterminate` by an
+    /// explicit reconciliation decision (`m0-persistence-observability-and-domain-events.md`
+    /// "Domain events": "`AttemptIndeterminate` | Attempt is closed
+    /// `Indeterminate`"; Issue #28). `attempt_id` is the narrow additional
+    /// correlation this event requires beyond `job_id`/`job_step_id`.
+    AttemptIndeterminate {
+        event_id: Uuid,
+        job_id: JobId,
+        job_step_id: JobStepId,
+        attempt_id: AttemptId,
+        endpoint_id: EndpointId,
+        occurred_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent {
@@ -108,7 +121,8 @@ impl DomainEvent {
             | DomainEvent::JobSucceeded { event_id, .. }
             | DomainEvent::JobFailed { event_id, .. }
             | DomainEvent::JobStepFailed { event_id, .. }
-            | DomainEvent::JobCancelled { event_id, .. } => *event_id,
+            | DomainEvent::JobCancelled { event_id, .. }
+            | DomainEvent::AttemptIndeterminate { event_id, .. } => *event_id,
         }
     }
 
@@ -122,7 +136,8 @@ impl DomainEvent {
             | DomainEvent::JobSucceeded { endpoint_id, .. }
             | DomainEvent::JobFailed { endpoint_id, .. }
             | DomainEvent::JobStepFailed { endpoint_id, .. }
-            | DomainEvent::JobCancelled { endpoint_id, .. } => *endpoint_id,
+            | DomainEvent::JobCancelled { endpoint_id, .. }
+            | DomainEvent::AttemptIndeterminate { endpoint_id, .. } => *endpoint_id,
         }
     }
 
@@ -136,11 +151,12 @@ impl DomainEvent {
             | DomainEvent::JobSucceeded { occurred_at, .. }
             | DomainEvent::JobFailed { occurred_at, .. }
             | DomainEvent::JobStepFailed { occurred_at, .. }
-            | DomainEvent::JobCancelled { occurred_at, .. } => *occurred_at,
+            | DomainEvent::JobCancelled { occurred_at, .. }
+            | DomainEvent::AttemptIndeterminate { occurred_at, .. } => *occurred_at,
         }
     }
 
-    /// The owning `JobId`, for the Job-scoped event types (Issue #26/#27).
+    /// The owning `JobId`, for the Job-scoped event types (Issue #26/#27/#28).
     /// Endpoint-only event types have no Job correlation.
     pub fn job_id(&self) -> Option<JobId> {
         match self {
@@ -148,16 +164,27 @@ impl DomainEvent {
             | DomainEvent::JobSucceeded { job_id, .. }
             | DomainEvent::JobFailed { job_id, .. }
             | DomainEvent::JobStepFailed { job_id, .. }
-            | DomainEvent::JobCancelled { job_id, .. } => Some(*job_id),
+            | DomainEvent::JobCancelled { job_id, .. }
+            | DomainEvent::AttemptIndeterminate { job_id, .. } => Some(*job_id),
             _ => None,
         }
     }
 
     /// The owning `JobStepId`, for the JobStep-scoped event types (Issue
-    /// #26). Every other event type has no JobStep correlation.
+    /// #26/#28). Every other event type has no JobStep correlation.
     pub fn job_step_id(&self) -> Option<crate::job::JobStepId> {
         match self {
-            DomainEvent::JobStepFailed { job_step_id, .. } => Some(*job_step_id),
+            DomainEvent::JobStepFailed { job_step_id, .. }
+            | DomainEvent::AttemptIndeterminate { job_step_id, .. } => Some(*job_step_id),
+            _ => None,
+        }
+    }
+
+    /// The owning `AttemptId`, for the Attempt-scoped event types (Issue
+    /// #28). Every other event type has no Attempt correlation.
+    pub fn attempt_id(&self) -> Option<AttemptId> {
+        match self {
+            DomainEvent::AttemptIndeterminate { attempt_id, .. } => Some(*attempt_id),
             _ => None,
         }
     }
@@ -173,6 +200,7 @@ impl DomainEvent {
             DomainEvent::JobFailed { .. } => "JobFailed",
             DomainEvent::JobStepFailed { .. } => "JobStepFailed",
             DomainEvent::JobCancelled { .. } => "JobCancelled",
+            DomainEvent::AttemptIndeterminate { .. } => "AttemptIndeterminate",
         }
     }
 }

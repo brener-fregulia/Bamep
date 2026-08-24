@@ -220,6 +220,57 @@ scheduled past that point. This is the same lock/read/decide/persist transaction
 concurrent cancellation request and terminal evidence commitment for the same Attempt serialize
 through the existing Attempt -> JobStep -> Job ordering rather than racing under a competing one.
 
+## Implemented uncertain-execution reconciliation
+
+`bamep_agent_protocol` adds `StatusQuery{action_id}` (Server -> Agent) and
+`StatusReport{action_id, known_state}` (Agent -> Server, `Accepted | Running | Succeeded |
+Failed | Cancelled | Unknown`) to `AgentProtocolMessage`, both carrying
+`correlation_id == action_id` and never a replacement action identity. `StatusQuery` is never an
+`ActionDispatch` retry.
+
+`bamep_domain::reconciliation` adds three pure decisions, deliberately separate from
+`action_evidence` (which never owns `AwaitingReconciliation`/`Indeterminate`) and from
+`cancellation` (which owns only `CancelAck` evidence): `mark_awaiting_reconciliation`
+(`Dispatched`/`InProgress -> AwaitingReconciliation`), `apply_status_report` (the closed
+`StatusReport` vocabulary applied against an `AwaitingReconciliation` Attempt — one `Unknown`
+never produces `Indeterminate`), and `close_indeterminate` (the explicit reconciliation decision
+that closes an `AwaitingReconciliation` Attempt `Indeterminate`, with `JobStep ->
+Failed{ReconciliationIndeterminate}` and one `AttemptIndeterminate` domain event, composing with
+a Job already `Cancelling` exactly like every other terminal reconciliation outcome).
+
+`bamep_server::application::ReconciliationService` holds five structurally distinct
+responsibilities on one shared instance, extending `JobRepository` with
+`mark_endpoint_active_attempt_uncertain`, `reconcile_all_active_attempts_on_startup`,
+`find_reconciliation_candidate`, `apply_status_report`, and `close_indeterminate`:
+
+- `mark_endpoint_uncertain` — the connection-loss trigger. `AgentControlGateway` calls it once
+  its authenticated-session task exits (normal disconnect or a Gateway error), after that task's
+  own message loop, so it never blocks the outbound channel it depends on.
+- `reconcile_on_startup` — Server-restart recovery: locks and reconciles every currently
+  `Dispatched`/`InProgress` Attempt across every Endpoint in one pass. No test/harness in this
+  repository runs a persistent Server process, so this is exercised by calling it directly
+  against durable state, standing in for an actual restart.
+- `reconcile_on_session_start` — issues `StatusQuery` for any `AwaitingReconciliation` Attempt
+  once a session (re-)establishes for its Endpoint. `AgentControlGateway` spawns this as a
+  background task immediately after registering outbound delivery/presence, concurrently with
+  (not before) its own message loop starting — the outbound send it performs awaits an ack only
+  that loop's `outbound_rx` ever fulfills.
+- `apply_status_report` — inbound `StatusReport` evidence, invoked only by `AgentControlGateway`.
+  Locks Attempt -> JobStep -> Job by `action_id`, exactly like `apply_action_evidence`/
+  `apply_cancel_ack`, and calls `bamep_domain::apply_status_report`.
+- `close_indeterminate` — the explicit reconciliation-close control path (never callable from
+  inbound Agent Protocol handling, mirroring `CancellationService::request`'s identical
+  separation). Locates the target Job's current `AwaitingReconciliation` Attempt, locks it, and
+  calls `bamep_domain::close_indeterminate`; the required operator-decision audit always commits
+  atomically alongside the terminal transition.
+
+Every terminal outcome from `apply_status_report`/`close_indeterminate` removes the Attempt's
+transient reservation mapping exactly once and releases it through
+`TechnicalResourceArbiter`, exactly like `ActionEvidenceService`/`CancellationService`; entering
+`AwaitingReconciliation` itself never releases it, and the mapping's absence after a Server
+restart (a fresh, empty in-memory registry) is a safe no-op release, never a correctness problem
+for the durable Attempt lifecycle.
+
 ## Maintenance rule
 
 Update this directory only for durable structure visible in implemented code. Do not copy

@@ -25,6 +25,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use bamep_agent_protocol::{
     ActionDispatchMessage, AgentProtocolMessage, CancelActionMessage, ProtocolId,
+    StatusQueryMessage,
 };
 use bamep_domain::EndpointId;
 use tokio::sync::{mpsc, oneshot};
@@ -203,6 +204,15 @@ impl AgentDispatchPort for OutboundSessionDirectory {
         cancel: CancelActionMessage,
     ) -> Result<(), AgentDispatchError> {
         self.send(endpoint_id, AgentProtocolMessage::CancelAction(cancel))
+            .await
+    }
+
+    async fn status_query(
+        &self,
+        endpoint_id: EndpointId,
+        query: StatusQueryMessage,
+    ) -> Result<(), AgentDispatchError> {
+        self.send(endpoint_id, AgentProtocolMessage::StatusQuery(query))
             .await
     }
 }

@@ -766,6 +766,93 @@ impl CancelAckMessage {
 }
 
 // ---------------------------------------------------------------------
+// StatusQuery — Server -> Agent
+// ---------------------------------------------------------------------
+
+/// `StatusQuery{action_id}` (`m0-agent-protocol-contract.md` "Message
+/// types"; Issue #28 "[WP] Reconcile interrupted Attempts safely").
+/// `action_id` is always the exact existing action identity being
+/// reconciled — a `StatusQuery` never generates a replacement action
+/// identity and is never itself an `ActionDispatch` retry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusQueryBody {
+    pub action_id: ProtocolId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusQueryMessage {
+    #[serde(flatten)]
+    pub envelope: Envelope,
+    #[serde(flatten)]
+    pub body: StatusQueryBody,
+}
+
+impl StatusQueryMessage {
+    /// A fresh envelope whose `correlation_id` is always `action_id`, exactly
+    /// like [`CancelActionMessage::new`].
+    pub fn new(action_id: ProtocolId) -> Self {
+        Self {
+            envelope: Envelope::new().with_correlation_id(action_id),
+            body: StatusQueryBody { action_id },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// StatusReport — Agent -> Server
+// ---------------------------------------------------------------------
+
+/// The closed `StatusReport.known_state` vocabulary
+/// (`m0-agent-protocol-contract.md` "Agent-action state vocabulary").
+/// `Unknown` means the Agent has no authoritative local state for the
+/// `action_id` — it never means "not executed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KnownActionState {
+    Accepted,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusReportBody {
+    pub action_id: ProtocolId,
+    pub known_state: KnownActionState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusReportMessage {
+    #[serde(flatten)]
+    pub envelope: Envelope,
+    #[serde(flatten)]
+    pub body: StatusReportBody,
+}
+
+impl StatusReportMessage {
+    pub fn new(action_id: ProtocolId, known_state: KnownActionState) -> Self {
+        Self {
+            envelope: Envelope::new().with_correlation_id(action_id),
+            body: StatusReportBody {
+                action_id,
+                known_state,
+            },
+        }
+    }
+
+    /// Re-emits this already-constructed report under a fresh `message_id`,
+    /// exactly like [`ActionAckMessage::with_fresh_message_id`] — used for
+    /// Agent-side idempotency when a duplicate/repeated `StatusQuery`
+    /// observes retained local state.
+    pub fn with_fresh_message_id(mut self) -> Self {
+        self.envelope.message_id = ProtocolId::generate();
+        self.envelope.timestamp = MessageTimestamp::now();
+        self
+    }
+}
+
+// ---------------------------------------------------------------------
 // Top-level message union
 // ---------------------------------------------------------------------
 
@@ -792,6 +879,8 @@ pub enum AgentProtocolMessage {
     ActionResult(ActionResultMessage),
     CancelAction(CancelActionMessage),
     CancelAck(CancelAckMessage),
+    StatusQuery(StatusQueryMessage),
+    StatusReport(StatusReportMessage),
     ProtocolError(ProtocolErrorMessage),
 }
 
@@ -809,6 +898,8 @@ impl AgentProtocolMessage {
             AgentProtocolMessage::ActionResult(m) => &m.envelope,
             AgentProtocolMessage::CancelAction(m) => &m.envelope,
             AgentProtocolMessage::CancelAck(m) => &m.envelope,
+            AgentProtocolMessage::StatusQuery(m) => &m.envelope,
+            AgentProtocolMessage::StatusReport(m) => &m.envelope,
             AgentProtocolMessage::ProtocolError(m) => &m.envelope,
         }
     }

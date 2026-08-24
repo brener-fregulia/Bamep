@@ -35,8 +35,8 @@ use tokio_tungstenite::WebSocketStream;
 use bamep_agent_protocol::{
     decode, encode, ActionAckMessage, ActionAckOutcome, ActionProgressMessage, ActionResultMessage,
     ActionResultOutcome, AgentProtocolMessage, AuthErrorMessage, AuthRequestMessage,
-    CancelAckMessage, CancelAckOutcome, MessageTimestamp, ProtocolErrorMessage, ProtocolId,
-    SessionEstablishedMessage,
+    CancelAckMessage, CancelAckOutcome, KnownActionState, MessageTimestamp, ProtocolErrorMessage,
+    ProtocolId, SessionEstablishedMessage, StatusReportMessage,
 };
 use bamep_domain::{ActionEvidence, CancelAckEvidence, EndpointId};
 use bamep_trusted_bootstrap::ServerCertFingerprint;
@@ -133,6 +133,10 @@ pub enum AgentGatewayError {
     ActionEvidenceServiceNotConfigured,
     #[error("authenticated session received CancelAck without a configured CancellationService")]
     CancellationServiceNotConfigured,
+    #[error(
+        "authenticated session received StatusReport without a configured ReconciliationService"
+    )]
+    ReconciliationServiceNotConfigured,
     #[error(transparent)]
     Application(#[from] ApplicationError),
 }
@@ -170,6 +174,14 @@ pub struct AgentControlGateway<R: EndpointRepository, C: CredentialRedemptionRep
     /// (`CancellationService::request`) must remain structurally separate
     /// from this inbound Agent Protocol message loop.
     cancellation: Option<Arc<CancellationService>>,
+    /// Applies inbound `StatusReport` evidence and drives connection-loss/
+    /// session-start reconciliation triggers (Issue #28 "Reconcile
+    /// interrupted Attempts safely"). Deliberately never used for the
+    /// explicit operator/internal Indeterminate-closure control path — that
+    /// path (`ReconciliationService::close_indeterminate`) must remain
+    /// structurally separate from this inbound Agent Protocol message loop,
+    /// mirroring `cancellation`'s identical separation requirement.
+    reconciliation: Option<Arc<crate::application::ReconciliationService>>,
     /// The Runtime Presence Registry this Gateway's authenticated sessions
     /// register with/unregister from (`m0-stack-and-boundaries-baseline.md`
     /// "Runtime Presence Registry"). Owned by the Gateway by default so every
@@ -195,6 +207,7 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             inventory: None,
             action_evidence: None,
             cancellation: None,
+            reconciliation: None,
             presence: Arc::new(PresenceRegistry::new()),
             outbound_sessions: Arc::new(OutboundSessionDirectory::new()),
         }
@@ -223,6 +236,14 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
 
     pub fn with_cancellation_service(mut self, service: Arc<CancellationService>) -> Self {
         self.cancellation = Some(service);
+        self
+    }
+
+    pub fn with_reconciliation_service(
+        mut self,
+        service: Arc<crate::application::ReconciliationService>,
+    ) -> Self {
+        self.reconciliation = Some(service);
         self
     }
 
@@ -273,8 +294,10 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let bootstrap_evidence = self
-            .bootstrap_evidence
+        // Fail fast, before any registration below, when this checkpoint's
+        // required configuration is missing — re-checked (and actually used)
+        // by `run_message_loop` once the message loop begins.
+        self.bootstrap_evidence
             .as_ref()
             .ok_or(AgentGatewayError::BootstrapEvidenceServiceNotConfigured)?;
 
@@ -308,6 +331,71 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
 
         let (mut write, mut read) = websocket.split();
 
+        // Reconciliation (Issue #28 "Reconciliation"): now that this session
+        // is outbound-ready, issue `StatusQuery` for any Attempt this
+        // Endpoint left `AwaitingReconciliation` — whether from an earlier
+        // disconnect or from Server restart. Spawned, not awaited here: the
+        // outbound `StatusQuery` send enqueues onto this same session's
+        // outbound channel and awaits an ack that only the message loop
+        // below (via `outbound_rx.recv()`) ever fulfills — awaiting it
+        // inline, before that loop starts, would deadlock this task against
+        // itself. Best-effort either way: a missing service or a local send
+        // failure must never prevent this session from proceeding to the
+        // normal message loop.
+        if let Some(reconciliation) = &self.reconciliation {
+            let reconciliation = Arc::clone(reconciliation);
+            let endpoint_id = session.endpoint_id;
+            tokio::spawn(async move {
+                let _ = reconciliation.reconcile_on_session_start(endpoint_id).await;
+            });
+        }
+
+        let result = self
+            .run_message_loop(
+                &mut write,
+                &mut read,
+                &mut outbound_rx,
+                session,
+                connection_fingerprint,
+            )
+            .await;
+
+        // Connection loss (Issue #28 "Connection loss"): on every exit from
+        // the message loop below — normal disconnect/Close (`Ok(())`) or a
+        // genuine Gateway error (`Err`) — mark this Endpoint's active
+        // Attempt, if any, `AwaitingReconciliation`. Best-effort and never
+        // overrides the loop's own result; an unwinding panic is not covered
+        // (no async Drop exists to run this), but durable Attempt state is
+        // never corrupted by skipping it — a later reconciliation trigger
+        // (the next session start, or a Server-restart sweep) still recovers
+        // it.
+        if let Some(reconciliation) = &self.reconciliation {
+            let _ = reconciliation
+                .mark_endpoint_uncertain(session.endpoint_id)
+                .await;
+        }
+
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_message_loop<S, W>(
+        &self,
+        write: &mut W,
+        read: &mut futures_util::stream::SplitStream<&mut WebSocketStream<S>>,
+        outbound_rx: &mut crate::runtime::outbound_sessions::OutboundReceiver,
+        session: AuthenticatedSession,
+        connection_fingerprint: ServerCertFingerprint,
+    ) -> Result<(), AgentGatewayError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        W: MessageSink,
+    {
+        let bootstrap_evidence = self
+            .bootstrap_evidence
+            .as_ref()
+            .ok_or(AgentGatewayError::BootstrapEvidenceServiceNotConfigured)?;
+
         loop {
             tokio::select! {
                 frame = read.next() => {
@@ -316,15 +404,15 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                     match frame {
                         Message::Close(_) => return Ok(()),
                         Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
-                        Message::Binary(_) => self.send_protocol_error(&mut write, None).await?,
+                        Message::Binary(_) => self.send_protocol_error(write, None).await?,
                         Message::Text(text) => {
                             let Ok(message) = decode(text.as_str()) else {
-                                self.send_protocol_error(&mut write, None).await?;
+                                self.send_protocol_error(write, None).await?;
                                 continue;
                             };
                             let id = message.envelope().message_id;
                             if !message.envelope().protocol_version.is_v1() {
-                                self.send_protocol_error(&mut write, Some(id)).await?;
+                                self.send_protocol_error(write, Some(id)).await?;
                                 continue;
                             }
                             match message {
@@ -345,16 +433,16 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                                     let _ = service.record(session.endpoint_id, report).await?;
                                 }
                                 AgentProtocolMessage::ActionAck(ack) => {
-                                    self.handle_action_ack(&mut write, session.endpoint_id, ack)
+                                    self.handle_action_ack(write, session.endpoint_id, ack)
                                         .await?;
                                 }
                                 AgentProtocolMessage::ActionResult(result) => {
-                                    self.handle_action_result(&mut write, session.endpoint_id, result)
+                                    self.handle_action_result(write, session.endpoint_id, result)
                                         .await?;
                                 }
                                 AgentProtocolMessage::ActionProgress(progress) => {
                                     self.handle_action_progress(
-                                        &mut write,
+                                        write,
                                         session.endpoint_id,
                                         id,
                                         progress,
@@ -362,7 +450,11 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                                     .await?;
                                 }
                                 AgentProtocolMessage::CancelAck(ack) => {
-                                    self.handle_cancel_ack(&mut write, session.endpoint_id, ack)
+                                    self.handle_cancel_ack(write, session.endpoint_id, ack)
+                                        .await?;
+                                }
+                                AgentProtocolMessage::StatusReport(report) => {
+                                    self.handle_status_report(write, session.endpoint_id, report)
                                         .await?;
                                 }
                                 AgentProtocolMessage::ProtocolError(_) => {}
@@ -370,13 +462,16 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                                 | AgentProtocolMessage::SessionEstablished(_)
                                 | AgentProtocolMessage::AuthError(_)
                                 | AgentProtocolMessage::ActionDispatch(_)
-                                | AgentProtocolMessage::CancelAction(_) => {
-                                    // `ActionDispatch`/`CancelAction` are
-                                    // Server -> Agent only; the Agent must
-                                    // never send either — in particular, the
-                                    // Agent must never be able to initiate
-                                    // Job cancellation.
-                                    self.send_protocol_error(&mut write, Some(id)).await?;
+                                | AgentProtocolMessage::CancelAction(_)
+                                | AgentProtocolMessage::StatusQuery(_) => {
+                                    // `ActionDispatch`/`CancelAction`/
+                                    // `StatusQuery` are Server -> Agent
+                                    // only; the Agent must never send any of
+                                    // them — in particular, the Agent must
+                                    // never be able to initiate Job
+                                    // cancellation or decide reconciliation
+                                    // on its own.
+                                    self.send_protocol_error(write, Some(id)).await?;
                                 }
                             }
                         }
@@ -496,6 +591,43 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
         };
         match service
             .apply_cancel_ack(ack.body.action_id, endpoint_id, evidence)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(ApplicationError::UnknownAction) => Ok(()),
+            Err(e) => Err(AgentGatewayError::Application(e)),
+        }
+    }
+
+    /// Validates the protocol-wide `correlation_id == action_id` rule, then
+    /// applies the evidence through [`crate::application::ReconciliationService`]
+    /// (Issue #28 "Gateway": inbound `StatusReport` evidence application).
+    /// Unknown/foreign `action_id` is deliberately silent and non-terminal,
+    /// mirroring [`Self::handle_action_ack`]/[`Self::handle_cancel_ack`].
+    async fn handle_status_report<W: MessageSink>(
+        &self,
+        write: &mut W,
+        endpoint_id: EndpointId,
+        report: StatusReportMessage,
+    ) -> Result<(), AgentGatewayError> {
+        let message_id = report.envelope.message_id;
+        if report.envelope.correlation_id != Some(report.body.action_id) {
+            return self.send_protocol_error(write, Some(message_id)).await;
+        }
+        let service = self
+            .reconciliation
+            .as_ref()
+            .ok_or(AgentGatewayError::ReconciliationServiceNotConfigured)?;
+        let evidence = match report.body.known_state {
+            KnownActionState::Accepted => bamep_domain::StatusReportEvidence::Accepted,
+            KnownActionState::Running => bamep_domain::StatusReportEvidence::Running,
+            KnownActionState::Succeeded => bamep_domain::StatusReportEvidence::Succeeded,
+            KnownActionState::Failed => bamep_domain::StatusReportEvidence::Failed,
+            KnownActionState::Cancelled => bamep_domain::StatusReportEvidence::Cancelled,
+            KnownActionState::Unknown => bamep_domain::StatusReportEvidence::Unknown,
+        };
+        match service
+            .apply_status_report(report.body.action_id, endpoint_id, evidence)
             .await
         {
             Ok(_) => Ok(()),

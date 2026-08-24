@@ -22,6 +22,7 @@ pub mod identity;
 pub mod inventory;
 pub mod job;
 pub mod presented_credential;
+pub mod reconciliation;
 pub mod target_fingerprint;
 pub mod transitions;
 
@@ -54,6 +55,10 @@ pub use job::{
     DestructiveIntent, DestructiveIntentError, EmptyWorkflow, Job, JobAdmissionError,
     JobAdmissionOutcome, JobId, JobState, JobStep, JobStepEligibilityError, JobStepFailureReason,
     JobStepId, JobStepState,
+};
+pub use reconciliation::{
+    apply_status_report, close_indeterminate, mark_awaiting_reconciliation,
+    CloseIndeterminateOutcome, ReconciliationApplied, ReconciliationOutcome, StatusReportEvidence,
 };
 pub use target_fingerprint::TargetFingerprint;
 pub use transitions::{RedeemOutcome, TrustedBootstrapOutcome};

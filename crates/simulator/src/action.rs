@@ -22,7 +22,8 @@ use std::sync::Mutex;
 use bamep_agent_protocol::{
     ActionAckError, ActionAckMessage, ActionDispatchMessage, ActionProgressMessage,
     ActionResultMessage, ActionResultOutcome, AgentProtocolMessage, CancelAckMessage,
-    CancelAckOutcome, CancelActionMessage, Percent, ProtocolId,
+    CancelAckOutcome, CancelActionMessage, KnownActionState, Percent, ProtocolId,
+    StatusQueryMessage, StatusReportMessage,
 };
 use serde_json::{Map, Value};
 
@@ -388,6 +389,45 @@ impl SimulatedActionAgent {
         }
     }
 
+    /// Decides the response to one `StatusQuery` (Issue #28 "Simulated
+    /// Agent"): reflects only this Agent's actual retained local knowledge,
+    /// never proof of non-execution.
+    ///
+    /// - `UNKNOWN` `action_id` -> `Unknown`;
+    /// - `KNOWN ACTIVE` -> `Running` (Agent-side `Accepted` and `Running`
+    ///   deliberately collapse into Attempt `InProgress` regardless —
+    ///   `m0-job-lifecycle-and-scheduling.md` "Agent Protocol mapping" — and
+    ///   this local record does not separately distinguish "accepted, not
+    ///   yet started" from "executing": both are answered identically here);
+    /// - `KNOWN COMPLETED` -> the retained terminal `ActionResult.outcome`
+    ///   (`Succeeded`/`Failed`);
+    /// - `KNOWN cancelled` (via [`Self::handle_cancel`]) -> `Cancelled`;
+    /// - `KNOWN REJECTED` -> `Unknown`. `StatusReport.known_state` has no
+    ///   `Rejected` value (`m0-agent-protocol-contract.md` "Agent-action
+    ///   state vocabulary") and the Attempt lifecycle's `AwaitingReconciliation
+    ///   -> Succeeded | Failed | Cancelled` mapping has no `Rejected` case
+    ///   either — a lost `ActionAck{Rejected}` is therefore reported as
+    ///   `Unknown` rather than inventing a wire value the Specification does
+    ///   not define; this correctly forces the Server through its explicit
+    ///   reconciliation-close decision instead of silently fabricating an
+    ///   outcome.
+    pub fn handle_status_query(&self, query: &StatusQueryMessage) -> StatusReportMessage {
+        let action_id = query.body.action_id;
+        let state = self.state.lock().unwrap();
+        let known_state = match state.get(&action_id) {
+            None => KnownActionState::Unknown,
+            Some(LocalActionState::Active { .. }) => KnownActionState::Running,
+            Some(LocalActionState::Completed { result, .. }) => match result.body.outcome {
+                ActionResultOutcome::Succeeded => KnownActionState::Succeeded,
+                ActionResultOutcome::Failed => KnownActionState::Failed,
+                ActionResultOutcome::Cancelled => KnownActionState::Cancelled,
+            },
+            Some(LocalActionState::Cancelled { .. }) => KnownActionState::Cancelled,
+            Some(LocalActionState::Rejected { .. }) => KnownActionState::Unknown,
+        };
+        StatusReportMessage::new(action_id, known_state)
+    }
+
     fn reject_and_record(
         &self,
         state: &mut HashMap<ProtocolId, LocalActionState>,
@@ -711,6 +751,109 @@ mod tests {
 
         let ack = agent.handle_cancel(&cancel(action_id));
         assert_eq!(ack.body.outcome, CancelAckOutcome::Cancelled);
+    }
+
+    // -- Issue #28: StatusQuery handling -----------------------------------
+
+    fn status_query(action_id: ProtocolId) -> StatusQueryMessage {
+        StatusQueryMessage::new(action_id)
+    }
+
+    #[test]
+    fn status_query_against_unknown_action_id_returns_unknown() {
+        let agent = SimulatedActionAgent::new();
+        let action_id = ProtocolId::generate();
+        let report = agent.handle_status_query(&status_query(action_id));
+        assert_eq!(report.body.action_id, action_id);
+        assert_eq!(report.body.known_state, KnownActionState::Unknown);
+    }
+
+    #[test]
+    fn status_query_against_a_known_active_action_returns_running() {
+        let agent =
+            SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::AcceptThenSucceed);
+        let action_id = ProtocolId::generate();
+        agent.handle_dispatch(&dispatch(action_id));
+
+        let report = agent.handle_status_query(&status_query(action_id));
+        assert_eq!(report.body.known_state, KnownActionState::Running);
+    }
+
+    #[test]
+    fn status_query_against_a_known_completed_success_returns_succeeded() {
+        let agent =
+            SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::AcceptThenSucceed);
+        let action_id = ProtocolId::generate();
+        agent.handle_dispatch(&dispatch(action_id));
+        agent.run_configured_scenario(action_id).unwrap();
+
+        let report = agent.handle_status_query(&status_query(action_id));
+        assert_eq!(report.body.known_state, KnownActionState::Succeeded);
+    }
+
+    #[test]
+    fn status_query_against_a_known_completed_failure_returns_failed() {
+        let agent =
+            SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::AcceptThenFail);
+        let action_id = ProtocolId::generate();
+        agent.handle_dispatch(&dispatch(action_id));
+        agent.run_configured_scenario(action_id).unwrap();
+
+        let report = agent.handle_status_query(&status_query(action_id));
+        assert_eq!(report.body.known_state, KnownActionState::Failed);
+    }
+
+    #[test]
+    fn status_query_against_a_known_cancelled_action_returns_cancelled() {
+        let agent =
+            SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::AcceptThenSucceed);
+        let action_id = ProtocolId::generate();
+        agent.handle_dispatch(&dispatch(action_id));
+        agent.handle_cancel(&cancel(action_id));
+
+        let report = agent.handle_status_query(&status_query(action_id));
+        assert_eq!(report.body.known_state, KnownActionState::Cancelled);
+    }
+
+    #[test]
+    fn status_query_against_a_known_rejected_action_returns_unknown_not_a_fabricated_state() {
+        let agent = SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::Reject);
+        let action_id = ProtocolId::generate();
+        agent.handle_dispatch(&dispatch(action_id));
+
+        let report = agent.handle_status_query(&status_query(action_id));
+        assert_eq!(report.body.known_state, KnownActionState::Unknown);
+    }
+
+    #[test]
+    fn agent_restart_loses_local_state_and_status_query_returns_unknown_never_proof_of_non_execution(
+    ) {
+        // A fresh Agent-local instance stands in for loss of local state
+        // (Agent restart) — a deterministic control hook, mirroring the same
+        // pattern already used for CancelAck (Issue #27's
+        // `job_cancellation_wss.rs`).
+        let agent =
+            SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::AcceptThenSucceed);
+        let action_id = ProtocolId::generate();
+        agent.handle_dispatch(&dispatch(action_id));
+        agent.run_configured_scenario(action_id).unwrap();
+
+        let restarted_agent = SimulatedActionAgent::new();
+        let report = restarted_agent.handle_status_query(&status_query(action_id));
+        assert_eq!(report.body.known_state, KnownActionState::Unknown);
+    }
+
+    #[test]
+    fn repeated_status_query_is_idempotent_and_uses_fresh_message_ids() {
+        let agent =
+            SimulatedActionAgent::new().with_default_scenario(ScenarioOutcome::AcceptThenSucceed);
+        let action_id = ProtocolId::generate();
+        agent.handle_dispatch(&dispatch(action_id));
+
+        let first = agent.handle_status_query(&status_query(action_id));
+        let second = agent.handle_status_query(&status_query(action_id));
+        assert_eq!(first.body.known_state, second.body.known_state);
+        assert_ne!(first.envelope.message_id, second.envelope.message_id);
     }
 
     #[test]

@@ -126,6 +126,14 @@ impl AgentDispatchPort for FakeDispatchPort {
         }
         Ok(())
     }
+
+    async fn status_query(
+        &self,
+        _endpoint_id: EndpointId,
+        _query: bamep_agent_protocol::StatusQueryMessage,
+    ) -> Result<(), AgentDispatchError> {
+        unimplemented!("job_cancellation.rs never sends StatusQuery through this fake")
+    }
 }
 
 struct Services {

@@ -18,7 +18,8 @@ CREATE TYPE domain_event_type AS ENUM (
     'JobSucceeded',
     'JobFailed',
     'JobStepFailed',
-    'JobCancelled'
+    'JobCancelled',
+    'AttemptIndeterminate'
 );
 
 CREATE TYPE audit_actor_kind AS ENUM (
@@ -109,11 +110,14 @@ CREATE TABLE endpoint_credentials (
 -- Domain-event envelope fields remain queryable columns; payload contains only
 -- the event-type-specific remainder. job_id is nullable because only
 -- Job-scoped events (currently JobStarted/JobSucceeded/JobFailed/
--- JobStepFailed, Issues #32/#26) carry it; every other event type currently
--- implemented is Endpoint-scoped only. job_step_id is nullable further still
--- — only JobStepFailed (Issue #26) carries it. Their FKs are added below,
--- once the `jobs`/`job_steps` tables this table is declared ahead of exist —
--- mirroring `endpoints_current_inventory_revision_fk` above.
+-- JobStepFailed/JobCancelled/AttemptIndeterminate, Issues #32/#26/#27/#28)
+-- carry it; every other event type currently implemented is Endpoint-scoped
+-- only. job_step_id is nullable further still — only JobStepFailed (Issue
+-- #26) and AttemptIndeterminate (Issue #28) carry it. attempt_id is nullable
+-- further still — only AttemptIndeterminate (Issue #28) carries it. Their FKs
+-- are added below, once the `jobs`/`job_steps`/`attempts` tables this table is
+-- declared ahead of exist — mirroring `endpoints_current_inventory_revision_fk`
+-- above.
 CREATE TABLE domain_events (
     event_id UUID PRIMARY KEY,
     event_type domain_event_type NOT NULL,
@@ -121,6 +125,7 @@ CREATE TABLE domain_events (
     endpoint_id UUID NOT NULL REFERENCES endpoints (id),
     job_id UUID,
     job_step_id UUID,
+    attempt_id UUID,
     occurred_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
 );
@@ -253,12 +258,11 @@ CREATE UNIQUE INDEX jobs_active_endpoint_exclusivity
 -- replace one). A later scheduling/dispatch Work Package consumes/revalidates
 -- this snapshot; it does not attach it.
 -- The Domain-owned minimum durable JobStep failure-reason vocabulary
--- (m0-job-lifecycle-and-scheduling.md "JobStep lifecycle"; Issue #26).
--- 'ReconciliationIndeterminate' belongs to #28 and is intentionally not
--- represented here yet.
+-- (m0-job-lifecycle-and-scheduling.md "JobStep lifecycle"; Issues #26/#28).
 CREATE TYPE job_step_failure_reason AS ENUM (
     'DispatchRejected',
-    'ExecutionFailed'
+    'ExecutionFailed',
+    'ReconciliationIndeterminate'
 );
 
 CREATE TABLE job_steps (
@@ -323,3 +327,8 @@ ALTER TABLE domain_events ADD CONSTRAINT domain_events_job_step_id_fk
     FOREIGN KEY (job_step_id) REFERENCES job_steps (id);
 
 CREATE INDEX idx_domain_events_job_step_id ON domain_events (job_step_id);
+
+ALTER TABLE domain_events ADD CONSTRAINT domain_events_attempt_id_fk
+    FOREIGN KEY (attempt_id) REFERENCES attempts (id);
+
+CREATE INDEX idx_domain_events_attempt_id ON domain_events (attempt_id);

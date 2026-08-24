@@ -23,11 +23,14 @@ use crate::ports::{
     ActionEvidenceLockedFacts, AdmitJobDecision, AdmitJobError, ApplyActionEvidenceDecision,
     ApplyActionEvidenceDecisionOutcome, ApplyActionEvidenceError, ApplyActionEvidenceResult,
     ApplyCancelAckDecision, ApplyCancelAckDecisionOutcome, ApplyCancelAckResult,
+    ApplyReconciliationDecision, ApplyReconciliationDecisionOutcome, ApplyReconciliationResult,
     AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError,
-    CancellationRequestDecided, CommitDestructiveDispatchError, CreateWorkflowError,
-    FinalDispatchDecision, FinalDispatchLockedFacts, JobRepository, RepositoryError,
-    RequestCancellationDecision, RequestCancellationError, RequestCancellationLockedFacts,
-    RequestCancellationResult, SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError,
+    CancellationRequestDecided, CloseIndeterminateDecision, CloseIndeterminateDecisionOutcome,
+    CloseIndeterminateError, CloseIndeterminateResult, CommitDestructiveDispatchError,
+    CreateWorkflowError, FinalDispatchDecision, FinalDispatchLockedFacts, JobRepository,
+    MarkUncertainDecision, RepositoryError, RequestCancellationDecision, RequestCancellationError,
+    RequestCancellationLockedFacts, RequestCancellationResult, SatisfyStepPreconditionsDecision,
+    SatisfyStepPreconditionsError,
 };
 
 /// Adapter-local representation of the `job_state` PostgreSQL ENUM
@@ -116,6 +119,7 @@ impl From<PgJobStepState> for JobStepState {
 enum PgJobStepFailureReason {
     DispatchRejected,
     ExecutionFailed,
+    ReconciliationIndeterminate,
 }
 
 impl From<JobStepFailureReason> for PgJobStepFailureReason {
@@ -123,6 +127,9 @@ impl From<JobStepFailureReason> for PgJobStepFailureReason {
         match reason {
             JobStepFailureReason::DispatchRejected => PgJobStepFailureReason::DispatchRejected,
             JobStepFailureReason::ExecutionFailed => PgJobStepFailureReason::ExecutionFailed,
+            JobStepFailureReason::ReconciliationIndeterminate => {
+                PgJobStepFailureReason::ReconciliationIndeterminate
+            }
         }
     }
 }
@@ -132,6 +139,9 @@ impl From<PgJobStepFailureReason> for JobStepFailureReason {
         match reason {
             PgJobStepFailureReason::DispatchRejected => JobStepFailureReason::DispatchRejected,
             PgJobStepFailureReason::ExecutionFailed => JobStepFailureReason::ExecutionFailed,
+            PgJobStepFailureReason::ReconciliationIndeterminate => {
+                JobStepFailureReason::ReconciliationIndeterminate
+            }
         }
     }
 }
@@ -1194,6 +1204,434 @@ impl JobRepository for PostgresJobRepository {
             }
         }
     }
+
+    /// Unlocked pre-scan for `endpoint_id`'s current active Job's
+    /// JobStep-current `Dispatched`/`InProgress` Attempt (at most one, by the
+    /// same invariant `active_attempt_candidate_rows` already relies on),
+    /// then locks exactly that Attempt row and re-verifies its state before
+    /// invoking `decide` — never trusting the pre-lock guess, mirroring
+    /// `apply_action_evidence`'s locked-then-decided pattern.
+    async fn mark_endpoint_active_attempt_uncertain(
+        &self,
+        endpoint_id: EndpointId,
+        decide: MarkUncertainDecision,
+    ) -> Result<Option<AttemptId>, RepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        let candidate_rows = sqlx::query(
+            "SELECT a.id AS attempt_id \
+             FROM attempts a \
+             JOIN job_steps js ON js.id = a.job_step_id \
+             JOIN jobs j ON j.id = js.job_id \
+             WHERE j.endpoint_id = $1 AND js.state = 'Dispatching' \
+               AND a.state IN ('Dispatched', 'InProgress')",
+        )
+        .bind(endpoint_id.0)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+        if candidate_rows.len() > 1 {
+            return Err(RepositoryError::Backend(
+                "invariant violation: more than one active attempt for endpoint".to_string(),
+            ));
+        }
+        let Some(candidate_row) = candidate_rows.first() else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Ok(None);
+        };
+        let candidate_id: uuid::Uuid = candidate_row
+            .try_get("attempt_id")
+            .map_err(to_backend_err)?;
+
+        let attempt_row = sqlx::query(
+            "SELECT id, job_step_id, action_id, state FROM attempts WHERE id = $1 FOR UPDATE",
+        )
+        .bind(candidate_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+        let Some(attempt_row) = attempt_row else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Ok(None);
+        };
+        let attempt = row_to_attempt(&attempt_row)?;
+
+        let Some(updated) = decide(&attempt) else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Ok(None);
+        };
+
+        sqlx::query("UPDATE attempts SET state = $1 WHERE id = $2")
+            .bind(PgAttemptState::from(updated.state))
+            .bind(updated.id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+
+        tx.commit().await.map_err(to_backend_err)?;
+        Ok(Some(updated.id))
+    }
+
+    /// Locks and reconciles every currently `Dispatched`/`InProgress`
+    /// Attempt row, across every Endpoint, one at a time, in one transaction
+    /// (Issue #28 "Server restart"). A bulk restart-recovery sweep, not a
+    /// hot path — executed at most once per Server startup.
+    async fn reconcile_all_active_attempts_on_startup(
+        &self,
+        decide: MarkUncertainDecision,
+    ) -> Result<Vec<AttemptId>, RepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        let candidate_ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM attempts WHERE state IN ('Dispatched', 'InProgress')",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+
+        let mut reconciled = Vec::new();
+        for candidate_id in candidate_ids {
+            let attempt_row = sqlx::query(
+                "SELECT id, job_step_id, action_id, state FROM attempts WHERE id = $1 FOR UPDATE",
+            )
+            .bind(candidate_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+            let Some(attempt_row) = attempt_row else {
+                continue;
+            };
+            let attempt = row_to_attempt(&attempt_row)?;
+            let Some(updated) = decide(&attempt) else {
+                continue;
+            };
+            sqlx::query("UPDATE attempts SET state = $1 WHERE id = $2")
+                .bind(PgAttemptState::from(updated.state))
+                .bind(updated.id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(to_backend_err)?;
+            reconciled.push(updated.id);
+        }
+
+        tx.commit().await.map_err(to_backend_err)?;
+        Ok(reconciled)
+    }
+
+    /// A plain, unlocked read — no transaction, no `FOR UPDATE`, nothing
+    /// persisted.
+    async fn find_reconciliation_candidate(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Result<Option<ActionId>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT a.action_id \
+             FROM attempts a \
+             JOIN job_steps js ON js.id = a.job_step_id \
+             JOIN jobs j ON j.id = js.job_id \
+             WHERE j.endpoint_id = $1 AND a.state = 'AwaitingReconciliation'",
+        )
+        .bind(endpoint_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(to_backend_err)?;
+        if rows.len() > 1 {
+            return Err(RepositoryError::Backend(
+                "invariant violation: more than one AwaitingReconciliation attempt for endpoint"
+                    .to_string(),
+            ));
+        }
+        match rows.first() {
+            Some(row) => {
+                let action_id: uuid::Uuid = row.try_get("action_id").map_err(to_backend_err)?;
+                Ok(Some(ActionId(action_id)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// See the Port doc. Lock order and correlation mirror
+    /// `apply_action_evidence`/`apply_cancel_ack` exactly: Attempt -> JobStep
+    /// -> Job by `action_id`, verifying the owning Job targets
+    /// `authenticated_endpoint_id`.
+    async fn apply_status_report(
+        &self,
+        action_id: ActionId,
+        authenticated_endpoint_id: EndpointId,
+        decide: ApplyReconciliationDecision,
+    ) -> Result<ApplyReconciliationResult, ApplyActionEvidenceError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        let attempt_row = sqlx::query(
+            "SELECT id, job_step_id, action_id, state FROM attempts WHERE action_id = $1 FOR UPDATE",
+        )
+        .bind(action_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+        let Some(attempt_row) = attempt_row else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(ApplyActionEvidenceError::UnknownAction);
+        };
+        let attempt = row_to_attempt(&attempt_row)?;
+
+        let step_row = sqlx::query(
+            "SELECT id, job_id, step_order, state, \
+                    authorized_inventory_revision_id, authorized_target_fingerprint, failure_reason \
+             FROM job_steps WHERE id = $1 FOR UPDATE",
+        )
+        .bind(attempt.job_step_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+        let Some(step_row) = step_row else {
+            return Err(ApplyActionEvidenceError::Repository(
+                RepositoryError::Backend(
+                    "attempt references a job_step that no longer exists".to_string(),
+                ),
+            ));
+        };
+        let job_step = row_to_job_step(&step_row)?;
+
+        let job_row = sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_step.job_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+        let Some(job_row) = job_row else {
+            return Err(ApplyActionEvidenceError::Repository(
+                RepositoryError::Backend(
+                    "job_step references a job that no longer exists".to_string(),
+                ),
+            ));
+        };
+        let job_endpoint_id: uuid::Uuid = job_row.try_get("endpoint_id").map_err(to_backend_err)?;
+        let job_state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
+        let steps = fetch_job_steps(&mut tx, job_step.job_id, true)
+            .await
+            .map_err(ApplyActionEvidenceError::Repository)?;
+        let job = Job {
+            id: job_step.job_id,
+            endpoint_id: EndpointId(job_endpoint_id),
+            state: job_state.into(),
+            steps,
+        };
+
+        if job.endpoint_id != authenticated_endpoint_id {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(ApplyActionEvidenceError::UnknownAction);
+        }
+
+        let facts = ActionEvidenceLockedFacts {
+            job,
+            job_step,
+            attempt,
+        };
+
+        match decide(facts) {
+            ApplyReconciliationDecisionOutcome::NoOp => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(ApplyReconciliationResult::NoOp)
+            }
+            ApplyReconciliationDecisionOutcome::Applied(commit) => {
+                let applied = commit.outcome;
+                persist_reconciliation_applied(&mut tx, &applied).await?;
+                if let Some(audit) = &commit.audit {
+                    insert_audit_record(&mut tx, audit)
+                        .await
+                        .map_err(ApplyActionEvidenceError::Repository)?;
+                }
+                tx.commit().await.map_err(to_backend_err)?;
+                Ok(ApplyReconciliationResult::Applied(applied))
+            }
+        }
+    }
+
+    /// Unlocked pre-scan for `job_id`'s current `AwaitingReconciliation`
+    /// Attempt (at most one, by the same JobStep-current-Attempt invariant
+    /// every other candidate scan in this file relies on), then locks Attempt
+    /// -> JobStep -> Job and re-verifies state before invoking `decide` —
+    /// never trusting the pre-lock guess.
+    async fn close_indeterminate(
+        &self,
+        job_id: JobId,
+        decide: CloseIndeterminateDecision,
+    ) -> Result<CloseIndeterminateResult, CloseIndeterminateError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        let candidate_rows = sqlx::query(
+            "SELECT a.id AS attempt_id \
+             FROM attempts a \
+             JOIN job_steps js ON js.id = a.job_step_id \
+             WHERE js.job_id = $1 AND js.state = 'Dispatching' \
+               AND a.state = 'AwaitingReconciliation'",
+        )
+        .bind(job_id.0)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+        if candidate_rows.len() > 1 {
+            return Err(CloseIndeterminateError::Repository(
+                RepositoryError::Backend(
+                    "invariant violation: more than one AwaitingReconciliation attempt for job"
+                        .to_string(),
+                ),
+            ));
+        }
+        let Some(candidate_row) = candidate_rows.first() else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(CloseIndeterminateError::NoUncertainAttempt(job_id));
+        };
+        let candidate_id: uuid::Uuid = candidate_row
+            .try_get("attempt_id")
+            .map_err(to_backend_err)?;
+
+        let attempt_row = sqlx::query(
+            "SELECT id, job_step_id, action_id, state FROM attempts WHERE id = $1 FOR UPDATE",
+        )
+        .bind(candidate_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+        let Some(attempt_row) = attempt_row else {
+            return Err(CloseIndeterminateError::Repository(
+                RepositoryError::Backend("candidate attempt disappeared under lock".to_string()),
+            ));
+        };
+        let attempt = row_to_attempt(&attempt_row).map_err(CloseIndeterminateError::Repository)?;
+
+        let step_row = sqlx::query(
+            "SELECT id, job_id, step_order, state, \
+                    authorized_inventory_revision_id, authorized_target_fingerprint, failure_reason \
+             FROM job_steps WHERE id = $1 FOR UPDATE",
+        )
+        .bind(attempt.job_step_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+        let Some(step_row) = step_row else {
+            return Err(CloseIndeterminateError::Repository(
+                RepositoryError::Backend(
+                    "attempt references a job_step that no longer exists".to_string(),
+                ),
+            ));
+        };
+        let job_step = row_to_job_step(&step_row).map_err(CloseIndeterminateError::Repository)?;
+
+        let job_row = sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+        let Some(job_row) = job_row else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(CloseIndeterminateError::JobNotFound(job_id));
+        };
+        let job_endpoint_id: uuid::Uuid = job_row.try_get("endpoint_id").map_err(to_backend_err)?;
+        let job_state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
+        let steps = fetch_job_steps(&mut tx, job_id, true)
+            .await
+            .map_err(CloseIndeterminateError::Repository)?;
+        let job = Job {
+            id: job_id,
+            endpoint_id: EndpointId(job_endpoint_id),
+            state: job_state.into(),
+            steps,
+        };
+
+        let facts = ActionEvidenceLockedFacts {
+            job,
+            job_step,
+            attempt,
+        };
+
+        match decide(facts) {
+            CloseIndeterminateDecisionOutcome::AlreadyIndeterminate => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(CloseIndeterminateResult::AlreadyIndeterminate)
+            }
+            CloseIndeterminateDecisionOutcome::NotEligible => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(CloseIndeterminateResult::NotEligible)
+            }
+            CloseIndeterminateDecisionOutcome::Applied(commit) => {
+                let applied = commit.outcome;
+                persist_reconciliation_applied(&mut tx, &applied)
+                    .await
+                    .map_err(|e| match e {
+                        ApplyActionEvidenceError::Repository(e) => {
+                            CloseIndeterminateError::Repository(e)
+                        }
+                        ApplyActionEvidenceError::UnknownAction => unreachable!(
+                            "persist_reconciliation_applied never returns UnknownAction"
+                        ),
+                    })?;
+                insert_audit_record(&mut tx, &commit.audit)
+                    .await
+                    .map_err(CloseIndeterminateError::Repository)?;
+                tx.commit().await.map_err(to_backend_err)?;
+                Ok(CloseIndeterminateResult::Applied(applied))
+            }
+        }
+    }
+}
+
+/// Persists a [`bamep_domain::ReconciliationApplied`] result's Attempt/
+/// JobStep/Job state and required events within `tx`, without committing —
+/// shared by [`PostgresJobRepository::apply_status_report`] and
+/// [`PostgresJobRepository::close_indeterminate`]. Never inserts the audit
+/// record — callers differ on whether one is required/optional.
+async fn persist_reconciliation_applied(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    applied: &bamep_domain::ReconciliationApplied,
+) -> Result<(), ApplyActionEvidenceError> {
+    sqlx::query("UPDATE attempts SET state = $1 WHERE id = $2")
+        .bind(PgAttemptState::from(applied.attempt.state))
+        .bind(applied.attempt.id.0)
+        .execute(&mut **tx)
+        .await
+        .map_err(to_backend_err)?;
+
+    sqlx::query("UPDATE job_steps SET state = $1, failure_reason = $2 WHERE id = $3")
+        .bind(PgJobStepState::from(applied.job_step.state))
+        .bind(
+            applied
+                .job_step
+                .failure_reason
+                .map(PgJobStepFailureReason::from),
+        )
+        .bind(applied.job_step.id.0)
+        .execute(&mut **tx)
+        .await
+        .map_err(to_backend_err)?;
+
+    sqlx::query("UPDATE jobs SET state = $1 WHERE id = $2")
+        .bind(PgJobState::from(applied.job.state))
+        .bind(applied.job.id.0)
+        .execute(&mut **tx)
+        .await
+        .map_err(to_backend_err)?;
+
+    for event in &applied.events {
+        sqlx::query(
+            "INSERT INTO domain_events \
+             (event_id, event_type, event_version, endpoint_id, job_id, job_step_id, attempt_id, occurred_at, payload) \
+             VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(event.event_id())
+        .bind(PgDomainEventType::from(event))
+        .bind(event.endpoint_id().0)
+        .bind(event.job_id().map(|id| id.0))
+        .bind(event.job_step_id().map(|id| id.0))
+        .bind(event.attempt_id().map(|id| id.0))
+        .bind(event.occurred_at())
+        .bind(event_payload(event))
+        .execute(&mut **tx)
+        .await
+        .map_err(to_backend_err)?;
+    }
+
+    Ok(())
 }
 
 /// Scans for the JobStep-current Attempt(s) in `Dispatched`/`InProgress`/

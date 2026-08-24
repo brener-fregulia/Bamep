@@ -32,6 +32,7 @@ pub use messages::{
     AuthErrorBody, AuthErrorMessage, AuthRequestBody, AuthRequestMessage, BootstrapEvidenceBody,
     BootstrapEvidenceMessage, CancelAckBody, CancelAckMessage, CancelAckOutcome, CancelActionBody,
     CancelActionMessage, EmptyActionProgress, InventoryReportBody, InventoryReportMessage,
-    LocalBootTrust, ProtocolErrorBody, ProtocolErrorMessage, SessionEstablishedBody,
-    SessionEstablishedMessage,
+    KnownActionState, LocalBootTrust, ProtocolErrorBody, ProtocolErrorMessage,
+    SessionEstablishedBody, SessionEstablishedMessage, StatusQueryBody, StatusQueryMessage,
+    StatusReportBody, StatusReportMessage,
 };
