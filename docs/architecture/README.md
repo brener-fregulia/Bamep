@@ -250,20 +250,37 @@ responsibilities on one shared instance, extending `JobRepository` with
   its authenticated-session task exits (normal disconnect or a Gateway error), after that task's
   own message loop, so it never blocks the outbound channel it depends on — and only when
   `OutboundSessionDirectory::dispatch_relevant_action` returns the exact `action_id` this session
-  actually carried via `ActionDispatch`. That `action_id` is threaded through as
-  `mark_endpoint_uncertain`'s own parameter and compared, inside the same `MarkUncertainDecision`
-  closure the Adapter already invokes under its Attempt lock, against the freshly locked candidate
-  Attempt's own `action_id` — a mismatch is a safe no-op. This closes a cross-Attempt race a purely
-  Endpoint-scoped correlation left open: `OutboundSessionDirectory` records only one
-  `(SessionId, ActionId)` pair per Endpoint (only for `ActionDispatch`, never `CancelAction`/
-  `StatusQuery` transmission), so a session that only ever carried an earlier, now-terminal Attempt
-  can otherwise still be read as "dispatch-relevant" for a later, unrelated Attempt already
-  dispatched through a different (or the same) session by the time this trigger's own PostgreSQL
-  call actually runs. Comparing the exact `action_id` — not just Endpoint identity — makes that
-  window safe without a second Attempt, a persisted `SessionId`, or a new `JobRepository` method.
-  Both registries unregister synchronously, with no `.await` in between, strictly before this (or
-  any) reconciliation call — never leaving a stale outbound-ready window a concurrent
-  final-dispatch attempt could observe.
+  is currently correlated to. That `action_id` is threaded through as `mark_endpoint_uncertain`'s
+  own parameter and compared, inside the same `MarkUncertainDecision` closure the Adapter already
+  invokes under its Attempt lock, against the freshly locked candidate Attempt's own `action_id` —
+  a mismatch is a safe no-op. This closes a cross-Attempt race a purely Endpoint-scoped correlation
+  left open: `OutboundSessionDirectory` records only one `(SessionId, ActionId)` pair per Endpoint,
+  so a session that only ever carried an earlier, now-terminal Attempt can otherwise still be read
+  as "dispatch-relevant" for a later, unrelated Attempt already dispatched through a different (or
+  the same) session by the time this trigger's own PostgreSQL call actually runs. Comparing the
+  exact `action_id` — not just Endpoint identity — makes that window safe without a second Attempt,
+  a persisted `SessionId`, or a new `JobRepository` method. Both registries unregister
+  synchronously, with no `.await` in between, strictly before this (or any) reconciliation call —
+  never leaving a stale outbound-ready window a concurrent final-dispatch attempt could observe.
+
+  The `(SessionId, ActionId)` correlation itself has two writers, both on
+  `OutboundSessionDirectory`: `ActionDispatch` transmission establishes it (`CancelAction`/
+  `StatusQuery` transmission never does — neither proves the resolved session owns the action's
+  execution); and `bind_dispatch_relevant_session` REBINDS it to whichever authenticated session
+  supplied evidence the Application/Repository layer actually accepted as authoritative
+  non-terminal knowledge (Issue #28 third corrective pass "Session-relevance transfer after
+  authoritative non-terminal evidence") — `AgentControlGateway::handle_status_report` for an
+  accepted `StatusReport{Accepted|Running}` (`AwaitingReconciliation -> InProgress`), and
+  `handle_action_ack` for an accepted `ActionAck{Accepted}` (`Dispatched -> InProgress`), each
+  gated on the real `ApplyReconciliationResult`/`ApplyActionEvidenceResult::Applied` with
+  `terminal: false` the Repository already returned — never merely because untrusted wire input
+  claimed `Running`/`Accepted`. This is consistent with the wider evidence-application contract,
+  which already correlates by `action_id` + authenticated Endpoint alone, never exact `SessionId`
+  identity (`JobRepository::apply_action_evidence`/`apply_status_report`). Without this transfer, a
+  session that legitimately became the one currently relevant to an action — by successfully
+  reporting/acking it after the original dispatching session disconnected or another session raced
+  ahead of it — could later disconnect without its own loss ever being considered
+  reconciliation-relevant, silently stranding the Attempt `InProgress` forever.
 - `reconcile_on_startup` — Server-restart recovery: locks and reconciles every currently
   `Dispatched`/`InProgress` Attempt across every Endpoint in one pass. No test/harness in this
   repository runs a persistent Server process, so this is exercised by calling it directly
@@ -275,7 +292,9 @@ responsibilities on one shared instance, extending `JobRepository` with
   that loop's `outbound_rx` ever fulfills.
 - `apply_status_report` — inbound `StatusReport` evidence, invoked only by `AgentControlGateway`.
   Locks Attempt -> JobStep -> Job by `action_id`, exactly like `apply_action_evidence`/
-  `apply_cancel_ack`, and calls `bamep_domain::apply_status_report`.
+  `apply_cancel_ack`, and calls `bamep_domain::apply_status_report`. `Unknown` evidence always
+  decides `NoOp` (`bamep_domain::reconciliation` module docs) and therefore never reaches the
+  `bind_dispatch_relevant_session` rebind above — it never proves current execution knowledge.
 - `close_indeterminate` — the explicit reconciliation-close control path (never callable from
   inbound Agent Protocol handling, mirroring `CancellationService::request`'s identical
   separation). Locates the target Job's current `AwaitingReconciliation` Attempt, locks it, and

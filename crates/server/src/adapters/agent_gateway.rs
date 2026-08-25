@@ -45,7 +45,10 @@ use crate::application::{
     ActionEvidenceService, ApplicationError, BootstrapEvidenceService, CancellationService,
     EnrollmentService, RedeemResult,
 };
-use crate::ports::{CredentialRedemptionRepository, EndpointRepository};
+use crate::ports::{
+    ApplyActionEvidenceResult, ApplyReconciliationResult, CredentialRedemptionRepository,
+    EndpointRepository,
+};
 use crate::runtime::outbound_sessions::{
     outbound_channel, OutboundCommand, OutboundSessionDirectory,
 };
@@ -484,8 +487,13 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                                     let _ = service.record(session.endpoint_id, report).await?;
                                 }
                                 AgentProtocolMessage::ActionAck(ack) => {
-                                    self.handle_action_ack(write, session.endpoint_id, ack)
-                                        .await?;
+                                    self.handle_action_ack(
+                                        write,
+                                        session.endpoint_id,
+                                        session.session_id,
+                                        ack,
+                                    )
+                                    .await?;
                                 }
                                 AgentProtocolMessage::ActionResult(result) => {
                                     self.handle_action_result(write, session.endpoint_id, result)
@@ -505,8 +513,13 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                                         .await?;
                                 }
                                 AgentProtocolMessage::StatusReport(report) => {
-                                    self.handle_status_report(write, session.endpoint_id, report)
-                                        .await?;
+                                    self.handle_status_report(
+                                        write,
+                                        session.endpoint_id,
+                                        session.session_id,
+                                        report,
+                                    )
+                                    .await?;
                                 }
                                 AgentProtocolMessage::ProtocolError(_) => {}
                                 AgentProtocolMessage::AuthRequest(_)
@@ -549,6 +562,7 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
         &self,
         write: &mut W,
         endpoint_id: EndpointId,
+        session_id: ProtocolId,
         ack: ActionAckMessage,
     ) -> Result<(), AgentGatewayError> {
         let message_id = ack.envelope.message_id;
@@ -567,7 +581,29 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             .apply(ack.body.action_id, endpoint_id, evidence)
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(result) => {
+                // Issue #28 third corrective pass "Session-relevance transfer
+                // after authoritative non-terminal evidence": `terminal:
+                // false` on `Applied` is only ever produced by
+                // `AckAccepted`'s `Dispatched -> InProgress` transition
+                // (`bamep_domain::action_evidence` module docs) — i.e. this
+                // durably-accepted evidence just confirmed THIS authenticated
+                // session currently participates in the Agent's knowledge of
+                // this action, whether or not it is the exact session
+                // `ActionDispatch` originally flowed through. Rebinding only
+                // AFTER the Repository has actually committed this — never
+                // merely because the wire claimed `Accepted`.
+                if let ApplyActionEvidenceResult::Applied(applied) = &result {
+                    if !applied.terminal {
+                        self.outbound_sessions.bind_dispatch_relevant_session(
+                            endpoint_id,
+                            session_id,
+                            ack.body.action_id,
+                        );
+                    }
+                }
+                Ok(())
+            }
             Err(ApplicationError::UnknownAction) => Ok(()),
             Err(e) => Err(AgentGatewayError::Application(e)),
         }
@@ -659,6 +695,7 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
         &self,
         write: &mut W,
         endpoint_id: EndpointId,
+        session_id: ProtocolId,
         report: StatusReportMessage,
     ) -> Result<(), AgentGatewayError> {
         let message_id = report.envelope.message_id;
@@ -681,7 +718,32 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             .apply_status_report(report.body.action_id, endpoint_id, evidence)
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(result) => {
+                // Issue #28 third corrective pass "Session-relevance transfer
+                // after authoritative non-terminal evidence": `terminal:
+                // false` on `Applied` is only ever produced by the
+                // `Accepted`/`Running` `AwaitingReconciliation -> InProgress`
+                // recovery (`bamep_domain::reconciliation` module docs) —
+                // never by `Unknown` (always `NoOp`) or any terminal outcome.
+                // This authenticated, correctly action_id-correlated session
+                // just supplied the durably-accepted authoritative knowledge
+                // that keeps the Attempt executing, whether or not it is the
+                // exact session `ActionDispatch` originally flowed through —
+                // it must become the session subsequent connection-loss
+                // reconciliation depends on. Rebinding only AFTER the
+                // Repository has actually committed this — never merely
+                // because untrusted wire input claimed `Running`.
+                if let ApplyReconciliationResult::Applied(applied) = &result {
+                    if !applied.terminal {
+                        self.outbound_sessions.bind_dispatch_relevant_session(
+                            endpoint_id,
+                            session_id,
+                            report.body.action_id,
+                        );
+                    }
+                }
+                Ok(())
+            }
             Err(ApplicationError::UnknownAction) => Ok(()),
             Err(e) => Err(AgentGatewayError::Application(e)),
         }

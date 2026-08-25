@@ -213,6 +213,58 @@ impl OutboundSessionDirectory {
             _ => None,
         }
     }
+
+    /// Rebinds `endpoint_id`'s dispatch-relevant correlation to
+    /// `(session_id, action_id)` — a second, deliberately narrow writer of
+    /// the exact same [`Inner::dispatch_correlation`] fact [`Self::send`]
+    /// itself writes for `ActionDispatch` (Issue #28 third corrective pass
+    /// "Session-relevance transfer after authoritative non-terminal
+    /// evidence"). This is not a new/generic concept — it is the same
+    /// correlation, given a second legitimate way to become current.
+    ///
+    /// Why a second writer is correct rather than a layering violation: the
+    /// wider Agent Protocol/evidence-application contract already treats
+    /// "authenticated Endpoint + `action_id`" — never exact `SessionId`
+    /// identity — as the correlation authority for evidence
+    /// (`JobRepository::apply_action_evidence`/`apply_status_report`: locked
+    /// and applied by `action_id` + `authenticated_endpoint_id` alone, with
+    /// no session check). A session that supplies AUTHORITATIVE evidence
+    /// restoring/maintaining an Attempt as `InProgress` —
+    /// `StatusReport{Accepted|Running}` after reconciliation, or
+    /// `ActionAck{Accepted}` on a session overlapping the one that carried
+    /// the original `ActionDispatch` — is therefore just as legitimately
+    /// "the session currently relevant to this action" as the one that sent
+    /// the original dispatch. Without this transfer, losing the ORIGINAL
+    /// dispatching session while a DIFFERENT, still-live session is the one
+    /// actually current would either (a) wrongly reconcile an Attempt a live
+    /// session remains responsible for (if the stale entry still names the
+    /// departed session and happens to match by accident), or, the actual
+    /// defect this method closes, (b) silently strand the Attempt
+    /// `InProgress` forever once the ORIGINAL session eventually
+    /// disconnects, because [`Self::dispatch_relevant_action`] no longer
+    /// names it and the disconnect is therefore never even considered
+    /// reconciliation-relevant.
+    ///
+    /// Callers MUST invoke this only after the Application/Repository layer
+    /// has already durably accepted the evidence for this exact
+    /// `(endpoint_id, action_id, session_id)` triple — never merely because
+    /// untrusted wire input claims `Accepted`/`Running`. See
+    /// `AgentControlGateway::handle_status_report`/`handle_action_ack`, the
+    /// only callers.
+    pub fn bind_dispatch_relevant_session(
+        &self,
+        endpoint_id: EndpointId,
+        session_id: ProtocolId,
+        action_id: ProtocolId,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("outbound session directory lock poisoned");
+        inner
+            .dispatch_correlation
+            .insert(endpoint_id, (session_id, action_id));
+    }
 }
 
 impl OutboundSessionDirectory {
@@ -839,6 +891,139 @@ mod tests {
             directory.dispatch_relevant_action(endpoint_id, session_b),
             None,
             "StatusQuery transmission through B must never make B look dispatch-relevant"
+        );
+    }
+
+    // -- Issue #28 third corrective pass: bind_dispatch_relevant_session --
+
+    #[tokio::test]
+    async fn rebinding_transfers_dispatch_relevance_to_the_reporting_session_for_the_same_action() {
+        // Session A dispatches action X; session B later supplies
+        // authoritative non-terminal evidence for the SAME action_id and is
+        // rebound. A must no longer be considered dispatch-relevant for X —
+        // only B is, from this point on.
+        let directory = Arc::new(OutboundSessionDirectory::new());
+        let endpoint_id = endpoint();
+        let (tx_a, mut rx_a) = outbound_channel();
+        let session_a = ProtocolId::generate();
+        directory.register(endpoint_id, session_a, tx_a);
+        let message = dispatch();
+        let action_id = message.body.action_id;
+        let send_task = tokio::spawn({
+            let directory = Arc::clone(&directory);
+            async move { directory.dispatch_action(endpoint_id, message).await }
+        });
+        let OutboundCommand::Send { ack, .. } = rx_a.recv().await.unwrap();
+        ack.send(Ok(())).unwrap();
+        send_task.await.unwrap().unwrap();
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_a),
+            Some(action_id)
+        );
+
+        let session_b = ProtocolId::generate();
+        directory.bind_dispatch_relevant_session(endpoint_id, session_b, action_id);
+
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_a),
+            None,
+            "A must no longer be dispatch-relevant once relevance transfers to B"
+        );
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_b),
+            Some(action_id),
+            "B must become dispatch-relevant for the exact action_id it reported on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rebind_for_a_stale_action_can_never_affect_a_different_current_action() {
+        // Mirrors the fbcbb37 safety property for the new writer: even if a
+        // rebind call somehow named a superseded action_id (X, now
+        // terminal), it must never be confused with a later, unrelated
+        // action_id (Y) dispatched afterward through a different session —
+        // the map holds one fact per Endpoint, and only the most recent
+        // write (dispatch OR rebind) is ever observable.
+        let directory = Arc::new(OutboundSessionDirectory::new());
+        let endpoint_id = endpoint();
+        let session_a = ProtocolId::generate();
+        let session_b = ProtocolId::generate();
+        let action_x = ProtocolId::generate();
+        let action_y = ProtocolId::generate();
+
+        // A stale rebind for a superseded action X, naming session A.
+        directory.bind_dispatch_relevant_session(endpoint_id, session_a, action_x);
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_a),
+            Some(action_x)
+        );
+
+        // A genuinely later action Y dispatches through session B.
+        let (tx_b, mut rx_b) = outbound_channel();
+        directory.register(endpoint_id, session_b, tx_b);
+        let message_y = ActionDispatchMessage::new(
+            action_y,
+            "bamep.m1.simulated-execution",
+            "1",
+            serde_json::Map::new(),
+        );
+        let send_task = tokio::spawn({
+            let directory = Arc::clone(&directory);
+            async move { directory.dispatch_action(endpoint_id, message_y).await }
+        });
+        let OutboundCommand::Send { ack, .. } = rx_b.recv().await.unwrap();
+        ack.send(Ok(())).unwrap();
+        send_task.await.unwrap().unwrap();
+
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_a),
+            None,
+            "the stale rebind to action X must never survive a later action Y's real dispatch"
+        );
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_b),
+            Some(action_y)
+        );
+    }
+
+    #[tokio::test]
+    async fn losing_the_last_live_session_still_clears_the_correlation_after_a_rebind() {
+        // The rebind path must compose with the existing last-live-session
+        // cleanup in `unregister` — a rebound session unregistering as the
+        // Endpoint's last live session must still clear the correlation,
+        // exactly like a plain dispatch would.
+        let directory = Arc::new(OutboundSessionDirectory::new());
+        let endpoint_id = endpoint();
+        let (tx_a, mut rx_a) = outbound_channel();
+        let session_a = ProtocolId::generate();
+        directory.register(endpoint_id, session_a, tx_a);
+        let message = dispatch();
+        let action_id = message.body.action_id;
+        let send_task = tokio::spawn({
+            let directory = Arc::clone(&directory);
+            async move { directory.dispatch_action(endpoint_id, message).await }
+        });
+        let OutboundCommand::Send { ack, .. } = rx_a.recv().await.unwrap();
+        ack.send(Ok(())).unwrap();
+        send_task.await.unwrap().unwrap();
+
+        let (tx_b, _rx_b) = outbound_channel();
+        let session_b = ProtocolId::generate();
+        directory.register(endpoint_id, session_b, tx_b);
+        directory.bind_dispatch_relevant_session(endpoint_id, session_b, action_id);
+        // B is now dispatch-relevant; A no longer is.
+        directory.unregister(endpoint_id, session_a);
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_b),
+            Some(action_id),
+            "A's unrelated unregister must not disturb B's rebound relevance"
+        );
+
+        directory.unregister(endpoint_id, session_b);
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_b),
+            None,
+            "B unregistering as the last live session must clear the correlation"
         );
     }
 }

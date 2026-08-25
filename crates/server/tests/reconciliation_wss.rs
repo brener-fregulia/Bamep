@@ -570,6 +570,7 @@ async fn reconnect(
     ClientWs,
     JoinHandle<Result<(), bamep_server::adapters::agent_gateway::AgentGatewayError>>,
     String,
+    bamep_agent_protocol::ProtocolId,
 ) {
     let listener = TcpListener::bind(addr).await.expect("bind");
     let bound_addr = listener.local_addr().unwrap();
@@ -611,8 +612,14 @@ async fn reconnect(
         panic!("rotated credential must re-establish a session")
     };
     let runtime_credential = established.body.runtime_credential.clone();
+    let session_id = established.body.session_id;
 
-    (connection.websocket, server_task, runtime_credential)
+    (
+        connection.websocket,
+        server_task,
+        runtime_credential,
+        session_id,
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -668,7 +675,7 @@ async fn disconnect_then_reconnect_status_query_and_report_reach_terminal_over_r
 
     // Reconnect using the rotated runtime_credential from the first session
     // (ADR-0012 reconnect) — a fresh real WSS session for the same Endpoint.
-    let (mut websocket2, server_task2, _rotated_again) = reconnect(
+    let (mut websocket2, server_task2, _rotated_again, _session_id_unused) = reconnect(
         &harness,
         &issuer,
         cert_der_2,
@@ -751,7 +758,7 @@ async fn agent_restart_status_query_returns_unknown_then_explicit_indeterminate_
         "AwaitingReconciliation"
     );
 
-    let (mut websocket2, server_task2, _rotated) = reconnect(
+    let (mut websocket2, server_task2, _rotated, _session_id_unused) = reconnect(
         &harness,
         &issuer,
         cert_der_2,
@@ -877,7 +884,7 @@ async fn server_restart_then_reconnect_issues_status_query_and_reaches_terminal_
 
     // The Endpoint reconnects against the restarted harness's own Gateway —
     // "Do NOT require an Agent to already be connected at Server startup".
-    let (mut websocket2, server_task2, _rotated) = reconnect(
+    let (mut websocket2, server_task2, _rotated, _session_id_unused) = reconnect(
         &restarted_harness,
         &issuer,
         cert_der_2,
@@ -951,7 +958,7 @@ async fn older_superseded_session_disconnecting_does_not_disturb_the_newer_dispa
 
     // ...then session B connects for the SAME Endpoint before any dispatch
     // has happened, becoming the newer/currently-selected session.
-    let (mut websocket_b, server_task_b, _rotated) = reconnect(
+    let (mut websocket_b, server_task_b, _rotated, _session_id_unused) = reconnect(
         &harness,
         &issuer,
         cert_der_2,
@@ -1070,7 +1077,7 @@ async fn dispatch_relevant_session_disconnecting_while_another_session_remains_l
     // Session B connects for the same Endpoint while A is still live — an
     // ordinary second authenticated session; no traffic has been sent
     // through it yet.
-    let (mut websocket_b, server_task_b, _rotated) = reconnect(
+    let (mut websocket_b, server_task_b, _rotated, _session_id_unused) = reconnect(
         &harness,
         &issuer,
         cert_der_2,
@@ -1245,7 +1252,7 @@ async fn cross_attempt_stale_dispatch_correlation_from_a_terminal_prior_attempt_
     wait_for_attempt_state(&db.pool, attempt_1.id.0, "Succeeded").await;
 
     // Session B connects for the same Endpoint while A remains live.
-    let (mut websocket_b, server_task_b, _rotated) = reconnect(
+    let (mut websocket_b, server_task_b, _rotated, _session_id_unused) = reconnect(
         &harness,
         &issuer,
         cert_der_2,
@@ -1374,6 +1381,344 @@ async fn cross_attempt_stale_dispatch_correlation_from_a_terminal_prior_attempt_
         harness.reconciliation.reconcile_on_startup().await.unwrap(),
         Vec::new(),
         "no Attempt was ever left Dispatched/InProgress for a restart sweep to find"
+    );
+
+    db.teardown().await;
+}
+
+// ---------------------------------------------------------------------
+// Session-relevance transfer after authoritative non-terminal evidence
+// (Issue #28 third corrective pass)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn status_report_running_transfers_relevance_and_losing_that_session_reawaits_reconciliation()
+{
+    // The defect this test closes: Session A dispatches X and disconnects
+    // while Session B remains live; B is correctly reused for StatusQuery
+    // and reports back Running, restoring X to InProgress. Without
+    // transferring Runtime dispatch-relevant-session correlation to B, B's
+    // OWN later disconnect would silently leave X InProgress forever — B
+    // never being "the session ActionDispatch flowed through", the Gateway
+    // would never even consider its disconnect reconciliation-relevant.
+    let db = TestDatabase::setup().await;
+    let (cert_der, key_der) = generate_test_cert("localhost");
+    let cert_der_2 = cert_der.clone();
+    let key_der_2 = key_der.clone_key();
+    let cert_der_3 = cert_der.clone();
+    let key_der_3 = key_der.clone_key();
+    let issuer = TrustedBootstrapFixtureIssuer::from_seed([0x88; 32]);
+    let services = build_services(db.pool.clone());
+    let harness = build_harness(db.pool.clone(), &services, &issuer);
+
+    let (mut websocket_a, server_task_a, fixture) = establish_and_dispatch(
+        &services,
+        &harness,
+        &issuer,
+        cert_der,
+        key_der,
+        "127.0.0.1:0".parse().unwrap(),
+        "wss-reconcile-running-relevance-transfer",
+    )
+    .await;
+
+    let AgentProtocolMessage::ActionDispatch(dispatch) = recv_agent_message(&mut websocket_a).await
+    else {
+        panic!("expected ActionDispatch on session A")
+    };
+    // Deliberately never Acked over A — X disconnects while still genuinely
+    // Dispatched, mirroring the concrete race in the defect report.
+
+    // Session B connects for the same Endpoint while A remains live.
+    let (mut websocket_b, server_task_b, rotated_b, _session_id_unused) = reconnect(
+        &harness,
+        &issuer,
+        cert_der_2,
+        key_der_2,
+        "127.0.0.1:0".parse().unwrap(),
+        fixture.boot_nonce,
+        fixture.fingerprint,
+        &fixture.runtime_credential,
+    )
+    .await;
+
+    // A — the actual dispatch-relevant session — disconnects.
+    websocket_a.close(None).await.unwrap();
+    server_task_a.await.unwrap().unwrap();
+
+    assert_eq!(
+        attempt_state(&db.pool, fixture.attempt.id.0).await,
+        "AwaitingReconciliation"
+    );
+
+    // Session B, the remaining live session, is reused for StatusQuery of
+    // the exact existing action_id.
+    let AgentProtocolMessage::StatusQuery(query) = recv_agent_message(&mut websocket_b).await
+    else {
+        panic!("expected StatusQuery on session B")
+    };
+    assert_eq!(query.body.action_id, dispatch.body.action_id);
+
+    // A fresh Simulated Agent instance seeds local Active state for this
+    // action_id via `handle_dispatch` WITHOUT ever transmitting the
+    // resulting ActionAck — this test exercises the StatusReport path only,
+    // never ActionAck (that is `action_ack_accepted_on_an_overlapping_session...`
+    // below). `handle_status_query` against Active state reports exactly
+    // `Running`.
+    let agent = SimulatedActionAgent::new()
+        .with_default_scenario(bamep_simulator::ScenarioOutcome::AcceptThenSucceed);
+    let _seed_only = agent.handle_dispatch(&dispatch);
+    let report = agent.handle_status_query(&query);
+    assert_eq!(report.body.known_state, KnownActionState::Running);
+    send_agent_message(&mut websocket_b, AgentProtocolMessage::StatusReport(report)).await;
+
+    // B stays open/live past this point, so poll rather than relying on a
+    // `server_task` join for synchronization (mirrors
+    // `wait_for_attempt_state`'s existing rationale).
+    wait_for_attempt_state(&db.pool, fixture.attempt.id.0, "InProgress").await;
+
+    // B — now the actual dispatch-relevant session, by virtue of having
+    // supplied the durably-accepted authoritative Running evidence —
+    // disconnects. This must reawait reconciliation: the Attempt is left
+    // durably InProgress with no live session's relevance confirmed for it
+    // any longer.
+    websocket_b.close(None).await.unwrap();
+    server_task_b.await.unwrap().unwrap();
+
+    assert_eq!(
+        attempt_state(&db.pool, fixture.attempt.id.0).await,
+        "AwaitingReconciliation",
+        "losing the session that supplied the authoritative Running evidence must reawait \
+         reconciliation, not leave the Attempt silently InProgress forever"
+    );
+
+    // No live session remains for this Endpoint — presence/outbound
+    // readiness are absent.
+    assert!(!harness.presence.is_present(fixture.endpoint_id));
+    let no_session = harness
+        .outbound
+        .status_query(
+            fixture.endpoint_id,
+            bamep_agent_protocol::StatusQueryMessage::new(
+                bamep_agent_protocol::ProtocolId::generate(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        no_session,
+        Err(bamep_server::ports::AgentDispatchError::NoSession)
+    );
+
+    // A future valid reconnect can StatusQuery the SAME action_id again —
+    // never a fresh ActionDispatch, never a replacement identity, and no
+    // second Attempt was ever created.
+    let (mut websocket_c, server_task_c, _rotated_c, _session_id_unused) = reconnect(
+        &harness,
+        &issuer,
+        cert_der_3,
+        key_der_3,
+        "127.0.0.1:0".parse().unwrap(),
+        fixture.boot_nonce,
+        fixture.fingerprint,
+        &rotated_b,
+    )
+    .await;
+    let AgentProtocolMessage::StatusQuery(query2) = recv_agent_message(&mut websocket_c).await
+    else {
+        panic!("expected StatusQuery on session C")
+    };
+    assert_eq!(query2.body.action_id, dispatch.body.action_id);
+
+    websocket_c.close(None).await.unwrap();
+    server_task_c.await.unwrap().unwrap();
+
+    assert_eq!(
+        attempt_state(&db.pool, fixture.attempt.id.0).await,
+        "AwaitingReconciliation",
+        "C never answered the StatusQuery, so nothing should have changed"
+    );
+    assert_eq!(
+        harness.reconciliation.reconcile_on_startup().await.unwrap(),
+        Vec::new(),
+        "no second Attempt/ActionDispatch was ever created"
+    );
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn status_report_unknown_never_transfers_relevance() {
+    // Secondary problem: StatusReport{Unknown} must never be mistaken for
+    // authoritative current-execution knowledge — it must not rebind
+    // dispatch-relevant-session correlation to the reporting session.
+    let db = TestDatabase::setup().await;
+    let (cert_der, key_der) = generate_test_cert("localhost");
+    let cert_der_2 = cert_der.clone();
+    let key_der_2 = key_der.clone_key();
+    let issuer = TrustedBootstrapFixtureIssuer::from_seed([0x89; 32]);
+    let services = build_services(db.pool.clone());
+    let harness = build_harness(db.pool.clone(), &services, &issuer);
+
+    let (mut websocket_a, server_task_a, fixture) = establish_and_dispatch(
+        &services,
+        &harness,
+        &issuer,
+        cert_der,
+        key_der,
+        "127.0.0.1:0".parse().unwrap(),
+        "wss-reconcile-unknown-never-transfers-relevance",
+    )
+    .await;
+
+    let AgentProtocolMessage::ActionDispatch(dispatch) = recv_agent_message(&mut websocket_a).await
+    else {
+        panic!("expected ActionDispatch on session A")
+    };
+
+    let (mut websocket_b, server_task_b, _rotated_b, session_id_b) = reconnect(
+        &harness,
+        &issuer,
+        cert_der_2,
+        key_der_2,
+        "127.0.0.1:0".parse().unwrap(),
+        fixture.boot_nonce,
+        fixture.fingerprint,
+        &fixture.runtime_credential,
+    )
+    .await;
+
+    websocket_a.close(None).await.unwrap();
+    server_task_a.await.unwrap().unwrap();
+    assert_eq!(
+        attempt_state(&db.pool, fixture.attempt.id.0).await,
+        "AwaitingReconciliation"
+    );
+
+    let AgentProtocolMessage::StatusQuery(query) = recv_agent_message(&mut websocket_b).await
+    else {
+        panic!("expected StatusQuery on session B")
+    };
+    assert_eq!(query.body.action_id, dispatch.body.action_id);
+
+    // A restarted Agent stands in for lost local state — Unknown never
+    // proves non-execution and must never be treated as authoritative
+    // "currently running" knowledge.
+    let restarted_agent = SimulatedActionAgent::new();
+    let report = restarted_agent.handle_status_query(&query);
+    assert_eq!(report.body.known_state, KnownActionState::Unknown);
+    send_agent_message(&mut websocket_b, AgentProtocolMessage::StatusReport(report)).await;
+
+    // B stays open/live past this point, so there is no `server_task`
+    // synchronization point yet (mirrors `wait_for_attempt_state`'s
+    // rationale) — a short bounded settle delay lets the Gateway's own task
+    // fully process the inbound frame before the direct, discriminating
+    // check below: `dispatch_relevant_action` against B's REAL session_id,
+    // taken WHILE B is still live. This must run before B disconnects —
+    // once B is the last live session and unregisters, the whole
+    // correlation entry is cleared regardless of whether it ever named B,
+    // which would make the check pass even for a buggy version that wrongly
+    // rebinds on any `Applied` evidence.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        harness
+            .outbound
+            .dispatch_relevant_action(fixture.endpoint_id, session_id_b),
+        None,
+        "StatusReport{{Unknown}} must never rebind dispatch-relevant-session correlation"
+    );
+
+    websocket_b.close(None).await.unwrap();
+    server_task_b.await.unwrap().unwrap();
+
+    assert_eq!(
+        attempt_state(&db.pool, fixture.attempt.id.0).await,
+        "AwaitingReconciliation",
+        "Unknown must never move the Attempt, and B's disconnect must never disturb it further"
+    );
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn action_ack_accepted_on_an_overlapping_session_transfers_relevance() {
+    // Owner-requested consistency check: the Agent Protocol/evidence-
+    // application contract already correlates ActionAck by
+    // `action_id` + authenticated Endpoint alone, never exact session
+    // identity (`JobRepository::apply_action_evidence` never checks it). So
+    // an `ActionAck{Accepted}` legitimately arriving on a DIFFERENT live
+    // session than the one `ActionDispatch` flowed through must transfer
+    // dispatch-relevant-session correlation exactly like
+    // `StatusReport{Accepted|Running}` does — this is the SAME underlying
+    // fact (authoritative non-terminal evidence), reached through the
+    // normal (non-reconciliation) evidence path instead.
+    let db = TestDatabase::setup().await;
+    let (cert_der, key_der) = generate_test_cert("localhost");
+    let cert_der_2 = cert_der.clone();
+    let key_der_2 = key_der.clone_key();
+    let issuer = TrustedBootstrapFixtureIssuer::from_seed([0x8a; 32]);
+    let services = build_services(db.pool.clone());
+    let harness = build_harness(db.pool.clone(), &services, &issuer);
+
+    let (mut websocket_a, server_task_a, fixture) = establish_and_dispatch(
+        &services,
+        &harness,
+        &issuer,
+        cert_der,
+        key_der,
+        "127.0.0.1:0".parse().unwrap(),
+        "wss-reconcile-ack-accepted-overlapping-session",
+    )
+    .await;
+
+    let AgentProtocolMessage::ActionDispatch(dispatch) = recv_agent_message(&mut websocket_a).await
+    else {
+        panic!("expected ActionDispatch on session A")
+    };
+
+    // Session B connects for the same Endpoint while A remains live.
+    let (mut websocket_b, server_task_b, _rotated_b, _session_id_unused) = reconnect(
+        &harness,
+        &issuer,
+        cert_der_2,
+        key_der_2,
+        "127.0.0.1:0".parse().unwrap(),
+        fixture.boot_nonce,
+        fixture.fingerprint,
+        &fixture.runtime_credential,
+    )
+    .await;
+
+    // The Agent's ActionAck{Accepted} for X arrives over B instead of A —
+    // a legitimate outcome under the existing Endpoint+action_id
+    // correlation contract.
+    let agent = SimulatedActionAgent::new()
+        .with_default_scenario(bamep_simulator::ScenarioOutcome::AcceptThenSucceed);
+    for message in agent.handle_dispatch(&dispatch) {
+        send_agent_message(&mut websocket_b, message).await;
+    }
+    wait_for_attempt_state(&db.pool, fixture.attempt.id.0, "InProgress").await;
+
+    // A — the ORIGINAL dispatching session, now stale — disconnects. This
+    // must NOT reconcile: B, which actually supplied the accepted evidence,
+    // remains live and is the currently relevant session.
+    websocket_a.close(None).await.unwrap();
+    server_task_a.await.unwrap().unwrap();
+
+    assert_eq!(
+        attempt_state(&db.pool, fixture.attempt.id.0).await,
+        "InProgress",
+        "A's disconnect must not disturb an Attempt B's ActionAck made relevant to B"
+    );
+
+    // B — the session that actually supplied the accepted evidence —
+    // disconnects. This must reconcile.
+    websocket_b.close(None).await.unwrap();
+    server_task_b.await.unwrap().unwrap();
+
+    assert_eq!(
+        attempt_state(&db.pool, fixture.attempt.id.0).await,
+        "AwaitingReconciliation",
+        "losing the session that actually accepted the action must reawait reconciliation"
     );
 
     db.teardown().await;
