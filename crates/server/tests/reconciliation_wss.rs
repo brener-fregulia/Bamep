@@ -226,6 +226,29 @@ async fn attempt_state(pool: &PgPool, attempt_id: uuid::Uuid) -> String {
         .unwrap()
 }
 
+/// Polls `attempt_id`'s durable state until it reaches `expected`, bounded to
+/// avoid ever hanging a test — the terminal-evidence frames a test sends over
+/// a still-open (not closed) session are processed by that session's own
+/// independent Gateway task, so there is no other synchronization point a
+/// test can await directly (unlike closing a session and awaiting its
+/// `server_task`, which this helper exists specifically to avoid needing when
+/// a test must keep that session open afterward). Panics with the
+/// last-observed state on timeout — never silently proceeds with a wrong
+/// precondition.
+async fn wait_for_attempt_state(pool: &PgPool, attempt_id: uuid::Uuid, expected: &str) {
+    for _ in 0..200 {
+        let observed = attempt_state(pool, attempt_id).await;
+        if observed == expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "attempt {attempt_id} never reached {expected:?}, last observed {:?}",
+        attempt_state(pool, attempt_id).await
+    );
+}
+
 async fn job_step_row(pool: &PgPool, step_id: JobStepId) -> (String, Option<String>) {
     let row = sqlx::query("SELECT state::text, failure_reason::text FROM job_steps WHERE id = $1")
         .bind(step_id.0)
@@ -280,9 +303,12 @@ struct PreparedSession {
 }
 
 /// Establishes one real WSS session for a freshly enrolled, fully-trusted
-/// Endpoint with one `Running` Job whose single step already holds
-/// `PreconditionsSatisfied` — everything short of the actual destructive
-/// dispatch commitment, which [`commit_and_dispatch`] performs separately.
+/// Endpoint with one `Running` Job of `step_count` ordered steps, whose FIRST
+/// step already holds `PreconditionsSatisfied` — everything short of the
+/// actual destructive dispatch commitment, which [`commit_and_dispatch`]
+/// performs separately. `step_count > 1` lets a test drive a second Attempt
+/// through the same Job once the first reaches a terminal state (Issue #28
+/// second corrective pass "cross-Attempt stale session correlation").
 #[allow(clippy::too_many_arguments)]
 async fn connect_and_prepare(
     services: &Services,
@@ -292,6 +318,7 @@ async fn connect_and_prepare(
     key_der: PrivateKeyDer<'static>,
     addr: SocketAddr,
     inventory_signal: &str,
+    step_count: usize,
 ) -> (
     ClientWs,
     JoinHandle<Result<(), bamep_server::adapters::agent_gateway::AgentGatewayError>>,
@@ -394,7 +421,11 @@ async fn connect_and_prepare(
         .target
         .set_current_target(endpoint_id, TargetFingerprint::new("disk-a"));
 
-    let job = services.jobs.create_workflow(endpoint_id, 1).await.unwrap();
+    let job = services
+        .jobs
+        .create_workflow(endpoint_id, step_count)
+        .await
+        .unwrap();
     let step_id = job.steps[0].id;
     services.intents.authorize(job.id, step_id).await.unwrap();
     services.scheduling.admit(job.id).await.unwrap();
@@ -492,6 +523,7 @@ async fn establish_and_dispatch(
         key_der,
         addr,
         inventory_signal,
+        1,
     )
     .await;
     let attempt = commit_and_dispatch(
@@ -913,6 +945,7 @@ async fn older_superseded_session_disconnecting_does_not_disturb_the_newer_dispa
         key_der,
         "127.0.0.1:0".parse().unwrap(),
         "wss-reconcile-older-superseded",
+        1,
     )
     .await;
 
@@ -1007,6 +1040,7 @@ async fn dispatch_relevant_session_disconnecting_while_another_session_remains_l
         key_der,
         "127.0.0.1:0".parse().unwrap(),
         "wss-reconcile-current-session-loss",
+        1,
     )
     .await;
     let attempt = commit_and_dispatch(
@@ -1139,6 +1173,207 @@ async fn last_live_session_ending_clears_presence_and_outbound_readiness_over_re
     assert_eq!(
         attempt_state(&db.pool, fixture.attempt.id.0).await,
         "AwaitingReconciliation"
+    );
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn cross_attempt_stale_dispatch_correlation_from_a_terminal_prior_attempt_never_disturbs_the_next_one(
+) {
+    // Issue #28 second corrective pass "Attempt-scoped session correlation":
+    // Session A dispatches and completes Attempt 1 entirely on its own.
+    // Session B then connects and stays live. The next JobStep's Attempt 2
+    // is committed and dispatched through B — the currently selected live
+    // session — while A is STILL live (not yet disconnecting). Only once
+    // Attempt 2 is already Dispatched through B does A disconnect. A's own
+    // disconnect-reconciliation trigger must observe that it only ever
+    // carried Attempt 1's (now terminal) action_id, never Attempt 2's, and
+    // must therefore never move Attempt 2 to AwaitingReconciliation — the
+    // exact cross-Attempt race the first corrective pass's Endpoint-scoped
+    // `last_sent_session` left open.
+    let db = TestDatabase::setup().await;
+    let (cert_der, key_der) = generate_test_cert("localhost");
+    let cert_der_2 = cert_der.clone();
+    let key_der_2 = key_der.clone_key();
+    let issuer = TrustedBootstrapFixtureIssuer::from_seed([0x87; 32]);
+    let services = build_services(db.pool.clone());
+    let harness = build_harness(db.pool.clone(), &services, &issuer);
+
+    // Session A connects and prepares a two-step Job.
+    let (mut websocket_a, server_task_a, prepared) = connect_and_prepare(
+        &services,
+        &harness,
+        &issuer,
+        cert_der,
+        key_der,
+        "127.0.0.1:0".parse().unwrap(),
+        "wss-reconcile-cross-attempt-stale-correlation",
+        2,
+    )
+    .await;
+
+    // Attempt 1 dispatches and completes entirely through session A.
+    let attempt_1 = commit_and_dispatch(
+        &services,
+        &harness,
+        prepared.job_id,
+        prepared.step_id,
+        prepared.endpoint_id,
+    )
+    .await;
+    let AgentProtocolMessage::ActionDispatch(dispatch_1) =
+        recv_agent_message(&mut websocket_a).await
+    else {
+        panic!("expected ActionDispatch for Attempt 1 on session A")
+    };
+    let agent = SimulatedActionAgent::new()
+        .with_default_scenario(bamep_simulator::ScenarioOutcome::AcceptThenSucceed);
+    for message in agent.handle_dispatch(&dispatch_1) {
+        send_agent_message(&mut websocket_a, message).await;
+    }
+    for message in agent
+        .run_configured_scenario(dispatch_1.body.action_id)
+        .unwrap()
+    {
+        send_agent_message(&mut websocket_a, message).await;
+    }
+    // Session A stays open/live past this point (it must still be the exact
+    // session whose disconnect is tested below), so there is no
+    // `server_task_a.await` synchronization point yet to confirm the Gateway
+    // has actually applied this terminal evidence — poll instead.
+    wait_for_attempt_state(&db.pool, attempt_1.id.0, "Succeeded").await;
+
+    // Session B connects for the same Endpoint while A remains live.
+    let (mut websocket_b, server_task_b, _rotated) = reconnect(
+        &harness,
+        &issuer,
+        cert_der_2,
+        key_der_2,
+        "127.0.0.1:0".parse().unwrap(),
+        prepared.boot_nonce,
+        prepared.fingerprint,
+        &prepared.runtime_credential,
+    )
+    .await;
+
+    // The next JobStep becomes eligible.
+    let job = services
+        .job_repo
+        .find_job(prepared.job_id)
+        .await
+        .unwrap()
+        .expect("job must exist");
+    let step_2 = job.steps[1].id;
+    services
+        .intents
+        .authorize(prepared.job_id, step_2)
+        .await
+        .unwrap();
+    services
+        .scheduling
+        .satisfy_current_step_preconditions(prepared.job_id, step_2)
+        .await
+        .unwrap();
+
+    // The actual race this test exists to close, made deterministic rather
+    // than left to scheduler luck: Attempt 2 is committed DURABLY to
+    // PostgreSQL first — via `FinalDispatchService` directly, deliberately
+    // WITHOUT yet calling `ActionDispatchService::dispatch` — so the Runtime
+    // `OutboundSessionDirectory` correlation map still says "(session A,
+    // Attempt 1's action_id)" at this exact point (nothing has dispatched
+    // Attempt 2 through it yet), while PostgreSQL's current active Attempt
+    // for this Endpoint is now genuinely Attempt 2. This is exactly the
+    // window the real production race can land in: `OutboundSessionDirectory`
+    // only records a new dispatch correlation once `ActionDispatchService`
+    // actually calls it, which always happens strictly AFTER the durable
+    // commit, never before or atomically with it.
+    let dispatch_service = FinalDispatchService::new(
+        Arc::clone(&services.job_repo),
+        Arc::clone(&harness.presence),
+        Arc::clone(&services.target) as Arc<dyn TargetRevalidationPort>,
+        Arc::clone(&harness.dispatch_arbiter),
+    );
+    let FinalDispatchResult::Committed {
+        outcome,
+        reservation,
+    } = dispatch_service
+        .commit_destructive_dispatch(prepared.job_id, step_2, network_claims())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a successful final-dispatch commitment for Attempt 2")
+    };
+    let attempt_2 = outcome.attempt;
+    let action_id_2 = bamep_agent_protocol::ProtocolId::from_uuid(attempt_2.action_id.0).unwrap();
+    assert_ne!(dispatch_1.body.action_id, action_id_2);
+
+    // Session A — which only ever carried Attempt 1's now-terminal
+    // action_id in the still-stale Runtime correlation map — disconnects
+    // now, exactly inside that window. This must NOT move the already-
+    // durably-committed Attempt 2 to AwaitingReconciliation: the decide-
+    // closure `mark_endpoint_uncertain` threads through the Adapter's lock
+    // locks Attempt 2 (PostgreSQL's genuine current candidate) and finds its
+    // `action_id` does not match the `action_id` A's disconnect captured, so
+    // it safely no-ops.
+    websocket_a.close(None).await.unwrap();
+    server_task_a.await.unwrap().unwrap();
+
+    assert_eq!(
+        attempt_state(&db.pool, attempt_2.id.0).await,
+        "Dispatched",
+        "an older session's disconnect must never disturb a later Attempt it never carried, \
+         even when that Attempt was already durably committed before the disconnect ran"
+    );
+
+    // Only now does `ActionDispatch` for Attempt 2 actually transmit through
+    // B, the currently selected live session — never through A, and never a
+    // second Attempt/commitment.
+    let action_dispatch_service = ActionDispatchService::new(
+        Arc::clone(&harness.reservations),
+        Arc::clone(&harness.outbound) as Arc<dyn AgentDispatchPort>,
+    );
+    let send_outcome = action_dispatch_service
+        .dispatch(prepared.endpoint_id, attempt_2, reservation)
+        .await;
+    assert!(
+        matches!(send_outcome, ActionDispatchOutcome::Sent),
+        "expected the local transport to accept the frame, got {send_outcome:?}"
+    );
+
+    let AgentProtocolMessage::ActionDispatch(dispatch_2) =
+        recv_agent_message(&mut websocket_b).await
+    else {
+        panic!("expected ActionDispatch for Attempt 2 on session B")
+    };
+    assert_eq!(dispatch_2.body.action_id, action_id_2);
+
+    // Normal evidence from B — the real dispatch-relevant session for
+    // Attempt 2 — completes it normally; B receives no unsolicited
+    // StatusQuery in between (the very next frame it observes is exactly the
+    // evidence this test drives).
+    for message in agent.handle_dispatch(&dispatch_2) {
+        send_agent_message(&mut websocket_b, message).await;
+    }
+    for message in agent
+        .run_configured_scenario(dispatch_2.body.action_id)
+        .unwrap()
+    {
+        send_agent_message(&mut websocket_b, message).await;
+    }
+
+    websocket_b.close(None).await.unwrap();
+    server_task_b.await.unwrap().unwrap();
+
+    assert_eq!(attempt_state(&db.pool, attempt_2.id.0).await, "Succeeded");
+    let (step_state, _) = job_step_row(&db.pool, step_2).await;
+    assert_eq!(step_state, "Succeeded");
+    assert_eq!(job_state_text(&db.pool, prepared.job_id).await, "Succeeded");
+    // No second Attempt/ActionDispatch was ever created for either JobStep.
+    assert_eq!(
+        harness.reconciliation.reconcile_on_startup().await.unwrap(),
+        Vec::new(),
+        "no Attempt was ever left Dispatched/InProgress for a restart sweep to find"
     );
 
     db.teardown().await;

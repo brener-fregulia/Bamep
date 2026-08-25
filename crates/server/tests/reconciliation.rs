@@ -57,6 +57,14 @@ fn object(value: Value) -> Map<String, Value> {
     value.as_object().unwrap().clone()
 }
 
+/// `attempt.action_id`'s wire `ProtocolId` form — the exact value
+/// `ReconciliationService::mark_endpoint_uncertain`'s `expected_action_id`
+/// parameter takes (Issue #28 second corrective pass "Attempt-scoped session
+/// correlation").
+fn action_id(attempt: &bamep_domain::Attempt) -> bamep_agent_protocol::ProtocolId {
+    bamep_agent_protocol::ProtocolId::from_uuid(attempt.action_id.0).unwrap()
+}
+
 fn network_claims() -> Vec<ResourceClaim> {
     vec![ResourceClaim::new(ResourceKind::new("network"), 1)]
 }
@@ -419,7 +427,10 @@ async fn dispatched_attempt_enters_awaiting_reconciliation_on_connection_loss() 
         FakeDispatchPort::new(),
     );
 
-    let reconciled = svc.mark_endpoint_uncertain(endpoint_id).await.unwrap();
+    let reconciled = svc
+        .mark_endpoint_uncertain(endpoint_id, action_id(&attempt))
+        .await
+        .unwrap();
     assert_eq!(reconciled, Some(attempt.id));
     assert_eq!(
         attempt_state(&db.pool, attempt.id.0).await,
@@ -449,7 +460,13 @@ async fn no_active_attempt_is_a_safe_no_op() {
         FakeDispatchPort::new(),
     );
 
-    let reconciled = svc.mark_endpoint_uncertain(endpoint_id).await.unwrap();
+    // No Attempt exists at all, so which action_id is "expected" is
+    // irrelevant — the repository finds no candidate row before `decide` is
+    // ever invoked.
+    let reconciled = svc
+        .mark_endpoint_uncertain(endpoint_id, bamep_agent_protocol::ProtocolId::generate())
+        .await
+        .unwrap();
     assert_eq!(reconciled, None);
 
     db.teardown().await;
@@ -477,9 +494,15 @@ async fn repeated_connection_loss_is_idempotent() {
         FakeDispatchPort::new(),
     );
 
-    let first = svc.mark_endpoint_uncertain(endpoint_id).await.unwrap();
+    let first = svc
+        .mark_endpoint_uncertain(endpoint_id, action_id(&attempt))
+        .await
+        .unwrap();
     assert_eq!(first, Some(attempt.id));
-    let second = svc.mark_endpoint_uncertain(endpoint_id).await.unwrap();
+    let second = svc
+        .mark_endpoint_uncertain(endpoint_id, action_id(&attempt))
+        .await
+        .unwrap();
     assert_eq!(
         second, None,
         "an already-AwaitingReconciliation Attempt is never re-reported as newly reconciled"
@@ -619,7 +642,9 @@ async fn session_start_issues_status_query_for_the_exact_existing_action_id() {
     );
 
     // Enter AwaitingReconciliation first (e.g. via a prior disconnect).
-    svc.mark_endpoint_uncertain(endpoint_id).await.unwrap();
+    svc.mark_endpoint_uncertain(endpoint_id, action_id(&attempt))
+        .await
+        .unwrap();
 
     let outcome = svc.reconcile_on_session_start(endpoint_id).await.unwrap();
     assert_eq!(outcome, StatusQuerySendOutcome::Sent);
@@ -686,7 +711,9 @@ async fn session_start_send_failure_never_causes_a_second_automatic_send() {
         arbiter(),
         Arc::clone(&dispatch),
     );
-    svc.mark_endpoint_uncertain(endpoint_id).await.unwrap();
+    svc.mark_endpoint_uncertain(endpoint_id, action_id(&attempt))
+        .await
+        .unwrap();
 
     let outcome = svc.reconcile_on_session_start(endpoint_id).await.unwrap();
     assert!(matches!(outcome, StatusQuerySendOutcome::SendFailed(_)));
@@ -721,7 +748,9 @@ async fn awaiting_reconciliation_attempt(
         arbiter(),
         FakeDispatchPort::new(),
     );
-    svc.mark_endpoint_uncertain(endpoint_id).await.unwrap();
+    svc.mark_endpoint_uncertain(endpoint_id, action_id(&attempt))
+        .await
+        .unwrap();
     (job_id, steps[0], endpoint_id, attempt)
 }
 
@@ -1400,7 +1429,10 @@ async fn close_indeterminate_reservation_absence_after_restart_never_corrupts_th
         arbiter(),
         FakeDispatchPort::new(),
     );
-    mark_svc.mark_endpoint_uncertain(endpoint_id).await.unwrap();
+    mark_svc
+        .mark_endpoint_uncertain(endpoint_id, action_id(&attempt))
+        .await
+        .unwrap();
 
     let result = mark_svc
         .close_indeterminate(job_id, operator())

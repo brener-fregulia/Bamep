@@ -249,9 +249,18 @@ responsibilities on one shared instance, extending `JobRepository` with
 - `mark_endpoint_uncertain` — the connection-loss trigger. `AgentControlGateway` calls it once
   its authenticated-session task exits (normal disconnect or a Gateway error), after that task's
   own message loop, so it never blocks the outbound channel it depends on — and only when
-  `OutboundSessionDirectory::is_dispatch_session` confirms this exact session was the one this
-  Endpoint's outbound traffic actually flowed through, so an unrelated overlapping session's own
-  disconnect never disturbs an Attempt a different, still-live session remains responsible for.
+  `OutboundSessionDirectory::dispatch_relevant_action` returns the exact `action_id` this session
+  actually carried via `ActionDispatch`. That `action_id` is threaded through as
+  `mark_endpoint_uncertain`'s own parameter and compared, inside the same `MarkUncertainDecision`
+  closure the Adapter already invokes under its Attempt lock, against the freshly locked candidate
+  Attempt's own `action_id` — a mismatch is a safe no-op. This closes a cross-Attempt race a purely
+  Endpoint-scoped correlation left open: `OutboundSessionDirectory` records only one
+  `(SessionId, ActionId)` pair per Endpoint (only for `ActionDispatch`, never `CancelAction`/
+  `StatusQuery` transmission), so a session that only ever carried an earlier, now-terminal Attempt
+  can otherwise still be read as "dispatch-relevant" for a later, unrelated Attempt already
+  dispatched through a different (or the same) session by the time this trigger's own PostgreSQL
+  call actually runs. Comparing the exact `action_id` — not just Endpoint identity — makes that
+  window safe without a second Attempt, a persisted `SessionId`, or a new `JobRepository` method.
   Both registries unregister synchronously, with no `.await` in between, strictly before this (or
   any) reconciliation call — never leaving a stale outbound-ready window a concurrent
   final-dispatch attempt could observe.

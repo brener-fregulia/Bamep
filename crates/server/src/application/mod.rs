@@ -1194,7 +1194,13 @@ pub enum StatusQuerySendOutcome {
 /// - [`Self::mark_endpoint_uncertain`] — connection-loss trigger. Called by
 ///   `AgentControlGateway` when an authenticated session for an Endpoint
 ///   ends (`m0-job-lifecycle-and-scheduling.md` "Attempt lifecycle":
-///   "connection loss ... while `Dispatched` or `InProgress`").
+///   "connection loss ... while `Dispatched` or `InProgress`"), and only when
+///   that session actually carried an `ActionDispatch`
+///   (`OutboundSessionDirectory::dispatch_relevant_action`). Scoped to the
+///   exact `action_id` that session carried, not merely to the Endpoint, so a
+///   stale correlation from an already-terminal Attempt can never move a
+///   later, unrelated Attempt into `AwaitingReconciliation` (Issue #28 second
+///   corrective pass "Attempt-scoped session correlation").
 /// - [`Self::reconcile_on_startup`] — Server-restart recovery. Called once,
 ///   before any Agent session is accepted, by the Runtime harness/test
 ///   standing in for Server startup (Issue #28 "Server restart": "Do NOT
@@ -1263,16 +1269,43 @@ impl ReconciliationService {
     }
 
     /// Connection-loss trigger: marks `endpoint_id`'s current active Attempt
-    /// (if any, and if currently `Dispatched`/`InProgress`)
-    /// `AwaitingReconciliation`. A safe no-op when no eligible Attempt
-    /// exists. Never touches any other Endpoint's Attempts.
+    /// `AwaitingReconciliation`, but ONLY when that Attempt's own `action_id`
+    /// still matches `expected_action_id` — the exact `action_id` the
+    /// disconnecting session actually carried via `ActionDispatch` (Issue #28
+    /// second corrective pass "Attempt-scoped session correlation").
+    ///
+    /// This is the fix for the cross-Attempt race the first corrective pass
+    /// left open: a disconnecting session may have carried an EARLIER Attempt
+    /// that already reached a terminal state and was superseded by a new one
+    /// — dispatched through a different (or the same) session — while the
+    /// disconnect was still being handled. Without this check, this method
+    /// would blindly mark whatever Attempt is *currently* active for the
+    /// Endpoint, even though the disconnecting session was never relevant to
+    /// it. Comparing `expected_action_id` against the freshly locked
+    /// candidate Attempt's own `action_id` — inside the same
+    /// [`crate::ports::MarkUncertainDecision`] closure hook the Adapter
+    /// already invokes under its own lock — makes the mismatch a safe no-op
+    /// (`Ok(None)`) instead of a false reconciliation, with no new Port
+    /// method and no second Attempt/Job lock required.
+    ///
+    /// A safe no-op when no eligible Attempt exists, or the eligible
+    /// Attempt's `action_id` does not match. Never touches any other
+    /// Endpoint's Attempts.
     pub async fn mark_endpoint_uncertain(
         &self,
         endpoint_id: EndpointId,
+        expected_action_id: ProtocolId,
     ) -> Result<Option<bamep_domain::AttemptId>, ApplicationError> {
+        let expected_action_id = ActionId(expected_action_id.as_uuid());
+        let decide: crate::ports::MarkUncertainDecision = Box::new(move |attempt: &Attempt| {
+            if attempt.action_id != expected_action_id {
+                return None;
+            }
+            bamep_domain::mark_awaiting_reconciliation(attempt)
+        });
         Ok(self
             .repo
-            .mark_endpoint_active_attempt_uncertain(endpoint_id, Self::mark_uncertain_decision())
+            .mark_endpoint_active_attempt_uncertain(endpoint_id, decide)
             .await?)
     }
 

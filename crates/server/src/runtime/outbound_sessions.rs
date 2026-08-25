@@ -72,19 +72,40 @@ struct Inner {
     /// #26 correction "Fix overlapping live-session selection").
     live_sessions: HashMap<EndpointId, Vec<ProtocolId>>,
     channels: HashMap<ProtocolId, OutboundSender>,
-    /// The `SessionId` most recently resolved to actually carry outbound
-    /// Agent Protocol traffic (`ActionDispatch`/`CancelAction`/`StatusQuery`)
-    /// for each Endpoint (Issue #28 corrective pass "Session-loss
-    /// reconciliation with overlapping sessions"). Deliberately distinct from
-    /// `live_sessions`' "currently selected" notion: that notion changes the
-    /// instant a newer session registers, which races a concurrent
-    /// reconnect against an older session's own disconnect handling. This
-    /// map instead reflects a fact fixed at send time, so a disconnecting
-    /// session can reliably tell whether *it* was the one actually used for
-    /// this Endpoint's most recent outbound send, immune to that race.
+    /// The `(SessionId, ActionId)` pair recorded when `ActionDispatch` was
+    /// last resolved to a session for each Endpoint (Issue #28 second
+    /// corrective pass "Attempt-scoped session correlation"). Deliberately
+    /// Attempt-scoped, not merely Endpoint-scoped: an Endpoint admits only
+    /// one active Attempt at a time, but that Attempt can reach a terminal
+    /// state and be superseded by a *later* Attempt/action_id while the
+    /// session that carried the earlier one is still live and only now
+    /// disconnecting — a purely Endpoint-scoped fact would then wrongly read
+    /// as "relevant" to the new Attempt. Recording the `action_id` alongside
+    /// the session lets a disconnecting session's own check be compared
+    /// against whichever Attempt is actually current at reconciliation time
+    /// (`ReconciliationService::mark_endpoint_uncertain`), so a stale
+    /// correlation from an already-terminal Attempt can never leak into a
+    /// later one.
+    ///
+    /// Deliberately distinct from `live_sessions`' "currently selected"
+    /// notion: that notion changes the instant a newer session registers,
+    /// which races a concurrent reconnect against an older session's own
+    /// disconnect handling. This map instead reflects a fact fixed at send
+    /// time, so a disconnecting session can reliably tell whether *it* was
+    /// the one actually used for this Endpoint's most recent `ActionDispatch`,
+    /// immune to that race.
+    ///
+    /// Only `ActionDispatch` ever writes this map — `CancelAction`/
+    /// `StatusQuery` transmission proves nothing about which session owns an
+    /// action's execution (a `CancelAction`/`StatusQuery` send can resolve to
+    /// a *different* live session than the one the original `ActionDispatch`
+    /// went through, and neither message's mere local-transport acceptance is
+    /// authoritative evidence the Agent on that session even recognizes the
+    /// action). See [`Self::send`].
+    ///
     /// Cleared for an Endpoint only when its last live session unregisters —
     /// mirrors `live_sessions`' own cleanup, never persisted.
-    last_sent_session: HashMap<EndpointId, ProtocolId>,
+    dispatch_correlation: HashMap<EndpointId, (ProtocolId, ProtocolId)>,
 }
 
 /// The transient authenticated-session delivery directory. See module docs.
@@ -151,30 +172,46 @@ impl OutboundSessionDirectory {
             if entry.get().is_empty() {
                 entry.remove();
                 // No live session remains for this Endpoint — the "most
-                // recently sent through" fact is no longer meaningful; a
-                // future session starts with a clean slate rather than
+                // recently dispatched through" fact is no longer meaningful;
+                // a future session starts with a clean slate rather than
                 // inheriting a stale binding from a since-departed session.
-                inner.last_sent_session.remove(&endpoint_id);
+                inner.dispatch_correlation.remove(&endpoint_id);
             }
         }
     }
 
-    /// Reports whether `session_id` was the session most recently resolved
-    /// to carry outbound Agent Protocol traffic for `endpoint_id` (Issue #28
-    /// corrective pass) — the transient, Runtime-only, Endpoint-scoped
-    /// correlation a disconnecting session uses to decide whether it was
-    /// dispatch-relevant for reconciliation purposes. Endpoint-scoped, not
-    /// Attempt-scoped: a Job admits only one active Attempt per Endpoint at
-    /// a time, so this fact is equivalent and simpler; never durable, never
-    /// used to fall back or resend. `false` when no outbound send has ever
-    /// resolved a session for this Endpoint, or the resolved session does
-    /// not match.
-    pub fn is_dispatch_session(&self, endpoint_id: EndpointId, session_id: ProtocolId) -> bool {
+    /// Reports the `action_id` `session_id` actually carried `ActionDispatch`
+    /// for on `endpoint_id`, if any — the transient, Runtime-only,
+    /// Attempt-scoped correlation a disconnecting session uses to decide
+    /// both *whether* it was dispatch-relevant for reconciliation purposes
+    /// and, crucially, *for which action* (Issue #28 second corrective pass
+    /// "Attempt-scoped session correlation": last-sent-session tracking alone
+    /// is Endpoint-scoped and can leak a stale, already-terminal Attempt's
+    /// relevance into a later Attempt dispatched through a different session
+    /// — see this type's module/field docs). `None` when no `ActionDispatch`
+    /// has ever resolved a session for this Endpoint, or the resolved
+    /// session does not match `session_id`. Never durable, never used to
+    /// fall back or resend.
+    ///
+    /// Returning the `action_id` itself (rather than a bare `bool`) is what
+    /// lets the caller pass it on to
+    /// `ReconciliationService::mark_endpoint_uncertain`, which only enters
+    /// `AwaitingReconciliation` for the Attempt actually carrying this exact
+    /// `action_id` — never merely "whatever Attempt happens to be current for
+    /// this Endpoint right now".
+    pub fn dispatch_relevant_action(
+        &self,
+        endpoint_id: EndpointId,
+        session_id: ProtocolId,
+    ) -> Option<ProtocolId> {
         let inner = self
             .inner
             .lock()
             .expect("outbound session directory lock poisoned");
-        inner.last_sent_session.get(&endpoint_id) == Some(&session_id)
+        match inner.dispatch_correlation.get(&endpoint_id) {
+            Some((sid, action_id)) if *sid == session_id => Some(*action_id),
+            _ => None,
+        }
     }
 }
 
@@ -200,13 +237,23 @@ impl OutboundSessionDirectory {
                 .and_then(|sessions| sessions.last())
                 .copied()
                 .ok_or(AgentDispatchError::NoSession)?;
-            // Fixes the dispatch-relevant session for this Endpoint at the
-            // moment of resolution — see `last_sent_session`'s docs. Recorded
-            // regardless of whether the local send below ultimately
-            // succeeds: resolving to `session_id` at all is itself the fact
-            // that matters, mirroring `dispatch_action`'s own "the local
-            // transport accepted the frame" trust boundary.
-            inner.last_sent_session.insert(endpoint_id, session_id);
+            // Fixes the dispatch-relevant (session, action_id) correlation
+            // for this Endpoint at the moment of resolution — see
+            // `dispatch_correlation`'s docs. Recorded regardless of whether
+            // the local send below ultimately succeeds: resolving to
+            // `session_id` at all is itself the fact that matters, mirroring
+            // `dispatch_action`'s own "the local transport accepted the
+            // frame" trust boundary.
+            //
+            // Deliberately only for `ActionDispatch`: `CancelAction`/
+            // `StatusQuery` transmission is never recorded here (Issue #28
+            // second corrective pass "secondary problem" — see
+            // `dispatch_correlation`'s docs for why).
+            if let AgentProtocolMessage::ActionDispatch(ref dispatch) = message {
+                inner
+                    .dispatch_correlation
+                    .insert(endpoint_id, (session_id, dispatch.body.action_id));
+            }
             inner
                 .channels
                 .get(&session_id)
@@ -435,43 +482,59 @@ mod tests {
         assert_eq!(result, Err(AgentDispatchError::SendFailed));
     }
 
-    // -- Issue #28 corrective pass: is_dispatch_session -------------------
+    // -- Issue #28 second corrective pass: dispatch_relevant_action -------
+
+    fn cancel(action_id: ProtocolId) -> CancelActionMessage {
+        CancelActionMessage::new(action_id)
+    }
+
+    fn status_query(action_id: ProtocolId) -> StatusQueryMessage {
+        StatusQueryMessage::new(action_id)
+    }
 
     #[tokio::test]
-    async fn no_send_has_ever_happened_is_never_a_dispatch_session() {
+    async fn no_send_has_ever_happened_is_never_a_dispatch_relevant_action() {
         let directory = OutboundSessionDirectory::new();
         let endpoint_id = endpoint();
         let session_id = ProtocolId::generate();
         directory.register(endpoint_id, session_id, outbound_channel().0);
-        assert!(!directory.is_dispatch_session(endpoint_id, session_id));
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_id),
+            None
+        );
     }
 
     #[tokio::test]
-    async fn a_successful_send_binds_the_resolved_session_as_the_dispatch_session() {
+    async fn a_successful_action_dispatch_send_binds_its_exact_action_id_to_the_resolved_session() {
         let directory = Arc::new(OutboundSessionDirectory::new());
         let endpoint_id = endpoint();
         let (tx, mut rx) = outbound_channel();
         let session_id = ProtocolId::generate();
         directory.register(endpoint_id, session_id, tx);
+        let message = dispatch();
+        let action_id = message.body.action_id;
 
         let send_task = tokio::spawn({
             let directory = Arc::clone(&directory);
-            async move { directory.dispatch_action(endpoint_id, dispatch()).await }
+            async move { directory.dispatch_action(endpoint_id, message).await }
         });
         let OutboundCommand::Send { ack, .. } = rx.recv().await.unwrap();
         ack.send(Ok(())).unwrap();
         send_task.await.unwrap().unwrap();
 
-        assert!(directory.is_dispatch_session(endpoint_id, session_id));
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_id),
+            Some(action_id)
+        );
     }
 
     #[tokio::test]
-    async fn a_newer_session_registering_alone_never_changes_the_dispatch_session_binding() {
+    async fn a_newer_session_registering_alone_never_changes_the_dispatch_correlation() {
         // Registration alone — no send — must not disturb which session is
-        // considered dispatch-relevant; only an actual resolved send does
-        // (Issue #28 corrective pass "Session-loss reconciliation with
-        // overlapping sessions": this is what makes a disconnecting older
-        // session's own check immune to a concurrent newer registration).
+        // considered dispatch-relevant; only an actual resolved ActionDispatch
+        // send does (Issue #28 corrective passes: this is what makes a
+        // disconnecting older session's own check immune to a concurrent
+        // newer registration).
         let directory = Arc::new(OutboundSessionDirectory::new());
         let endpoint_id = endpoint();
         let (tx_a, mut rx_a) = outbound_channel();
@@ -479,28 +542,37 @@ mod tests {
         let session_a = ProtocolId::generate();
         let session_b = ProtocolId::generate();
         directory.register(endpoint_id, session_a, tx_a);
+        let message = dispatch();
+        let action_id = message.body.action_id;
 
         let send_task = tokio::spawn({
             let directory = Arc::clone(&directory);
-            async move { directory.dispatch_action(endpoint_id, dispatch()).await }
+            async move { directory.dispatch_action(endpoint_id, message).await }
         });
         let OutboundCommand::Send { ack, .. } = rx_a.recv().await.unwrap();
         ack.send(Ok(())).unwrap();
         send_task.await.unwrap().unwrap();
-        assert!(directory.is_dispatch_session(endpoint_id, session_a));
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_a),
+            Some(action_id)
+        );
 
         // B registers afterward — becomes the newest *live* session, but
         // never actually had anything sent through it.
         directory.register(endpoint_id, session_b, tx_b);
-        assert!(
-            directory.is_dispatch_session(endpoint_id, session_a),
-            "A must remain the dispatch session until something is actually sent through B"
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_a),
+            Some(action_id),
+            "A must remain the dispatch-relevant session until something is actually sent through B"
         );
-        assert!(!directory.is_dispatch_session(endpoint_id, session_b));
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_b),
+            None
+        );
     }
 
     #[tokio::test]
-    async fn a_send_through_the_newly_selected_session_rebinds_the_dispatch_session() {
+    async fn a_send_through_the_newly_selected_session_rebinds_the_dispatch_correlation() {
         let directory = Arc::new(OutboundSessionDirectory::new());
         let endpoint_id = endpoint();
         let (tx_a, mut rx_a) = outbound_channel();
@@ -508,68 +580,87 @@ mod tests {
         let session_a = ProtocolId::generate();
         let session_b = ProtocolId::generate();
         directory.register(endpoint_id, session_a, tx_a);
+        let message_a = dispatch();
         let send_task = tokio::spawn({
             let directory = Arc::clone(&directory);
-            async move { directory.dispatch_action(endpoint_id, dispatch()).await }
+            async move { directory.dispatch_action(endpoint_id, message_a).await }
         });
         let OutboundCommand::Send { ack, .. } = rx_a.recv().await.unwrap();
         ack.send(Ok(())).unwrap();
         send_task.await.unwrap().unwrap();
 
         directory.register(endpoint_id, session_b, tx_b);
+        let message_b = dispatch();
+        let action_id_b = message_b.body.action_id;
         let send_task = tokio::spawn({
             let directory = Arc::clone(&directory);
-            async move { directory.dispatch_action(endpoint_id, dispatch()).await }
+            async move { directory.dispatch_action(endpoint_id, message_b).await }
         });
         let OutboundCommand::Send { ack, .. } = rx_b.recv().await.unwrap();
         ack.send(Ok(())).unwrap();
         send_task.await.unwrap().unwrap();
 
-        assert!(!directory.is_dispatch_session(endpoint_id, session_a));
-        assert!(directory.is_dispatch_session(endpoint_id, session_b));
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_a),
+            None
+        );
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_b),
+            Some(action_id_b)
+        );
     }
 
     #[tokio::test]
-    async fn the_last_live_session_unregistering_clears_the_dispatch_session_binding() {
+    async fn the_last_live_session_unregistering_clears_the_dispatch_correlation() {
         let directory = Arc::new(OutboundSessionDirectory::new());
         let endpoint_id = endpoint();
         let (tx, mut rx) = outbound_channel();
         let session_id = ProtocolId::generate();
         directory.register(endpoint_id, session_id, tx);
+        let message = dispatch();
+        let action_id = message.body.action_id;
         let send_task = tokio::spawn({
             let directory = Arc::clone(&directory);
-            async move { directory.dispatch_action(endpoint_id, dispatch()).await }
+            async move { directory.dispatch_action(endpoint_id, message).await }
         });
         let OutboundCommand::Send { ack, .. } = rx.recv().await.unwrap();
         ack.send(Ok(())).unwrap();
         send_task.await.unwrap().unwrap();
-        assert!(directory.is_dispatch_session(endpoint_id, session_id));
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_id),
+            Some(action_id)
+        );
 
         directory.unregister(endpoint_id, session_id);
 
         // A brand-new session, even if (hypothetically) it reused the exact
         // same SessionId, must never inherit a stale binding.
-        assert!(!directory.is_dispatch_session(endpoint_id, session_id));
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_id),
+            None
+        );
     }
 
     #[tokio::test]
     async fn an_older_sessions_own_disconnect_check_is_unaffected_by_a_concurrently_registering_newer_session(
     ) {
-        // Regression proof for the exact race the corrective pass closes:
-        // Attempt X is dispatched through session A. A's own disconnect
-        // handling must observe "I was the dispatch session" reliably even
-        // when a brand-new session B registers for the same Endpoint in the
-        // interim (a concurrent reconnect racing A's own cleanup) — because
-        // B's mere registration never touches the binding, only an actual
-        // resolved send would.
+        // Regression proof for the exact race the first corrective pass
+        // closes: Attempt X is dispatched through session A. A's own
+        // disconnect handling must observe "I carried action X" reliably
+        // even when a brand-new session B registers for the same Endpoint in
+        // the interim (a concurrent reconnect racing A's own cleanup) —
+        // because B's mere registration never touches the correlation, only
+        // an actual resolved ActionDispatch send would.
         let directory = Arc::new(OutboundSessionDirectory::new());
         let endpoint_id = endpoint();
         let (tx_a, mut rx_a) = outbound_channel();
         let session_a = ProtocolId::generate();
         directory.register(endpoint_id, session_a, tx_a);
+        let message = dispatch();
+        let action_id = message.body.action_id;
         let send_task = tokio::spawn({
             let directory = Arc::clone(&directory);
-            async move { directory.dispatch_action(endpoint_id, dispatch()).await }
+            async move { directory.dispatch_action(endpoint_id, message).await }
         });
         let OutboundCommand::Send { ack, .. } = rx_a.recv().await.unwrap();
         ack.send(Ok(())).unwrap();
@@ -581,7 +672,173 @@ mod tests {
         directory.register(endpoint_id, session_b, tx_b);
 
         // A's disconnect handling still correctly identifies itself as the
-        // dispatch-relevant session for the Attempt it actually carried.
-        assert!(directory.is_dispatch_session(endpoint_id, session_a));
+        // session that carried this exact action_id.
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_a),
+            Some(action_id)
+        );
+    }
+
+    // -- Issue #28 second corrective pass: cross-Attempt stale correlation
+    // and the CancelAction/StatusQuery "secondary problem" -----------------
+
+    #[tokio::test]
+    async fn a_later_action_dispatch_through_the_same_session_supersedes_an_earlier_terminal_ones_correlation(
+    ) {
+        // Session A dispatches Attempt 1's action, which later reaches a
+        // terminal state; the SAME still-live session A then dispatches
+        // Attempt 2's action (the next JobStep). A's own disconnect check
+        // must observe Attempt 2's action_id, never a stale binding to
+        // Attempt 1 — Runtime-level proof that a terminal prior action's
+        // correlation is never reused for a later one, even without an
+        // intervening session change.
+        let directory = Arc::new(OutboundSessionDirectory::new());
+        let endpoint_id = endpoint();
+        let (tx, mut rx) = outbound_channel();
+        let session_id = ProtocolId::generate();
+        directory.register(endpoint_id, session_id, tx);
+
+        let attempt_1 = dispatch();
+        let action_id_1 = attempt_1.body.action_id;
+        let send_task = tokio::spawn({
+            let directory = Arc::clone(&directory);
+            async move { directory.dispatch_action(endpoint_id, attempt_1).await }
+        });
+        let OutboundCommand::Send { ack, .. } = rx.recv().await.unwrap();
+        ack.send(Ok(())).unwrap();
+        send_task.await.unwrap().unwrap();
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_id),
+            Some(action_id_1)
+        );
+
+        // Attempt 1 reaches a terminal state (irrelevant to this directory —
+        // it never tracks Attempt state); the next JobStep's Attempt 2
+        // dispatches through the same still-live session.
+        let attempt_2 = dispatch();
+        let action_id_2 = attempt_2.body.action_id;
+        assert_ne!(action_id_1, action_id_2);
+        let send_task = tokio::spawn({
+            let directory = Arc::clone(&directory);
+            async move { directory.dispatch_action(endpoint_id, attempt_2).await }
+        });
+        let OutboundCommand::Send { ack, .. } = rx.recv().await.unwrap();
+        ack.send(Ok(())).unwrap();
+        send_task.await.unwrap().unwrap();
+
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_id),
+            Some(action_id_2),
+            "the stale Attempt 1 correlation must never be observable once Attempt 2 dispatches"
+        );
+    }
+
+    #[tokio::test]
+    async fn transmitting_cancel_action_never_establishes_or_disturbs_dispatch_correlation() {
+        // Secondary problem: CancelAction transmission proves nothing about
+        // which session owns the action's execution and must never be
+        // treated as equivalent to ActionDispatch routing.
+        let directory = Arc::new(OutboundSessionDirectory::new());
+        let endpoint_id = endpoint();
+        let (tx, mut rx) = outbound_channel();
+        let session_id = ProtocolId::generate();
+        directory.register(endpoint_id, session_id, tx);
+
+        let action_id = ProtocolId::generate();
+        let send_task = tokio::spawn({
+            let directory = Arc::clone(&directory);
+            async move {
+                directory
+                    .cancel_action(endpoint_id, cancel(action_id))
+                    .await
+            }
+        });
+        let OutboundCommand::Send { ack, .. } = rx.recv().await.unwrap();
+        ack.send(Ok(())).unwrap();
+        send_task.await.unwrap().unwrap();
+
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_id),
+            None,
+            "CancelAction transmission alone must never establish dispatch correlation"
+        );
+    }
+
+    #[tokio::test]
+    async fn transmitting_status_query_never_establishes_or_disturbs_dispatch_correlation() {
+        let directory = Arc::new(OutboundSessionDirectory::new());
+        let endpoint_id = endpoint();
+        let (tx, mut rx) = outbound_channel();
+        let session_id = ProtocolId::generate();
+        directory.register(endpoint_id, session_id, tx);
+
+        let action_id = ProtocolId::generate();
+        let send_task = tokio::spawn({
+            let directory = Arc::clone(&directory);
+            async move {
+                directory
+                    .status_query(endpoint_id, status_query(action_id))
+                    .await
+            }
+        });
+        let OutboundCommand::Send { ack, .. } = rx.recv().await.unwrap();
+        ack.send(Ok(())).unwrap();
+        send_task.await.unwrap().unwrap();
+
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_id),
+            None,
+            "StatusQuery transmission alone must never establish dispatch correlation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_status_query_through_another_session_never_erases_the_original_dispatch_correlation(
+    ) {
+        // Session A dispatches ActionDispatch; a later StatusQuery for the
+        // same action_id resolves to session B (the currently-selected live
+        // session at that moment). A's own correlation to the original
+        // action must remain intact — StatusQuery transmission through B
+        // must never overwrite or erase it.
+        let directory = Arc::new(OutboundSessionDirectory::new());
+        let endpoint_id = endpoint();
+        let (tx_a, mut rx_a) = outbound_channel();
+        let session_a = ProtocolId::generate();
+        directory.register(endpoint_id, session_a, tx_a);
+        let message = dispatch();
+        let action_id = message.body.action_id;
+        let send_task = tokio::spawn({
+            let directory = Arc::clone(&directory);
+            async move { directory.dispatch_action(endpoint_id, message).await }
+        });
+        let OutboundCommand::Send { ack, .. } = rx_a.recv().await.unwrap();
+        ack.send(Ok(())).unwrap();
+        send_task.await.unwrap().unwrap();
+
+        let (tx_b, mut rx_b) = outbound_channel();
+        let session_b = ProtocolId::generate();
+        directory.register(endpoint_id, session_b, tx_b);
+        let send_task = tokio::spawn({
+            let directory = Arc::clone(&directory);
+            async move {
+                directory
+                    .status_query(endpoint_id, status_query(action_id))
+                    .await
+            }
+        });
+        let OutboundCommand::Send { ack, .. } = rx_b.recv().await.unwrap();
+        ack.send(Ok(())).unwrap();
+        send_task.await.unwrap().unwrap();
+
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_a),
+            Some(action_id),
+            "A's original dispatch correlation must survive an unrelated StatusQuery send"
+        );
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_b),
+            None,
+            "StatusQuery transmission through B must never make B look dispatch-relevant"
+        );
     }
 }

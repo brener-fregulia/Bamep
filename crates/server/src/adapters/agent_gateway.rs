@@ -376,37 +376,49 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
         // outbound-ready and durably create a new Attempt during that
         // window even though this session's message loop is already gone.
         //
-        // `is_dispatch_session` is captured first, before either registry
-        // mutates: it reports whether this exact session was the one this
-        // Endpoint's outbound traffic actually flowed through, immune to a
-        // concurrent reconnect racing this cleanup (unlike "currently
+        // `dispatch_relevant_action` is captured first, before either
+        // registry mutates: it reports the exact `action_id` this session's
+        // outbound `ActionDispatch` traffic actually carried, if any, immune
+        // to a concurrent reconnect racing this cleanup (unlike "currently
         // selected live session", which changes the instant a new session
         // registers — see that method's docs). An unrelated older/
         // superseded session's disconnect must never move an Attempt that a
         // different, still-live session remains responsible for.
-        let was_dispatch_relevant = self
+        //
+        // Capturing the `action_id` itself — not merely a boolean — is what
+        // closes the Issue #28 second corrective pass's cross-Attempt race:
+        // this exact session may have carried an EARLIER Attempt that has
+        // since reached a terminal state and been superseded by a new one
+        // dispatched through a different (or the same) session while this
+        // one's own message loop was still shutting down.
+        // `mark_endpoint_uncertain` below only enters `AwaitingReconciliation`
+        // for the Attempt that still carries this exact `action_id` — never
+        // "whatever Attempt happens to be current for this Endpoint right
+        // now" — so a stale correlation from an already-terminal Attempt can
+        // never leak into a later one.
+        let dispatched_action = self
             .outbound_sessions
-            .is_dispatch_session(session.endpoint_id, session.session_id);
+            .dispatch_relevant_action(session.endpoint_id, session.session_id);
         self.presence
             .unregister(session.endpoint_id, session.session_id);
         self.outbound_sessions
             .unregister(session.endpoint_id, session.session_id);
 
-        // Connection loss (Issue #28 "Connection loss"): only when this was
-        // actually the dispatch-relevant session. Best-effort and never
-        // overrides the loop's own result; an unwinding panic is not covered
-        // (no async Drop exists to run this), but durable Attempt state is
-        // never corrupted by skipping it — a later reconciliation trigger
-        // (the next session start, or a Server-restart sweep) still recovers
-        // it. If another authenticated session for the Endpoint remains
-        // live (already registered, or one that raced this cleanup and is
-        // now selected), it is awaited directly here — not spawned — since
-        // it enqueues onto a *different*, already-running session task's
-        // outbound channel, never this one's own now-torn-down loop.
-        if was_dispatch_relevant {
+        // Connection loss (Issue #28 "Connection loss"): only when this
+        // session actually carried an `ActionDispatch`. Best-effort and
+        // never overrides the loop's own result; an unwinding panic is not
+        // covered (no async Drop exists to run this), but durable Attempt
+        // state is never corrupted by skipping it — a later reconciliation
+        // trigger (the next session start, or a Server-restart sweep) still
+        // recovers it. If another authenticated session for the Endpoint
+        // remains live (already registered, or one that raced this cleanup
+        // and is now selected), it is awaited directly here — not spawned —
+        // since it enqueues onto a *different*, already-running session
+        // task's outbound channel, never this one's own now-torn-down loop.
+        if let Some(action_id) = dispatched_action {
             if let Some(reconciliation) = &self.reconciliation {
                 let _ = reconciliation
-                    .mark_endpoint_uncertain(session.endpoint_id)
+                    .mark_endpoint_uncertain(session.endpoint_id, action_id)
                     .await;
                 let _ = reconciliation
                     .reconcile_on_session_start(session.endpoint_id)
