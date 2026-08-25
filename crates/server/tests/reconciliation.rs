@@ -1027,6 +1027,182 @@ async fn status_report_while_job_cancelling_still_ends_the_job_cancelled() {
     db.teardown().await;
 }
 
+#[tokio::test]
+async fn status_report_cancelled_against_a_running_job_never_initiates_cancellation() {
+    let db = TestDatabase::setup().await;
+    let services = build_services(db.pool.clone());
+    let presence = Arc::new(PresenceRegistry::new());
+    let reservations = Arc::new(AttemptReservationRegistry::new());
+    let (job_id, _step_id, endpoint_id, attempt) = awaiting_reconciliation_attempt(
+        &db,
+        &services,
+        &presence,
+        &reservations,
+        "reconcile-status-cancelled-running",
+    )
+    .await;
+    assert_eq!(job_state_text(&db.pool, job_id).await, "Running");
+
+    let svc = reconciliation_service(
+        Arc::clone(&services.job_repo),
+        Arc::clone(&reservations),
+        arbiter(),
+        FakeDispatchPort::new(),
+    );
+    let protocol_action_id =
+        bamep_agent_protocol::ProtocolId::from_uuid(attempt.action_id.0).unwrap();
+    let result = svc
+        .apply_status_report(
+            protocol_action_id,
+            endpoint_id,
+            StatusReportEvidence::Cancelled,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        ApplyReconciliationResult::NoOp,
+        "an Agent-reported Cancelled must never itself initiate Job cancellation"
+    );
+    assert_eq!(
+        attempt_state(&db.pool, attempt.id.0).await,
+        "AwaitingReconciliation"
+    );
+    assert_eq!(
+        job_state_text(&db.pool, job_id).await,
+        "Running",
+        "the Job must remain Running, never fabricated into Cancelled"
+    );
+    assert_eq!(event_count(&db.pool, job_id, "JobCancelled").await, 0);
+    assert!(
+        reservation_still_held(&reservations, attempt.id),
+        "a no-op must never release the reservation"
+    );
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn status_report_cancelled_while_cancelling_completes_cancellation() {
+    let db = TestDatabase::setup().await;
+    let services = build_services(db.pool.clone());
+    let presence = Arc::new(PresenceRegistry::new());
+    let (job_id, steps, endpoint_id, attempt, reservation) = dispatched_attempt(
+        &db.pool,
+        &services,
+        &presence,
+        "reconcile-status-cancelled-cancelling",
+    )
+    .await;
+
+    let reservations = Arc::new(AttemptReservationRegistry::new());
+    reservations.register(attempt.id, reservation);
+    let cancellation = cancellation_service(
+        Arc::clone(&services.job_repo),
+        Arc::clone(&reservations),
+        arbiter(),
+    );
+    cancellation.request(job_id, operator()).await.unwrap();
+    assert_eq!(job_state_text(&db.pool, job_id).await, "Cancelling");
+
+    let protocol_action_id =
+        bamep_agent_protocol::ProtocolId::from_uuid(attempt.action_id.0).unwrap();
+    cancellation
+        .apply_cancel_ack(protocol_action_id, endpoint_id, CancelAckEvidence::Unknown)
+        .await
+        .unwrap();
+    assert_eq!(
+        attempt_state(&db.pool, attempt.id.0).await,
+        "AwaitingReconciliation"
+    );
+
+    let reconciliation = reconciliation_service(
+        Arc::clone(&services.job_repo),
+        Arc::clone(&reservations),
+        arbiter(),
+        FakeDispatchPort::new(),
+    );
+    let result = reconciliation
+        .apply_status_report(
+            protocol_action_id,
+            endpoint_id,
+            StatusReportEvidence::Cancelled,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(result, ApplyReconciliationResult::Applied(_)));
+
+    assert_eq!(attempt_state(&db.pool, attempt.id.0).await, "Cancelled");
+    let (step_state, _) = job_step_row(&db.pool, steps[0]).await;
+    assert_eq!(step_state, "Cancelled");
+    assert_eq!(job_state_text(&db.pool, job_id).await, "Cancelled");
+    assert_eq!(event_count(&db.pool, job_id, "JobCancelled").await, 1);
+    assert_eq!(reservations.take(attempt.id), None, "released exactly once");
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn duplicate_late_status_report_cancelled_after_terminal_commit_is_a_no_op() {
+    let db = TestDatabase::setup().await;
+    let services = build_services(db.pool.clone());
+    let presence = Arc::new(PresenceRegistry::new());
+    let (job_id, _steps, endpoint_id, attempt, reservation) = dispatched_attempt(
+        &db.pool,
+        &services,
+        &presence,
+        "reconcile-status-cancelled-duplicate",
+    )
+    .await;
+
+    let reservations = Arc::new(AttemptReservationRegistry::new());
+    reservations.register(attempt.id, reservation);
+    let cancellation = cancellation_service(
+        Arc::clone(&services.job_repo),
+        Arc::clone(&reservations),
+        arbiter(),
+    );
+    cancellation.request(job_id, operator()).await.unwrap();
+    let protocol_action_id =
+        bamep_agent_protocol::ProtocolId::from_uuid(attempt.action_id.0).unwrap();
+    cancellation
+        .apply_cancel_ack(protocol_action_id, endpoint_id, CancelAckEvidence::Unknown)
+        .await
+        .unwrap();
+
+    let reconciliation = reconciliation_service(
+        Arc::clone(&services.job_repo),
+        Arc::clone(&reservations),
+        arbiter(),
+        FakeDispatchPort::new(),
+    );
+    reconciliation
+        .apply_status_report(
+            protocol_action_id,
+            endpoint_id,
+            StatusReportEvidence::Cancelled,
+        )
+        .await
+        .unwrap();
+    assert_eq!(attempt_state(&db.pool, attempt.id.0).await, "Cancelled");
+
+    // A late/duplicate StatusReport{Cancelled} arriving after the terminal
+    // commit must never re-apply or duplicate the JobCancelled event.
+    let result = reconciliation
+        .apply_status_report(
+            protocol_action_id,
+            endpoint_id,
+            StatusReportEvidence::Cancelled,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, ApplyReconciliationResult::NoOp);
+    assert_eq!(attempt_state(&db.pool, attempt.id.0).await, "Cancelled");
+    assert_eq!(event_count(&db.pool, job_id, "JobCancelled").await, 1);
+
+    db.teardown().await;
+}
+
 // ---------------------------------------------------------------------
 // Explicit Indeterminate closure
 // ---------------------------------------------------------------------

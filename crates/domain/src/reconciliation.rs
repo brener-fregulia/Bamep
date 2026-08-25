@@ -13,7 +13,11 @@
 //!   (connection loss, Server restart, acknowledgment timeout).
 //! - [`apply_status_report`] — the closed `StatusReport.known_state`
 //!   evidence vocabulary applied against an `AwaitingReconciliation` Attempt.
-//!   One `Unknown` never produces `Indeterminate`.
+//!   One `Unknown` never produces `Indeterminate`. `Cancelled` evidence
+//!   completes cancellation only when `job` is already `Cancelling` —
+//!   mirroring `crate::cancellation::apply_cancel_ack`'s identical authority
+//!   guard, an Agent-reported `Cancelled` must never itself initiate Job
+//!   cancellation.
 //! - [`close_indeterminate`] — the explicit reconciliation decision that
 //!   closes an `AwaitingReconciliation` Attempt as `Indeterminate` when the
 //!   authoritative outcome cannot be established. The Agent can never reach
@@ -145,9 +149,19 @@ pub fn apply_status_report(
         StatusReportEvidence::Failed => {
             ReconciliationOutcome::Applied(terminal_failure(job, job_step, attempt, now))
         }
-        StatusReportEvidence::Cancelled => {
+        // Mirrors `crate::cancellation::apply_cancel_ack`'s identical
+        // authority guard ("the Agent can never initiate Job cancellation"):
+        // a `StatusReport{Cancelled}` must never itself create cancellation
+        // intent. `CancelAction` is Server -> Agent only and is sent only
+        // while `Cancelling` (Issue #27), so there is no legitimate way for
+        // this evidence to be authoritative against a merely `Running` Job —
+        // untrusted wire input the Server does not act on. The Attempt
+        // remains `AwaitingReconciliation`, exactly like any other evidence
+        // this module does not currently accept.
+        StatusReportEvidence::Cancelled if job.state == JobState::Cancelling => {
             ReconciliationOutcome::Applied(terminal_cancelled(job, job_step, attempt, now))
         }
+        StatusReportEvidence::Cancelled => ReconciliationOutcome::NoOp,
         // One StatusReport{Unknown} never automatically produces
         // Indeterminate (`m0-job-lifecycle-and-scheduling.md`: "One
         // StatusReport{Unknown} does not automatically produce
@@ -276,13 +290,12 @@ fn terminal_failure(
     }
 }
 
-/// `StatusReport{Cancelled}`: Attempt -> `Cancelled`, current JobStep ->
-/// `Cancelled`, Job -> `Cancelled` with exactly one `JobCancelled` event —
-/// mirrors `crate::cancellation::cancel_terminal` unconditionally, since a
-/// locally-`Cancelled` Agent action state can only ever arise from a
-/// `CancelAction` the Server itself sent while `Cancelling`
-/// (`m0-agent-protocol-contract.md` "Message types": `CancelAction` is
-/// Server -> Agent only).
+/// `StatusReport{Cancelled}` while `job` is already `Cancelling`: Attempt ->
+/// `Cancelled`, current JobStep -> `Cancelled`, Job -> `Cancelled` with
+/// exactly one `JobCancelled` event — mirrors `crate::cancellation::cancel_terminal`.
+/// Callers must verify `job.state == JobState::Cancelling` first
+/// ([`apply_status_report`]'s only call site already does); this function
+/// itself does not re-check it.
 fn terminal_cancelled(
     job: &Job,
     job_step: &JobStep,
@@ -601,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_reaches_full_terminal_cancellation() {
+    fn cancelled_while_cancelling_reaches_full_terminal_cancellation() {
         let (job, ids) = cancelling_job(1, 0);
         let step = job.steps[0].clone();
         let attempt = attempt_for(ids[0], AttemptState::AwaitingReconciliation);
@@ -621,6 +634,45 @@ mod tests {
         assert_eq!(applied.job.state, JobState::Cancelled);
         assert_eq!(applied.events.len(), 1);
         assert_eq!(applied.events[0].event_type(), "JobCancelled");
+    }
+
+    #[test]
+    fn duplicate_late_cancelled_after_terminal_commit_never_overwrites_it() {
+        // Late/duplicate StatusReport{Cancelled} arriving after the Attempt
+        // already committed Cancelled (even under a Cancelling Job) must
+        // never re-apply or duplicate the JobCancelled event.
+        let (job, ids) = cancelling_job(1, 0);
+        let step = job.steps[0].clone();
+        let attempt = attempt_for(ids[0], AttemptState::Cancelled);
+
+        let outcome = apply_status_report(
+            &job,
+            &step,
+            &attempt,
+            StatusReportEvidence::Cancelled,
+            now(),
+        );
+        assert_eq!(outcome, ReconciliationOutcome::NoOp);
+    }
+
+    #[test]
+    fn cancelled_against_a_running_job_is_a_no_op_and_never_initiates_cancellation() {
+        // The Agent can never initiate Job cancellation — mirrors
+        // crate::cancellation's identical authority boundary. Even though an
+        // Attempt is genuinely AwaitingReconciliation, an unsolicited
+        // StatusReport{Cancelled} must not move a merely Running Job.
+        let (job, ids) = running_job(1, 0);
+        let step = job.steps[0].clone();
+        let attempt = attempt_for(ids[0], AttemptState::AwaitingReconciliation);
+
+        let outcome = apply_status_report(
+            &job,
+            &step,
+            &attempt,
+            StatusReportEvidence::Cancelled,
+            now(),
+        );
+        assert_eq!(outcome, ReconciliationOutcome::NoOp);
     }
 
     #[test]

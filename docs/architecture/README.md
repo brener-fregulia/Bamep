@@ -233,10 +233,13 @@ Failed | Cancelled | Unknown`) to `AgentProtocolMessage`, both carrying
 `cancellation` (which owns only `CancelAck` evidence): `mark_awaiting_reconciliation`
 (`Dispatched`/`InProgress -> AwaitingReconciliation`), `apply_status_report` (the closed
 `StatusReport` vocabulary applied against an `AwaitingReconciliation` Attempt — one `Unknown`
-never produces `Indeterminate`), and `close_indeterminate` (the explicit reconciliation decision
-that closes an `AwaitingReconciliation` Attempt `Indeterminate`, with `JobStep ->
-Failed{ReconciliationIndeterminate}` and one `AttemptIndeterminate` domain event, composing with
-a Job already `Cancelling` exactly like every other terminal reconciliation outcome).
+never produces `Indeterminate`; `Cancelled` evidence completes cancellation only when the Job is
+already `Cancelling`, mirroring `cancellation::apply_cancel_ack`'s identical authority guard so an
+Agent-reported `Cancelled` can never itself initiate Job cancellation), and `close_indeterminate`
+(the explicit reconciliation decision that closes an `AwaitingReconciliation` Attempt
+`Indeterminate`, with `JobStep -> Failed{ReconciliationIndeterminate}` and one
+`AttemptIndeterminate` domain event, composing with a Job already `Cancelling` exactly like every
+other terminal reconciliation outcome).
 
 `bamep_server::application::ReconciliationService` holds five structurally distinct
 responsibilities on one shared instance, extending `JobRepository` with
@@ -245,7 +248,13 @@ responsibilities on one shared instance, extending `JobRepository` with
 
 - `mark_endpoint_uncertain` — the connection-loss trigger. `AgentControlGateway` calls it once
   its authenticated-session task exits (normal disconnect or a Gateway error), after that task's
-  own message loop, so it never blocks the outbound channel it depends on.
+  own message loop, so it never blocks the outbound channel it depends on — and only when
+  `OutboundSessionDirectory::is_dispatch_session` confirms this exact session was the one this
+  Endpoint's outbound traffic actually flowed through, so an unrelated overlapping session's own
+  disconnect never disturbs an Attempt a different, still-live session remains responsible for.
+  Both registries unregister synchronously, with no `.await` in between, strictly before this (or
+  any) reconciliation call — never leaving a stale outbound-ready window a concurrent
+  final-dispatch attempt could observe.
 - `reconcile_on_startup` — Server-restart recovery: locks and reconciles every currently
   `Dispatched`/`InProgress` Attempt across every Endpoint in one pass. No test/harness in this
   repository runs a persistent Server process, so this is exercised by calling it directly

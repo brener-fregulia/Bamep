@@ -263,12 +263,28 @@ struct Fixture {
     runtime_credential: String,
 }
 
-/// Establishes the first real WSS session, commits one destructive
-/// `Attempt{Dispatched}`, transmits `ActionDispatch` for it, and returns both
-/// the live `websocket`/`server_task` and the [`Fixture`] context needed to
-/// reconnect later — mirrors `job_cancellation_wss.rs::establish_and_dispatch`.
+/// The Job/Endpoint/session context [`connect_and_prepare`] establishes,
+/// before any destructive dispatch has been committed — split out from
+/// [`Fixture`] so a test can connect an additional overlapping session
+/// (Issue #28 corrective pass "Session-loss reconciliation with overlapping
+/// sessions") before deciding when dispatch should actually happen (and
+/// therefore which currently-live session it routes through).
+#[allow(dead_code)]
+struct PreparedSession {
+    boot_nonce: BootNonce,
+    fingerprint: ServerCertFingerprint,
+    job_id: JobId,
+    step_id: JobStepId,
+    endpoint_id: EndpointId,
+    runtime_credential: String,
+}
+
+/// Establishes one real WSS session for a freshly enrolled, fully-trusted
+/// Endpoint with one `Running` Job whose single step already holds
+/// `PreconditionsSatisfied` — everything short of the actual destructive
+/// dispatch commitment, which [`commit_and_dispatch`] performs separately.
 #[allow(clippy::too_many_arguments)]
-async fn establish_and_dispatch(
+async fn connect_and_prepare(
     services: &Services,
     harness: &Harness,
     issuer: &TrustedBootstrapFixtureIssuer,
@@ -279,7 +295,7 @@ async fn establish_and_dispatch(
 ) -> (
     ClientWs,
     JoinHandle<Result<(), bamep_server::adapters::agent_gateway::AgentGatewayError>>,
-    Fixture,
+    PreparedSession,
 ) {
     let now = Utc::now();
     let boot_nonce = BootNonce::generate().expect("OS CSPRNG must be available in tests");
@@ -388,6 +404,33 @@ async fn establish_and_dispatch(
         .await
         .unwrap();
 
+    (
+        connection.websocket,
+        server_task,
+        PreparedSession {
+            boot_nonce,
+            fingerprint,
+            job_id: job.id,
+            step_id,
+            endpoint_id,
+            runtime_credential,
+        },
+    )
+}
+
+/// Commits one destructive `Attempt{Dispatched}` for `job_id`/`step_id` and
+/// transmits `ActionDispatch` for it — the local transport routes it through
+/// whichever session is *currently* selected for `endpoint_id` at the exact
+/// moment this is called, which is the point of keeping this separate from
+/// [`connect_and_prepare`]: a test can connect a second overlapping session
+/// first, so dispatch provably routes through the newer one.
+async fn commit_and_dispatch(
+    services: &Services,
+    harness: &Harness,
+    job_id: JobId,
+    step_id: JobStepId,
+    endpoint_id: EndpointId,
+) -> Attempt {
     let dispatch_service = FinalDispatchService::new(
         Arc::clone(&services.job_repo),
         Arc::clone(&harness.presence),
@@ -398,7 +441,7 @@ async fn establish_and_dispatch(
         outcome,
         reservation,
     } = dispatch_service
-        .commit_destructive_dispatch(job.id, step_id, network_claims())
+        .commit_destructive_dispatch(job_id, step_id, network_claims())
         .await
         .unwrap()
     else {
@@ -417,17 +460,60 @@ async fn establish_and_dispatch(
         "expected the local transport to accept the frame, got {outcome_send:?}"
     );
 
+    outcome.attempt
+}
+
+/// Establishes the first real WSS session, commits one destructive
+/// `Attempt{Dispatched}`, transmits `ActionDispatch` for it, and returns both
+/// the live `websocket`/`server_task` and the [`Fixture`] context needed to
+/// reconnect later — mirrors `job_cancellation_wss.rs::establish_and_dispatch`.
+/// Composes [`connect_and_prepare`] + [`commit_and_dispatch`] for the common
+/// single-session case; a test needing overlapping sessions calls those two
+/// helpers directly instead.
+#[allow(clippy::too_many_arguments)]
+async fn establish_and_dispatch(
+    services: &Services,
+    harness: &Harness,
+    issuer: &TrustedBootstrapFixtureIssuer,
+    cert_der: CertificateDer<'static>,
+    key_der: PrivateKeyDer<'static>,
+    addr: SocketAddr,
+    inventory_signal: &str,
+) -> (
+    ClientWs,
+    JoinHandle<Result<(), bamep_server::adapters::agent_gateway::AgentGatewayError>>,
+    Fixture,
+) {
+    let (websocket, server_task, prepared) = connect_and_prepare(
+        services,
+        harness,
+        issuer,
+        cert_der,
+        key_der,
+        addr,
+        inventory_signal,
+    )
+    .await;
+    let attempt = commit_and_dispatch(
+        services,
+        harness,
+        prepared.job_id,
+        prepared.step_id,
+        prepared.endpoint_id,
+    )
+    .await;
+
     (
-        connection.websocket,
+        websocket,
         server_task,
         Fixture {
-            boot_nonce,
-            fingerprint,
-            job_id: job.id,
-            step_id,
-            endpoint_id,
-            attempt: outcome.attempt,
-            runtime_credential,
+            boot_nonce: prepared.boot_nonce,
+            fingerprint: prepared.fingerprint,
+            job_id: prepared.job_id,
+            step_id: prepared.step_id,
+            endpoint_id: prepared.endpoint_id,
+            attempt,
+            runtime_credential: prepared.runtime_credential,
         },
     )
 }
@@ -797,6 +883,262 @@ async fn server_restart_then_reconnect_issues_status_query_and_reaches_terminal_
     assert_eq!(
         restarted_harness.reservations.take(fixture.attempt.id),
         None
+    );
+
+    db.teardown().await;
+}
+
+// ---------------------------------------------------------------------
+// Session-loss reconciliation with overlapping sessions (Issue #28
+// corrective pass)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn older_superseded_session_disconnecting_does_not_disturb_the_newer_dispatch_relevant_session(
+) {
+    let db = TestDatabase::setup().await;
+    let (cert_der, key_der) = generate_test_cert("localhost");
+    let cert_der_2 = cert_der.clone();
+    let key_der_2 = key_der.clone_key();
+    let issuer = TrustedBootstrapFixtureIssuer::from_seed([0x84; 32]);
+    let services = build_services(db.pool.clone());
+    let harness = build_harness(db.pool.clone(), &services, &issuer);
+
+    // Session A connects first...
+    let (mut websocket_a, server_task_a, prepared) = connect_and_prepare(
+        &services,
+        &harness,
+        &issuer,
+        cert_der,
+        key_der,
+        "127.0.0.1:0".parse().unwrap(),
+        "wss-reconcile-older-superseded",
+    )
+    .await;
+
+    // ...then session B connects for the SAME Endpoint before any dispatch
+    // has happened, becoming the newer/currently-selected session.
+    let (mut websocket_b, server_task_b, _rotated) = reconnect(
+        &harness,
+        &issuer,
+        cert_der_2,
+        key_der_2,
+        "127.0.0.1:0".parse().unwrap(),
+        prepared.boot_nonce,
+        prepared.fingerprint,
+        &prepared.runtime_credential,
+    )
+    .await;
+
+    // Dispatch happens only now — it must route through B, the currently
+    // selected session, never through A.
+    let attempt = commit_and_dispatch(
+        &services,
+        &harness,
+        prepared.job_id,
+        prepared.step_id,
+        prepared.endpoint_id,
+    )
+    .await;
+
+    let AgentProtocolMessage::ActionDispatch(dispatch) = recv_agent_message(&mut websocket_b).await
+    else {
+        panic!("expected ActionDispatch on session B")
+    };
+    let expected_action_id =
+        bamep_agent_protocol::ProtocolId::from_uuid(attempt.action_id.0).unwrap();
+    assert_eq!(dispatch.body.action_id, expected_action_id);
+
+    // Session A — older, superseded, never carried this Attempt's traffic —
+    // disconnects. This must NOT move the active Attempt to
+    // AwaitingReconciliation.
+    websocket_a.close(None).await.unwrap();
+    server_task_a.await.unwrap().unwrap();
+
+    assert_eq!(
+        attempt_state(&db.pool, attempt.id.0).await,
+        "Dispatched",
+        "an unrelated older session's disconnect must never move the active Attempt"
+    );
+
+    // Normal terminal evidence from B — the real dispatch-relevant session —
+    // still completes the Attempt normally.
+    let agent = SimulatedActionAgent::new()
+        .with_default_scenario(bamep_simulator::ScenarioOutcome::AcceptThenSucceed);
+    for message in agent.handle_dispatch(&dispatch) {
+        send_agent_message(&mut websocket_b, message).await;
+    }
+    for message in agent
+        .run_configured_scenario(dispatch.body.action_id)
+        .unwrap()
+    {
+        send_agent_message(&mut websocket_b, message).await;
+    }
+
+    websocket_b.close(None).await.unwrap();
+    server_task_b.await.unwrap().unwrap();
+
+    assert_eq!(attempt_state(&db.pool, attempt.id.0).await, "Succeeded");
+    let (step_state, _) = job_step_row(&db.pool, prepared.step_id).await;
+    assert_eq!(step_state, "Succeeded");
+    assert_eq!(job_state_text(&db.pool, prepared.job_id).await, "Succeeded");
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn dispatch_relevant_session_disconnecting_while_another_session_remains_live_triggers_reconciliation_and_reuses_it(
+) {
+    let db = TestDatabase::setup().await;
+    let (cert_der, key_der) = generate_test_cert("localhost");
+    let cert_der_2 = cert_der.clone();
+    let key_der_2 = key_der.clone_key();
+    let issuer = TrustedBootstrapFixtureIssuer::from_seed([0x85; 32]);
+    let services = build_services(db.pool.clone());
+    let harness = build_harness(db.pool.clone(), &services, &issuer);
+
+    // Session A connects, and dispatch happens through it — A is the only
+    // live session at that point.
+    let (mut websocket_a, server_task_a, prepared) = connect_and_prepare(
+        &services,
+        &harness,
+        &issuer,
+        cert_der,
+        key_der,
+        "127.0.0.1:0".parse().unwrap(),
+        "wss-reconcile-current-session-loss",
+    )
+    .await;
+    let attempt = commit_and_dispatch(
+        &services,
+        &harness,
+        prepared.job_id,
+        prepared.step_id,
+        prepared.endpoint_id,
+    )
+    .await;
+
+    let AgentProtocolMessage::ActionDispatch(dispatch) = recv_agent_message(&mut websocket_a).await
+    else {
+        panic!("expected ActionDispatch on session A")
+    };
+    let agent = SimulatedActionAgent::new()
+        .with_default_scenario(bamep_simulator::ScenarioOutcome::AcceptThenSucceed);
+    for message in agent.handle_dispatch(&dispatch) {
+        send_agent_message(&mut websocket_a, message).await;
+    }
+    // Executed locally but withheld — the Server still sees an active
+    // Attempt when A disconnects.
+    let _withheld = agent
+        .run_configured_scenario(dispatch.body.action_id)
+        .unwrap();
+
+    // Session B connects for the same Endpoint while A is still live — an
+    // ordinary second authenticated session; no traffic has been sent
+    // through it yet.
+    let (mut websocket_b, server_task_b, _rotated) = reconnect(
+        &harness,
+        &issuer,
+        cert_der_2,
+        key_der_2,
+        "127.0.0.1:0".parse().unwrap(),
+        prepared.boot_nonce,
+        prepared.fingerprint,
+        &prepared.runtime_credential,
+    )
+    .await;
+
+    // Session A — the actual dispatch-relevant session — disconnects.
+    websocket_a.close(None).await.unwrap();
+    server_task_a.await.unwrap().unwrap();
+
+    assert_eq!(
+        attempt_state(&db.pool, attempt.id.0).await,
+        "AwaitingReconciliation"
+    );
+
+    // Session B, still live, is reused for StatusQuery of the exact
+    // existing action_id — never a fresh ActionDispatch/replacement
+    // identity.
+    let AgentProtocolMessage::StatusQuery(query) = recv_agent_message(&mut websocket_b).await
+    else {
+        panic!("expected StatusQuery on the remaining live session B")
+    };
+    assert_eq!(query.body.action_id, dispatch.body.action_id);
+
+    let report = agent.handle_status_query(&query);
+    assert_eq!(report.body.known_state, KnownActionState::Succeeded);
+    send_agent_message(&mut websocket_b, AgentProtocolMessage::StatusReport(report)).await;
+
+    websocket_b.close(None).await.unwrap();
+    server_task_b.await.unwrap().unwrap();
+
+    assert_eq!(attempt_state(&db.pool, attempt.id.0).await, "Succeeded");
+    let (step_state, _) = job_step_row(&db.pool, prepared.step_id).await;
+    assert_eq!(step_state, "Succeeded");
+    assert_eq!(job_state_text(&db.pool, prepared.job_id).await, "Succeeded");
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn last_live_session_ending_clears_presence_and_outbound_readiness_over_real_wss() {
+    let db = TestDatabase::setup().await;
+    let (cert_der, key_der) = generate_test_cert("localhost");
+    let issuer = TrustedBootstrapFixtureIssuer::from_seed([0x86; 32]);
+    let services = build_services(db.pool.clone());
+    let harness = build_harness(db.pool.clone(), &services, &issuer);
+
+    let (mut websocket, server_task, fixture) = establish_and_dispatch(
+        &services,
+        &harness,
+        &issuer,
+        cert_der,
+        key_der,
+        "127.0.0.1:0".parse().unwrap(),
+        "wss-reconcile-last-session-ends",
+    )
+    .await;
+
+    let AgentProtocolMessage::ActionDispatch(_dispatch) = recv_agent_message(&mut websocket).await
+    else {
+        panic!("expected ActionDispatch")
+    };
+    assert!(harness.presence.is_present(fixture.endpoint_id));
+
+    // The only live session for this Endpoint ends.
+    websocket.close(None).await.unwrap();
+    server_task.await.unwrap().unwrap();
+
+    // Presence/outbound readiness are gone — the exact facts
+    // `FinalDispatchService`'s destructive gate (precondition 2, transient
+    // half; already exhaustively proven by
+    // `crates/domain/src/final_dispatch.rs`'s own
+    // `missing_agent_presence_fails_while_credential_remains_active`) and
+    // `ReconciliationService::reconcile_on_session_start`'s `StatusQuery`
+    // send both depend on. `run_authenticated_session` unregisters both
+    // synchronously, with no `.await` in between, strictly before it ever
+    // awaits `ReconciliationService` — so there is no stale-ready window a
+    // concurrent final-dispatch attempt could observe, unlike before this
+    // corrective pass.
+    assert!(!harness.presence.is_present(fixture.endpoint_id));
+    let status_result = harness
+        .outbound
+        .status_query(
+            fixture.endpoint_id,
+            bamep_agent_protocol::StatusQueryMessage::new(
+                bamep_agent_protocol::ProtocolId::generate(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        status_result,
+        Err(bamep_server::ports::AgentDispatchError::NoSession)
+    );
+
+    assert_eq!(
+        attempt_state(&db.pool, fixture.attempt.id.0).await,
+        "AwaitingReconciliation"
     );
 
     db.teardown().await;

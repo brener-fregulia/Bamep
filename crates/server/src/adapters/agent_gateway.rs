@@ -73,17 +73,23 @@ pub struct AuthenticatedSession {
 
 /// Reliably unregisters exactly one `(endpoint_id, session_id)` from both the
 /// Runtime Presence Registry and the [`OutboundSessionDirectory`] on drop —
-/// covering the normal `Ok(())` return, every `?` early-return, and an
-/// unwinding panic alike. A single combined guard, not two separate ones, so
-/// the required shutdown order (Issue #26 correction "Make presence mean
-/// outbound-ready for this session": presence removed first, outbound
-/// delivery removed second) is enforced structurally by this one `Drop` impl
-/// rather than by relying on two guards being declared in the right order —
-/// the registries themselves remain fully separate: this type owns no
-/// registry logic of its own, it only sequences two existing `unregister`
-/// calls. Constructed only by [`AgentControlGateway::run_authenticated_session`],
-/// after both registrations have already happened (in the required outbound-
-/// then-presence startup order).
+/// a panic-safety backstop for an unwinding panic, which no explicit code
+/// path can run. The normal `Ok(())` return and every `?` early-return
+/// instead unregister eagerly, synchronously, immediately once the message
+/// loop ends (Issue #28 corrective pass "Session-loss reconciliation with
+/// overlapping sessions": presence/outbound readiness must drop before any
+/// asynchronous reconciliation work runs) — this guard's own `drop` then
+/// finds both registries already clear and is a harmless idempotent no-op.
+/// A single combined guard, not two separate ones, so the required shutdown
+/// order (Issue #26 correction "Make presence mean outbound-ready for this
+/// session": presence removed first, outbound delivery removed second) is
+/// enforced structurally by this one `Drop` impl rather than by relying on
+/// two guards being declared in the right order — the registries themselves
+/// remain fully separate: this type owns no registry logic of its own, it
+/// only sequences two existing `unregister` calls. Constructed only by
+/// [`AgentControlGateway::run_authenticated_session`], after both
+/// registrations have already happened (in the required outbound-then-
+/// presence startup order).
 struct SessionLifecycleGuard {
     presence: Arc<PresenceRegistry>,
     outbound_sessions: Arc<OutboundSessionDirectory>,
@@ -360,19 +366,52 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             )
             .await;
 
-        // Connection loss (Issue #28 "Connection loss"): on every exit from
-        // the message loop below — normal disconnect/Close (`Ok(())`) or a
-        // genuine Gateway error (`Err`) — mark this Endpoint's active
-        // Attempt, if any, `AwaitingReconciliation`. Best-effort and never
+        // Issue #28 corrective pass "Session-loss reconciliation with
+        // overlapping sessions": the moment this exact session's message
+        // loop ends — normal disconnect/Close (`Ok(())`) or a genuine
+        // Gateway error (`Err`) — it must stop advertising presence/
+        // outbound readiness for this Endpoint BEFORE any asynchronous
+        // reconciliation work (which awaits PostgreSQL) can run. Otherwise a
+        // concurrent final-dispatch could still observe this Endpoint as
+        // outbound-ready and durably create a new Attempt during that
+        // window even though this session's message loop is already gone.
+        //
+        // `is_dispatch_session` is captured first, before either registry
+        // mutates: it reports whether this exact session was the one this
+        // Endpoint's outbound traffic actually flowed through, immune to a
+        // concurrent reconnect racing this cleanup (unlike "currently
+        // selected live session", which changes the instant a new session
+        // registers — see that method's docs). An unrelated older/
+        // superseded session's disconnect must never move an Attempt that a
+        // different, still-live session remains responsible for.
+        let was_dispatch_relevant = self
+            .outbound_sessions
+            .is_dispatch_session(session.endpoint_id, session.session_id);
+        self.presence
+            .unregister(session.endpoint_id, session.session_id);
+        self.outbound_sessions
+            .unregister(session.endpoint_id, session.session_id);
+
+        // Connection loss (Issue #28 "Connection loss"): only when this was
+        // actually the dispatch-relevant session. Best-effort and never
         // overrides the loop's own result; an unwinding panic is not covered
         // (no async Drop exists to run this), but durable Attempt state is
         // never corrupted by skipping it — a later reconciliation trigger
         // (the next session start, or a Server-restart sweep) still recovers
-        // it.
-        if let Some(reconciliation) = &self.reconciliation {
-            let _ = reconciliation
-                .mark_endpoint_uncertain(session.endpoint_id)
-                .await;
+        // it. If another authenticated session for the Endpoint remains
+        // live (already registered, or one that raced this cleanup and is
+        // now selected), it is awaited directly here — not spawned — since
+        // it enqueues onto a *different*, already-running session task's
+        // outbound channel, never this one's own now-torn-down loop.
+        if was_dispatch_relevant {
+            if let Some(reconciliation) = &self.reconciliation {
+                let _ = reconciliation
+                    .mark_endpoint_uncertain(session.endpoint_id)
+                    .await;
+                let _ = reconciliation
+                    .reconcile_on_session_start(session.endpoint_id)
+                    .await;
+            }
         }
 
         result
