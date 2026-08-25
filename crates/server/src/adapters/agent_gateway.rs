@@ -595,7 +595,16 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                 // merely because the wire claimed `Accepted`.
                 if let ApplyActionEvidenceResult::Applied(applied) = &result {
                     if !applied.terminal {
-                        self.outbound_sessions.bind_dispatch_relevant_session(
+                        // The return value (Issue #28 fourth corrective pass
+                        // "Late stale rebind ordering") is intentionally
+                        // ignored here: `StaleActionIgnored` means this
+                        // continuation resumed after the Endpoint's
+                        // correlation already genuinely moved on to a later
+                        // `action_id` via a newer `ActionDispatch` — exactly
+                        // the safe no-op this compare-and-swap-like method
+                        // exists to produce, requiring no further Gateway
+                        // action.
+                        let _ = self.outbound_sessions.bind_dispatch_relevant_session(
                             endpoint_id,
                             session_id,
                             ack.body.action_id,
@@ -735,7 +744,9 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                 // because untrusted wire input claimed `Running`.
                 if let ApplyReconciliationResult::Applied(applied) = &result {
                     if !applied.terminal {
-                        self.outbound_sessions.bind_dispatch_relevant_session(
+                        // Return value intentionally ignored — see the
+                        // identical note in `handle_action_ack`.
+                        let _ = self.outbound_sessions.bind_dispatch_relevant_session(
                             endpoint_id,
                             session_id,
                             report.body.action_id,

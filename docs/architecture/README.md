@@ -264,12 +264,12 @@ responsibilities on one shared instance, extending `JobRepository` with
   never leaving a stale outbound-ready window a concurrent final-dispatch attempt could observe.
 
   The `(SessionId, ActionId)` correlation itself has two writers, both on
-  `OutboundSessionDirectory`: `ActionDispatch` transmission establishes it (`CancelAction`/
-  `StatusQuery` transmission never does — neither proves the resolved session owns the action's
-  execution); and `bind_dispatch_relevant_session` REBINDS it to whichever authenticated session
-  supplied evidence the Application/Repository layer actually accepted as authoritative
-  non-terminal knowledge (Issue #28 third corrective pass "Session-relevance transfer after
-  authoritative non-terminal evidence") — `AgentControlGateway::handle_status_report` for an
+  `OutboundSessionDirectory`: `ActionDispatch` transmission unconditionally establishes it
+  (`CancelAction`/`StatusQuery` transmission never does — neither proves the resolved session owns
+  the action's execution); and `bind_dispatch_relevant_session` REBINDS it to whichever
+  authenticated session supplied evidence the Application/Repository layer actually accepted as
+  authoritative non-terminal knowledge (Issue #28 third corrective pass "Session-relevance transfer
+  after authoritative non-terminal evidence") — `AgentControlGateway::handle_status_report` for an
   accepted `StatusReport{Accepted|Running}` (`AwaitingReconciliation -> InProgress`), and
   `handle_action_ack` for an accepted `ActionAck{Accepted}` (`Dispatched -> InProgress`), each
   gated on the real `ApplyReconciliationResult`/`ApplyActionEvidenceResult::Applied` with
@@ -281,6 +281,20 @@ responsibilities on one shared instance, extending `JobRepository` with
   reporting/acking it after the original dispatching session disconnected or another session raced
   ahead of it — could later disconnect without its own loss ever being considered
   reconciliation-relevant, silently stranding the Attempt `InProgress` forever.
+
+  `bind_dispatch_relevant_session` is compare-and-swap-like, not a blind overwrite (Issue #28
+  fourth corrective pass "Late stale rebind ordering"): it returns `BindOutcome::Bound` when no
+  correlation currently exists for the Endpoint or the current one already names this exact
+  `action_id`, and `BindOutcome::StaleActionIgnored` (no mutation) when the current correlation
+  names a DIFFERENT `action_id`. This closes the gap the unconditional version left: the Gateway
+  task calling it resumes from its own evidence-application `.await` with no guarantee the
+  Endpoint's correlation hasn't since moved on — a genuinely later `ActionDispatch` for the next
+  ordered JobStep's Attempt can commit and transmit through a different session while this
+  continuation was still in flight. Since a later action always obtains its own correlation through
+  its own `ActionDispatch`, once the correlation has genuinely advanced past a given `action_id`,
+  any surviving continuation for it is stale and must never move the correlation backward —
+  mirroring the durable no-regression rules used elsewhere (newer authoritative lifecycle identity
+  is never overwritten by delayed evidence for an earlier one).
 - `reconcile_on_startup` — Server-restart recovery: locks and reconciles every currently
   `Dispatched`/`InProgress` Attempt across every Endpoint in one pass. No test/harness in this
   repository runs a persistent Server process, so this is exercised by calling it directly

@@ -95,13 +95,27 @@ struct Inner {
     /// the one actually used for this Endpoint's most recent `ActionDispatch`,
     /// immune to that race.
     ///
-    /// Only `ActionDispatch` ever writes this map — `CancelAction`/
-    /// `StatusQuery` transmission proves nothing about which session owns an
+    /// Two writers. `ActionDispatch` transmission ([`Self::send`])
+    /// unconditionally overwrites this map — it always corresponds to the
+    /// literal creation of a fresh, never-before-seen `action_id` for the
+    /// next Attempt, so it is always monotonically newer than whatever the
+    /// map currently holds and must always win. `CancelAction`/`StatusQuery`
+    /// transmission never writes here — neither proves which session owns an
     /// action's execution (a `CancelAction`/`StatusQuery` send can resolve to
     /// a *different* live session than the one the original `ActionDispatch`
     /// went through, and neither message's mere local-transport acceptance is
     /// authoritative evidence the Agent on that session even recognizes the
-    /// action). See [`Self::send`].
+    /// action).
+    ///
+    /// [`Self::bind_dispatch_relevant_session`] is the second writer
+    /// (Issue #28 fourth corrective pass "Late stale rebind ordering"):
+    /// unlike `ActionDispatch`, it can legitimately fire for an `action_id`
+    /// that is no longer current — an evidence-application continuation
+    /// (`ActionAck{Accepted}`/`StatusReport{Accepted|Running}`) can resume
+    /// from its own `.await` an arbitrary amount of time after a NEWER
+    /// `ActionDispatch` for a different, later Attempt has already
+    /// overwritten this map. That second writer is therefore
+    /// compare-and-swap-like, never a blind overwrite — see its own docs.
     ///
     /// Cleared for an Endpoint only when its last live session unregisters —
     /// mirrors `live_sessions`' own cleanup, never persisted.
@@ -251,20 +265,73 @@ impl OutboundSessionDirectory {
     /// untrusted wire input claims `Accepted`/`Running`. See
     /// `AgentControlGateway::handle_status_report`/`handle_action_ack`, the
     /// only callers.
+    ///
+    /// Compare-and-swap-like, NOT a blind overwrite (Issue #28 fourth
+    /// corrective pass "Late stale rebind ordering"): the Gateway task that
+    /// calls this resumes from its own evidence-application `.await` with no
+    /// guarantee that this Endpoint's correlation hasn't since moved on to a
+    /// genuinely later Attempt — e.g. session B awaits
+    /// `ActionEvidenceService::apply` for action X; before B's task resumes,
+    /// a different session supplies X's terminal evidence, the next ordered
+    /// JobStep commits Attempt Y, and `ActionDispatch{Y}` transmits through
+    /// session D, correctly overwriting the map to `(D, Y)` via
+    /// [`Self::send`]. B's now-stale continuation must not then overwrite
+    /// that with `(B, X)` — doing so would strand Y: D's later disconnect
+    /// would find `dispatch_relevant_action(endpoint, D)` returning `None`
+    /// (the map now wrongly names B) and never even consider reconciling Y.
+    /// A legitimate later action always obtains its own correlation through
+    /// its own `ActionDispatch`, so once the correlation has genuinely moved
+    /// from X to Y, any asynchronous continuation still carrying X is stale
+    /// with respect to session-loss tracking and must never move it
+    /// backward — mirroring the durable no-regression rules already used
+    /// elsewhere (newer authoritative lifecycle identity is never overwritten
+    /// by delayed evidence for an earlier one).
+    ///
+    /// Three cases, decided by the CURRENT correlation's `action_id`:
+    /// - no correlation exists for `endpoint_id` yet: bind unconditionally
+    ///   (required for Server-restart reconciliation, where Runtime state
+    ///   starts empty and `StatusReport{Accepted|Running}` must be able to
+    ///   establish relevance from nothing);
+    /// - the current correlation already names this exact `action_id`
+    ///   (possibly through a different session): rebind/transfer to
+    ///   `session_id`, exactly [`Self::bind_dispatch_relevant_session`]'s
+    ///   original purpose;
+    /// - the current correlation names a DIFFERENT `action_id`: reject —
+    ///   [`BindOutcome::StaleActionIgnored`], no mutation. That different
+    ///   `action_id` can only have gotten there through a genuinely later
+    ///   `ActionDispatch`.
     pub fn bind_dispatch_relevant_session(
         &self,
         endpoint_id: EndpointId,
         session_id: ProtocolId,
         action_id: ProtocolId,
-    ) {
+    ) -> BindOutcome {
         let mut inner = self
             .inner
             .lock()
             .expect("outbound session directory lock poisoned");
+        if let Some((_, current_action_id)) = inner.dispatch_correlation.get(&endpoint_id) {
+            if *current_action_id != action_id {
+                return BindOutcome::StaleActionIgnored;
+            }
+        }
         inner
             .dispatch_correlation
             .insert(endpoint_id, (session_id, action_id));
+        BindOutcome::Bound
     }
+}
+
+/// The outcome of [`OutboundSessionDirectory::bind_dispatch_relevant_session`]
+/// — see that method's docs for the exact compare-and-swap-like semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindOutcome {
+    /// The correlation was absent or already named this exact `action_id`;
+    /// it now names `(session_id, action_id)`.
+    Bound,
+    /// The correlation already named a DIFFERENT, necessarily newer
+    /// `action_id` — the bind was ignored; nothing was mutated.
+    StaleActionIgnored,
 }
 
 impl OutboundSessionDirectory {
@@ -922,8 +989,13 @@ mod tests {
         );
 
         let session_b = ProtocolId::generate();
-        directory.bind_dispatch_relevant_session(endpoint_id, session_b, action_id);
+        let outcome = directory.bind_dispatch_relevant_session(endpoint_id, session_b, action_id);
 
+        assert_eq!(
+            outcome,
+            BindOutcome::Bound,
+            "rebinding the same action_id to a different session must be allowed"
+        );
         assert_eq!(
             directory.dispatch_relevant_action(endpoint_id, session_a),
             None,
@@ -1024,6 +1096,109 @@ mod tests {
             directory.dispatch_relevant_action(endpoint_id, session_b),
             None,
             "B unregistering as the last live session must clear the correlation"
+        );
+    }
+
+    // -- Issue #28 fourth corrective pass: late stale rebind ordering ------
+
+    #[tokio::test]
+    async fn a_delayed_stale_rebind_for_a_superseded_action_can_never_overwrite_a_newer_real_dispatch(
+    ) {
+        // The missing direction from
+        // `a_rebind_for_a_stale_action_can_never_affect_a_different_current_action`:
+        // there, a stale bind happens FIRST and a real dispatch for a later
+        // action correctly overwrites it. Here, the real dispatch for the
+        // later action Y happens FIRST, and the stale evidence-application
+        // continuation for the EARLIER action X only calls
+        // `bind_dispatch_relevant_session` afterward — exactly the race the
+        // concrete defect describes: session B awaits
+        // `ActionEvidenceService::apply` for X; before B's Gateway task
+        // resumes, X reaches a terminal state elsewhere, the next ordered
+        // JobStep commits Attempt Y, and `ActionDispatch{Y}` transmits
+        // through session D. B's now-stale continuation must not then
+        // overwrite `(D, Y)` with `(B, X)`.
+        let directory = Arc::new(OutboundSessionDirectory::new());
+        let endpoint_id = endpoint();
+
+        // 1. Correlation for action X is established through session B.
+        let (tx_b, mut rx_b) = outbound_channel();
+        let session_b = ProtocolId::generate();
+        directory.register(endpoint_id, session_b, tx_b);
+        let message_x = dispatch();
+        let action_x = message_x.body.action_id;
+        let send_task = tokio::spawn({
+            let directory = Arc::clone(&directory);
+            async move { directory.dispatch_action(endpoint_id, message_x).await }
+        });
+        let OutboundCommand::Send { ack, .. } = rx_b.recv().await.unwrap();
+        ack.send(Ok(())).unwrap();
+        send_task.await.unwrap().unwrap();
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_b),
+            Some(action_x)
+        );
+
+        // 2. A genuinely newer action Y — the next ordered JobStep's Attempt
+        // — dispatches through session D, exactly like the real Gateway
+        // path (`FinalDispatchService` commit followed by
+        // `ActionDispatchService::dispatch`).
+        let (tx_d, mut rx_d) = outbound_channel();
+        let session_d = ProtocolId::generate();
+        directory.register(endpoint_id, session_d, tx_d);
+        let message_y = dispatch();
+        let action_y = message_y.body.action_id;
+        let send_task = tokio::spawn({
+            let directory = Arc::clone(&directory);
+            async move { directory.dispatch_action(endpoint_id, message_y).await }
+        });
+        let OutboundCommand::Send { ack, .. } = rx_d.recv().await.unwrap();
+        ack.send(Ok(())).unwrap();
+        send_task.await.unwrap().unwrap();
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_d),
+            Some(action_y)
+        );
+
+        // 3. Session B's own, now-stale evidence-application continuation
+        // for X — begun before Y ever existed — finally resumes and invokes
+        // the rebind.
+        let outcome = directory.bind_dispatch_relevant_session(endpoint_id, session_b, action_x);
+
+        // 4. Rejected; the correlation remains exactly (session_d, action_y).
+        assert_eq!(outcome, BindOutcome::StaleActionIgnored);
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_d),
+            Some(action_y),
+            "the newer real ActionDispatch correlation for Y must survive the stale rebind for X"
+        );
+        // 5. Session B must never become relevant again for the superseded
+        // action X.
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_b),
+            None,
+            "session B must not regain relevance for the superseded action X"
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_from_no_existing_correlation_is_allowed_and_returns_bound() {
+        // Server-restart case: Runtime state starts empty — no
+        // `ActionDispatch` has ever been recorded in this process for this
+        // Endpoint — yet an accepted `StatusReport{Accepted|Running}` must
+        // still be able to establish relevance from nothing once a session
+        // (re-)reports on a `Dispatched`/`InProgress` Attempt the restarted
+        // Server never itself dispatched.
+        let directory = OutboundSessionDirectory::new();
+        let endpoint_id = endpoint();
+        let session_id = ProtocolId::generate();
+        let action_id = ProtocolId::generate();
+
+        let outcome = directory.bind_dispatch_relevant_session(endpoint_id, session_id, action_id);
+
+        assert_eq!(outcome, BindOutcome::Bound);
+        assert_eq!(
+            directory.dispatch_relevant_action(endpoint_id, session_id),
+            Some(action_id)
         );
     }
 }
