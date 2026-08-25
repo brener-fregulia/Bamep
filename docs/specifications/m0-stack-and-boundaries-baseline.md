@@ -109,6 +109,20 @@ A protocol selected for one boundary does not become a requirement for another.
 Externally relevant contracts remain explicit and independently versioned rather than being
 defined solely by shared Rust types.
 
+### Presentation dependency boundary
+
+Presentation clients — browser, desktop, or mobile — consume Bamep business state and
+operations only through the applicable versioned Administrative API contract.
+
+They must not bypass that contract through direct persistence access, Server-internal
+models, or privileged native commands.
+
+Native-only capabilities may be exposed through narrow platform adapters, but those
+adapters must not become an alternative Application or Domain boundary.
+
+ADR-0016 owns the Presentation client stack, static delivery model, and native-shell
+platform boundary rationale.
+
 ## Boot orchestration
 
 Domain must not depend on a concrete network-boot mechanism.
@@ -163,6 +177,7 @@ This Specification does not define:
 - ADR-0010 — trusted bootstrap / Secure Boot.
 - ADR-0013 — PostgreSQL persistence backend.
 - ADR-0015 — commercial entitlement boundary.
+- ADR-0016 — static SvelteKit Presentation client and platform boundary.
 - `docs/reference/winpe-boot-mechanism-spike.md` — WinPE boot evidence.
 - `docs/discovery/architecture-redesign.md` — unresolved production network-delivery
   mechanism.
