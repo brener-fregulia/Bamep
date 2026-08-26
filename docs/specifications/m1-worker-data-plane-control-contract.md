@@ -1,7 +1,6 @@
 # M1 — Worker Data-Plane Control Contract
 
-Status: **Proposed** — materialized by Issue #35 as a proposed normative contract delta,
-pending owner review. Not yet approved.
+Status: **Approved**
 
 This Specification is the authoritative, implementation-language-independent wire contract
 for the local Unix Domain Socket (UDS) boundary between `bamepd` and the isolated Worker

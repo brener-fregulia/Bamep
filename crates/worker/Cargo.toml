@@ -1,0 +1,26 @@
+[package]
+name = "bamep-worker"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "bamep_worker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bamep-worker"
+path = "src/main.rs"
+
+[dependencies]
+bamep-worker-protocol = { path = "../worker-protocol" }
+bamep-trusted-bootstrap = { path = "../trusted-bootstrap" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+uuid = { version = "1", features = ["v4"] }
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }

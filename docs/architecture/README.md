@@ -6,15 +6,17 @@ ADRs own decision rationale.
 
 ## Current workspace
 
-Bamep currently has five Rust crates:
+Bamep currently has seven Rust crates:
 
 | Crate | Implemented responsibility |
 | --- | --- |
 | `bamep-trusted-bootstrap` | Trusted-bootstrap primitives, assertion parsing/transcript, and verification |
 | `bamep-agent-protocol` | Rust wire model/codec for the implemented Agent Protocol v1 slice |
 | `bamep-domain` | Pure Endpoint identity, boot-context, trusted-bootstrap, runtime-credential, and Job/JobStep workflow business logic |
-| `bamep-server` | Application services, Ports, PostgreSQL/transport Adapters, and Agent session handling |
+| `bamep-server` | Application services, Ports, PostgreSQL/transport Adapters, Agent session handling, and the `bamepd` Worker-supervision composition root |
 | `bamep-simulator` | Simulated Agent participant using real trusted-bootstrap and WSS/Agent Protocol boundaries |
+| `bamep-worker-protocol` | Rust wire model/codec/framing for the implemented Worker IPC v1 handshake slice |
+| `bamep-worker` | The isolated Worker process: UDS reconnecting client, fail-closed authority tracking, and Server TLS identity loading |
 
 Planned components remain outside Architecture until corresponding code exists.
 
@@ -34,6 +36,19 @@ The implemented structure preserves these rules:
 - `bamep-server` contains `application`, `ports`, and `adapters`; Application coordinates
   through Ports and Domain, while infrastructure-specific dependencies stay in Adapters.
 - PostgreSQL/SQLx and Agent transport/gateway implementations are Server Adapter concerns.
+- `bamep-worker-protocol` is a transport-independent Rust representation of the Worker IPC v1
+  handshake slice defined by `m1-worker-data-plane-control-contract.md`; it has no Domain,
+  Server, PostgreSQL, or HTTP-framework dependency, only `serde`/`serde_json`/`uuid`/
+  `thiserror` and `tokio`'s `io-util` feature (the generic `AsyncRead`/`AsyncWrite` framing
+  traits — no `net`/`rt`/`process`).
+- `bamep-worker` (both the `bamep_worker` library and its `bamep-worker` binary) depends on
+  `bamep-worker-protocol` and `bamep-trusted-bootstrap` only; it has no `bamep-domain`,
+  `bamep-server`, or SQLx/PostgreSQL dependency, and owns no PostgreSQL repository Adapter —
+  Worker holds no Domain/Application authority (ADR-0018).
+- `bamep-server` depends on `bamep-worker-protocol` (for the `bamepd`-side UDS handshake) but
+  not on `bamep-worker` itself in production code, preserving one-directional isolation; the
+  `bamepd` binary spawns the compiled `bamep-worker` executable as a separate OS process
+  rather than linking against its crate.
 
 Infrastructure must not leak into Domain transitions.
 
@@ -401,6 +416,89 @@ It sends `bamep.m1.data-plane-transfer` v1 with `parameters` reconstructed only 
 bound `Transfer` (`transfer_id`, `artifact_id`, `direction`, `digest_algorithm`, `chunk_size`) —
 never a caller-supplied replacement. The pre-existing `dispatch`/`bamep.m1.simulated-execution`
 path is unchanged.
+
+## Implemented isolated Worker runtime and control boundary
+
+Issue #37 materializes the process/runtime boundary ADR-0001/ADR-0003/ADR-0018 require, and
+the M1 Worker IPC handshake slice `m1-worker-data-plane-control-contract.md` defines. It does
+not implement transfer authorization, capability/proof cryptography, replay protection, chunk
+HTTP routes, body transfer, storage I/O, or Artifact verification — those remain future Work
+Packages (#38/#39/#19).
+
+**Process topology.** `bamepd` (a new `[[bin]]` target on the `bamep-server` package,
+`crates/server/src/bin/bamepd.rs`) is the minimal Server daemon composition root: it binds the
+Worker UDS listener, supervises the Worker OS process, and forwards Worker configuration/TLS
+identity paths through the child process environment. It owns nothing else — no PostgreSQL
+startup, Administrative API, Agent WSS listener, Web, scheduler workflows, transfer
+authorization, Worker HTTPS, or storage — so `bamepd` is currently only a *partial*
+composition root; those existing/future responsibilities remain wired through their own
+Application/Adapter boundaries until their own composition-root work requires integration.
+`bamep-worker` (`crates/worker`, package `bamep-worker`) is a genuinely separate Rust
+crate/binary: `bamepd` spawns it as a real child OS process (`tokio::process`), never an
+in-process task.
+
+**Worker IPC v1.** `bamep-worker-protocol` implements the explicit u32be-length-prefixed
+JSON framing, the common envelope (`protocol_version`/`message_id`/`type`, `in_reply_to` on
+responses), and the handshake/error message slice
+(`WorkerHello`/`ServerHello`/`HandshakeRejected`/`ProtocolError`) from
+`m1-worker-data-plane-control-contract.md`. The remaining business message catalog
+(`AuthorizationQuery`, `ChunkAcceptanceRequest`, `ArtifactVerificationReport`, and their
+responses) is not yet represented. `crate::framing` provides the length-prefix codec generic
+over `tokio::io::AsyncRead`/`AsyncWrite`, reused by both the `bamepd`-side listener and the
+Worker client so the framing logic exists in exactly one place.
+
+**`bamepd`-side UDS control plane.** `bamep_server::adapters::worker_control_plane::WorkerControlPlane`
+binds/listens on a configurable UDS path (`BAMEP_WORKER_UDS_PATH`), creating its parent
+directory (`0700`) and restricting the bound socket to owner-only access (`0600`). A
+pre-existing path is removed only after confirming it is actually a socket
+(`std::os::unix::fs::FileTypeExt::is_socket`) — an unrelated file at that path is refused,
+never deleted. It accepts each connection, performs the handshake, and hands the resulting
+`worker_instance_id` to `bamep_server::runtime::worker_authority::WorkerAuthorityRegistry` — an
+in-process (never PostgreSQL-durable) Runtime Service, mirroring `presence`/`outbound_sessions`,
+that tracks the single current connection generation. A newer successful handshake always
+supersedes the previous one; a superseded generation's later disconnect is a no-op against the
+now-current generation. This registry is the narrow readiness/control-connection seam #38/#39
+are expected to consume rather than inventing another notion of Worker authority. On
+`bamepd` shutdown, the control plane stops accepting new connections and removes the socket
+file.
+
+**Worker-side reconnecting client.** `bamep_worker::ipc::client::run_client_loop` connects to
+the configured UDS as a client, performs the handshake, and then blocks until the connection
+ends (EOF, I/O error, or any post-handshake message, since none is valid business content in
+this Work Package), sleeping a configurable bounded delay before reconnecting — never
+busy-spinning. `bamep_worker::ipc::authority::AuthorityTracker` exposes the fail-closed
+`AuthorityPhase` (`Disconnected`/`Connecting`/`Handshaking`/`Ready`) plus a per-process
+monotonic connection-generation counter over a `tokio::sync::watch` channel:
+`AuthoritySnapshot::is_available()` is `true` only for a current-generation successful
+handshake, and becomes `false` immediately on disconnect. `worker_instance_id` is a UUID v4
+generated once per Worker process start (`bamep-worker`'s `main.rs`) and stays stable across
+that process's reconnects; a new Worker process always gets a new one. Unix Domain Sockets are
+Unix-only: both the `bamepd`-side listener and the Worker client keep their real
+`tokio::net::Unix*`-based implementation behind `#[cfg(unix)]`, with a narrow non-Unix stub
+that never becomes available (no fake TCP/localhost substitute) — Linux/WSL2 remains the
+reference/production environment and the only environment that exercises the real code path.
+
+**Worker process supervision.** `bamep_server::runtime::worker_supervisor::WorkerSupervisor`
+spawns the configured Worker executable via `tokio::process::Command` (`kill_on_drop(true)` as
+a defense-in-depth backstop), observes its exit through `Child::wait()`, and respawns it after
+a fixed configurable delay — distinguishing a spawn/configuration failure
+(`SupervisorEvent::SpawnFailed`) from an observed child exit
+(`SupervisorEvent::WorkerExited`) without treating either as `bamepd` itself crashing. On
+controlled shutdown it kills and reaps the current child before returning. Startup ordering is
+UDS listener bind, then supervisor/Worker start, so Worker never races a listener that failed
+to bind.
+
+**TLS identity provisioning.** ADR-0018 requires Worker to reuse the exact same Server TLS
+identity without private-key bytes crossing the ordinary Worker IPC protocol. `bamep-worker`
+loads the Server certificate chain/private key from host-local PEM files
+(`BAMEP_WORKER_TLS_CERT_PATH`/`BAMEP_WORKER_TLS_KEY_PATH`, parsed with `rustls-pemfile`) —
+paths are forwarded through process configuration, never key material through UDS JSON — and
+proves the pair is rustls-usable (TLS 1.3, `ring` provider, no client-certificate
+authentication, mirroring `adapters::agent_transport::AgentTransportAcceptor`'s existing
+configuration shape) before considering itself ready. `bamep_worker::tls::identity::ServerTlsIdentity`
+implements a manual (never derived) `Debug` that redacts the private key. No production HTTPS
+data-plane listener is bound anywhere in this Work Package — that remains #39's
+responsibility; a temporary rustls `ServerConfig` is built only to validate loadability.
 
 ## Maintenance rule
 

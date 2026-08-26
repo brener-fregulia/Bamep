@@ -4,7 +4,10 @@
 //! (persistence and protocol transports) and `application` (Domain
 //! orchestration).
 
+pub mod bamepd_config;
 pub mod outbound_sessions;
 pub mod presence;
 pub mod reservation_registry;
 pub mod resource_arbiter;
+pub mod worker_authority;
+pub mod worker_supervisor;

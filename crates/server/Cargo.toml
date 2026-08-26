@@ -8,12 +8,17 @@ publish.workspace = true
 name = "bamep_server"
 path = "src/lib.rs"
 
+[[bin]]
+name = "bamepd"
+path = "src/bin/bamepd.rs"
+
 [dependencies]
 bamep-domain = { path = "../domain" }
 bamep-agent-protocol = { path = "../agent-protocol" }
 bamep-trusted-bootstrap = { path = "../trusted-bootstrap" }
+bamep-worker-protocol = { path = "../worker-protocol" }
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "process", "time", "io-util", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
