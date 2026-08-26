@@ -361,9 +361,46 @@ for an existing Endpoint/Job/JobStep correlation with no Attempt — a `Transfer
 `attempt_id: None` is never treated as transfer-authorized. No Attempt/action identity is created,
 no JobStep is transitioned, and the destructive-operation gate is never evaluated by this path.
 Binding an existing Transfer to an owning Attempt exactly once, and rejecting a conflicting
-rebind, is implemented and tested, but committing that owning Attempt itself remains unimplemented
-(#40), as does Agent Protocol transfer authorization (#38), the Worker process/HTTPS chunk
-transport (#37/#39), and end-to-end Simulator integration (#19).
+rebind, is implemented and tested; #40 (below) is the first consumer that actually commits that
+owning Attempt. Agent Protocol transfer authorization (#38), the Worker process/HTTPS chunk
+transport (#37/#39), and end-to-end Simulator integration (#19) remain unimplemented.
+
+## Implemented non-destructive M1 transfer dispatch-commit path
+
+`bamep-domain` adds a fourth pure module, `transfer_dispatch`
+(`m1-simulated-vertical-slice-and-baseline-validation.md` RF-005; Issue #40), structurally
+separate from `final_dispatch` (the destructive gate, Issue #25): its `TransferDispatchInputs`
+carries no Endpoint/credential/presence/inventory/target-fingerprint/hardware-confidence/
+trusted-bootstrap evidence at all, so `evaluate_transfer_dispatch` cannot reach the seven-item
+destructive-operation gate even by accident. It checks only generic workflow/scheduler
+authorization (Job `Running`, current ordered step, no unresolved prior Attempt), rejects a
+JobStep that already carries a `DestructiveIntent` (Issue #31) as structurally out of scope for
+this action, verifies the presented `Transfer` correlates to the exact Job/JobStep/Endpoint under
+evaluation, and composes `bamep_domain::transfer::bind_attempt` to bind the fresh `Attempt` to
+that `Transfer` in the same decision — never regenerating `TransferId`/`ArtifactId`.
+
+`bamep_server::ports::JobRepository` gained one sibling method to `commit_destructive_dispatch`,
+`commit_transfer_dispatch`, taking a `TransferDispatchLockedFacts` (Job/JobStep/existing-Attempt
+facts plus the locked `Transfer` — no `EndpointAggregate` field exists on this type, so the
+destructive gate's evidence is structurally unreachable from the Adapter side too).
+`PostgresJobRepository::commit_transfer_dispatch` locks `jobs` -> `job_steps` -> `attempts`
+(existence check) -> `transfers`, extending its own existing lock order by one leaf; it reuses
+`adapters::postgres::transfer_repository`'s `pub(crate)` `load_locked_facts`/
+`persist_attempt_binding` primitives directly (never through `TransferRepository::bind_attempt`,
+which owns its own separate transaction) so the `JobStep -> Dispatching` transition, the new
+`attempts` row, and the `transfers.attempt_id` binding commit in one PostgreSQL transaction. No
+destructive-dispatch audit record or new `DomainEvent` is created for this non-destructive
+commitment. `bamep_server::application::TransferDispatchService` is the non-destructive sibling of
+`FinalDispatchService`: it composes the same `TechnicalResourceArbiter` reservation
+acquire/release discipline around the pure Domain gate and never depends on an `AgentDispatchPort`
+at all, so sending `ActionDispatch` is structurally unreachable from it.
+
+`bamep_server::application::ActionDispatchService` gained `dispatch_transfer`, sharing its
+existing guard/registration/exactly-once-send logic with `dispatch` through one private helper.
+It sends `bamep.m1.data-plane-transfer` v1 with `parameters` reconstructed only from the durably
+bound `Transfer` (`transfer_id`, `artifact_id`, `direction`, `digest_algorithm`, `chunk_size`) —
+never a caller-supplied replacement. The pre-existing `dispatch`/`bamep.m1.simulated-execution`
+path is unchanged.
 
 ## Maintenance rule
 

@@ -16,12 +16,13 @@ use bamep_agent_protocol::{
 use bamep_domain::credential::{CredentialDimension, CredentialHash};
 use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_domain::{
-    evaluate_final_destructive_dispatch, transitions, ActionEvidence, ActionEvidenceOutcome,
-    ActionId, Actor, Attempt, AttemptState, AuditRecord, BootContext, BootNonce, CancelAckEvidence,
-    CancellationRequestOutcome, DestructiveIntent, EmptyWorkflow, EndpointId, FinalDispatchInputs,
-    FinalDispatchOutcome, FinalDispatchRejection, IdentityState, InvalidIdentityTransition,
-    InventoryRevision, InventorySnapshot, Job, JobId, JobStepId, TrustedBootstrapState,
-    DEFAULT_CREDENTIAL_TTL,
+    evaluate_final_destructive_dispatch, evaluate_transfer_dispatch, transitions, ActionEvidence,
+    ActionEvidenceOutcome, ActionId, Actor, Attempt, AttemptState, AuditRecord, BootContext,
+    BootNonce, CancelAckEvidence, CancellationRequestOutcome, DestructiveIntent, DigestAlgorithm,
+    EmptyWorkflow, EndpointId, FinalDispatchInputs, FinalDispatchOutcome, FinalDispatchRejection,
+    IdentityState, InvalidIdentityTransition, InventoryRevision, InventorySnapshot, Job, JobId,
+    JobStepId, Transfer, TransferDirection, TransferDispatchInputs, TransferDispatchRejection,
+    TransferId, TrustedBootstrapState, DEFAULT_CREDENTIAL_TTL,
 };
 use bamep_trusted_bootstrap::{AcceptedSiteKeys, BootstrapAssertion, ServerCertFingerprint};
 use chrono::{DateTime, Duration, Utc};
@@ -34,12 +35,13 @@ use crate::ports::{
     ApplyCancelAckDecision, ApplyCancelAckDecisionOutcome, ApplyCancelAckResult,
     AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError, BootContextRepository,
     CancelAckCommit, CancellationRequestDecided, CommitDestructiveDispatchError,
-    CreateWorkflowError, CredentialRedemptionRepository, EndpointRepository, EndpointUpdateError,
-    FinalDispatchCommit, FinalDispatchDecision, FinalDispatchLockedFacts, InventoryRepository,
-    JobRepository, RedemptionDecision, RedemptionTarget, RepositoryError,
-    RequestCancellationDecision, RequestCancellationError, RequestCancellationLockedFacts,
-    RequestCancellationResult, SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError,
-    TargetRevalidationPort, TransferRepository,
+    CommitTransferDispatchError, CreateWorkflowError, CredentialRedemptionRepository,
+    EndpointRepository, EndpointUpdateError, FinalDispatchCommit, FinalDispatchDecision,
+    FinalDispatchLockedFacts, InventoryRepository, JobRepository, RedemptionDecision,
+    RedemptionTarget, RepositoryError, RequestCancellationDecision, RequestCancellationError,
+    RequestCancellationLockedFacts, RequestCancellationResult, SatisfyStepPreconditionsDecision,
+    SatisfyStepPreconditionsError, TargetRevalidationPort, TransferDispatchDecision,
+    TransferDispatchLockedFacts, TransferRepository,
 };
 use crate::runtime::presence::PresenceRegistry;
 use crate::runtime::reservation_registry::{AttemptReservationRegistry, RegistrationOutcome};
@@ -54,6 +56,54 @@ use crate::runtime::resource_arbiter::{
 /// `parameters` schema is closed and empty.
 pub const M1_SIMULATED_EXECUTION_ACTION_TYPE: &str = "bamep.m1.simulated-execution";
 pub const M1_SIMULATED_EXECUTION_ACTION_VERSION: &str = "1";
+
+/// The M1 Agent -> Server data-plane transfer concrete typed action
+/// (`m1-simulated-vertical-slice-and-baseline-validation.md` RF-005),
+/// distinct from [`M1_SIMULATED_EXECUTION_ACTION_TYPE`]. Its v1 `parameters`
+/// schema is `{transfer_id, artifact_id, direction, digest_algorithm,
+/// chunk_size}`, built by [`transfer_action_parameters`] from authoritative
+/// durable Transfer state only — never a caller-supplied replacement.
+pub const M1_DATA_PLANE_TRANSFER_ACTION_TYPE: &str = "bamep.m1.data-plane-transfer";
+pub const M1_DATA_PLANE_TRANSFER_ACTION_VERSION: &str = "1";
+
+/// Builds the exact RF-005 `bamep.m1.data-plane-transfer` v1 `parameters`
+/// object from durable `transfer` (Issue #40 "Action parameter
+/// reconstruction"). Every value is reconstructed from the authoritative
+/// `Transfer` the durable dispatch commitment already bound — `transfer_id`
+/// and `artifact_id` are never regenerated, and `direction`/
+/// `digest_algorithm` are converted through an exhaustive `match` so a
+/// future additional Domain variant cannot silently fall through to the
+/// wrong wire string.
+fn transfer_action_parameters(transfer: &Transfer) -> serde_json::Map<String, serde_json::Value> {
+    let direction = match transfer.direction {
+        TransferDirection::AgentToServer => "agent_to_server",
+    };
+    let digest_algorithm = match transfer.digest_algorithm {
+        DigestAlgorithm::Sha256 => "sha256",
+    };
+    let mut parameters = serde_json::Map::new();
+    parameters.insert(
+        "transfer_id".to_string(),
+        serde_json::Value::String(transfer.id.0.to_string()),
+    );
+    parameters.insert(
+        "artifact_id".to_string(),
+        serde_json::Value::String(transfer.artifact_id.0.to_string()),
+    );
+    parameters.insert(
+        "direction".to_string(),
+        serde_json::Value::String(direction.to_string()),
+    );
+    parameters.insert(
+        "digest_algorithm".to_string(),
+        serde_json::Value::String(digest_algorithm.to_string()),
+    );
+    parameters.insert(
+        "chunk_size".to_string(),
+        serde_json::Value::Number(transfer.chunk_size.get().into()),
+    );
+    parameters
+}
 
 /// `ActionResult.detail`'s exact normative shape for the single M1 concrete
 /// action (`m1-simulated-vertical-slice-and-baseline-validation.md` RF-004;
@@ -753,6 +803,118 @@ impl<J: JobRepository> FinalDispatchService<J> {
     }
 }
 
+/// Outcome of one [`TransferDispatchService::commit_transfer_dispatch`] call
+/// — mirrors [`FinalDispatchResult`]'s three cases for the non-destructive
+/// path.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum TransferDispatchResult {
+    /// The required technical-resource reservation could not be acquired.
+    /// Final revalidation never began: the candidate JobStep remains exactly
+    /// `PreconditionsSatisfied`, and nothing was persisted.
+    ResourceUnavailable,
+    /// Final revalidation failed after the reservation was acquired
+    /// (`bamep_domain::TransferDispatchRejection` identifies why). The
+    /// reservation has already been released. The pre-dispatch Transfer/
+    /// Artifact identities are unchanged and remain unauthorized.
+    Rejected(TransferDispatchRejection),
+    /// The dispatch commitment durably succeeded: the reservation remains
+    /// held, returned here together with the committed
+    /// JobStep/Attempt/bound-Transfer context so #26 can consume it.
+    Committed {
+        outcome: bamep_domain::TransferDispatchOutcome,
+        reservation: ReservationId,
+    },
+}
+
+/// The internal Application/harness final non-destructive transfer-dispatch
+/// path for `bamep.m1.data-plane-transfer` Agent -> Server capture (Issue
+/// #40 "[WP] Commit non-destructive transfer Attempts for dispatch"). The
+/// non-destructive sibling of [`FinalDispatchService`]: it composes #32's
+/// [`TechnicalResourceArbiter`] around the pure Domain gate
+/// (`bamep_domain::evaluate_transfer_dispatch`), following the same `lock ->
+/// freshly read -> Domain decision -> persist -> commit` pattern, but it
+/// never resolves or requires Runtime Presence Registry, `TargetRevalidationPort`,
+/// or any other destructive-only evidence — the seven-item destructive-
+/// operation gate is structurally unreachable from this service.
+///
+/// Callers identify only the Job/JobStep, the durable pre-dispatch
+/// `TransferId` (Issue #36), and the technical resource claims this Attempt
+/// requires. The fresh `AttemptId`/`ActionId` and the Transfer -> Attempt
+/// binding are produced by the Domain gate this service calls, at decision
+/// time, never accepted from the caller.
+///
+/// This service never constructs or sends `ActionDispatch`: its only output
+/// is the durably committed Attempt/action/Transfer-binding context plus the
+/// transient [`ReservationId`] for #26.
+pub struct TransferDispatchService<J: JobRepository> {
+    repo: Arc<J>,
+    arbiter: Arc<TechnicalResourceArbiter>,
+}
+
+impl<J: JobRepository> TransferDispatchService<J> {
+    pub fn new(repo: Arc<J>, arbiter: Arc<TechnicalResourceArbiter>) -> Self {
+        Self { repo, arbiter }
+    }
+
+    /// Attempts to commit exactly one non-destructive transfer dispatch for
+    /// `step_id` under `job_id`, binding the durable pre-dispatch Transfer
+    /// `transfer_id` (Issue #36) to the freshly committed Attempt, acquiring
+    /// `claims` from the technical-resource arbiter first — mirrors
+    /// [`FinalDispatchService::commit_destructive_dispatch`]'s identical
+    /// sequence and failure/release semantics.
+    pub async fn commit_transfer_dispatch(
+        &self,
+        job_id: JobId,
+        step_id: JobStepId,
+        transfer_id: TransferId,
+        claims: Vec<ResourceClaim>,
+    ) -> Result<TransferDispatchResult, ApplicationError> {
+        let reservation = match self.arbiter.acquire(claims) {
+            Ok(id) => id,
+            Err(InsufficientCapacity) => return Ok(TransferDispatchResult::ResourceUnavailable),
+        };
+
+        let decide: TransferDispatchDecision =
+            Box::new(move |facts: TransferDispatchLockedFacts| {
+                let inputs = TransferDispatchInputs {
+                    job: facts.job,
+                    step_id,
+                    existing_active_attempt: facts.existing_active_attempt,
+                    transfer: facts.transfer,
+                };
+                evaluate_transfer_dispatch(&inputs)
+            });
+
+        match self
+            .repo
+            .commit_transfer_dispatch(job_id, step_id, transfer_id, decide)
+            .await
+        {
+            Ok(outcome) => Ok(TransferDispatchResult::Committed {
+                outcome,
+                reservation,
+            }),
+            Err(CommitTransferDispatchError::Rejected(rejection)) => {
+                self.arbiter.release(reservation);
+                Ok(TransferDispatchResult::Rejected(rejection))
+            }
+            Err(CommitTransferDispatchError::JobNotFound(id)) => {
+                self.arbiter.release(reservation);
+                Err(ApplicationError::JobNotFound(id))
+            }
+            Err(CommitTransferDispatchError::TransferNotFound(id)) => {
+                self.arbiter.release(reservation);
+                Err(ApplicationError::TransferNotFound(id))
+            }
+            Err(CommitTransferDispatchError::Repository(e)) => {
+                self.arbiter.release(reservation);
+                Err(ApplicationError::Repository(e))
+            }
+        }
+    }
+}
+
 /// Outcome of [`ActionDispatchService::dispatch`]: whether the local
 /// transport accepted the `ActionDispatch` frame, or why it did not, or why
 /// no send was attempted at all. Neither `Sent` nor `SendFailed` implies
@@ -824,6 +986,58 @@ impl ActionDispatchService {
         attempt: Attempt,
         reservation: ReservationId,
     ) -> ActionDispatchOutcome {
+        let action_id = ProtocolId::from_uuid(attempt.action_id.0)
+            .expect("a Domain ActionId is always a valid UUID v4");
+        let dispatch = ActionDispatchMessage::new(
+            action_id,
+            M1_SIMULATED_EXECUTION_ACTION_TYPE,
+            M1_SIMULATED_EXECUTION_ACTION_VERSION,
+            serde_json::Map::new(),
+        );
+        self.dispatch_message(endpoint_id, attempt, reservation, dispatch)
+            .await
+    }
+
+    /// The non-destructive transfer-dispatch sibling of
+    /// [`Self::dispatch`] (Issue #40 "Handoff to #26 outbound delivery"):
+    /// identical guard/registration/exactly-once-send discipline, reusing
+    /// this same outbound boundary rather than a second transport path.
+    /// Builds `ActionDispatch` for `bamep.m1.data-plane-transfer` v1 with
+    /// [`transfer_action_parameters`], reconstructed from authoritative
+    /// durable `transfer` state alone — never a caller-invented
+    /// `transfer_id`/`artifact_id`.
+    pub async fn dispatch_transfer(
+        &self,
+        endpoint_id: EndpointId,
+        attempt: Attempt,
+        reservation: ReservationId,
+        transfer: &Transfer,
+    ) -> ActionDispatchOutcome {
+        let action_id = ProtocolId::from_uuid(attempt.action_id.0)
+            .expect("a Domain ActionId is always a valid UUID v4");
+        let dispatch = ActionDispatchMessage::new(
+            action_id,
+            M1_DATA_PLANE_TRANSFER_ACTION_TYPE,
+            M1_DATA_PLANE_TRANSFER_ACTION_VERSION,
+            transfer_action_parameters(transfer),
+        );
+        self.dispatch_message(endpoint_id, attempt, reservation, dispatch)
+            .await
+    }
+
+    /// Guards against constructing/sending from a stale or terminal Attempt
+    /// object, then registers `attempt.id -> reservation` — only sending
+    /// when this call is the one that actually establishes that mapping.
+    /// Shared by [`Self::dispatch`] and [`Self::dispatch_transfer`] so both
+    /// M1 concrete actions get identical exactly-once-send/registration
+    /// discipline from one implementation.
+    async fn dispatch_message(
+        &self,
+        endpoint_id: EndpointId,
+        attempt: Attempt,
+        reservation: ReservationId,
+        dispatch: ActionDispatchMessage,
+    ) -> ActionDispatchOutcome {
         if attempt.state != AttemptState::Dispatched {
             return ActionDispatchOutcome::NotDispatchable;
         }
@@ -834,15 +1048,6 @@ impl ActionDispatchService {
             }
             RegistrationOutcome::Registered => {}
         }
-
-        let action_id = ProtocolId::from_uuid(attempt.action_id.0)
-            .expect("a Domain ActionId is always a valid UUID v4");
-        let dispatch = ActionDispatchMessage::new(
-            action_id,
-            M1_SIMULATED_EXECUTION_ACTION_TYPE,
-            M1_SIMULATED_EXECUTION_ACTION_VERSION,
-            serde_json::Map::new(),
-        );
 
         match self.transport.dispatch_action(endpoint_id, dispatch).await {
             Ok(()) => ActionDispatchOutcome::Sent,
@@ -2375,6 +2580,19 @@ mod tests {
                 unimplemented!("DestructiveIntentService never commits a dispatch")
             }
 
+            async fn commit_transfer_dispatch(
+                &self,
+                _job_id: JobId,
+                _step_id: JobStepId,
+                _transfer_id: bamep_domain::TransferId,
+                _decide: crate::ports::TransferDispatchDecision,
+            ) -> Result<
+                bamep_domain::TransferDispatchOutcome,
+                crate::ports::CommitTransferDispatchError,
+            > {
+                unimplemented!("DestructiveIntentService never commits a transfer dispatch")
+            }
+
             async fn find_attempt(
                 &self,
                 _attempt_id: bamep_domain::AttemptId,
@@ -2907,6 +3125,19 @@ mod tests {
                         Err(CommitDestructiveDispatchError::Rejected(denial.rejection))
                     }
                 }
+            }
+
+            async fn commit_transfer_dispatch(
+                &self,
+                _job_id: JobId,
+                _step_id: JobStepId,
+                _transfer_id: bamep_domain::TransferId,
+                _decide: crate::ports::TransferDispatchDecision,
+            ) -> Result<
+                bamep_domain::TransferDispatchOutcome,
+                crate::ports::CommitTransferDispatchError,
+            > {
+                unimplemented!("FinalDispatchService tests never commit a transfer dispatch")
             }
 
             async fn find_attempt(
@@ -3461,6 +3692,499 @@ mod tests {
         }
     }
 
+    mod transfer_dispatch_service {
+        use super::*;
+        use crate::runtime::resource_arbiter::{ResourceClaim, ResourceKind};
+        use bamep_domain::{
+            create_transfer_context, create_workflow, Attempt, ChunkSize, DigestAlgorithm,
+            JobState, JobStep, JobStepState, SourceProvenance, Transfer, TransferDirection,
+            TransferId,
+        };
+        use std::collections::HashMap;
+
+        /// In-memory `JobRepository` fake mirroring
+        /// `PostgresJobRepository::commit_transfer_dispatch`'s lock -> decide
+        /// -> persist sequence closely enough to exercise
+        /// `TransferDispatchService` end to end without PostgreSQL. Unlike
+        /// `final_dispatch_service::FakeJobRepository`, this fake carries no
+        /// `EndpointAggregate`/inventory/hardware-confidence/trusted-
+        /// bootstrap state at all — proving structurally that this path
+        /// never reads any of it. The real atomicity/concurrency/reload
+        /// behavior is covered separately by
+        /// `crates/server/tests/transfer_dispatch_commit.rs`.
+        #[derive(Default)]
+        struct FakeJobRepository {
+            jobs: Mutex<HashMap<JobId, Job>>,
+            transfers: Mutex<HashMap<TransferId, Transfer>>,
+            attempts: Mutex<Vec<Attempt>>,
+            fail_persist: bool,
+        }
+
+        impl FakeJobRepository {
+            fn new(job: Job, transfer: Transfer) -> Self {
+                let mut jobs = HashMap::new();
+                let mut transfers = HashMap::new();
+                jobs.insert(job.id, job);
+                transfers.insert(transfer.id, transfer);
+                Self {
+                    jobs: Mutex::new(jobs),
+                    transfers: Mutex::new(transfers),
+                    attempts: Mutex::new(Vec::new()),
+                    fail_persist: false,
+                }
+            }
+
+            fn failing_persist(job: Job, transfer: Transfer) -> Self {
+                let mut fake = Self::new(job, transfer);
+                fake.fail_persist = true;
+                fake
+            }
+
+            fn step_state(&self, job_id: JobId, step_id: JobStepId) -> JobStepState {
+                self.jobs.lock().unwrap()[&job_id]
+                    .steps
+                    .iter()
+                    .find(|s| s.id == step_id)
+                    .unwrap()
+                    .state
+            }
+
+            fn attempt_count(&self) -> usize {
+                self.attempts.lock().unwrap().len()
+            }
+
+            fn transfer_attempt_id(
+                &self,
+                transfer_id: TransferId,
+            ) -> Option<bamep_domain::AttemptId> {
+                self.transfers.lock().unwrap()[&transfer_id].attempt_id
+            }
+        }
+
+        #[async_trait]
+        impl JobRepository for FakeJobRepository {
+            async fn create_workflow(&self, _job: &Job) -> Result<(), CreateWorkflowError> {
+                unimplemented!("TransferDispatchService never creates a workflow")
+            }
+
+            async fn find_job(&self, id: JobId) -> Result<Option<Job>, RepositoryError> {
+                Ok(self.jobs.lock().unwrap().get(&id).cloned())
+            }
+
+            async fn authorize_destructive_intent(
+                &self,
+                _job_id: JobId,
+                _step_id: JobStepId,
+                _decide: AuthorizeDestructiveIntentDecision,
+            ) -> Result<DestructiveIntent, AuthorizeDestructiveIntentError> {
+                unimplemented!("TransferDispatchService never authorizes destructive intent")
+            }
+
+            async fn admit_job(
+                &self,
+                _job_id: JobId,
+                _decide: AdmitJobDecision,
+            ) -> Result<Job, AdmitJobError> {
+                unimplemented!("TransferDispatchService never admits a Job")
+            }
+
+            async fn satisfy_current_step_preconditions(
+                &self,
+                _job_id: JobId,
+                _step_id: JobStepId,
+                _decide: SatisfyStepPreconditionsDecision,
+            ) -> Result<JobStep, SatisfyStepPreconditionsError> {
+                unimplemented!("TransferDispatchService never advances a JobStep")
+            }
+
+            async fn commit_destructive_dispatch(
+                &self,
+                _job_id: JobId,
+                _step_id: JobStepId,
+                _decide: FinalDispatchDecision,
+            ) -> Result<FinalDispatchOutcome, CommitDestructiveDispatchError> {
+                unimplemented!("TransferDispatchService never commits a destructive dispatch")
+            }
+
+            async fn commit_transfer_dispatch(
+                &self,
+                job_id: JobId,
+                step_id: JobStepId,
+                transfer_id: TransferId,
+                decide: TransferDispatchDecision,
+            ) -> Result<bamep_domain::TransferDispatchOutcome, CommitTransferDispatchError>
+            {
+                let Some(job) = self.jobs.lock().unwrap().get(&job_id).cloned() else {
+                    return Err(CommitTransferDispatchError::JobNotFound(job_id));
+                };
+                let Some(transfer) = self.transfers.lock().unwrap().get(&transfer_id).cloned()
+                else {
+                    return Err(CommitTransferDispatchError::TransferNotFound(transfer_id));
+                };
+                let existing_active_attempt = self.attempts.lock().unwrap().iter().any(|a| {
+                    a.job_step_id == step_id
+                        && matches!(
+                            a.state,
+                            AttemptState::Dispatched
+                                | AttemptState::InProgress
+                                | AttemptState::AwaitingReconciliation
+                        )
+                });
+
+                let facts = TransferDispatchLockedFacts {
+                    job,
+                    existing_active_attempt,
+                    transfer,
+                };
+
+                match decide(facts) {
+                    Ok(outcome) => {
+                        if self.fail_persist {
+                            return Err(CommitTransferDispatchError::Repository(
+                                RepositoryError::Backend("simulated persistence failure".into()),
+                            ));
+                        }
+                        let mut jobs = self.jobs.lock().unwrap();
+                        let job = jobs.get_mut(&job_id).unwrap();
+                        if let Some(step) = job.steps.iter_mut().find(|s| s.id == step_id) {
+                            step.state = outcome.job_step.state;
+                        }
+                        drop(jobs);
+                        self.attempts.lock().unwrap().push(outcome.attempt);
+                        self.transfers
+                            .lock()
+                            .unwrap()
+                            .insert(transfer_id, outcome.transfer.clone());
+                        Ok(outcome)
+                    }
+                    Err(denial) => {
+                        // Mirrors `PostgresJobRepository::commit_transfer_dispatch`:
+                        // persist exactly `denial.pending_job_step`, never
+                        // independently decide "revalidation failure means
+                        // Pending". `transfers` is never touched here.
+                        if let Some(pending_step) = &denial.pending_job_step {
+                            let mut jobs = self.jobs.lock().unwrap();
+                            let job = jobs.get_mut(&job_id).unwrap();
+                            if let Some(step) = job.steps.iter_mut().find(|s| s.id == step_id) {
+                                step.state = pending_step.state;
+                            }
+                        }
+                        Err(CommitTransferDispatchError::Rejected(denial.rejection))
+                    }
+                }
+            }
+
+            async fn find_attempt(
+                &self,
+                attempt_id: bamep_domain::AttemptId,
+            ) -> Result<Option<Attempt>, RepositoryError> {
+                Ok(self
+                    .attempts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|a| a.id == attempt_id)
+                    .cloned())
+            }
+
+            async fn apply_action_evidence(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+                _decide: ApplyActionEvidenceDecision,
+            ) -> Result<ApplyActionEvidenceResult, ApplyActionEvidenceError> {
+                unimplemented!("TransferDispatchService never applies action evidence")
+            }
+
+            async fn action_targets_endpoint(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+            ) -> Result<bool, RepositoryError> {
+                unimplemented!("TransferDispatchService never correlates ActionProgress")
+            }
+
+            async fn request_cancellation(
+                &self,
+                _job_id: JobId,
+                _decide: RequestCancellationDecision,
+            ) -> Result<RequestCancellationResult, RequestCancellationError> {
+                unimplemented!("TransferDispatchService never requests cancellation")
+            }
+
+            async fn apply_cancel_ack(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+                _decide: ApplyCancelAckDecision,
+            ) -> Result<crate::ports::ApplyCancelAckResult, ApplyActionEvidenceError> {
+                unimplemented!("TransferDispatchService never applies a CancelAck")
+            }
+
+            async fn mark_endpoint_active_attempt_uncertain(
+                &self,
+                _endpoint_id: EndpointId,
+                _decide: crate::ports::MarkUncertainDecision,
+            ) -> Result<Option<bamep_domain::AttemptId>, RepositoryError> {
+                unimplemented!("TransferDispatchService never marks an Attempt uncertain")
+            }
+
+            async fn reconcile_all_active_attempts_on_startup(
+                &self,
+                _decide: crate::ports::MarkUncertainDecision,
+            ) -> Result<Vec<bamep_domain::AttemptId>, RepositoryError> {
+                unimplemented!("TransferDispatchService never reconciles on startup")
+            }
+
+            async fn find_reconciliation_candidate(
+                &self,
+                _endpoint_id: EndpointId,
+            ) -> Result<Option<bamep_domain::ActionId>, RepositoryError> {
+                unimplemented!("TransferDispatchService never finds a reconciliation candidate")
+            }
+
+            async fn apply_status_report(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+                _decide: crate::ports::ApplyReconciliationDecision,
+            ) -> Result<crate::ports::ApplyReconciliationResult, ApplyActionEvidenceError>
+            {
+                unimplemented!("TransferDispatchService never applies a StatusReport")
+            }
+
+            async fn close_indeterminate(
+                &self,
+                _job_id: JobId,
+                _decide: crate::ports::CloseIndeterminateDecision,
+            ) -> Result<crate::ports::CloseIndeterminateResult, crate::ports::CloseIndeterminateError>
+            {
+                unimplemented!("TransferDispatchService never closes Indeterminate")
+            }
+        }
+
+        fn claims() -> Vec<ResourceClaim> {
+            vec![ResourceClaim::new(ResourceKind::new("network"), 1)]
+        }
+
+        /// A `Running` Job with its single JobStep at `PreconditionsSatisfied`
+        /// (non-destructive: no `DestructiveIntent` ever attached), plus a
+        /// fresh unbound pre-dispatch `Transfer` correlated to it — the
+        /// minimum eligible fixture `evaluate_transfer_dispatch` accepts.
+        fn preconditions_satisfied_fixture() -> (Job, JobStepId, Transfer) {
+            let endpoint_id = EndpointId::new();
+            let job = create_workflow(endpoint_id, 1).unwrap();
+            let running = bamep_domain::admit_job(&job, Utc::now()).unwrap().job;
+            let step_id = running.steps[0].id;
+            let advanced =
+                bamep_domain::satisfy_preliminary_preconditions(&running, step_id).unwrap();
+            let mut job = running;
+            job.steps[0] = advanced;
+            let transfer = create_transfer_context(
+                endpoint_id,
+                job.id,
+                step_id,
+                TransferDirection::AgentToServer,
+                DigestAlgorithm::Sha256,
+                ChunkSize::new(4096).unwrap(),
+                SourceProvenance::new("disk-0"),
+            )
+            .transfer;
+            (job, step_id, transfer)
+        }
+
+        #[tokio::test]
+        async fn eligible_transfer_dispatch_commits_and_binds_the_exact_transfer() {
+            let (job, step_id, transfer) = preconditions_satisfied_fixture();
+            let job_id = job.id;
+            let transfer_id = transfer.id;
+            let artifact_id = transfer.artifact_id;
+            let repo = Arc::new(FakeJobRepository::new(job, transfer));
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                10,
+            )]));
+            let svc = TransferDispatchService::new(Arc::clone(&repo), Arc::clone(&arbiter));
+
+            let result = svc
+                .commit_transfer_dispatch(job_id, step_id, transfer_id, claims())
+                .await
+                .unwrap();
+
+            let TransferDispatchResult::Committed { outcome, .. } = result else {
+                panic!("expected a successful commitment, got {result:?}");
+            };
+            assert_eq!(outcome.job_step.state, JobStepState::Dispatching);
+            assert_eq!(outcome.attempt.state, AttemptState::Dispatched);
+            assert_eq!(
+                outcome.transfer.id, transfer_id,
+                "TransferId must never be regenerated"
+            );
+            assert_eq!(
+                outcome.transfer.artifact_id, artifact_id,
+                "ArtifactId must never be regenerated"
+            );
+            assert_eq!(outcome.transfer.attempt_id, Some(outcome.attempt.id));
+            assert_eq!(repo.step_state(job_id, step_id), JobStepState::Dispatching);
+            assert_eq!(repo.attempt_count(), 1);
+            assert_eq!(
+                repo.transfer_attempt_id(transfer_id),
+                Some(outcome.attempt.id)
+            );
+        }
+
+        #[tokio::test]
+        async fn resource_unavailable_leaves_step_preconditions_satisfied_without_persisting() {
+            let (job, step_id, transfer) = preconditions_satisfied_fixture();
+            let job_id = job.id;
+            let transfer_id = transfer.id;
+            let repo = Arc::new(FakeJobRepository::new(job, transfer));
+            // Zero capacity: the arbiter must reject before final
+            // revalidation ever begins.
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                0,
+            )]));
+            let svc = TransferDispatchService::new(Arc::clone(&repo), Arc::clone(&arbiter));
+
+            let result = svc
+                .commit_transfer_dispatch(job_id, step_id, transfer_id, claims())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                result,
+                TransferDispatchResult::ResourceUnavailable
+            ));
+            assert_eq!(
+                repo.step_state(job_id, step_id),
+                JobStepState::PreconditionsSatisfied
+            );
+            assert_eq!(repo.attempt_count(), 0);
+            assert_eq!(repo.transfer_attempt_id(transfer_id), None);
+        }
+
+        #[tokio::test]
+        async fn revalidation_failure_releases_reservation_and_returns_step_to_pending() {
+            let (mut job, step_id, transfer) = preconditions_satisfied_fixture();
+            job.state = JobState::Cancelling;
+            let job_id = job.id;
+            let transfer_id = transfer.id;
+            let repo = Arc::new(FakeJobRepository::new(job, transfer));
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                1,
+            )]));
+            let svc = TransferDispatchService::new(Arc::clone(&repo), Arc::clone(&arbiter));
+
+            let result = svc
+                .commit_transfer_dispatch(job_id, step_id, transfer_id, claims())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                result,
+                TransferDispatchResult::Rejected(TransferDispatchRejection::JobNotRunning)
+            ));
+            assert_eq!(repo.step_state(job_id, step_id), JobStepState::Pending);
+            assert_eq!(repo.attempt_count(), 0);
+            assert_eq!(repo.transfer_attempt_id(transfer_id), None);
+            // The reservation must have been released: full capacity (1
+            // unit) must be acquirable again.
+            assert!(arbiter.acquire(claims()).is_ok());
+        }
+
+        #[tokio::test]
+        async fn persistence_failure_releases_reservation_and_creates_nothing() {
+            let (job, step_id, transfer) = preconditions_satisfied_fixture();
+            let job_id = job.id;
+            let transfer_id = transfer.id;
+            let repo = Arc::new(FakeJobRepository::failing_persist(job, transfer));
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                1,
+            )]));
+            let svc = TransferDispatchService::new(Arc::clone(&repo), Arc::clone(&arbiter));
+
+            let err = svc
+                .commit_transfer_dispatch(job_id, step_id, transfer_id, claims())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, ApplicationError::Repository(_)));
+            assert_eq!(repo.attempt_count(), 0);
+            assert!(arbiter.acquire(claims()).is_ok());
+        }
+
+        #[tokio::test]
+        async fn success_keeps_the_reservation_held_for_number_26() {
+            let (job, step_id, transfer) = preconditions_satisfied_fixture();
+            let job_id = job.id;
+            let transfer_id = transfer.id;
+            let repo = Arc::new(FakeJobRepository::new(job, transfer));
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                1,
+            )]));
+            let svc = TransferDispatchService::new(Arc::clone(&repo), Arc::clone(&arbiter));
+
+            let result = svc
+                .commit_transfer_dispatch(job_id, step_id, transfer_id, claims())
+                .await
+                .unwrap();
+            assert!(matches!(result, TransferDispatchResult::Committed { .. }));
+
+            // Full capacity (1 unit) is already held by the successful
+            // commitment: a second claim must fail until it is explicitly
+            // released — this is the exact reservation #26 later consumes.
+            assert_eq!(
+                arbiter.acquire(claims()),
+                Err(crate::runtime::resource_arbiter::InsufficientCapacity)
+            );
+            if let TransferDispatchResult::Committed { reservation, .. } = result {
+                arbiter.release(reservation);
+            }
+            assert!(arbiter.acquire(claims()).is_ok());
+        }
+
+        #[tokio::test]
+        async fn an_already_bound_transfer_is_rejected_without_a_second_attempt() {
+            let (job, step_id, transfer) = preconditions_satisfied_fixture();
+            let job_id = job.id;
+            let transfer_id = transfer.id;
+            let other_attempt = Attempt {
+                id: bamep_domain::AttemptId::new(),
+                job_step_id: step_id,
+                action_id: bamep_domain::ActionId::new(),
+                state: AttemptState::Dispatched,
+            };
+            let bound_transfer = bamep_domain::bind_attempt(&transfer, &other_attempt).unwrap();
+            let repo = Arc::new(FakeJobRepository::new(job, bound_transfer));
+            let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+                ResourceKind::new("network"),
+                1,
+            )]));
+            let svc = TransferDispatchService::new(Arc::clone(&repo), Arc::clone(&arbiter));
+
+            let result = svc
+                .commit_transfer_dispatch(job_id, step_id, transfer_id, claims())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                result,
+                TransferDispatchResult::Rejected(TransferDispatchRejection::TransferAlreadyBound)
+            ));
+            assert_eq!(repo.attempt_count(), 0);
+            assert_eq!(
+                repo.transfer_attempt_id(transfer_id),
+                Some(other_attempt.id),
+                "the original binding must remain exactly as it was"
+            );
+            assert!(arbiter.acquire(claims()).is_ok());
+        }
+    }
+
     mod action_dispatch_service {
         use super::*;
         use crate::ports::AgentDispatchError;
@@ -3477,6 +4201,7 @@ mod tests {
         struct FakeDispatchPort {
             calls: AtomicUsize,
             fail_next: Mutex<bool>,
+            last_dispatch: Mutex<Option<ActionDispatchMessage>>,
         }
 
         impl FakeDispatchPort {
@@ -3488,11 +4213,19 @@ mod tests {
                 Self {
                     calls: AtomicUsize::new(0),
                     fail_next: Mutex::new(true),
+                    last_dispatch: Mutex::new(None),
                 }
             }
 
             fn call_count(&self) -> usize {
                 self.calls.load(Ordering::SeqCst)
+            }
+
+            /// The most recently transmitted `ActionDispatch` body — used to
+            /// assert the exact `action_type`/`action_version`/`parameters`
+            /// #40 constructs from durable Transfer state.
+            fn last_dispatch(&self) -> Option<ActionDispatchMessage> {
+                self.last_dispatch.lock().unwrap().clone()
             }
         }
 
@@ -3501,9 +4234,10 @@ mod tests {
             async fn dispatch_action(
                 &self,
                 _endpoint_id: EndpointId,
-                _dispatch: ActionDispatchMessage,
+                dispatch: ActionDispatchMessage,
             ) -> Result<(), AgentDispatchError> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
+                *self.last_dispatch.lock().unwrap() = Some(dispatch);
                 let mut fail = self.fail_next.lock().unwrap();
                 if *fail {
                     *fail = false;
@@ -3669,6 +4403,196 @@ mod tests {
                 None,
                 "no mapping must be registered for a non-Dispatched attempt"
             );
+        }
+
+        fn transfer_fixture() -> bamep_domain::Transfer {
+            bamep_domain::create_transfer_context(
+                EndpointId::new(),
+                bamep_domain::JobId::new(),
+                JobStepId::new(),
+                bamep_domain::TransferDirection::AgentToServer,
+                bamep_domain::DigestAlgorithm::Sha256,
+                bamep_domain::ChunkSize::new(4096).unwrap(),
+                bamep_domain::SourceProvenance::new("disk-0"),
+            )
+            .transfer
+        }
+
+        /// Issue #40 "Action parameter reconstruction" / "Wire boundary":
+        /// `dispatch_transfer` must produce the exact RF-005
+        /// `bamep.m1.data-plane-transfer` v1 action, with `parameters`
+        /// reconstructed only from durable `transfer` state — no arbitrary
+        /// caller-supplied action surface.
+        #[tokio::test]
+        async fn dispatch_transfer_sends_the_exact_rf005_action() {
+            let reservations = Arc::new(AttemptReservationRegistry::new());
+            let transport = Arc::new(FakeDispatchPort::new());
+            let svc = ActionDispatchService::new(
+                Arc::clone(&reservations),
+                Arc::clone(&transport) as Arc<dyn AgentDispatchPort>,
+            );
+            let arbiter = arbiter();
+            let res = reservation(&arbiter);
+            let transfer = transfer_fixture();
+            let attempt = Attempt {
+                job_step_id: transfer.job_step_id,
+                ..dispatched_attempt()
+            };
+
+            let outcome = svc
+                .dispatch_transfer(EndpointId::new(), attempt, res, &transfer)
+                .await;
+
+            assert_eq!(outcome, ActionDispatchOutcome::Sent);
+            let sent = transport
+                .last_dispatch()
+                .expect("exactly one ActionDispatch must have been sent");
+            assert_eq!(sent.body.action_id.as_uuid(), attempt.action_id.0);
+            assert_eq!(
+                sent.body.action_type,
+                super::super::M1_DATA_PLANE_TRANSFER_ACTION_TYPE
+            );
+            assert_eq!(
+                sent.body.action_version,
+                super::super::M1_DATA_PLANE_TRANSFER_ACTION_VERSION
+            );
+            assert_eq!(
+                sent.envelope.correlation_id,
+                Some(ProtocolId::from_uuid(attempt.action_id.0).unwrap()),
+                "correlation_id must equal action_id"
+            );
+
+            let params = &sent.body.parameters;
+            assert_eq!(
+                params.len(),
+                5,
+                "no extra/arbitrary parameter may be present"
+            );
+            assert_eq!(
+                params.get("transfer_id").and_then(|v| v.as_str()),
+                Some(transfer.id.0.to_string()).as_deref()
+            );
+            assert_eq!(
+                params.get("artifact_id").and_then(|v| v.as_str()),
+                Some(transfer.artifact_id.0.to_string()).as_deref()
+            );
+            assert_eq!(
+                params.get("direction").and_then(|v| v.as_str()),
+                Some("agent_to_server")
+            );
+            assert_eq!(
+                params.get("digest_algorithm").and_then(|v| v.as_str()),
+                Some("sha256")
+            );
+            assert_eq!(
+                params.get("chunk_size").and_then(|v| v.as_u64()),
+                Some(transfer.chunk_size.get() as u64)
+            );
+        }
+
+        #[tokio::test]
+        async fn dispatch_transfer_registers_the_reservation_like_dispatch() {
+            let reservations = Arc::new(AttemptReservationRegistry::new());
+            let transport = Arc::new(FakeDispatchPort::new());
+            let svc = ActionDispatchService::new(
+                Arc::clone(&reservations),
+                Arc::clone(&transport) as Arc<dyn AgentDispatchPort>,
+            );
+            let arbiter = arbiter();
+            let res = reservation(&arbiter);
+            let transfer = transfer_fixture();
+            let attempt = Attempt {
+                job_step_id: transfer.job_step_id,
+                ..dispatched_attempt()
+            };
+
+            svc.dispatch_transfer(EndpointId::new(), attempt, res, &transfer)
+                .await;
+            assert_eq!(reservations.take(attempt.id), Some(res));
+        }
+
+        #[tokio::test]
+        async fn dispatch_transfer_repeated_call_sends_nothing_a_second_time() {
+            let reservations = Arc::new(AttemptReservationRegistry::new());
+            let transport = Arc::new(FakeDispatchPort::new());
+            let svc = ActionDispatchService::new(
+                Arc::clone(&reservations),
+                Arc::clone(&transport) as Arc<dyn AgentDispatchPort>,
+            );
+            let arbiter = arbiter();
+            let transfer = transfer_fixture();
+            let attempt = Attempt {
+                job_step_id: transfer.job_step_id,
+                ..dispatched_attempt()
+            };
+
+            let first_reservation = reservation(&arbiter);
+            let first = svc
+                .dispatch_transfer(EndpointId::new(), attempt, first_reservation, &transfer)
+                .await;
+            assert_eq!(first, ActionDispatchOutcome::Sent);
+
+            let second_reservation = reservation(&arbiter);
+            let second = svc
+                .dispatch_transfer(EndpointId::new(), attempt, second_reservation, &transfer)
+                .await;
+            assert_eq!(second, ActionDispatchOutcome::AlreadyDispatched);
+            assert_eq!(transport.call_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn dispatch_transfer_a_non_dispatched_attempt_is_rejected() {
+            let reservations = Arc::new(AttemptReservationRegistry::new());
+            let transport = Arc::new(FakeDispatchPort::new());
+            let svc = ActionDispatchService::new(
+                Arc::clone(&reservations),
+                Arc::clone(&transport) as Arc<dyn AgentDispatchPort>,
+            );
+            let arbiter = arbiter();
+            let res = reservation(&arbiter);
+            let transfer = transfer_fixture();
+            let attempt = Attempt {
+                job_step_id: transfer.job_step_id,
+                state: AttemptState::Succeeded,
+                ..dispatched_attempt()
+            };
+
+            let outcome = svc
+                .dispatch_transfer(EndpointId::new(), attempt, res, &transfer)
+                .await;
+
+            assert_eq!(outcome, ActionDispatchOutcome::NotDispatchable);
+            assert_eq!(transport.call_count(), 0);
+        }
+
+        /// Confirms the pre-existing single M1 action is untouched by #40's
+        /// generalization: `dispatch` still sends exactly
+        /// `bamep.m1.simulated-execution` v1 with empty `parameters`.
+        #[tokio::test]
+        async fn existing_simulated_execution_dispatch_is_unaffected() {
+            let reservations = Arc::new(AttemptReservationRegistry::new());
+            let transport = Arc::new(FakeDispatchPort::new());
+            let svc = ActionDispatchService::new(
+                Arc::clone(&reservations),
+                Arc::clone(&transport) as Arc<dyn AgentDispatchPort>,
+            );
+            let arbiter = arbiter();
+            let res = reservation(&arbiter);
+            let attempt = dispatched_attempt();
+
+            let outcome = svc.dispatch(EndpointId::new(), attempt, res).await;
+
+            assert_eq!(outcome, ActionDispatchOutcome::Sent);
+            let sent = transport.last_dispatch().unwrap();
+            assert_eq!(
+                sent.body.action_type,
+                super::super::M1_SIMULATED_EXECUTION_ACTION_TYPE
+            );
+            assert_eq!(
+                sent.body.action_version,
+                super::super::M1_SIMULATED_EXECUTION_ACTION_VERSION
+            );
+            assert!(sent.body.parameters.is_empty());
         }
     }
 }

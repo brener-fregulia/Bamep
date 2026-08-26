@@ -27,6 +27,7 @@ pub mod presented_credential;
 pub mod reconciliation;
 pub mod target_fingerprint;
 pub mod transfer;
+pub mod transfer_dispatch;
 pub mod transitions;
 
 pub use action_evidence::{
@@ -76,5 +77,9 @@ pub use target_fingerprint::TargetFingerprint;
 pub use transfer::{
     bind_attempt, create_transfer_context, SourceProvenance, Transfer, TransferBindingError,
     TransferContext, TransferDirection, TransferId,
+};
+pub use transfer_dispatch::{
+    evaluate_transfer_dispatch, TransferDispatchDenial, TransferDispatchInputs,
+    TransferDispatchOutcome, TransferDispatchRejection,
 };
 pub use transitions::{RedeemOutcome, TrustedBootstrapOutcome};

@@ -27,10 +27,11 @@ use crate::ports::{
     AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError,
     CancellationRequestDecided, CloseIndeterminateDecision, CloseIndeterminateDecisionOutcome,
     CloseIndeterminateError, CloseIndeterminateResult, CommitDestructiveDispatchError,
-    CreateWorkflowError, FinalDispatchDecision, FinalDispatchLockedFacts, JobRepository,
-    MarkUncertainDecision, RepositoryError, RequestCancellationDecision, RequestCancellationError,
-    RequestCancellationLockedFacts, RequestCancellationResult, SatisfyStepPreconditionsDecision,
-    SatisfyStepPreconditionsError,
+    CommitTransferDispatchError, CreateWorkflowError, FinalDispatchDecision,
+    FinalDispatchLockedFacts, JobRepository, MarkUncertainDecision, RepositoryError,
+    RequestCancellationDecision, RequestCancellationError, RequestCancellationLockedFacts,
+    RequestCancellationResult, SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError,
+    TransferDispatchDecision, TransferDispatchLockedFacts,
 };
 
 /// Adapter-local representation of the `job_state` PostgreSQL ENUM
@@ -622,6 +623,138 @@ impl JobRepository for PostgresJobRepository {
 
         tx.commit().await.map_err(to_backend_err)?;
         Ok(commit.outcome)
+    }
+
+    /// Non-destructive sibling of [`Self::commit_destructive_dispatch`]
+    /// (Issue #40). Lock order: `jobs` -> `job_steps` -> `attempts`
+    /// (existence check) -> `transfers` (via `super::transfer_repository`'s
+    /// #36 primitives). This strictly extends the existing `jobs ->
+    /// job_steps -> attempts` order this file already uses everywhere else
+    /// (see `commit_destructive_dispatch` above) by one additional leaf,
+    /// `transfers`; no other transaction in the repository ever locks
+    /// `transfers` together with `jobs`/`job_steps`/`attempts` in the
+    /// opposite order — `PostgresTransferRepository`'s own methods
+    /// (`load_locked_facts`) never lock `jobs`/`job_steps`/`attempts` at
+    /// all — so this ordering introduces no new deadlock cycle.
+    async fn commit_transfer_dispatch(
+        &self,
+        job_id: JobId,
+        step_id: JobStepId,
+        transfer_id: bamep_domain::TransferId,
+        decide: TransferDispatchDecision,
+    ) -> Result<bamep_domain::TransferDispatchOutcome, CommitTransferDispatchError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        let job_row = sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+        let Some(job_row) = job_row else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(CommitTransferDispatchError::JobNotFound(job_id));
+        };
+        let endpoint_id: uuid::Uuid = job_row.try_get("endpoint_id").map_err(to_backend_err)?;
+        let job_state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
+
+        let steps = fetch_job_steps(&mut tx, job_id, true)
+            .await
+            .map_err(CommitTransferDispatchError::Repository)?;
+        let job = Job {
+            id: job_id,
+            endpoint_id: EndpointId(endpoint_id),
+            state: job_state.into(),
+            steps,
+        };
+
+        let existing_active_attempt: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM attempts \
+                WHERE job_step_id = $1 \
+                  AND state IN ('Dispatched', 'InProgress', 'AwaitingReconciliation') \
+                FOR UPDATE \
+             )",
+        )
+        .bind(step_id.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+
+        // Reuses #36's pub(crate) locking/read primitive directly inside
+        // this Adapter — never through Application, and never a second,
+        // separate transaction (Issue #40 "Do not use Transfer binding as a
+        // separate transaction").
+        let Some(transfer_facts) =
+            super::transfer_repository::load_locked_facts(&mut tx, transfer_id)
+                .await
+                .map_err(CommitTransferDispatchError::Repository)?
+        else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(CommitTransferDispatchError::TransferNotFound(transfer_id));
+        };
+
+        let facts = TransferDispatchLockedFacts {
+            job,
+            existing_active_attempt,
+            transfer: transfer_facts.transfer,
+        };
+
+        let outcome = match decide(facts) {
+            Ok(outcome) => outcome,
+            Err(denial) => {
+                // Mirrors `commit_destructive_dispatch`'s identical
+                // contract: the Domain decision itself already decided the
+                // exact durable result, if any — this Adapter persists
+                // exactly `denial.pending_job_step` and never independently
+                // encodes "revalidation failure means Pending". `transfers`
+                // is never touched on this path.
+                if let Some(pending_step) = &denial.pending_job_step {
+                    sqlx::query("UPDATE job_steps SET state = $1 WHERE id = $2")
+                        .bind(PgJobStepState::from(pending_step.state))
+                        .bind(step_id.0)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(to_backend_err)?;
+                    tx.commit().await.map_err(to_backend_err)?;
+                } else {
+                    tx.rollback().await.map_err(to_backend_err)?;
+                }
+                return Err(CommitTransferDispatchError::Rejected(denial.rejection));
+            }
+        };
+
+        sqlx::query("UPDATE job_steps SET state = $1 WHERE id = $2")
+            .bind(PgJobStepState::from(outcome.job_step.state))
+            .bind(step_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+
+        sqlx::query(
+            "INSERT INTO attempts (id, job_step_id, action_id, state) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(outcome.attempt.id.0)
+        .bind(step_id.0)
+        .bind(outcome.attempt.action_id.0)
+        .bind(PgAttemptState::from(outcome.attempt.state))
+        .execute(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+
+        // Same transaction, same commit — the one-time Transfer -> Attempt
+        // binding Issue #40 requires, reusing #36's pub(crate) write
+        // primitive rather than `TransferRepository::bind_attempt`'s
+        // self-contained transaction.
+        super::transfer_repository::persist_attempt_binding(
+            &mut tx,
+            transfer_id,
+            outcome.attempt.id,
+        )
+        .await
+        .map_err(CommitTransferDispatchError::Repository)?;
+
+        tx.commit().await.map_err(to_backend_err)?;
+        Ok(outcome)
     }
 
     async fn find_attempt(

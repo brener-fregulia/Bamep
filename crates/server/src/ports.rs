@@ -300,6 +300,43 @@ pub trait JobRepository: Send + Sync {
         decide: FinalDispatchDecision,
     ) -> Result<FinalDispatchOutcome, CommitDestructiveDispatchError>;
 
+    /// Locks exactly the `Job` identified by `job_id` (including its current
+    /// ordered `JobStep`s), whether an existing non-terminal `Attempt`
+    /// exists for `step_id`, and the durable pre-dispatch `Transfer`
+    /// identified by `transfer_id` (Issue #36), then invokes `decide` with
+    /// that freshly-read [`TransferDispatchLockedFacts`] (Issue #40
+    /// "Commit non-destructive transfer Attempts for dispatch"). This is the
+    /// non-destructive sibling of [`Self::commit_destructive_dispatch`]: it
+    /// never resolves or requires Endpoint identity/credential/presence/
+    /// hardware-confidence/trusted-bootstrap/target-fingerprint evidence —
+    /// the seven-item destructive-operation gate is structurally
+    /// unreachable from this method.
+    ///
+    /// On `Ok`, atomically persists — in the same transaction — the
+    /// candidate JobStep's `PreconditionsSatisfied -> Dispatching`
+    /// transition, the new `attempts` row, and the one-time Transfer ->
+    /// Attempt binding together
+    /// (`m0-persistence-observability-and-domain-events.md` "Atomic
+    /// persistence"). No `ActionDispatch` is sent by this method or
+    /// anything it calls, and no destructive-dispatch audit record is
+    /// created — this action is non-destructive and the persistence
+    /// contract does not require one for this commitment.
+    ///
+    /// On `Err`, persists exactly the
+    /// `TransferDispatchDenial::pending_job_step` the Domain decision
+    /// returned, mirroring [`Self::commit_destructive_dispatch`]'s identical
+    /// contract — this Adapter never independently decides that a
+    /// revalidation failure means `Pending`. Never mutates `transfers` on
+    /// any `Err` path: the existing pre-dispatch Transfer/Artifact remain
+    /// exactly as they were.
+    async fn commit_transfer_dispatch(
+        &self,
+        job_id: JobId,
+        step_id: JobStepId,
+        transfer_id: bamep_domain::TransferId,
+        decide: TransferDispatchDecision,
+    ) -> Result<bamep_domain::TransferDispatchOutcome, CommitTransferDispatchError>;
+
     /// Read-only lookup of one persisted `Attempt` by its Server Domain
     /// identity (Issue #25 correction: persistence reload must reconstruct
     /// the committed Attempt/action correlation through this Port, not
@@ -824,6 +861,62 @@ pub enum CommitDestructiveDispatchError {
     /// decision returned — this is not itself a repository failure.
     #[error("final dispatch was not authorized: {0}")]
     Rejected(FinalDispatchRejection),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
+/// Durable facts read under lock immediately before one final non-
+/// destructive transfer-dispatch decision (Issue #40 "Commit non-
+/// destructive transfer Attempts for dispatch"): everything
+/// `bamep_domain::evaluate_transfer_dispatch` needs. Structurally distinct
+/// from [`FinalDispatchLockedFacts`] — it carries no `EndpointAggregate`
+/// and no transient Runtime Presence Registry / `TargetRevalidationPort`
+/// evidence, so the destructive gate cannot be reached from this type.
+pub struct TransferDispatchLockedFacts {
+    /// The owning Job, including every ordered `JobStep`, locked and freshly
+    /// read in the same transaction that may later persist this decision.
+    pub job: Job,
+    /// Whether an `Attempt` already exists for the candidate JobStep in a
+    /// non-terminal state, read under lock so a concurrent dispatch
+    /// commitment cannot race past it.
+    pub existing_active_attempt: bool,
+    /// The durable pre-dispatch `Transfer` (Issue #36), locked and freshly
+    /// read in the same transaction.
+    pub transfer: bamep_domain::Transfer,
+}
+
+/// A pure decision over freshly locked [`TransferDispatchLockedFacts`],
+/// producing the durable commitment to persist — the advanced `JobStep` +
+/// `Attempt` + bound `Transfer` — or the reason final dispatch is not
+/// currently authorized (`bamep_domain::evaluate_transfer_dispatch`; Issue
+/// #40). Mirrors [`FinalDispatchDecision`]: the Adapter locks and reads
+/// current state, this closure decides, and the Adapter persists the result
+/// atomically in the same transaction. Unlike [`FinalDispatchDecision`],
+/// this closure requires no audit record — no destructive-dispatch audit
+/// is required for this non-destructive commitment.
+pub type TransferDispatchDecision = Box<
+    dyn FnOnce(
+            TransferDispatchLockedFacts,
+        ) -> Result<
+            bamep_domain::TransferDispatchOutcome,
+            bamep_domain::TransferDispatchDenial,
+        > + Send,
+>;
+
+/// Errors from [`JobRepository::commit_transfer_dispatch`].
+#[derive(Debug, thiserror::Error)]
+pub enum CommitTransferDispatchError {
+    #[error("job {0:?} not found")]
+    JobNotFound(JobId),
+    /// No Transfer with this `TransferId` was ever created (Issue #36).
+    #[error("transfer {0:?} not found")]
+    TransferNotFound(bamep_domain::TransferId),
+    /// Final revalidation rejected the candidate JobStep
+    /// (`bamep_domain::TransferDispatchRejection`). The caller's Job/JobStep
+    /// durable state reflects exactly the `TransferDispatchDenial` the
+    /// Domain decision returned — this is not itself a repository failure.
+    #[error("transfer dispatch was not authorized: {0}")]
+    Rejected(bamep_domain::TransferDispatchRejection),
     #[error(transparent)]
     Repository(#[from] RepositoryError),
 }
