@@ -176,6 +176,95 @@ A simulated data-plane JobStep completes end to end with transfer authorization,
 sender-constrained transfer authentication, chunk resume, Artifact lifecycle, and Artifact
 verification against disposable local data.
 
+M1's proven direction is **Agent -> Server** simulated capture. This narrows only which
+direction M1 itself validates; it does not narrow the generic bidirectional M0 data-plane
+contract owned by `m0-data-plane-and-storage-contracts.md`, which remains direction-agnostic.
+A future milestone may prove Server -> Agent without requiring a contract change here.
+
+M1 introduces one concrete data-plane transfer action, owned here under
+`m0-agent-protocol-contract.md`'s rule that concrete action types belong to the
+Specification that introduces them, and distinct from `bamep.m1.simulated-execution`
+(`RF-004`), which explicitly has no data-plane transfer:
+
+```text
+action_type: "bamep.m1.data-plane-transfer"
+action_version: "1"
+parameters: {
+    transfer_id: string,       // UUID v4; the durable logical Transfer identity
+    artifact_id: string,       // UUID v4; the durable logical Artifact identity
+    direction: "agent_to_server",
+    digest_algorithm: "sha256",
+    chunk_size: integer        // positive; bytes; fixed for this Transfer's manifest
+}
+```
+
+`transfer_id` and `artifact_id` are created durably by `bamepd` before dispatch (they are not
+Agent-originated) and delivered to the Agent exclusively through this action's `parameters`,
+which is the single channel that exists for the Agent to learn them; they are not duplicated
+elsewhere on the wire merely because they are also durable Server state. `direction` is a
+closed enumeration with exactly one M1 v1 value, `"agent_to_server"`; the field exists because
+the per-request data-plane proof defined by `m0-data-plane-and-storage-contracts.md` binds
+direction, not because M1 exercises more than one value. `digest_algorithm` is a closed
+enumeration with exactly one M1 v1 value, `"sha256"`; this is an M1 interoperability choice
+carried explicitly on the wire, not a universal, permanently fixed Bamep digest algorithm.
+`chunk_size` is Server-selected per Transfer and carried explicitly on the wire; this
+Specification does not fix a universal chunk size, and an M1 implementation choosing a
+concrete value (for example, matching `docs/reference/transfer-resumability-spike.md`'s 4 MiB
+experimental value) does so as an M1-scoped operational choice, not as durable architecture.
+
+The concrete disposable source bytes the Simulated Agent captures for Agent -> Server capture
+are supplied through Simulator/test-harness configuration, not through this action's
+`parameters` or any other Agent Protocol message — the same fixture boundary already used for
+trusted-bootstrap material (`m0-trusted-bootstrap-and-server-fingerprint-contract.md`
+"Simulator contract"). This keeps the action's parameters limited to values the Agent could not
+otherwise obtain and that are required by the interoperability contract itself.
+
+Beyond `parameters`, the Agent obtains everything else it needs from the already-required
+protocol exchanges this action triggers: the ephemeral proof keypair is Agent-generated
+locally (`m0-data-plane-and-storage-contracts.md` "Ephemeral proof key"); the Worker
+data-plane HTTPS origin is delivered via `TransferAuthorizationGrant.data_plane_base_url`
+(`m0-agent-protocol-contract.md` "Transfer authorization"); the exact chunk-request/resume
+HTTPS surface is `m0-data-plane-and-storage-contracts.md`'s "HTTPS data-plane v1 contract".
+No value required to execute this action is obtainable only by reading Server Rust source.
+
+For this action, `ActionAck{Rejected}.error.code` is one of the following closed values, used
+only as needed to express the behavior above (the same closed set used by
+`bamep.m1.simulated-execution` for consistency; no data-plane-specific code is currently
+required):
+
+- `UNSUPPORTED_ACTION`;
+- `UNSUPPORTED_ACTION_VERSION`;
+- `INVALID_PARAMETERS` — used for a structurally invalid `parameters` object, including an
+  unknown `direction`/`digest_algorithm` enum value or a non-positive `chunk_size`;
+- `ACTION_NOT_AVAILABLE`.
+
+`ActionResult.detail` composes with the authoritative Artifact lifecycle
+(`m0-data-plane-and-storage-contracts.md` "Artifact lifecycle") rather than merely reporting
+that bytes were sent:
+
+- `Succeeded` — sent only after `bamepd` has durably committed the owning Artifact to
+  `Verified`: `{ "code": "TRANSFER_VERIFIED", "artifact_id": "<uuid>" }`;
+- `Failed` — sent once `bamepd` has durably committed a terminal `Failed` outcome for the
+  Transfer/Artifact/Attempt, using one of the following closed values:
+  - `{ "code": "ARTIFACT_VERIFICATION_FAILED", "artifact_id": "<uuid>" }` — Artifact reached
+    `PendingVerification -> Failed`;
+  - `{ "code": "CHUNK_VERIFICATION_FAILED", "artifact_id": "<uuid>" }` — a required chunk
+    could not be reproduced/verified (`Incomplete -> Failed`);
+  - `{ "code": "TRANSFER_ABANDONED", "artifact_id": "<uuid>" }` — capture was abandoned or
+    cancelled before completion (`Incomplete -> Failed`).
+
+`Cancelled` remains part of the generic Agent Protocol vocabulary, composing with the Job
+lifecycle `Cancelling` contract; cancellation does not roll back chunks already durably
+accepted, and an Artifact that cannot reach `Verified` because of cancellation follows the
+existing `Incomplete -> Failed` rule above rather than a data-plane-specific cancellation
+state.
+
+`ActionProgress` for this action uses `percent` and/or `bytes_processed`; when used,
+`bytes_processed` means cumulative bytes of chunks `bamepd` has durably accepted for this
+Transfer so far. This is action-specific meaning for the otherwise generic optional field
+defined by `m0-agent-protocol-contract.md`, which itself defines no transfer-specific
+semantics for it.
+
 Required fail-closed cases remain those owned by the data-plane and Simulator Specifications.
 
 ### RF-006 — Administrative API and Web observation
@@ -267,8 +356,9 @@ M1 directly consumes:
   and persistence-load validation;
 - `m0-administrative-api-web-read-contract.md` — Administrative API v1 read boundary;
 - `m0-stack-and-boundaries-baseline.md` — product/component dependency boundaries;
-- ADR-0004, ADR-0005, ADR-0006, ADR-0008, ADR-0010, ADR-0012, and ADR-0013 for the rationale behind
-  the directly exercised contracts.
+- `m1-worker-data-plane-control-contract.md` — Server↔Worker UDS contract for RF-005;
+- ADR-0004, ADR-0005, ADR-0006, ADR-0008, ADR-0010, ADR-0012, ADR-0013, and ADR-0018 for the
+  rationale behind the directly exercised contracts.
 
 ADR-0007 is historical (`Superseded by ADR-0013`). ADR-0009 and the real ADR-0011 ceremony remain
 outside M1 execution.

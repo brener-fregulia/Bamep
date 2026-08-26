@@ -86,14 +86,65 @@ inventory state.
 After `SessionEstablished` and `ActionAck{outcome: Accepted}` for a data-plane transfer action, the Agent may use:
 
 - `TransferAuthorizationRequest{transfer_id, proof_public_key}` — Agent -> Server;
-- `TransferAuthorizationGrant{transfer_id, token, expires_at}` — Server -> Agent;
+- `TransferAuthorizationGrant{transfer_id, token, expires_at, data_plane_base_url}` — Server -> Agent;
 - `TransferAuthorizationDenied{transfer_id, reason}` — Server -> Agent.
 
 `proof_public_key` represents an Agent-generated ephemeral public key. Its private counterpart never leaves the Agent. The exact key algorithm/encoding and data-plane proof-of-possession mechanism belong to `m0-data-plane-and-storage-contracts.md`.
 
 A grant requires the Server to confirm that the transfer has a non-terminal Attempt bound to the requesting Endpoint and that the session has `CredentialActive`. `token` is opaque to Agent Protocol and is sender-constrained to the presented proof key according to the data-plane contract.
 
-A currently authenticated Agent may request renewal for the same legitimate non-terminal `transfer_id` after expiry or Agent restart, using the same or a new proof key. Renewal is not a retry and creates no new Attempt.
+### Correlation
+
+Every `TransferAuthorizationRequest`, `TransferAuthorizationGrant`, and
+`TransferAuthorizationDenied` message MUST have `correlation_id` equal to the `action_id` of
+the owning data-plane transfer action, exactly as the generic message-envelope correlation
+rule below already requires for action-scoped messages. The transfer belongs to that action's
+Attempt; reusing `action_id` avoids inventing a second correlation identity and composes
+cleanly with renewal: a renewal request for the same still-legitimate `transfer_id` after
+expiry or Agent restart reuses the same `action_id`/`correlation_id`, because renewal creates
+no new Attempt and therefore no new action. `transfer_id` remains an independent durable
+transfer identity carried in the message body; `message_id` never carries transfer/action
+identity per the generic envelope rule.
+
+### Endpoint discovery for the data-plane listener
+
+`TransferAuthorizationGrant.data_plane_base_url` is the HTTPS origin (scheme, host, and port;
+no path) of the Worker-owned data-plane listener defined by
+`m0-data-plane-and-storage-contracts.md`. The Agent constructs concrete request paths under
+that origin using the fixed `/api/data/v1/` namespace owned by that Specification; the origin
+itself carries no path segment because the route namespace is already fixed by contract and
+need not be repeated per Endpoint/deployment.
+
+This is the only mechanism by which the Agent learns where the Worker listener is; V1 defines
+no separate discovery message and no fixed/hardcoded port. The value is delivered over the
+already-authenticated WSS control plane and MUST be HTTPS. Every `TransferAuthorizationGrant`,
+including renewals, carries the current value; the Agent always uses the most recently granted
+value and must not cache or hardcode one across a full reconnect.
+
+Because ADR-0018 requires the Worker to terminate the data-plane listener using the exact same
+Server TLS identity already trusted by the Agent, connecting to `data_plane_base_url`
+introduces no new trust decision: the Agent MUST verify the exact same trusted leaf
+`ServerCertFingerprint` established by trusted bootstrap
+(`m0-trusted-bootstrap-and-server-fingerprint-contract.md`) against the certificate presented
+by the data-plane listener, using the identical exact-pin comparison used for the control-plane
+WSS connection — never hostname/DNS-derived identity, and never a second pin. A fingerprint
+mismatch on the data-plane connection fails closed exactly as it does for WSS, with no TOFU and
+no fallback. The Worker-owned `/api/data/v1/` surface issues no HTTP redirects; if the Agent
+ever observes a redirect response from that origin, it MUST treat it as a fatal transport error
+and MUST NOT follow it to a different origin, so a redirect can never silently move the Agent
+to a differently trusted identity.
+
+### Renewal and restart
+
+A currently authenticated Agent may request renewal for the same legitimate non-terminal `transfer_id` after expiry or Agent restart, using the same or a new proof key. Renewal is not a retry and creates no new Attempt, and per the correlation rule above it is sent under the same `action_id`/`correlation_id` as the original request for that transfer.
+
+The Agent is expected to retain `transfer_id`, `artifact_id`, and the owning `action_id` in its own local state across its own restart, distinct from the ephemeral proof private key, which is explicitly non-durable and Agent-local
+(`m0-data-plane-and-storage-contracts.md` "Ephemeral proof key") and is regenerated fresh on
+renewal. Concrete Agent-local retention/storage mechanics are implementation-time. If the Agent
+has lost that local state entirely (not merely the proof key), it cannot itself request
+renewal; that total-loss case is already covered by the generic reconnection/reconciliation
+contract below (`StatusQuery`/`StatusReport{Unknown}`) and by Job-lifecycle policy, and this
+Specification does not add a separate recovery path for it.
 
 `TransferAuthorizationDenied.reason` is intentionally minimally revealing; V1 may use one closed generic value and must not distinguish unknown transfer, wrong Endpoint, terminal transfer, or other internal denial causes.
 
@@ -109,7 +160,7 @@ Every message contains:
 - `timestamp` — RFC 3339 / ISO 8601 UTC string;
 - `correlation_id` — optional.
 
-Every action-scoped message MUST have `correlation_id` equal to its relevant `action_id`. This is a protocol-wide rule covering every action-scoped message type, including `ActionDispatch`, `ActionAck`, `ActionProgress`, `ActionResult`, `CancelAction`, `CancelAck`, `StatusQuery`, and `StatusReport`; Issue #26 currently implements only `ActionDispatch`/`ActionAck`/`ActionProgress`/`ActionResult`, but that implementation scope does not narrow the rule itself. For a non-action `ProtocolError`, it may identify the offending `message_id`.
+Every action-scoped message MUST have `correlation_id` equal to its relevant `action_id`. This is a protocol-wide rule covering every action-scoped message type, including `ActionDispatch`, `ActionAck`, `ActionProgress`, `ActionResult`, `CancelAction`, `CancelAck`, `StatusQuery`, `StatusReport`, `TransferAuthorizationRequest`, `TransferAuthorizationGrant`, and `TransferAuthorizationDenied`; Issue #26 currently implements only `ActionDispatch`/`ActionAck`/`ActionProgress`/`ActionResult`, but that implementation scope does not narrow the rule itself. The `action_id` a `TransferAuthorization*` message correlates to is the owning data-plane transfer action's `action_id`, per "Transfer authorization" below. For a non-action `ProtocolError`, it may identify the offending `message_id`.
 
 `message_id` is a fresh UUID v4 for every message transmission, including when retained semantic evidence (for example, a stored `ActionResult`) is resent or re-emitted in response to a duplicate. `action_id` — not `message_id` — is the field that carries duplicate/idempotency meaning.
 
@@ -134,7 +185,7 @@ Every action-scoped message MUST have `correlation_id` equal to its relevant `ac
 - `BootstrapEvidence{boot_nonce, bootstrap_assertion, local_boot_trust: Established}`
 - `InventoryReport{inventory}` — Agent -> Server; post-session observational report.
 - `TransferAuthorizationRequest{transfer_id, proof_public_key}`
-- `TransferAuthorizationGrant{transfer_id, token, expires_at}`
+- `TransferAuthorizationGrant{transfer_id, token, expires_at, data_plane_base_url}`
 - `TransferAuthorizationDenied{transfer_id, reason}`
 - `ActionDispatch{action_id, action_type, action_version, parameters, retry_of?}` — Server -> Agent.
 - `ActionAck{action_id, outcome: Accepted|Rejected, error?}` — Agent -> Server. `Rejected` means execution did not occur and must not be represented as `ActionResult{Failed}`.
