@@ -332,3 +332,108 @@ ALTER TABLE domain_events ADD CONSTRAINT domain_events_attempt_id_fk
     FOREIGN KEY (attempt_id) REFERENCES attempts (id);
 
 CREATE INDEX idx_domain_events_attempt_id ON domain_events (attempt_id);
+
+-- Durable Transfer/Artifact/ChunkManifest data-plane metadata (Issue #36;
+-- m0-data-plane-and-storage-contracts.md; m1-simulated-vertical-slice-and-
+-- baseline-validation.md RF-005). Bulk Artifact bytes are never stored here
+-- (m0-data-plane-and-storage-contracts.md "Data-plane boundary") — only
+-- durable identity/lifecycle/manifest metadata.
+
+CREATE TYPE artifact_state AS ENUM (
+    'Incomplete',
+    'PendingVerification',
+    'Verified',
+    'Failed'
+);
+
+-- m0-data-plane-and-storage-contracts.md "Capture-consistency fact": a
+-- closed vocabulary independent from artifact_state. 'Established' is never
+-- a column DEFAULT — every insert supplies its starting value explicitly
+-- (mirroring hardware_confidence_state above).
+CREATE TYPE capture_consistency_state AS ENUM (
+    'NotApplicable',
+    'NotEstablished',
+    'Established'
+);
+
+-- One atomic integrity/completeness unit
+-- (m0-data-plane-and-storage-contracts.md "Artifact lifecycle").
+-- capture_consistency is tracked on the same row but transitions
+-- independently of state; no CHECK ties the two together.
+CREATE TABLE artifacts (
+    id UUID PRIMARY KEY,
+    state artifact_state NOT NULL,
+    capture_consistency capture_consistency_state NOT NULL
+);
+
+CREATE TYPE transfer_direction AS ENUM (
+    'agent_to_server'
+);
+
+-- M1's single interoperability digest algorithm
+-- (m1-simulated-vertical-slice-and-baseline-validation.md RF-005). Not
+-- claimed as permanent Bamep architecture.
+CREATE TYPE digest_algorithm AS ENUM (
+    'sha256'
+);
+
+-- Durable logical Transfer correlation
+-- (m0-data-plane-and-storage-contracts.md "Durable versus transient
+-- authorization state"). attempt_id is NULL before a later dispatch
+-- boundary (#40) binds this Transfer to its owning Attempt exactly once;
+-- the UNIQUE constraint additionally protects against one Attempt
+-- accidentally owning more than one Transfer. digest_algorithm/chunk_size
+-- are the fixed manifest parameters this Transfer's action needs to
+-- reconstruct later (RF-005); chunk_size mirrors chunk_manifests'
+-- durable-completeness facts but is fixed at Transfer-creation time, before
+-- any chunk identity exists.
+CREATE TABLE transfers (
+    id UUID PRIMARY KEY,
+    endpoint_id UUID NOT NULL REFERENCES endpoints (id),
+    job_id UUID NOT NULL REFERENCES jobs (id),
+    job_step_id UUID NOT NULL REFERENCES job_steps (id),
+    artifact_id UUID NOT NULL UNIQUE REFERENCES artifacts (id),
+    direction transfer_direction NOT NULL,
+    digest_algorithm digest_algorithm NOT NULL,
+    chunk_size INTEGER NOT NULL CHECK (chunk_size > 0),
+    source_provenance TEXT NOT NULL,
+    attempt_id UUID UNIQUE REFERENCES attempts (id)
+);
+
+CREATE INDEX idx_transfers_endpoint_id ON transfers (endpoint_id);
+CREATE INDEX idx_transfers_job_id ON transfers (job_id);
+CREATE INDEX idx_transfers_job_step_id ON transfers (job_step_id);
+
+-- One Artifact's chunk manifest (m0-data-plane-and-storage-contracts.md
+-- "Chunk manifest"). digest_algorithm/chunk_size are not duplicated here —
+-- they are already owned by `transfers` (one fact, one owner) and reached
+-- through artifact_id's 1:1 correlation to transfers.artifact_id. The
+-- all-or-none CHECK mirrors endpoints_current_boot_all_or_none: sealing is
+-- atomic across chunk_count/artifact_digest.
+CREATE TABLE chunk_manifests (
+    artifact_id UUID PRIMARY KEY REFERENCES artifacts (id),
+    sealed BOOLEAN NOT NULL DEFAULT FALSE,
+    chunk_count INTEGER CHECK (chunk_count IS NULL OR chunk_count >= 0),
+    artifact_digest BYTEA CHECK (artifact_digest IS NULL OR octet_length(artifact_digest) = 32),
+    CONSTRAINT chunk_manifests_sealed_facts_all_or_none CHECK (
+        (sealed = FALSE AND chunk_count IS NULL AND artifact_digest IS NULL)
+        OR (sealed = TRUE AND chunk_count IS NOT NULL AND artifact_digest IS NOT NULL)
+    )
+);
+
+-- Per-chunk expected identity plus durable held/verified state
+-- (m0-data-plane-and-storage-contracts.md "Chunk manifest", "Chunk transfer
+-- and resumability"; Issue #36 "Held / verified chunk state"). `held`
+-- distinguishes "expected identity recorded" from "matching bytes durably
+-- accepted" on the same row — the actual chunk bytes are never stored here
+-- (that remains later Worker/storage work, #39). digest is fixed at 32
+-- bytes for the current single supported algorithm (sha256); a future
+-- additional algorithm would need its own length rule.
+CREATE TABLE chunk_identities (
+    artifact_id UUID NOT NULL REFERENCES artifacts (id),
+    chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
+    size INTEGER NOT NULL CHECK (size > 0),
+    digest BYTEA NOT NULL CHECK (octet_length(digest) = 32),
+    held BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (artifact_id, chunk_index)
+);

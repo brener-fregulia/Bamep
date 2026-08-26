@@ -15,16 +15,20 @@
 //! so the Domain remains the sole owner of transition/business-rule
 //! decisions; the Adapter never reimplements them in SQL.
 
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use bamep_domain::presented_credential::{CredentialKind, CredentialLookupId};
 use bamep_domain::{
-    ActionEvidenceApplied, ActionId, Attempt, AttemptId, AuditRecord, BootContext,
-    BootContextResolveError, CancelAckApplied, CancellationRequestError, DestructiveIntent,
+    ActionEvidenceApplied, ActionId, Artifact, ArtifactTransitionError, Attempt, AttemptId,
+    AuditRecord, BootContext, BootContextResolveError, CancelAckApplied, CancellationRequestError,
+    ChunkAcceptError, ChunkIndex, ChunkRecordError, ChunkRecordOutcome, DestructiveIntent,
     DestructiveIntentError, EndpointAggregate, EndpointId, FinalDispatchDenial,
     FinalDispatchOutcome, FinalDispatchRejection, InvalidIdentityTransition, InventoryRevision,
     InventoryRevisionId, InventorySnapshot, Job, JobAdmissionError, JobAdmissionOutcome, JobId,
-    JobStep, JobStepEligibilityError, JobStepId, ReconciliationApplied, RedeemOutcome,
-    TargetFingerprint, TransitionOutcome, TrustedBootstrapOutcome,
+    JobStep, JobStepEligibilityError, JobStepId, ReconciliationApplied, RedeemOutcome, SealError,
+    SealOutcome, TargetFingerprint, Transfer, TransferBindingError, TransferContext, TransferId,
+    TransitionOutcome, TrustedBootstrapOutcome,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -996,4 +1000,245 @@ pub enum AgentDispatchError {
     ChannelClosed,
     #[error("the local websocket send failed")]
     SendFailed,
+}
+
+/// Durable facts read under lock immediately before one Transfer/Artifact/
+/// manifest decision (Issue #36 "Concurrency / atomicity"): the current
+/// `Transfer`, its owning `Artifact`, its `ChunkManifest`, and the set of
+/// chunk indices currently durably held/verified. `held_chunk_indices`
+/// reflects only durable acceptance — never Worker-local transient state.
+pub struct TransferLockedFacts {
+    pub transfer: Transfer,
+    pub artifact: Artifact,
+    pub manifest: bamep_domain::ChunkManifest,
+    pub held_chunk_indices: BTreeSet<ChunkIndex>,
+}
+
+/// A pure decision over freshly locked [`TransferLockedFacts`], mirroring
+/// [`FinalDispatchDecision`]/[`AdmitJobDecision`]: the Adapter locks and
+/// reads current state, this closure decides (calling
+/// `bamep_domain::ChunkManifest::record_expected_chunk`), and the Adapter
+/// persists the result atomically in the same transaction.
+pub type RecordChunkDecision =
+    Box<dyn FnOnce(&TransferLockedFacts) -> Result<ChunkRecordOutcome, ChunkRecordError> + Send>;
+
+/// A pure decision over freshly locked [`TransferLockedFacts`] for one
+/// verified-chunk acceptance, calling
+/// `bamep_domain::validate_verified_chunk`. This closure never itself marks
+/// a chunk held — it only validates that the already independently verified
+/// bytes match the durable expected identity; the Adapter performs the
+/// idempotent durable `held` write only when this returns `Ok`.
+pub type AcceptChunkDecision =
+    Box<dyn FnOnce(&TransferLockedFacts) -> Result<(), ChunkAcceptError> + Send>;
+
+/// A pure decision over freshly locked [`TransferLockedFacts`], calling
+/// `bamep_domain::ChunkManifest::seal`.
+pub type SealManifestDecision =
+    Box<dyn FnOnce(&TransferLockedFacts) -> Result<SealOutcome, SealError> + Send>;
+
+/// A pure decision over freshly locked [`TransferLockedFacts`], calling one
+/// of `bamep_domain::begin_verification`/`complete_verification`/
+/// `fail_incomplete`. Shared by every Artifact-lifecycle Port method below —
+/// each supplies the Domain call appropriate to its own transition.
+pub type ArtifactTransitionDecision =
+    Box<dyn FnOnce(&TransferLockedFacts) -> Result<Artifact, ArtifactTransitionError> + Send>;
+
+/// A pure decision over freshly locked [`TransferLockedFacts`], calling
+/// `bamep_domain::bind_attempt`.
+pub type BindAttemptDecision =
+    Box<dyn FnOnce(&TransferLockedFacts) -> Result<Transfer, TransferBindingError> + Send>;
+
+/// Errors from [`TransferRepository::create_transfer_context`]. Distinct
+/// from [`CreateWorkflowError`]: this verifies Job/JobStep correlation, not
+/// Endpoint enrollment state — a Transfer's eligibility beyond structural
+/// correlation belongs to a later Work Package (#40).
+#[derive(Debug, thiserror::Error)]
+pub enum CreateTransferError {
+    #[error("endpoint {0:?} not found")]
+    EndpointNotFound(EndpointId),
+    #[error("job {0:?} not found")]
+    JobNotFound(JobId),
+    #[error("job {0:?} does not target endpoint {1:?}")]
+    JobEndpointMismatch(JobId, EndpointId),
+    #[error("job step {0:?} not found in job {1:?}")]
+    JobStepNotFound(JobStepId, JobId),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RecordChunkError {
+    #[error("transfer {0:?} not found")]
+    TransferNotFound(TransferId),
+    #[error(transparent)]
+    Domain(#[from] ChunkRecordError),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
+/// The result of [`TransferRepository::accept_verified_chunk`] after
+/// successful validation — distinguishes a genuinely new durable acceptance
+/// from an idempotent resubmission of an already-held chunk (Issue #36
+/// "Concurrency / atomicity": "duplicate verified-held acceptance").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptChunkOutcome {
+    Accepted,
+    AlreadyHeld,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AcceptChunkError {
+    #[error("transfer {0:?} not found")]
+    TransferNotFound(TransferId),
+    #[error(transparent)]
+    Domain(#[from] ChunkAcceptError),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SealManifestError {
+    #[error("transfer {0:?} not found")]
+    TransferNotFound(TransferId),
+    #[error(transparent)]
+    Domain(#[from] SealError),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
+/// Errors shared by every Artifact-lifecycle Port method below (Issue #36:
+/// `begin_artifact_verification`/`complete_artifact_verification`/
+/// `fail_incomplete_artifact`).
+#[derive(Debug, thiserror::Error)]
+pub enum ArtifactTransitionRepoError {
+    #[error("transfer {0:?} not found")]
+    TransferNotFound(TransferId),
+    #[error(transparent)]
+    Domain(#[from] ArtifactTransitionError),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BindAttemptError {
+    #[error("transfer {0:?} not found")]
+    TransferNotFound(TransferId),
+    #[error(transparent)]
+    Domain(#[from] TransferBindingError),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
+/// Durable Transfer/Artifact/ChunkManifest metadata persistence (Issue #36
+/// "Persist Transfer, Artifact, and ChunkManifest lifecycle";
+/// `m0-data-plane-and-storage-contracts.md`). Never persists bulk Artifact
+/// bytes — those remain later Worker/storage work (#39). Every mutating
+/// method here locks exactly the named `Transfer` (and its Artifact/
+/// manifest/held-chunk facts) before invoking its `decide` closure, mirroring
+/// [`JobRepository`]'s lock/decide/persist discipline, so Domain remains the
+/// sole owner of transition/business-rule decisions.
+#[async_trait]
+pub trait TransferRepository: Send + Sync {
+    /// Verifies `context.transfer.job_id`/`job_step_id` correlate to an
+    /// existing JobStep for an existing Job targeting
+    /// `context.transfer.endpoint_id`, then atomically persists the
+    /// already-constructed pre-dispatch `Transfer`/`Artifact`/empty
+    /// `ChunkManifest` (Issue #36 "Pre-dispatch creation"). Never creates an
+    /// Attempt or action identity, never transitions the JobStep, never
+    /// evaluates the destructive-operation gate.
+    async fn create_transfer_context(
+        &self,
+        context: &TransferContext,
+    ) -> Result<(), CreateTransferError>;
+
+    /// Read-only reload of a persisted `Transfer`/`Artifact`/`ChunkManifest`
+    /// plus its currently durably held/verified chunk indices, for
+    /// verification/reporting and restart/recovery (Issue #36 "Reload /
+    /// restart"). `None` when no Transfer with `transfer_id` was ever
+    /// created.
+    async fn find_transfer_context(
+        &self,
+        transfer_id: TransferId,
+    ) -> Result<Option<(TransferContext, BTreeSet<ChunkIndex>)>, RepositoryError>;
+
+    /// Locks exactly the `Transfer` identified by `transfer_id`, invokes
+    /// `decide` with its freshly locked [`TransferLockedFacts`], and — only
+    /// for `Ok(ChunkRecordOutcome::Added(..))` — atomically persists the new
+    /// expected chunk-identity row in the same transaction.
+    /// `Ok(ChunkRecordOutcome::AlreadyRecorded)` persists nothing
+    /// (idempotent no-op).
+    async fn record_expected_chunk(
+        &self,
+        transfer_id: TransferId,
+        decide: RecordChunkDecision,
+    ) -> Result<ChunkRecordOutcome, RecordChunkError>;
+
+    /// Locks exactly the `Transfer` identified by `transfer_id`, invokes
+    /// `decide` with its freshly locked [`TransferLockedFacts`], and — only
+    /// on `Ok(())` — atomically marks `index` durably held/verified in the
+    /// same transaction. Reports [`AcceptChunkOutcome::AlreadyHeld`] without
+    /// a second write when `index` is already held under the same lock.
+    async fn accept_verified_chunk(
+        &self,
+        transfer_id: TransferId,
+        index: ChunkIndex,
+        decide: AcceptChunkDecision,
+    ) -> Result<AcceptChunkOutcome, AcceptChunkError>;
+
+    /// Locks exactly the `Transfer` identified by `transfer_id`, invokes
+    /// `decide` with its freshly locked [`TransferLockedFacts`], and — only
+    /// for `Ok(SealOutcome::Sealed(..))` — atomically persists the sealed
+    /// manifest facts (`chunk_count`, `artifact_digest`, `sealed = true`) in
+    /// the same transaction. `Ok(SealOutcome::AlreadySealed)` persists
+    /// nothing.
+    async fn seal_manifest(
+        &self,
+        transfer_id: TransferId,
+        decide: SealManifestDecision,
+    ) -> Result<SealOutcome, SealManifestError>;
+
+    /// Locks exactly the `Transfer` identified by `transfer_id`, invokes
+    /// `decide` (`bamep_domain::begin_verification`), and — only on `Ok` —
+    /// atomically persists `Incomplete -> PendingVerification` in the same
+    /// transaction.
+    async fn begin_artifact_verification(
+        &self,
+        transfer_id: TransferId,
+        decide: ArtifactTransitionDecision,
+    ) -> Result<Artifact, ArtifactTransitionRepoError>;
+
+    /// Locks exactly the `Transfer` identified by `transfer_id`, invokes
+    /// `decide` (`bamep_domain::complete_verification`), and — only on `Ok`
+    /// — atomically persists `PendingVerification -> Verified | Failed` in
+    /// the same transaction.
+    async fn complete_artifact_verification(
+        &self,
+        transfer_id: TransferId,
+        decide: ArtifactTransitionDecision,
+    ) -> Result<Artifact, ArtifactTransitionRepoError>;
+
+    /// Locks exactly the `Transfer` identified by `transfer_id`, invokes
+    /// `decide` (`bamep_domain::fail_incomplete`), and — only on `Ok` —
+    /// atomically persists `Incomplete -> Failed` in the same transaction.
+    async fn fail_incomplete_artifact(
+        &self,
+        transfer_id: TransferId,
+        decide: ArtifactTransitionDecision,
+    ) -> Result<Artifact, ArtifactTransitionRepoError>;
+
+    /// Locks exactly the `Transfer` identified by `transfer_id`, invokes
+    /// `decide` (`bamep_domain::bind_attempt`), and — only on `Ok` —
+    /// atomically persists the one-time Transfer -> Attempt binding (Issue
+    /// #36 "Transfer -> Attempt binding support"). This Port method opens
+    /// and commits its own transaction, sufficient for #36's own scope. A
+    /// later dispatch boundary (#40) that must commit this binding
+    /// atomically alongside its own JobStep/Attempt commitment composes the
+    /// lower-level `adapters::postgres::transfer_repository` locking/
+    /// persistence primitives directly into its own transaction instead of
+    /// calling this method — see that module's docs.
+    async fn bind_attempt(
+        &self,
+        transfer_id: TransferId,
+        decide: BindAttemptDecision,
+    ) -> Result<Transfer, BindAttemptError>;
 }

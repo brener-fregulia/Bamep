@@ -322,6 +322,49 @@ transient reservation mapping exactly once and releases it through
 restart (a fresh, empty in-memory registry) is a safe no-op release, never a correctness problem
 for the durable Attempt lifecycle.
 
+## Implemented pre-dispatch Transfer/Artifact/ChunkManifest durable model
+
+`bamep-domain` adds three pure modules for the M1 data-plane
+(`m0-data-plane-and-storage-contracts.md`; Issue #36): `transfer` (`TransferId`,
+`TransferDirection` — currently only `AgentToServer` —, `SourceProvenance`, `Transfer`,
+`create_transfer_context`, `bind_attempt`), `artifact` (`ArtifactId`, `ArtifactState`,
+`CaptureConsistency`, `Artifact`, and the `begin_verification`/`complete_verification`/
+`fail_incomplete`/`set_capture_consistency` transitions), and `chunk_manifest`
+(`DigestAlgorithm` — currently only `Sha256` —, `Digest`, `ChunkSize`, `ChunkIndex`,
+`ChunkManifest`, `record_expected_chunk`, `seal`, `validate_verified_chunk`). `Transfer` carries
+no state machine of its own — only an optional `attempt_id`, `None` until a later dispatch
+boundary binds it — and `ArtifactState`/`CaptureConsistency` transition independently of each
+other on the same `Artifact`.
+
+`bamep_server::ports::TransferRepository` is a new Port mirroring `JobRepository`'s lock/decide/
+persist discipline: every mutating method locks the named `Transfer`'s row before invoking a
+caller-supplied `decide` closure over `TransferLockedFacts` (the current `Transfer`, `Artifact`,
+`ChunkManifest`, and durably held chunk indices), so Domain remains the sole owner of transition
+legality. `bamep_server::application::TransferService` is the thin Application layer calling
+exactly one `bamep_domain` decision per method and handing it to the Port; it performs no
+hashing, file, storage, or network I/O.
+
+`bamep_server::adapters::postgres::PostgresTransferRepository` implements this Port against four
+new relational tables folded into `0001_initial_schema.sql` (pre-baseline phase):
+`artifacts` (state, capture consistency), `transfers` (Endpoint/Job/JobStep correlation,
+direction, digest algorithm, chunk size, source provenance, nullable/unique `attempt_id`),
+`chunk_manifests` (sealed/chunk_count/artifact_digest, all-or-none), and `chunk_identities`
+(per-chunk expected size/digest plus a `held` column distinguishing "expected identity recorded"
+from "matching bytes durably accepted"). No bulk Artifact bytes are stored in PostgreSQL. The
+module's `load_locked_facts`/`persist_attempt_binding` functions are `pub(crate)` primitives a
+later Work Package (#40) can compose directly into its own transaction to commit the Transfer ->
+Attempt binding atomically alongside its JobStep/Attempt commitment, without requiring #36 to
+decide that future transaction's shape now.
+
+This durable model supports creating a pre-dispatch `Transfer`/`Artifact`/empty `ChunkManifest`
+for an existing Endpoint/Job/JobStep correlation with no Attempt — a `Transfer` with
+`attempt_id: None` is never treated as transfer-authorized. No Attempt/action identity is created,
+no JobStep is transitioned, and the destructive-operation gate is never evaluated by this path.
+Binding an existing Transfer to an owning Attempt exactly once, and rejecting a conflicting
+rebind, is implemented and tested, but committing that owning Attempt itself remains unimplemented
+(#40), as does Agent Protocol transfer authorization (#38), the Worker process/HTTPS chunk
+transport (#37/#39), and end-to-end Simulator integration (#19).
+
 ## Maintenance rule
 
 Update this directory only for durable structure visible in implemented code. Do not copy

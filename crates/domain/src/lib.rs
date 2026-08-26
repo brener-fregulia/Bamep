@@ -9,9 +9,11 @@
 //! persistence entirely to the `server` crate's Adapters.
 
 pub mod action_evidence;
+pub mod artifact;
 pub mod attempt;
 pub mod boot_context;
 pub mod cancellation;
+pub mod chunk_manifest;
 pub mod credential;
 pub mod current_boot;
 pub mod endpoint;
@@ -24,10 +26,15 @@ pub mod job;
 pub mod presented_credential;
 pub mod reconciliation;
 pub mod target_fingerprint;
+pub mod transfer;
 pub mod transitions;
 
 pub use action_evidence::{
     apply_action_evidence, ActionEvidence, ActionEvidenceApplied, ActionEvidenceOutcome,
+};
+pub use artifact::{
+    begin_verification, complete_verification, fail_incomplete, set_capture_consistency, Artifact,
+    ArtifactId, ArtifactState, ArtifactTransitionError, CaptureConsistency,
 };
 pub use attempt::{ActionId, Attempt, AttemptId, AttemptState};
 pub use bamep_trusted_bootstrap::BootNonce;
@@ -35,6 +42,11 @@ pub use boot_context::{BootContext, BootContextResolveError};
 pub use cancellation::{
     apply_cancel_ack, request_cancellation, CancelAckApplied, CancelAckEvidence, CancelAckOutcome,
     CancellationRequestError, CancellationRequestOutcome,
+};
+pub use chunk_manifest::{
+    validate_verified_chunk, ChunkAcceptError, ChunkIndex, ChunkManifest, ChunkRecordError,
+    ChunkRecordOutcome, ChunkSize, Digest, DigestAlgorithm, ExpectedChunk, InvalidChunkSize,
+    InvalidDigestLength, SealError, SealOutcome,
 };
 pub use credential::{AuthOutcome, CredentialChain, CredentialDimension, DEFAULT_CREDENTIAL_TTL};
 pub use current_boot::{CurrentBoot, TrustedBootstrapState};
@@ -61,4 +73,8 @@ pub use reconciliation::{
     CloseIndeterminateOutcome, ReconciliationApplied, ReconciliationOutcome, StatusReportEvidence,
 };
 pub use target_fingerprint::TargetFingerprint;
+pub use transfer::{
+    bind_attempt, create_transfer_context, SourceProvenance, Transfer, TransferBindingError,
+    TransferContext, TransferDirection, TransferId,
+};
 pub use transitions::{RedeemOutcome, TrustedBootstrapOutcome};

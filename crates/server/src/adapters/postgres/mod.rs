@@ -13,12 +13,14 @@ mod inventory_repository;
 mod job_repository;
 mod repository;
 mod shared;
+mod transfer_repository;
 
 pub use boot_context_repository::PostgresBootContextRepository;
 pub use credential_redemption_repository::PostgresCredentialRedemptionRepository;
 pub use inventory_repository::PostgresInventoryRepository;
 pub use job_repository::PostgresJobRepository;
 pub use repository::PostgresEndpointRepository;
+pub use transfer_repository::PostgresTransferRepository;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;

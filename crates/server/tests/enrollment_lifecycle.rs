@@ -216,9 +216,12 @@ async fn migrations_apply_cleanly_to_a_fresh_database() {
     assert_eq!(
         tables,
         vec![
+            "artifacts",
             "attempts",
             "audit_records",
             "boot_contexts",
+            "chunk_identities",
+            "chunk_manifests",
             "domain_events",
             "endpoint_credential_lookups",
             "endpoint_credentials",
@@ -226,6 +229,7 @@ async fn migrations_apply_cleanly_to_a_fresh_database() {
             "inventory_revisions",
             "job_steps",
             "jobs",
+            "transfers",
         ]
     );
 

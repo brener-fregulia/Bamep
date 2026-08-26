@@ -39,7 +39,7 @@ use crate::ports::{
     JobRepository, RedemptionDecision, RedemptionTarget, RepositoryError,
     RequestCancellationDecision, RequestCancellationError, RequestCancellationLockedFacts,
     RequestCancellationResult, SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError,
-    TargetRevalidationPort,
+    TargetRevalidationPort, TransferRepository,
 };
 use crate::runtime::presence::PresenceRegistry;
 use crate::runtime::reservation_registry::{AttemptReservationRegistry, RegistrationOutcome};
@@ -122,12 +122,101 @@ pub enum ApplicationError {
     /// correlation").
     #[error("unknown action")]
     UnknownAction,
+    /// Issue #36: `context.transfer.job_id` does not target
+    /// `context.transfer.endpoint_id`.
+    #[error("job {0:?} does not target endpoint {1:?}")]
+    JobEndpointMismatch(JobId, EndpointId),
+    /// Issue #36: no Transfer with this `TransferId` was ever created.
+    #[error("transfer {0:?} not found")]
+    TransferNotFound(bamep_domain::TransferId),
     #[error(transparent)]
     InvalidTransition(#[from] InvalidIdentityTransition),
     #[error(transparent)]
     EmptyWorkflow(#[from] EmptyWorkflow),
     #[error(transparent)]
+    ChunkRecord(#[from] bamep_domain::ChunkRecordError),
+    #[error(transparent)]
+    ChunkAccept(#[from] bamep_domain::ChunkAcceptError),
+    #[error(transparent)]
+    Seal(#[from] bamep_domain::SealError),
+    #[error(transparent)]
+    ArtifactTransition(#[from] bamep_domain::ArtifactTransitionError),
+    #[error(transparent)]
+    TransferBinding(#[from] bamep_domain::TransferBindingError),
+    #[error(transparent)]
     Repository(#[from] RepositoryError),
+}
+
+impl From<crate::ports::CreateTransferError> for ApplicationError {
+    fn from(err: crate::ports::CreateTransferError) -> Self {
+        use crate::ports::CreateTransferError as E;
+        match err {
+            E::EndpointNotFound(id) => ApplicationError::EndpointNotFound(id),
+            E::JobNotFound(id) => ApplicationError::JobNotFound(id),
+            E::JobEndpointMismatch(job_id, endpoint_id) => {
+                ApplicationError::JobEndpointMismatch(job_id, endpoint_id)
+            }
+            E::JobStepNotFound(step_id, job_id) => {
+                ApplicationError::JobStepNotFound(step_id, job_id)
+            }
+            E::Repository(e) => ApplicationError::Repository(e),
+        }
+    }
+}
+
+impl From<crate::ports::RecordChunkError> for ApplicationError {
+    fn from(err: crate::ports::RecordChunkError) -> Self {
+        use crate::ports::RecordChunkError as E;
+        match err {
+            E::TransferNotFound(id) => ApplicationError::TransferNotFound(id),
+            E::Domain(e) => ApplicationError::ChunkRecord(e),
+            E::Repository(e) => ApplicationError::Repository(e),
+        }
+    }
+}
+
+impl From<crate::ports::AcceptChunkError> for ApplicationError {
+    fn from(err: crate::ports::AcceptChunkError) -> Self {
+        use crate::ports::AcceptChunkError as E;
+        match err {
+            E::TransferNotFound(id) => ApplicationError::TransferNotFound(id),
+            E::Domain(e) => ApplicationError::ChunkAccept(e),
+            E::Repository(e) => ApplicationError::Repository(e),
+        }
+    }
+}
+
+impl From<crate::ports::SealManifestError> for ApplicationError {
+    fn from(err: crate::ports::SealManifestError) -> Self {
+        use crate::ports::SealManifestError as E;
+        match err {
+            E::TransferNotFound(id) => ApplicationError::TransferNotFound(id),
+            E::Domain(e) => ApplicationError::Seal(e),
+            E::Repository(e) => ApplicationError::Repository(e),
+        }
+    }
+}
+
+impl From<crate::ports::ArtifactTransitionRepoError> for ApplicationError {
+    fn from(err: crate::ports::ArtifactTransitionRepoError) -> Self {
+        use crate::ports::ArtifactTransitionRepoError as E;
+        match err {
+            E::TransferNotFound(id) => ApplicationError::TransferNotFound(id),
+            E::Domain(e) => ApplicationError::ArtifactTransition(e),
+            E::Repository(e) => ApplicationError::Repository(e),
+        }
+    }
+}
+
+impl From<crate::ports::BindAttemptError> for ApplicationError {
+    fn from(err: crate::ports::BindAttemptError) -> Self {
+        use crate::ports::BindAttemptError as E;
+        match err {
+            E::TransferNotFound(id) => ApplicationError::TransferNotFound(id),
+            E::Domain(e) => ApplicationError::TransferBinding(e),
+            E::Repository(e) => ApplicationError::Repository(e),
+        }
+    }
 }
 
 impl From<AdmitJobError> for ApplicationError {
@@ -1782,6 +1871,204 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> EnrollmentService
             .update_endpoint(endpoint_id, decide)
             .await?;
         Ok(())
+    }
+}
+
+/// The narrow pre-dispatch Transfer/Artifact/ChunkManifest metadata
+/// operations Issue #36 requires
+/// (`docs/specifications/m0-data-plane-and-storage-contracts.md`;
+/// `m1-simulated-vertical-slice-and-baseline-validation.md` RF-005). Owns no
+/// business rules itself — every method here calls exactly one
+/// `bamep_domain` decision function and hands it to the `TransferRepository`
+/// Port as a `decide` closure so the Adapter can invoke it under lock. This
+/// service never hashes bulk bytes, reads files, writes storage, receives
+/// HTTP requests, or verifies transfer capabilities — those responsibilities
+/// belong to later Worker/HTTP Work Packages (#37/#38/#39); it only records
+/// already-computed/verified facts handed to it.
+pub struct TransferService<T: TransferRepository> {
+    repo: Arc<T>,
+}
+
+impl<T: TransferRepository> TransferService<T> {
+    pub fn new(repo: Arc<T>) -> Self {
+        Self { repo }
+    }
+
+    /// Constructs and durably persists a fresh pre-dispatch
+    /// `Transfer`/`Artifact`/empty `ChunkManifest` for one Endpoint/JobStep
+    /// workflow context (`bamep_domain::create_transfer_context`; Issue #36
+    /// "Pre-dispatch creation"). Never creates an Attempt or action
+    /// identity, never transitions the JobStep, never evaluates the
+    /// destructive-operation gate.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_transfer_context(
+        &self,
+        endpoint_id: EndpointId,
+        job_id: JobId,
+        job_step_id: JobStepId,
+        direction: bamep_domain::TransferDirection,
+        digest_algorithm: bamep_domain::DigestAlgorithm,
+        chunk_size: bamep_domain::ChunkSize,
+        source_provenance: bamep_domain::SourceProvenance,
+    ) -> Result<bamep_domain::TransferContext, ApplicationError> {
+        let context = bamep_domain::create_transfer_context(
+            endpoint_id,
+            job_id,
+            job_step_id,
+            direction,
+            digest_algorithm,
+            chunk_size,
+            source_provenance,
+        );
+        self.repo.create_transfer_context(&context).await?;
+        Ok(context)
+    }
+
+    /// Read-only reload of a persisted Transfer/Artifact/manifest plus its
+    /// currently durably held/verified chunk indices (Issue #36 "Reload /
+    /// restart").
+    pub async fn find_transfer_context(
+        &self,
+        transfer_id: bamep_domain::TransferId,
+    ) -> Result<
+        Option<(
+            bamep_domain::TransferContext,
+            std::collections::BTreeSet<bamep_domain::ChunkIndex>,
+        )>,
+        ApplicationError,
+    > {
+        self.repo
+            .find_transfer_context(transfer_id)
+            .await
+            .map_err(ApplicationError::from)
+    }
+
+    /// Records one expected chunk identity
+    /// (`bamep_domain::ChunkManifest::record_expected_chunk`): a genuinely
+    /// new index continues an unsealed manifest; an identical already-
+    /// recorded index is idempotent; a conflicting index is rejected without
+    /// ever rewriting the original expected identity.
+    pub async fn record_expected_chunk(
+        &self,
+        transfer_id: bamep_domain::TransferId,
+        index: bamep_domain::ChunkIndex,
+        size: u32,
+        digest_bytes: Vec<u8>,
+    ) -> Result<bamep_domain::ChunkRecordOutcome, ApplicationError> {
+        let decide: crate::ports::RecordChunkDecision = Box::new(move |facts| {
+            facts
+                .manifest
+                .record_expected_chunk(index, size, digest_bytes)
+        });
+        self.repo
+            .record_expected_chunk(transfer_id, decide)
+            .await
+            .map_err(ApplicationError::from)
+    }
+
+    /// Durably marks `index` held once its already independently verified
+    /// digest matches the recorded expected identity
+    /// (`bamep_domain::validate_verified_chunk`). Idempotent when `index` is
+    /// already held.
+    pub async fn accept_verified_chunk(
+        &self,
+        transfer_id: bamep_domain::TransferId,
+        index: bamep_domain::ChunkIndex,
+        verified_digest_bytes: Vec<u8>,
+    ) -> Result<crate::ports::AcceptChunkOutcome, ApplicationError> {
+        let decide: crate::ports::AcceptChunkDecision = Box::new(move |facts| {
+            bamep_domain::validate_verified_chunk(&facts.manifest, index, &verified_digest_bytes)
+        });
+        self.repo
+            .accept_verified_chunk(transfer_id, index, decide)
+            .await
+            .map_err(ApplicationError::from)
+    }
+
+    /// Seals the manifest (`bamep_domain::ChunkManifest::seal`): idempotent
+    /// on an identical already-sealed retry, rejected on conflicting reseal.
+    pub async fn seal_manifest(
+        &self,
+        transfer_id: bamep_domain::TransferId,
+        chunk_count: u32,
+        artifact_digest_bytes: Vec<u8>,
+    ) -> Result<bamep_domain::SealOutcome, ApplicationError> {
+        let decide: crate::ports::SealManifestDecision =
+            Box::new(move |facts| facts.manifest.seal(chunk_count, artifact_digest_bytes));
+        self.repo
+            .seal_manifest(transfer_id, decide)
+            .await
+            .map_err(ApplicationError::from)
+    }
+
+    /// `Incomplete -> PendingVerification` (`bamep_domain::begin_verification`):
+    /// requires a sealed manifest with every expected chunk durably held.
+    pub async fn begin_artifact_verification(
+        &self,
+        transfer_id: bamep_domain::TransferId,
+    ) -> Result<bamep_domain::Artifact, ApplicationError> {
+        let decide: crate::ports::ArtifactTransitionDecision = Box::new(move |facts| {
+            bamep_domain::begin_verification(
+                &facts.artifact,
+                &facts.manifest,
+                &facts.held_chunk_indices,
+            )
+        });
+        self.repo
+            .begin_artifact_verification(transfer_id, decide)
+            .await
+            .map_err(ApplicationError::from)
+    }
+
+    /// `PendingVerification -> Verified | Failed`
+    /// (`bamep_domain::complete_verification`), decided by an already
+    /// independently computed full-Artifact digest match. This method
+    /// performs no hashing itself.
+    pub async fn complete_artifact_verification(
+        &self,
+        transfer_id: bamep_domain::TransferId,
+        digest_matches: bool,
+    ) -> Result<bamep_domain::Artifact, ApplicationError> {
+        let decide: crate::ports::ArtifactTransitionDecision = Box::new(move |facts| {
+            bamep_domain::complete_verification(&facts.artifact, digest_matches)
+        });
+        self.repo
+            .complete_artifact_verification(transfer_id, decide)
+            .await
+            .map_err(ApplicationError::from)
+    }
+
+    /// `Incomplete -> Failed` (`bamep_domain::fail_incomplete`): a required
+    /// chunk could not be reproduced/verified, or capture/transfer was
+    /// abandoned/cancelled.
+    pub async fn fail_incomplete_artifact(
+        &self,
+        transfer_id: bamep_domain::TransferId,
+    ) -> Result<bamep_domain::Artifact, ApplicationError> {
+        let decide: crate::ports::ArtifactTransitionDecision =
+            Box::new(move |facts| bamep_domain::fail_incomplete(&facts.artifact));
+        self.repo
+            .fail_incomplete_artifact(transfer_id, decide)
+            .await
+            .map_err(ApplicationError::from)
+    }
+
+    /// Binds this Transfer to its owning `attempt` exactly once
+    /// (`bamep_domain::bind_attempt`; Issue #36 "Transfer -> Attempt binding
+    /// support"). This method never creates the Attempt itself — the caller
+    /// supplies an already-committed `Attempt` value. Idempotent when
+    /// already bound to this exact Attempt; rejects a conflicting rebind.
+    pub async fn bind_attempt(
+        &self,
+        transfer_id: bamep_domain::TransferId,
+        attempt: Attempt,
+    ) -> Result<bamep_domain::Transfer, ApplicationError> {
+        let decide: crate::ports::BindAttemptDecision =
+            Box::new(move |facts| bamep_domain::bind_attempt(&facts.transfer, &attempt));
+        self.repo
+            .bind_attempt(transfer_id, decide)
+            .await
+            .map_err(ApplicationError::from)
     }
 }
 
