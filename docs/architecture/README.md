@@ -447,12 +447,29 @@ responses), and the handshake/error message slice
 (`AuthorizationQuery`, `ChunkAcceptanceRequest`, `ArtifactVerificationReport`, and their
 responses) is not yet represented. `crate::framing` provides the length-prefix codec generic
 over `tokio::io::AsyncRead`/`AsyncWrite`, reused by both the `bamepd`-side listener and the
-Worker client so the framing logic exists in exactly one place.
+Worker client so the framing logic exists in exactly one place. `crate::codec::decode`
+distinguishes an unrecognized top-level `type` (`DecodeError::UnknownType`) from every other
+malformed-JSON case, so a receiver can answer it with a stable `ProtocolError` rather than
+silently closing the connection. `is_uuid_v4` requires both the version-4 nibble and the
+RFC4122/RFC9562 standard variant.
+
+**Worker control-boundary lifetime ownership.** Before touching the Worker UDS socket
+pathname at all, `bamepd` validates/creates the trusted runtime directory
+(`bamep_server::adapters::worker_runtime_ownership::TrustedRuntimeDir`: a real, non-symlink,
+owner-only-mode directory owned by the effective UID running `bamepd`, under an ancestor that
+cannot be replaced by an untrusted principal) and acquires an exclusive, non-blocking advisory
+lock (`flock(LOCK_EX | LOCK_NB)` via `rustix`) on a dedicated lock file inside it
+(`RuntimeOwnershipLock`), held for the entire daemon lifetime. A second `bamepd` targeting the
+same runtime directory fails at lock acquisition — before it ever inspects, probes, or attempts
+to bind the socket pathname. This lock is the primary exclusivity guarantee; the
+directory/socket filesystem checks below remain defense in depth. Shutdown ordering is
+explicit: stop handlers, stop Worker, clean up the Worker socket, release the ownership lock
+last.
 
 **`bamepd`-side UDS control plane.** `bamep_server::adapters::worker_control_plane::WorkerControlPlane`
-binds/listens on a configurable UDS path (`BAMEP_WORKER_UDS_PATH`), creating its parent
-directory (`0700`) and restricting the bound socket to owner-only access (`0600`). A
-pre-existing path is removed only after confirming it is actually a socket
+binds/listens on a configurable UDS path (`BAMEP_WORKER_UDS_PATH`) only after the ownership
+lock above is held, restricting the bound socket to owner-only access (`0600`). A pre-existing
+path is removed only after confirming it is actually a socket
 (`std::os::unix::fs::FileTypeExt::is_socket`) — an unrelated file at that path is refused,
 never deleted. It accepts each connection, performs the handshake, and hands the resulting
 `worker_instance_id` to `bamep_server::runtime::worker_authority::WorkerAuthorityRegistry` — an
@@ -460,8 +477,9 @@ in-process (never PostgreSQL-durable) Runtime Service, mirroring `presence`/`out
 that tracks the single current connection generation. A newer successful handshake always
 supersedes the previous one; a superseded generation's later disconnect is a no-op against the
 now-current generation. This registry is the narrow readiness/control-connection seam #38/#39
-are expected to consume rather than inventing another notion of Worker authority. On
-`bamepd` shutdown, the control plane stops accepting new connections and removes the socket
+are expected to consume rather than inventing another notion of Worker authority. The accept
+loop drains completed connection-handler tasks during normal operation, not only at shutdown.
+On `bamepd` shutdown, the control plane stops accepting new connections and removes the socket
 file.
 
 **Worker-side reconnecting client.** `bamep_worker::ipc::client::run_client_loop` connects to
@@ -483,17 +501,22 @@ reference/production environment and the only environment that exercises the rea
 **Worker process supervision.** `bamep_server::runtime::worker_supervisor::WorkerSupervisor`
 spawns the configured Worker executable via `tokio::process::Command` (`kill_on_drop(true)` as
 a defense-in-depth backstop), observes its exit through `Child::wait()`, and respawns it after
-a fixed configurable delay — distinguishing a spawn/configuration failure
+a fixed configurable delay (minimum `100`ms) — distinguishing a spawn/configuration failure
 (`SupervisorEvent::SpawnFailed`) from an observed child exit
-(`SupervisorEvent::WorkerExited`) without treating either as `bamepd` itself crashing. On
-controlled shutdown it kills and reaps the current child before returning. Startup ordering is
+(`SupervisorEvent::WorkerExited`) without treating either as `bamepd` itself crashing.
+Diagnostic events are sent over a bounded channel via `try_send`, dropping on backpressure
+rather than letting a stalled log consumer block Worker supervision. On controlled shutdown it
+kills and reaps the current child before returning. Startup ordering is ownership lock, then
 UDS listener bind, then supervisor/Worker start, so Worker never races a listener that failed
 to bind.
 
 **TLS identity provisioning.** ADR-0018 requires Worker to reuse the exact same Server TLS
 identity without private-key bytes crossing the ordinary Worker IPC protocol. `bamep-worker`
-loads the Server certificate chain/private key from host-local PEM files
-(`BAMEP_WORKER_TLS_CERT_PATH`/`BAMEP_WORKER_TLS_KEY_PATH`, parsed with `rustls-pemfile`) —
+loads the Server certificate chain from a host-local PEM file
+(`BAMEP_WORKER_TLS_CERT_PATH`, parsed with `rustls-pemfile`) and the private key from
+`BAMEP_WORKER_TLS_KEY_PATH` by opening it once with `O_NOFOLLOW` (via `rustix`), validating
+regular-file/owner-only-mode from that same file descriptor's `fstat`, and reading its bytes
+from that same descriptor — never a separate `symlink_metadata`-then-`read` path resolution —
 paths are forwarded through process configuration, never key material through UDS JSON — and
 proves the pair is rustls-usable (TLS 1.3, `ring` provider, no client-certificate
 authentication, mirroring `adapters::agent_transport::AgentTransportAcceptor`'s existing

@@ -82,14 +82,24 @@ impl Default for Envelope {
     }
 }
 
-/// Whether `id` is a UUID v4 (the version nibble equals 4), the normative
-/// identity shape required for `message_id` and `worker_instance_id`
-/// (`m1-worker-data-plane-control-contract.md` "Handshake"). Checks the
-/// version nibble directly rather than `Uuid::get_version()` so a value that
-/// is version-4-shaped but carries a non-RFC4122 variant is still accepted —
-/// this is a wire-format shape check, not a generator-provenance proof.
+/// Whether `id` is an ordinary UUID v4, the normative identity shape
+/// required for `message_id` and `worker_instance_id`
+/// (`m1-worker-data-plane-control-contract.md` "Handshake"). Requires both:
+///
+/// - the version nibble equals 4;
+/// - the variant is the RFC4122/RFC9562 standard variant every ordinary
+///   `Uuid::new_v4()` value carries.
+///
+/// Checking the version nibble alone (correction audit "UUID v4 variant
+/// validation") would also accept a value whose top two variant bits encode
+/// the reserved NCS, Microsoft, or future variants while merely *reusing*
+/// the version-4 bit pattern by coincidence — a version-4-shaped value that
+/// no real `Uuid::new_v4()` implementation would ever produce. Rejecting
+/// those closes that gap without changing the wire representation: a real
+/// v4 UUID from any conforming generator still satisfies this exactly as
+/// before.
 pub fn is_uuid_v4(id: &Uuid) -> bool {
-    id.get_version_num() == 4
+    id.get_version_num() == 4 && id.get_variant() == uuid::Variant::RFC4122
 }
 
 #[cfg(test)]
@@ -119,6 +129,54 @@ mod tests {
     #[test]
     fn is_uuid_v4_accepts_a_real_v4_value() {
         assert!(is_uuid_v4(&Uuid::new_v4()));
+    }
+
+    /// Sets the version nibble (bits 4-7 of byte 6) to `version`, keeping
+    /// the low nibble untouched.
+    fn with_version(mut bytes: [u8; 16], version: u8) -> [u8; 16] {
+        bytes[6] = (bytes[6] & 0x0f) | (version << 4);
+        bytes
+    }
+
+    /// Sets byte 8's top bits to encode `variant_top_bits` (already shifted
+    /// into position), keeping the low 6 bits untouched.
+    fn with_variant_top_bits(mut bytes: [u8; 16], variant_top_bits: u8) -> [u8; 16] {
+        bytes[8] = (bytes[8] & 0b0011_1111) | variant_top_bits;
+        bytes
+    }
+
+    #[test]
+    fn is_uuid_v4_rejects_a_nil_uuid() {
+        assert!(!is_uuid_v4(&Uuid::nil()));
+    }
+
+    #[test]
+    fn is_uuid_v4_rejects_version_nibble_4_with_the_ncs_variant() {
+        // NCS variant: top bit of byte 8 is 0 (0b0xxx_xxxx).
+        let bytes = with_variant_top_bits(with_version(*Uuid::new_v4().as_bytes(), 4), 0b0000_0000);
+        assert!(!is_uuid_v4(&Uuid::from_bytes(bytes)));
+    }
+
+    #[test]
+    fn is_uuid_v4_rejects_version_nibble_4_with_the_microsoft_variant() {
+        // Microsoft variant: top 3 bits of byte 8 are 110.
+        let bytes = with_variant_top_bits(with_version(*Uuid::new_v4().as_bytes(), 4), 0b1100_0000);
+        assert!(!is_uuid_v4(&Uuid::from_bytes(bytes)));
+    }
+
+    #[test]
+    fn is_uuid_v4_rejects_version_nibble_4_with_the_future_variant() {
+        // "Future" reserved variant: top 3 bits of byte 8 are 111.
+        let bytes = with_variant_top_bits(with_version(*Uuid::new_v4().as_bytes(), 4), 0b1110_0000);
+        assert!(!is_uuid_v4(&Uuid::from_bytes(bytes)));
+    }
+
+    #[test]
+    fn is_uuid_v4_accepts_version_nibble_4_with_the_rfc4122_variant() {
+        // RFC4122/RFC9562 standard variant: top 2 bits of byte 8 are 10 —
+        // exactly what every real `Uuid::new_v4()` value carries.
+        let bytes = with_variant_top_bits(with_version(*Uuid::new_v4().as_bytes(), 4), 0b1000_0000);
+        assert!(is_uuid_v4(&Uuid::from_bytes(bytes)));
     }
 
     #[test]

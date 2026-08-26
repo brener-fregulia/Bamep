@@ -116,11 +116,7 @@ fn load_certificate_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, T
 }
 
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsIdentityError> {
-    ensure_secure_private_key_permissions(path)?;
-    let bytes = std::fs::read(path).map_err(|source| TlsIdentityError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
+    let bytes = read_private_key_bytes_with_verified_permissions(path)?;
     let mut reader = BufReader::new(bytes.as_slice());
     rustls_pemfile::private_key(&mut reader)
         .map_err(|source| TlsIdentityError::MalformedPem {
@@ -132,27 +128,36 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsIdentityEr
         })
 }
 
-/// Enforces the least-privilege Unix policy for the Server TLS *private
-/// key* path before any byte of it is read (correction audit "TLS
-/// private-key file security"). Deliberately applied only to the private
-/// key, never mechanically to the public certificate, which carries no
-/// equivalent secrecy requirement.
+/// Opens the Server TLS *private key* path exactly once, validates the
+/// least-privilege Unix policy against the metadata of the **same opened
+/// file descriptor**, and reads its bytes from that same descriptor
+/// (correction audit "TLS private key — open once, validate that file"):
+/// the security policy must apply to the actual bytes read, not to a
+/// separate `symlink_metadata(path)` resolution followed by an independent
+/// `std::fs::read(path)` — two path resolutions that can each observe a
+/// different filesystem object if the final path component is swapped
+/// between them (a TOCTOU race), or if it is a symlink pointing outside the
+/// intended protected location. `O_NOFOLLOW` rejects a symlink at the final
+/// component outright, so no attacker-controlled indirection is ever
+/// followed, and every check below runs against the exact bytes read next.
+///
+/// Deliberately applied only to the private key, never mechanically to the
+/// public certificate, which carries no equivalent secrecy requirement.
 ///
 /// Policy, chosen to be the narrowest that still catches the realistic
 /// host-local misconfigurations for a protected-file key
 /// (ADR-0018 "TLS identity"):
 ///
-/// - the path must not be a symlink — a symlink could point outside the
-///   intended protected location without that being visible from the
-///   configured path string alone;
-/// - the path must be a regular file — not a directory, device, or other
-///   special file;
+/// - the opened path must not be a symlink (enforced by `O_NOFOLLOW` at
+///   open time, and re-confirmed from the resulting `fstat`);
+/// - the opened file must be a regular file — not a directory, device, or
+///   other special file;
 /// - the file must grant no permission bits at all to `group` or `other`
 ///   (mode `& 0o077 == 0`), i.e. owner-only access. This deliberately
 ///   rejects group-read as well as any write bit: a private key has no
 ///   legitimate multi-principal read use case on a host-local single-
-///   product deployment, so the strictest owner-only shape is chosen
-///   over a narrower "reject only write" policy.
+///   product deployment, so the strictest owner-only shape is chosen over a
+///   narrower "reject only write" policy.
 ///
 /// This does not require the key's Unix *owner* to equal a hardcoded
 /// username — only that the mode bits themselves are owner-only; whichever
@@ -160,27 +165,49 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsIdentityEr
 /// startup to succeed at all, which is sufficient without hardcoding an
 /// identity here.
 #[cfg(unix)]
-fn ensure_secure_private_key_permissions(path: &Path) -> Result<(), TlsIdentityError> {
-    use std::os::unix::fs::MetadataExt;
+fn read_private_key_bytes_with_verified_permissions(
+    path: &Path,
+) -> Result<Vec<u8>, TlsIdentityError> {
+    use std::io::Read;
 
-    let metadata = std::fs::symlink_metadata(path).map_err(|source| TlsIdentityError::Io {
-        path: path.display().to_string(),
-        source,
+    use rustix::fs::{fstat, open, FileType, Mode, OFlags};
+
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| {
+        let source: std::io::Error = errno.into();
+        if source.kind() == std::io::ErrorKind::NotFound {
+            TlsIdentityError::Io {
+                path: path.display().to_string(),
+                source,
+            }
+        } else {
+            // Most relevantly `ELOOP`/`ENOTDIR`-shaped failures from
+            // `O_NOFOLLOW` hitting a symlink at the final component.
+            TlsIdentityError::InsecureKeyPermissions {
+                path: path.display().to_string(),
+                reason: format!(
+                    "failed to open private key without following a final-component symlink: {source}"
+                ),
+            }
+        }
     })?;
 
-    if metadata.file_type().is_symlink() {
-        return Err(TlsIdentityError::InsecureKeyPermissions {
-            path: path.display().to_string(),
-            reason: "private key path is a symlink, not a regular file".to_string(),
-        });
-    }
-    if !metadata.is_file() {
+    let stat = fstat(&fd).map_err(|errno| TlsIdentityError::Io {
+        path: path.display().to_string(),
+        source: errno.into(),
+    })?;
+
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
         return Err(TlsIdentityError::InsecureKeyPermissions {
             path: path.display().to_string(),
             reason: "private key path is not a regular file".to_string(),
         });
     }
-    if metadata.mode() & 0o077 != 0 {
+    if stat.st_mode & 0o077 != 0 {
         return Err(TlsIdentityError::InsecureKeyPermissions {
             path: path.display().to_string(),
             reason:
@@ -188,16 +215,32 @@ fn ensure_secure_private_key_permissions(path: &Path) -> Result<(), TlsIdentityE
                     .to_string(),
         });
     }
-    Ok(())
+
+    // Same descriptor whose metadata was just validated — no second path
+    // resolution.
+    let mut file = std::fs::File::from(fd);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| TlsIdentityError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+    Ok(bytes)
 }
 
-/// Non-Unix platforms have no equivalent POSIX permission model to check
-/// here. Linux is the Worker reference/production environment
+/// Non-Unix platforms have no equivalent POSIX permission/symlink model to
+/// check here. Linux is the Worker reference/production environment
 /// (`docs/development/testing.md`); this is a compile/test portability
-/// no-op only, never a claim that it validates Linux deployment security.
+/// fallback only, never a claim that it validates Linux deployment
+/// security.
 #[cfg(not(unix))]
-fn ensure_secure_private_key_permissions(_path: &Path) -> Result<(), TlsIdentityError> {
-    Ok(())
+fn read_private_key_bytes_with_verified_permissions(
+    path: &Path,
+) -> Result<Vec<u8>, TlsIdentityError> {
+    std::fs::read(path).map_err(|source| TlsIdentityError::Io {
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 /// Proves the loaded identity is actually usable by rustls to terminate

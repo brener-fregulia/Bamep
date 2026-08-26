@@ -29,6 +29,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }

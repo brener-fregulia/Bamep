@@ -38,7 +38,16 @@ const DEFAULT_RECONNECT_DELAY_MS: u64 = 500;
 /// Worker spawn (`WorkerSupervisor::run`) or a persistently unreachable
 /// `bamepd` (`bamep_worker::ipc::client::run_client_loop`) busy-loop
 /// (correction audit "Bounded non-zero timing config").
-const MIN_DELAY_MS: u64 = 1;
+///
+/// `1`ms is not an operationally defensible floor (correction audit "Retry/
+/// restart minimum"): at that scale the loop is still effectively
+/// busy-retrying against a persistently failing Worker spawn/connection,
+/// dominated by scheduler/syscall overhead rather than by the configured
+/// delay. `100`ms is chosen as the smallest value that meaningfully bounds
+/// retry frequency (at most 10 attempts/second) while staying far below the
+/// `500`ms default, so an operator who deliberately configures a tighter
+/// retry still gets one.
+const MIN_DELAY_MS: u64 = 100;
 /// Conservative implementation-time upper bound around the existing
 /// `500ms` default, shared by both delays for consistency.
 const MAX_DELAY_MS: u64 = 30_000;
@@ -195,7 +204,7 @@ mod tests {
     #[test]
     fn worker_env_forwards_the_exact_variable_names_worker_config_reads() {
         let mut values = base_values();
-        values.push((ENV_RECONNECT_DELAY_MS, "42"));
+        values.push((ENV_RECONNECT_DELAY_MS, "142"));
         let config = BamepdConfig::from_lookup(lookup(&values)).expect("valid config");
         let env = config.worker_env();
 
@@ -212,7 +221,7 @@ mod tests {
             get(ENV_TLS_KEY_PATH),
             Some("/etc/bamep/tls/key.pem".to_string())
         );
-        assert_eq!(get(ENV_RECONNECT_DELAY_MS), Some("42".to_string()));
+        assert_eq!(get(ENV_RECONNECT_DELAY_MS), Some("142".to_string()));
     }
 
     fn with_delay(name: &'static str, raw: &str) -> Result<BamepdConfig, BamepdConfigError> {

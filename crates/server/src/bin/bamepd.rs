@@ -16,10 +16,11 @@
 use std::sync::Arc;
 
 use bamep_server::adapters::worker_control_plane::WorkerControlPlane;
+use bamep_server::adapters::worker_runtime_ownership::{RuntimeOwnershipLock, TrustedRuntimeDir};
 use bamep_server::runtime::bamepd_config::BamepdConfig;
 use bamep_server::runtime::worker_authority::WorkerAuthorityRegistry;
 use bamep_server::runtime::worker_supervisor::{
-    SupervisorConfig, SupervisorEvent, WorkerSupervisor,
+    SupervisorConfig, SupervisorEvent, WorkerSupervisor, SUPERVISOR_EVENT_CHANNEL_CAPACITY,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -40,10 +41,31 @@ fn main() {
     runtime.block_on(run(config));
 }
 
-/// Startup ordering (Issue #37 "Startup ordering"): the UDS listener is
-/// bound *before* the Worker supervisor starts, so Worker never races
-/// against a listener that was never successfully created.
+/// Startup ordering (Issue #37 "Startup ordering"; correction audit "Solve
+/// the ownership model once"):
+///
+/// 1. validate/create the trusted runtime directory;
+/// 2. acquire the exclusive, non-blocking, lifetime-held ownership lock —
+///    a competing live `bamepd` targeting the same runtime directory fails
+///    here, before ever touching the Worker UDS socket pathname;
+/// 3. only then bind the UDS listener;
+/// 4. only then start the Worker supervisor, so Worker never races against
+///    a listener that was never successfully created.
 async fn run(config: BamepdConfig) {
+    let runtime_dir_path = config.uds_path.parent().unwrap_or_else(|| {
+        eprintln!("bamepd: configured Worker UDS path has no parent directory");
+        std::process::exit(1);
+    });
+    let runtime_dir =
+        TrustedRuntimeDir::validate_or_create(runtime_dir_path).unwrap_or_else(|err| {
+            eprintln!("bamepd: untrusted Worker control-boundary runtime directory: {err}");
+            std::process::exit(1);
+        });
+    let ownership_lock = RuntimeOwnershipLock::acquire(&runtime_dir).unwrap_or_else(|err| {
+        eprintln!("bamepd: failed to acquire the Worker control-boundary ownership lock: {err}");
+        std::process::exit(1);
+    });
+
     let control_plane = WorkerControlPlane::bind(&config.uds_path).unwrap_or_else(|err| {
         eprintln!("bamepd: failed to bind Worker UDS listener: {err}");
         std::process::exit(1);
@@ -51,7 +73,7 @@ async fn run(config: BamepdConfig) {
 
     let registry = Arc::new(WorkerAuthorityRegistry::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (events_tx, mut events_rx) = mpsc::channel(SUPERVISOR_EVENT_CHANNEL_CAPACITY);
 
     let supervisor = WorkerSupervisor::new(SupervisorConfig {
         worker_executable: config.worker_executable.clone(),
@@ -123,6 +145,13 @@ async fn run(config: BamepdConfig) {
         let _ = control_plane_task.await;
     }
     event_log_task.abort();
+
+    // `WorkerControlPlane::run` already removed its own socket file before
+    // returning (awaited above in both branches), so the ownership lock is
+    // the last thing released — correction audit "Solve the ownership model
+    // once": stop handlers, stop Worker, clean up the Worker socket, release
+    // the lifetime ownership lock LAST.
+    ownership_lock.release();
 
     if control_plane_failure.is_some() {
         eprintln!("bamepd: exiting after fatal Worker control-plane failure");

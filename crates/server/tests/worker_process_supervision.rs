@@ -30,7 +30,7 @@ use bamep_server::runtime::bamepd_config::{
 };
 use bamep_server::runtime::worker_authority::{WorkerAuthorityRegistry, WorkerControlState};
 use bamep_server::runtime::worker_supervisor::{
-    SupervisorConfig, SupervisorEvent, WorkerSupervisor,
+    SupervisorConfig, SupervisorEvent, WorkerSupervisor, SUPERVISOR_EVENT_CHANNEL_CAPACITY,
 };
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use tokio::sync::{mpsc, watch};
@@ -176,14 +176,14 @@ async fn supervisor_manages_a_genuinely_separate_worker_process_through_handshak
             ENV_TLS_KEY_PATH.to_string(),
             env.key_path.display().to_string(),
         ),
-        (ENV_RECONNECT_DELAY_MS.to_string(), "50".to_string()),
+        (ENV_RECONNECT_DELAY_MS.to_string(), "100".to_string()),
     ];
     let supervisor = WorkerSupervisor::new(SupervisorConfig {
         worker_executable,
         env: supervisor_env,
         restart_delay: Duration::from_millis(100),
     });
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (events_tx, mut events_rx) = mpsc::channel(SUPERVISOR_EVENT_CHANNEL_CAPACITY);
     let supervisor_task = tokio::spawn(async move { supervisor.run(shutdown_rx, events_tx).await });
 
     // 1+2: a real, genuinely separate OS process.

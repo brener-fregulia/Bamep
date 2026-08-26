@@ -25,7 +25,13 @@ const DEFAULT_RECONNECT_DELAY_MS: u64 = 500;
 /// reconnect loop (`crate::ipc::client::run_client_loop`) busy-spin against
 /// a `bamepd` that is down or refusing connections (correction audit
 /// "Bounded non-zero timing config").
-const MIN_RECONNECT_DELAY_MS: u64 = 1;
+///
+/// `1`ms is not an operationally defensible floor (correction audit "Retry/
+/// restart minimum"): kept identical to
+/// `bamep_server::runtime::bamepd_config::MIN_DELAY_MS` (`100`ms) so both
+/// sides of the Worker/`bamepd` reconnect relationship share the same
+/// realistic retry-frequency floor.
+const MIN_RECONNECT_DELAY_MS: u64 = 100;
 /// Conservative implementation-time upper bound around the existing
 /// `500ms` default: high enough to avoid meaningfully changing normal
 /// operation, low enough that a misconfigured value cannot silently make
@@ -138,11 +144,11 @@ mod tests {
             (ENV_UDS_PATH, "/run/bamep/worker.sock"),
             (ENV_TLS_CERT_PATH, "/etc/bamep/tls/cert.pem"),
             (ENV_TLS_KEY_PATH, "/etc/bamep/tls/key.pem"),
-            (ENV_RECONNECT_DELAY_MS, "25"),
+            (ENV_RECONNECT_DELAY_MS, "150"),
         ]))
         .expect("valid config");
 
-        assert_eq!(config.reconnect_delay, Duration::from_millis(25));
+        assert_eq!(config.reconnect_delay, Duration::from_millis(150));
     }
 
     #[test]

@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use crate::adapters::worker_runtime_ownership::RuntimeDirError;
 use crate::runtime::worker_authority::WorkerAuthorityRegistry;
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +67,58 @@ pub enum WorkerControlPlaneError {
     UnsupportedPlatform,
 }
 
+/// The trusted-runtime-directory validation this module's own `bind` still
+/// performs as defense in depth (correction audit: "Filesystem metadata
+/// checks are defense in depth") reuses
+/// `worker_runtime_ownership::TrustedRuntimeDir` rather than duplicating
+/// directory-trust logic. This maps its richer error classification back
+/// onto the pre-existing variants above so every existing caller/test
+/// keeps observing the same `WorkerControlPlaneError` shape.
+impl From<RuntimeDirError> for WorkerControlPlaneError {
+    fn from(err: RuntimeDirError) -> Self {
+        match err {
+            RuntimeDirError::Symlink { path } => WorkerControlPlaneError::UnsafeParentDirectory {
+                path,
+                reason: "parent path is a symlink, not a real directory".to_string(),
+            },
+            RuntimeDirError::NotADirectory { path } => {
+                WorkerControlPlaneError::UnsafeParentDirectory {
+                    path,
+                    reason: "parent path is not a directory".to_string(),
+                }
+            }
+            RuntimeDirError::InsecureMode { path } => {
+                WorkerControlPlaneError::UnsafeParentDirectory {
+                    path,
+                    reason: "parent directory grants group/other permissions; expected \
+                             owner-only (0700)"
+                        .to_string(),
+                }
+            }
+            RuntimeDirError::WrongOwner {
+                path,
+                expected,
+                actual,
+            } => WorkerControlPlaneError::UnsafeParentDirectory {
+                path,
+                reason: format!(
+                    "parent directory is owned by uid {actual}, not the effective uid \
+                     {expected} running bamepd"
+                ),
+            },
+            RuntimeDirError::UnsafeAncestor { path, reason } => {
+                WorkerControlPlaneError::UnsafeParentDirectory { path, reason }
+            }
+            RuntimeDirError::Create { path, source } => {
+                WorkerControlPlaneError::PrepareDirectory { path, source }
+            }
+            RuntimeDirError::Inspect { path, source } => {
+                WorkerControlPlaneError::InspectExisting { path, source }
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 mod imp {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -74,7 +127,7 @@ mod imp {
     use std::time::Duration;
 
     use bamep_worker_protocol::{
-        receive, send, HandshakeRejectedMessage, ProtocolErrorMessage, ReceiveError,
+        receive, send, DecodeError, HandshakeRejectedMessage, ProtocolErrorMessage, ReceiveError,
         ServerHelloMessage, WorkerProtocolMessage,
     };
     use tokio::net::{UnixListener, UnixStream};
@@ -108,6 +161,8 @@ mod imp {
         IncompatibleVersion,
         #[error("WorkerHello envelope or identity fields failed normative validation")]
         MalformedIdentity,
+        #[error("received an unrecognized top-level message type")]
+        UnknownMessageType,
     }
 
     /// The exact Unix filesystem identity (device, inode) of the socket this
@@ -161,7 +216,20 @@ mod imp {
         ///   evidence of staleness (`ECONNREFUSED`/`ENOENT` on connect) is
         ///   removed.
         pub fn bind(path: &Path) -> Result<Self, WorkerControlPlaneError> {
-            ensure_trusted_parent_dir(path)?;
+            // Directory-trust validation now lives in
+            // `worker_runtime_ownership::TrustedRuntimeDir`, shared with the
+            // primary ownership-lock mechanism `bamepd` acquires *before*
+            // calling `bind` (correction audit "Solve the ownership model
+            // once"). `bind` still performs this check itself so it remains
+            // independently safe to call directly (as this module's own
+            // tests do), but production startup order is: validate/create
+            // this same directory, acquire the lifetime lock, only then
+            // call `bind`.
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                crate::adapters::worker_runtime_ownership::TrustedRuntimeDir::validate_or_create(
+                    parent,
+                )?;
+            }
 
             match std::fs::symlink_metadata(path) {
                 Ok(metadata) => {
@@ -262,6 +330,28 @@ mod imp {
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() {
                             break Ok(());
+                        }
+                    }
+                    // Drains completed connection-handler tasks *during*
+                    // normal operation, not only at shutdown (correction
+                    // audit "Drain completed JoinSet tasks during normal
+                    // operation"): every handler still eventually completes
+                    // on its own (disconnect, protocol violation, or
+                    // controlled shutdown), so leaving finished `JoinHandle`s
+                    // parked in `tasks` until this method's own shutdown path
+                    // would let them accumulate for as long as the daemon
+                    // keeps running. The `if !tasks.is_empty()` guard is
+                    // required: `JoinSet::join_next()` on an empty set
+                    // resolves immediately with `None`, which would
+                    // otherwise make this branch spuriously ready on every
+                    // loop iteration.
+                    Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                        if let Err(join_err) = result {
+                            if join_err.is_panic() {
+                                eprintln!(
+                                    "bamepd: Worker control-plane connection handler panicked: {join_err}"
+                                );
+                            }
                         }
                     }
                 }
@@ -371,14 +461,32 @@ mod imp {
         // on every exit path, including cancellation.
         tokio::select! {
             received = receive(&mut stream) => {
-                if let Ok(_unexpected) = received {
-                    let _ = send(
-                        &mut stream,
-                        &WorkerProtocolMessage::ProtocolError(ProtocolErrorMessage::new(
-                            "unexpected_message",
-                        )),
-                    )
-                    .await;
+                match received {
+                    Ok(_unexpected) => {
+                        let _ = send(
+                            &mut stream,
+                            &WorkerProtocolMessage::ProtocolError(ProtocolErrorMessage::new(
+                                "unexpected_message",
+                            )),
+                        )
+                        .await;
+                    }
+                    // Unknown top-level `type`: the approved contract
+                    // requires a stable `ProtocolError`, distinct from
+                    // silently dropping the connection on decode failure
+                    // (`m1-worker-data-plane-control-contract.md`: "Unknown
+                    // top-level type: rejected with ProtocolError").
+                    Err(ReceiveError::Decode(DecodeError::UnknownType(type_name))) => {
+                        let _ = send(
+                            &mut stream,
+                            &WorkerProtocolMessage::ProtocolError(
+                                ProtocolErrorMessage::new("unknown_message_type")
+                                    .with_message(format!("unrecognized type {type_name:?}")),
+                            ),
+                        )
+                        .await;
+                    }
+                    Err(_) => {}
                 }
             }
             _ = shutdown.changed() => {}
@@ -386,7 +494,27 @@ mod imp {
     }
 
     async fn handshake_as_server(stream: &mut UnixStream) -> Result<Uuid, HandshakeError> {
-        let first = receive(stream).await?;
+        let first = match receive(stream).await {
+            Ok(message) => message,
+            // Unknown top-level `type`: distinct from every other
+            // malformed-frame case because the envelope was parseable
+            // enough to name a `type` at all
+            // (`m1-worker-data-plane-control-contract.md`: "Unknown
+            // top-level type: rejected with ProtocolError"). Never reaches
+            // `begin_generation`.
+            Err(ReceiveError::Decode(DecodeError::UnknownType(type_name))) => {
+                let _ = send(
+                    stream,
+                    &WorkerProtocolMessage::ProtocolError(
+                        ProtocolErrorMessage::new("unknown_message_type")
+                            .with_message(format!("unrecognized type {type_name:?}")),
+                    ),
+                )
+                .await;
+                return Err(HandshakeError::UnknownMessageType);
+            }
+            Err(err) => return Err(HandshakeError::Receive(err)),
+        };
         let WorkerProtocolMessage::WorkerHello(hello) = first else {
             let _ = send(
                 stream,
@@ -440,65 +568,6 @@ mod imp {
         Ok(hello.body.worker_instance_id)
     }
 
-    /// Validates the UDS socket's parent directory is a trustworthy part of
-    /// the host-local IPC trust boundary
-    /// (`m1-worker-data-plane-control-contract.md` "Trust boundary";
-    /// correction audit "Trusted UDS parent directory"). A missing parent is
-    /// created fresh as owner-only `0700`. An *existing* parent is validated,
-    /// never blindly `chmod`ed: it must be a real directory, must not be a
-    /// symlink, and must carry no group/other permission bits at all — the
-    /// same owner-only shape this function creates itself. A dedicated
-    /// runtime directory such as `/run/bamep/` is expected to satisfy this;
-    /// a broad shared directory such as `/run` itself is expected to fail
-    /// it.
-    fn ensure_trusted_parent_dir(path: &Path) -> Result<(), WorkerControlPlaneError> {
-        let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
-            return Ok(());
-        };
-
-        match std::fs::symlink_metadata(parent) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    return Err(WorkerControlPlaneError::UnsafeParentDirectory {
-                        path: parent.display().to_string(),
-                        reason: "parent path is a symlink, not a real directory".to_string(),
-                    });
-                }
-                if !metadata.is_dir() {
-                    return Err(WorkerControlPlaneError::UnsafeParentDirectory {
-                        path: parent.display().to_string(),
-                        reason: "parent path is not a directory".to_string(),
-                    });
-                }
-                if metadata.mode() & 0o077 != 0 {
-                    return Err(WorkerControlPlaneError::UnsafeParentDirectory {
-                        path: parent.display().to_string(),
-                        reason: "parent directory grants group/other permissions; expected owner-only (0700)".to_string(),
-                    });
-                }
-                Ok(())
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir_all(parent).map_err(|source| {
-                    WorkerControlPlaneError::PrepareDirectory {
-                        path: parent.display().to_string(),
-                        source,
-                    }
-                })?;
-                set_permissions(parent, 0o700).map_err(|source| {
-                    WorkerControlPlaneError::PrepareDirectory {
-                        path: parent.display().to_string(),
-                        source,
-                    }
-                })
-            }
-            Err(source) => Err(WorkerControlPlaneError::InspectExisting {
-                path: parent.display().to_string(),
-                source,
-            }),
-        }
-    }
-
     /// Probes whether `path` is a *live* reachable UDS listener, distinct
     /// from a stale socket left by an unclean exit (correction audit "Safe
     /// UDS path ownership"). A successful connect is unambiguous evidence of
@@ -535,6 +604,39 @@ mod imp {
     #[cfg(test)]
     mod unit_tests {
         use super::*;
+
+        /// Proves the exact `tokio::select!` arm shape `WorkerControlPlane::run`
+        /// uses to drain completed connection-handler tasks
+        /// (correction audit "Drain completed JoinSet tasks during normal
+        /// operation"): every already-completed task is reaped without
+        /// waiting for a shutdown signal, and the `if !tasks.is_empty()`
+        /// guard stops the branch from firing once nothing remains.
+        #[tokio::test]
+        async fn join_set_completed_tasks_are_drained_without_waiting_for_shutdown() {
+            let mut tasks: JoinSet<()> = JoinSet::new();
+            for _ in 0..5 {
+                tasks.spawn(async {});
+            }
+            // Give the spawned no-op tasks a real chance to complete before
+            // the drain loop below starts observing them.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let mut drained = 0;
+            while !tasks.is_empty() {
+                tokio::select! {
+                    Some(_) = tasks.join_next(), if !tasks.is_empty() => {
+                        drained += 1;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => break,
+                }
+            }
+
+            assert_eq!(
+                drained, 5,
+                "every completed task must be reaped without waiting for shutdown"
+            );
+            assert!(tasks.is_empty());
+        }
 
         #[test]
         fn fewer_than_the_threshold_is_not_terminal() {

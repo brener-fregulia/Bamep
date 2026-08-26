@@ -191,6 +191,60 @@ async fn a_message_before_worker_hello_is_a_pre_handshake_violation() {
     run_task.abort();
 }
 
+/// Correction audit "Unknown top-level Worker message type": an unknown
+/// `type` on an otherwise-parseable envelope, sent as the very first
+/// message, must receive a stable `ProtocolError` — distinct from the
+/// generic `pre_handshake_violation` case above — and must never let
+/// authority become current
+/// (`m1-worker-data-plane-control-contract.md`: "Unknown top-level type:
+/// rejected with ProtocolError"). Uses real framed JSON over a real
+/// connection, not a unit-level `serde_json::from_str` assertion.
+#[tokio::test]
+async fn an_unknown_top_level_message_type_receives_a_protocol_error_and_never_registers_a_generation(
+) {
+    let socket = TempSocketPath::fresh();
+    let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
+    let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+
+    let mut stream = UnixStream::connect(&socket.0).await.expect("connect");
+    let raw = format!(
+        r#"{{"type":"TotallyBogusMessageType","protocol_version":"1","message_id":"{}"}}"#,
+        Uuid::new_v4()
+    );
+    bamep_worker_protocol::write_frame(&mut stream, raw.as_bytes())
+        .await
+        .expect("write raw frame");
+
+    let response = timeout(TEST_TIMEOUT, receive(&mut stream))
+        .await
+        .expect("no timeout")
+        .expect("receive response");
+    match response {
+        WorkerProtocolMessage::ProtocolError(body) => {
+            assert_eq!(body.body.code, "unknown_message_type");
+        }
+        other => panic!("expected ProtocolError, got {other:?}"),
+    }
+
+    assert_eq!(
+        registry.current(),
+        WorkerControlState::NoConnection,
+        "authority must never become current for an unknown top-level message type"
+    );
+
+    // The connection must close/fail safely afterward: a further read
+    // observes EOF/error rather than the connection staying open as if
+    // handshake had succeeded.
+    let after = timeout(TEST_TIMEOUT, receive(&mut stream)).await;
+    if let Ok(Ok(other)) = after {
+        panic!("expected the connection to close, got {other:?}");
+    }
+
+    run_task.abort();
+}
+
 #[tokio::test]
 async fn incompatible_protocol_version_is_rejected_and_never_registers_a_generation() {
     let socket = TempSocketPath::fresh();
@@ -586,4 +640,39 @@ async fn controlled_shutdown_disconnects_an_active_connection_before_returning()
     // The connection generation must have been invalidated by the same
     // shutdown, never left dangling as "available" with no live peer.
     assert_eq!(registry.current(), WorkerControlState::NoConnection);
+}
+
+/// Correction audit "Drain completed JoinSet tasks during normal
+/// operation": many sequential connect/handshake/disconnect cycles must not
+/// degrade the accept loop's responsiveness during normal operation (before
+/// any shutdown is requested). If completed handlers were only reaped at
+/// shutdown, this would still *pass* in wall-clock terms for a small cycle
+/// count, but the point of this test is combined with
+/// `join_set_completed_tasks_are_drained_without_waiting_for_shutdown` in
+/// `worker_control_plane.rs`'s own unit tests, which proves the exact
+/// `tokio::select!` drain mechanism directly — this test additionally
+/// proves the real listener stays healthy and promptly responsive across
+/// many cycles.
+#[tokio::test]
+async fn repeated_connect_disconnect_cycles_keep_the_listener_promptly_responsive() {
+    let socket = TempSocketPath::fresh();
+    let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
+    let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+
+    for _ in 0..200 {
+        let (stream, _worker_instance_id) = handshake(&socket.0).await;
+        drop(stream);
+    }
+
+    // A fresh connection after 200 prior cycles must still handshake
+    // promptly, well within the same timeout every other test in this file
+    // uses for a single cycle.
+    let (_stream, _worker_instance_id) = timeout(TEST_TIMEOUT, handshake(&socket.0)).await.expect(
+        "the listener must remain promptly responsive after many connect/disconnect cycles",
+    );
+    wait_until(&registry, |state| state.is_available()).await;
+
+    run_task.abort();
 }
