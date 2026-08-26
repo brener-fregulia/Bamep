@@ -181,6 +181,31 @@ direction M1 itself validates; it does not narrow the generic bidirectional M0 d
 contract owned by `m0-data-plane-and-storage-contracts.md`, which remains direction-agnostic.
 A future milestone may prove Server -> Agent without requiring a contract change here.
 
+**Classification: non-destructive.** `bamep.m1.data-plane-transfer` in its M1 Agent -> Server
+capture direction is a **non-destructive, read-only** transfer action: it reads Volume/Image
+or Selective source bytes without writing to Endpoint storage, consistent with the offline
+read-only capture model `m0-data-plane-and-storage-contracts.md` "V1 capture consistency"
+already requires. It is therefore dispatched and committed through the generic
+**non-destructive** JobStep path owned by `m0-job-lifecycle-and-scheduling.md`: workflow/
+scheduler authorization, applicable Attempt-scoped resource leases, this action's own
+time-sensitive declared preconditions, final pre-dispatch revalidation, and the
+persist-before-send Attempt/dispatch commitment
+(`m0-persistence-observability-and-domain-events.md` "Agent action dispatch"). It MUST NOT
+require, consume, or be gated by the seven-item destructive-operation precondition gate owned
+by `m0-endpoint-identity-lifecycle.md` — that gate governs destructive JobSteps specifically,
+and this action does not become one merely because the currently implemented
+`bamep.m1.simulated-execution` Attempt-commit path (Issue #25/#26) happens to materialize the
+destructive dispatch path for the action it serves. A future Server -> Agent direction of this
+same `action_type` performing a destructive write is out of scope for M1 and would need its
+own explicit classification when defined.
+
+This Work Package does not design or implement the non-destructive transfer Attempt-commit
+path itself. That path does not yet exist in the repository — the only currently implemented
+Attempt-commit path materializes the destructive gate for `bamep.m1.simulated-execution` — and
+remains a repository implementation dependency for #19's end-to-end RF-005 integration. This
+classification is recorded only so that dependency is not later implemented by reusing or
+narrowing the destructive path.
+
 M1 introduces one concrete data-plane transfer action, owned here under
 `m0-agent-protocol-contract.md`'s rule that concrete action types belong to the
 Specification that introduces them, and distinct from `bamep.m1.simulated-execution`
