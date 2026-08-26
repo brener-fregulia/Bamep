@@ -30,12 +30,21 @@ mod imp {
         Receive(#[from] bamep_worker_protocol::ReceiveError),
         #[error("bamepd rejected the handshake as incompatible")]
         Rejected,
-        #[error("bamepd's handshake response did not correlate to this WorkerHello")]
-        Uncorrelated,
+        #[error("bamepd's ServerHello failed normative envelope/field/correlation validation")]
+        InvalidServerHello,
+        #[error("bamepd's HandshakeRejected failed normative envelope/correlation validation")]
+        InvalidHandshakeRejected,
         #[error("bamepd sent an unexpected message before the handshake completed")]
         UnexpectedMessage,
     }
 
+    /// Every field this Worker requires from a received `ServerHello`/
+    /// `HandshakeRejected` is validated here — envelope `protocol_version`/
+    /// `message_id`, `server_protocol_version`, `compatible`, and
+    /// `in_reply_to` correlation to the `WorkerHello` this Worker sent
+    /// (`m1-worker-data-plane-control-contract.md` "Handshake"). Worker must
+    /// never enter `Ready` on a malformed or uncorrelated response, even one
+    /// that superficially resembles success.
     async fn perform_handshake(
         mut stream: UnixStream,
         worker_instance_id: Uuid,
@@ -46,17 +55,14 @@ mod imp {
 
         match receive(&mut stream).await? {
             WorkerProtocolMessage::ServerHello(response) => {
-                if response.body.in_reply_to != sent_id {
-                    return Err(HandshakeError::Uncorrelated);
-                }
-                if !response.body.compatible {
-                    return Err(HandshakeError::Rejected);
+                if !response.is_valid_reply_to(sent_id) {
+                    return Err(HandshakeError::InvalidServerHello);
                 }
                 Ok(stream)
             }
             WorkerProtocolMessage::HandshakeRejected(response) => {
-                if response.body.in_reply_to != sent_id {
-                    return Err(HandshakeError::Uncorrelated);
+                if !response.is_valid_reply_to(sent_id) {
+                    return Err(HandshakeError::InvalidHandshakeRejected);
                 }
                 Err(HandshakeError::Rejected)
             }

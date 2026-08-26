@@ -32,7 +32,7 @@ pub mod framing;
 pub mod messages;
 
 pub use codec::{decode, encode, DecodeError, EncodeError};
-pub use envelope::{Envelope, ProtocolVersion, PROTOCOL_VERSION_V1};
+pub use envelope::{is_uuid_v4, Envelope, ProtocolVersion, PROTOCOL_VERSION_V1};
 pub use framing::{
     read_frame, receive, send, write_frame, FrameReadError, FrameWriteError, ReceiveError,
     SendError, MAX_FRAME_PAYLOAD_BYTES,

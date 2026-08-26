@@ -18,6 +18,7 @@
 
 #![cfg(unix)]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::Arc;
@@ -51,6 +52,12 @@ impl TestEnv {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&dir).expect("create test dir");
+        // `WorkerControlPlane::bind` requires an already-existing parent
+        // directory to be owner-only (correction audit "Trusted UDS parent
+        // directory"); the default umask would otherwise leave this
+        // group/other-readable.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("set trusted test dir permissions");
 
         let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(
@@ -61,6 +68,12 @@ impl TestEnv {
         let key_path = dir.join("key.pem");
         std::fs::write(&cert_path, cert.pem()).expect("write cert.pem");
         std::fs::write(&key_path, signing_key.serialize_pem()).expect("write key.pem");
+        // The spawned `bamep-worker` process now enforces least-privilege
+        // Unix permissions on the private key path before reading it
+        // (correction audit "TLS private-key file security"); the default
+        // umask would otherwise leave this group/other-readable.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("set trusted key.pem permissions");
 
         Self {
             socket_path: dir.join("worker.sock"),
@@ -252,10 +265,14 @@ async fn supervisor_manages_a_genuinely_separate_worker_process_through_handshak
         .await
         .expect("no timeout")
         .expect("supervisor task");
-    timeout(TEST_TIMEOUT, control_plane_task)
+    let control_plane_result = timeout(TEST_TIMEOUT, control_plane_task)
         .await
         .expect("no timeout")
         .expect("control plane task");
+    assert!(
+        control_plane_result.is_ok(),
+        "controlled shutdown must return Ok(()): {control_plane_result:?}"
+    );
     assert!(
         !env.socket_path.exists(),
         "socket file must be cleaned up on controlled shutdown"

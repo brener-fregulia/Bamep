@@ -30,6 +30,20 @@ pub struct SupervisorConfig {
     pub restart_delay: Duration,
 }
 
+/// Sent over an `mpsc::UnboundedSender` in [`WorkerSupervisor::run`].
+///
+/// Correction-audit conclusion (unbounded supervisor-event channel):
+/// bounded, strictly-positive `restart_delay`
+/// (`crate::runtime::bamepd_config` — `MIN_DELAY_MS`/`MAX_DELAY_MS`) already
+/// caps the event production rate at one event per `restart_delay` per
+/// spawn-failure/exit cycle, so unbounded growth would require the sole
+/// consumer (`bamepd`'s `event_log_task`, which only `eprintln!`s each
+/// event) to fall permanently behind that bounded rate — implausible for a
+/// narrow, non-adversarial, logging-only path with no external backpressure
+/// source. A bounded channel would additionally require deciding a drop/
+/// block policy this narrow path does not need. No channel-type change is
+/// made; if a future consumer becomes slower or more complex, revisit this
+/// conclusion rather than assuming it still holds.
 #[derive(Debug)]
 pub enum SupervisorEvent {
     WorkerStarted {

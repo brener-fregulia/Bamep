@@ -377,8 +377,10 @@ for an existing Endpoint/Job/JobStep correlation with no Attempt — a `Transfer
 no JobStep is transitioned, and the destructive-operation gate is never evaluated by this path.
 Binding an existing Transfer to an owning Attempt exactly once, and rejecting a conflicting
 rebind, is implemented and tested; #40 (below) is the first consumer that actually commits that
-owning Attempt. Agent Protocol transfer authorization (#38), the Worker process/HTTPS chunk
-transport (#37/#39), and end-to-end Simulator integration (#19) remain unimplemented.
+owning Attempt. Agent Protocol transfer authorization (#38), the Worker HTTPS chunk transport
+(#39), and end-to-end Simulator integration (#19) remain unimplemented. The isolated Worker
+process/control boundary itself (#37) is implemented — see "Implemented isolated Worker runtime
+and control boundary" below.
 
 ## Implemented non-destructive M1 transfer dispatch-commit path
 

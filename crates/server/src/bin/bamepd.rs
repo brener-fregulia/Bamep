@@ -83,13 +83,49 @@ async fn run(config: BamepdConfig) {
     // handshake, and registers the resulting connection generation with
     // `registry` — the narrow readiness/control-connection seam #38/#39
     // consume through `registry.current()`.
-    let control_plane_task = tokio::spawn(control_plane.run(Arc::clone(&registry), shutdown_rx));
+    let mut control_plane_task =
+        tokio::spawn(control_plane.run(Arc::clone(&registry), shutdown_rx));
 
-    let _ = tokio::signal::ctrl_c().await;
-    eprintln!("bamepd: shutdown requested");
+    // Wait for either a controlled shutdown request or the Worker
+    // control-plane task terminating on its own — a persistent `accept()`
+    // failure, or an unexpected panic — since `bamepd` must never remain
+    // apparently healthy with no authoritative Worker UDS boundary
+    // (correction audit "bamepd response to control-plane failure").
+    // `&mut control_plane_task` is polled here without consuming it, so it
+    // can still be awaited again below only if this branch never fired.
+    let control_plane_failure = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("bamepd: shutdown requested");
+            None
+        }
+        joined = &mut control_plane_task => {
+            match &joined {
+                Ok(Ok(())) => {
+                    eprintln!("bamepd: Worker control plane stopped unexpectedly with no shutdown requested");
+                }
+                Ok(Err(err)) => {
+                    eprintln!("bamepd: Worker control plane failed: {err}");
+                }
+                Err(join_err) => {
+                    eprintln!("bamepd: Worker control plane task panicked: {join_err}");
+                }
+            }
+            Some(joined)
+        }
+    };
 
+    // Fail-closed shutdown: stop/kill/reap the supervised Worker regardless
+    // of which branch above fired — a normal Worker child crash is already
+    // the supervisor's own concern and must not itself reach this path.
     let _ = shutdown_tx.send(true);
     let _ = supervisor_task.await;
-    let _ = control_plane_task.await;
+    if control_plane_failure.is_none() {
+        let _ = control_plane_task.await;
+    }
     event_log_task.abort();
+
+    if control_plane_failure.is_some() {
+        eprintln!("bamepd: exiting after fatal Worker control-plane failure");
+        std::process::exit(1);
+    }
 }

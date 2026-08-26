@@ -14,6 +14,7 @@
 
 #![cfg(unix)]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -221,6 +222,102 @@ async fn incompatible_protocol_version_is_rejected_and_never_registers_a_generat
     run_task.abort();
 }
 
+/// Server validation (correction audit "Strict handshake validation"): a
+/// `WorkerHello` whose envelope `protocol_version` is not `"1"` is a
+/// malformed-identity violation, distinct from a well-formed-but-
+/// unsupported `worker_protocol_version` — it must never reach
+/// `begin_generation`.
+#[tokio::test]
+async fn worker_hello_with_wrong_envelope_protocol_version_never_registers_a_generation() {
+    let socket = TempSocketPath::fresh();
+    let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
+    let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+
+    let mut stream = UnixStream::connect(&socket.0).await.expect("connect");
+    let mut hello = WorkerHelloMessage::new(Uuid::new_v4());
+    hello.envelope.protocol_version = bamep_worker_protocol::ProtocolVersion::new("2");
+    send(&mut stream, &WorkerProtocolMessage::WorkerHello(hello))
+        .await
+        .expect("send");
+
+    let response = timeout(TEST_TIMEOUT, receive(&mut stream))
+        .await
+        .expect("no timeout")
+        .expect("receive response");
+    match response {
+        WorkerProtocolMessage::ProtocolError(body) => {
+            assert_eq!(body.body.code, "malformed_handshake_identity");
+        }
+        other => panic!("expected ProtocolError, got {other:?}"),
+    }
+    assert_eq!(registry.current(), WorkerControlState::NoConnection);
+    run_task.abort();
+}
+
+/// Server validation: a `WorkerHello` envelope `message_id` that is not a
+/// UUID v4 must never reach `begin_generation`.
+#[tokio::test]
+async fn worker_hello_with_non_v4_message_id_never_registers_a_generation() {
+    let socket = TempSocketPath::fresh();
+    let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
+    let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+
+    let mut stream = UnixStream::connect(&socket.0).await.expect("connect");
+    let mut hello = WorkerHelloMessage::new(Uuid::new_v4());
+    hello.envelope.message_id = Uuid::nil();
+    send(&mut stream, &WorkerProtocolMessage::WorkerHello(hello))
+        .await
+        .expect("send");
+
+    let response = timeout(TEST_TIMEOUT, receive(&mut stream))
+        .await
+        .expect("no timeout")
+        .expect("receive response");
+    match response {
+        WorkerProtocolMessage::ProtocolError(body) => {
+            assert_eq!(body.body.code, "malformed_handshake_identity");
+        }
+        other => panic!("expected ProtocolError, got {other:?}"),
+    }
+    assert_eq!(registry.current(), WorkerControlState::NoConnection);
+    run_task.abort();
+}
+
+/// Server validation: a non-v4 `worker_instance_id` must never reach
+/// `begin_generation`, even though `message_id`/`protocol_version` are
+/// otherwise valid.
+#[tokio::test]
+async fn worker_hello_with_non_v4_worker_instance_id_never_registers_a_generation() {
+    let socket = TempSocketPath::fresh();
+    let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
+    let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+
+    let mut stream = UnixStream::connect(&socket.0).await.expect("connect");
+    let hello = WorkerHelloMessage::new(Uuid::nil());
+    send(&mut stream, &WorkerProtocolMessage::WorkerHello(hello))
+        .await
+        .expect("send");
+
+    let response = timeout(TEST_TIMEOUT, receive(&mut stream))
+        .await
+        .expect("no timeout")
+        .expect("receive response");
+    match response {
+        WorkerProtocolMessage::ProtocolError(body) => {
+            assert_eq!(body.body.code, "malformed_handshake_identity");
+        }
+        other => panic!("expected ProtocolError, got {other:?}"),
+    }
+    assert_eq!(registry.current(), WorkerControlState::NoConnection);
+    run_task.abort();
+}
+
 #[tokio::test]
 async fn an_overlapping_second_handshake_supersedes_the_first_and_its_later_disconnect_is_stale() {
     let socket = TempSocketPath::fresh();
@@ -276,10 +373,11 @@ async fn controlled_shutdown_removes_the_socket_file() {
     let run_task = tokio::spawn(plane.run(registry, shutdown_rx));
 
     shutdown_tx.send(true).expect("send shutdown");
-    timeout(TEST_TIMEOUT, run_task)
+    let result = timeout(TEST_TIMEOUT, run_task)
         .await
         .expect("no timeout")
         .expect("task");
+    assert!(result.is_ok(), "controlled shutdown must return Ok(())");
 
     assert!(!socket.0.exists());
 }
@@ -289,21 +387,56 @@ async fn a_stale_socket_left_by_an_unclean_shutdown_is_replaced() {
     let socket = TempSocketPath::fresh();
     let first = WorkerControlPlane::bind(&socket.0).expect("first bind");
     // Simulate an unclean shutdown: the listener is dropped without ever
-    // running its own socket-file cleanup.
+    // running its own socket-file cleanup. The kernel-level listen
+    // association ends with the fd, so a subsequent connect attempt gets
+    // `ECONNREFUSED` — the narrow evidence `WorkerControlPlane::bind`
+    // accepts as proof of staleness (correction audit "Safe UDS path
+    // ownership").
     drop(first);
     assert!(socket.0.exists());
 
-    // A fresh bind must recognize the leftover path is actually a socket
-    // and replace it, rather than refusing to start.
+    // A fresh bind must recognize the leftover path is actually a stale
+    // socket and replace it, rather than refusing to start.
     let second =
         WorkerControlPlane::bind(&socket.0).expect("second bind replaces the stale socket");
     drop(second);
 }
 
 #[tokio::test]
+async fn a_still_live_socket_is_never_unlinked_or_replaced() {
+    let socket = TempSocketPath::fresh();
+    let first = WorkerControlPlane::bind(&socket.0).expect("first bind");
+    let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Keep the first control plane genuinely running (a live listener),
+    // never dropped before the second bind attempt below.
+    let first_run_task = tokio::spawn(first.run(registry, shutdown_rx));
+
+    let err = WorkerControlPlane::bind(&socket.0)
+        .err()
+        .expect("must refuse to replace a live socket");
+    assert!(matches!(
+        err,
+        WorkerControlPlaneError::SocketAlreadyActive { .. }
+    ));
+
+    // The first control plane must still be exactly the one serving that
+    // path — a second `bamepd` must never unlink the first live daemon's
+    // pathname.
+    let (_stream, _worker_instance_id) = handshake(&socket.0).await;
+
+    first_run_task.abort();
+}
+
+#[tokio::test]
 async fn a_pre_existing_non_socket_path_is_never_blindly_deleted() {
     let socket = TempSocketPath::fresh();
     std::fs::create_dir_all(socket.0.parent().unwrap()).expect("create parent dir");
+    std::fs::set_permissions(
+        socket.0.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("set trusted parent dir permissions");
     std::fs::write(&socket.0, b"not a socket, an unrelated file").expect("write regular file");
 
     let err = match WorkerControlPlane::bind(&socket.0) {
@@ -318,4 +451,139 @@ async fn a_pre_existing_non_socket_path_is_never_blindly_deleted() {
     // The unrelated file must still exist, untouched.
     let contents = std::fs::read(&socket.0).expect("file still exists");
     assert_eq!(contents, b"not a socket, an unrelated file");
+}
+
+#[tokio::test]
+async fn a_symlink_at_the_socket_path_is_never_followed_or_removed() {
+    let socket = TempSocketPath::fresh();
+    std::fs::create_dir_all(socket.0.parent().unwrap()).expect("create parent dir");
+    std::fs::set_permissions(
+        socket.0.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("set trusted parent dir permissions");
+
+    // A real socket exists at a different path...
+    let real_socket_path = socket.0.parent().unwrap().join("real.sock");
+    let real_listener =
+        std::os::unix::net::UnixListener::bind(&real_socket_path).expect("bind real socket");
+
+    // ...and the configured path is a symlink pointing at it.
+    std::os::unix::fs::symlink(&real_socket_path, &socket.0).expect("create symlink");
+
+    let err = match WorkerControlPlane::bind(&socket.0) {
+        Ok(_) => panic!("must refuse to follow a symlink at the socket path"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        WorkerControlPlaneError::RefusingToRemoveNonSocket { .. }
+    ));
+
+    // Neither the symlink nor the real target socket was touched.
+    assert!(std::fs::symlink_metadata(&socket.0)
+        .expect("symlink still exists")
+        .file_type()
+        .is_symlink());
+    assert!(real_socket_path.exists());
+    drop(real_listener);
+}
+
+#[tokio::test]
+async fn an_unsafe_pre_existing_parent_directory_is_rejected() {
+    let socket = TempSocketPath::fresh();
+    std::fs::create_dir_all(socket.0.parent().unwrap()).expect("create parent dir");
+    // World-writable: exactly the kind of shared/untrustworthy directory
+    // this policy must reject rather than silently `chmod`.
+    std::fs::set_permissions(
+        socket.0.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .expect("relax parent dir permissions");
+
+    let err = match WorkerControlPlane::bind(&socket.0) {
+        Ok(_) => panic!("must refuse an unsafe pre-existing parent directory"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        WorkerControlPlaneError::UnsafeParentDirectory { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_secure_pre_existing_parent_directory_works() {
+    let socket = TempSocketPath::fresh();
+    std::fs::create_dir_all(socket.0.parent().unwrap()).expect("create parent dir");
+    std::fs::set_permissions(
+        socket.0.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("set trusted parent dir permissions");
+
+    let plane = WorkerControlPlane::bind(&socket.0)
+        .expect("bind must succeed against an already-secure parent directory");
+    drop(plane);
+}
+
+#[tokio::test]
+async fn controlled_shutdown_does_not_remove_a_pathname_replaced_after_bind() {
+    let socket = TempSocketPath::fresh();
+    let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
+    let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Simulate the pathname being replaced by an unrelated object after
+    // this instance bound it — controlled shutdown must never remove this
+    // replacement (correction audit "Owned socket cleanup").
+    std::fs::remove_file(&socket.0).expect("remove original socket file");
+    std::fs::write(&socket.0, b"unrelated replacement content").expect("write replacement file");
+
+    let run_task = tokio::spawn(plane.run(registry, shutdown_rx));
+    shutdown_tx.send(true).expect("send shutdown");
+    let result = timeout(TEST_TIMEOUT, run_task)
+        .await
+        .expect("no timeout")
+        .expect("task");
+    assert!(result.is_ok());
+
+    let contents = std::fs::read(&socket.0).expect("replacement file must still exist");
+    assert_eq!(contents, b"unrelated replacement content");
+}
+
+#[tokio::test]
+async fn controlled_shutdown_disconnects_an_active_connection_before_returning() {
+    let socket = TempSocketPath::fresh();
+    let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
+    let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+
+    let (mut stream, _worker_instance_id) = handshake(&socket.0).await;
+    wait_until(&registry, |state| state.is_available()).await;
+
+    shutdown_tx.send(true).expect("send shutdown");
+
+    // `run()` must not return while the active connection handler is still
+    // live: by the time the task completes, the peer must already observe
+    // its side of the connection closed (EOF) — the handler was actually
+    // stopped and reaped, not merely detached (correction audit "Connection
+    // shutdown").
+    let eof = timeout(TEST_TIMEOUT, receive(&mut stream))
+        .await
+        .expect("no timeout");
+    assert!(
+        eof.is_err(),
+        "the server must close the connection on shutdown"
+    );
+
+    let result = timeout(TEST_TIMEOUT, run_task)
+        .await
+        .expect("no timeout")
+        .expect("task");
+    assert!(result.is_ok());
+
+    // The connection generation must have been invalidated by the same
+    // shutdown, never left dangling as "available" with no live peer.
+    assert_eq!(registry.current(), WorkerControlState::NoConnection);
 }

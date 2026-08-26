@@ -33,6 +33,16 @@ pub const ENV_WORKER_RESTART_DELAY_MS: &str = "BAMEPD_WORKER_RESTART_DELAY_MS";
 const DEFAULT_RESTART_DELAY_MS: u64 = 500;
 const DEFAULT_RECONNECT_DELAY_MS: u64 = 500;
 
+/// Both the Worker restart delay and the reconnect delay forwarded to
+/// Worker must be strictly positive: `0` would let a persistently failing
+/// Worker spawn (`WorkerSupervisor::run`) or a persistently unreachable
+/// `bamepd` (`bamep_worker::ipc::client::run_client_loop`) busy-loop
+/// (correction audit "Bounded non-zero timing config").
+const MIN_DELAY_MS: u64 = 1;
+/// Conservative implementation-time upper bound around the existing
+/// `500ms` default, shared by both delays for consistency.
+const MAX_DELAY_MS: u64 = 30_000;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BamepdConfigError {
     #[error("missing required environment variable {0}")]
@@ -121,6 +131,14 @@ fn optional_millis(
                 name,
                 reason: "not a valid non-negative integer".to_string(),
             })?;
+            if !(MIN_DELAY_MS..=MAX_DELAY_MS).contains(&ms) {
+                return Err(BamepdConfigError::InvalidEnv {
+                    name,
+                    reason: format!(
+                        "must be between {MIN_DELAY_MS} and {MAX_DELAY_MS} milliseconds, got {ms}"
+                    ),
+                });
+            }
             Ok(Duration::from_millis(ms))
         }
         None => Ok(Duration::from_millis(default_ms)),
@@ -195,5 +213,72 @@ mod tests {
             Some("/etc/bamep/tls/key.pem".to_string())
         );
         assert_eq!(get(ENV_RECONNECT_DELAY_MS), Some("42".to_string()));
+    }
+
+    fn with_delay(name: &'static str, raw: &str) -> Result<BamepdConfig, BamepdConfigError> {
+        let mut values = base_values();
+        values.push((name, raw));
+        BamepdConfig::from_lookup(lookup(&values))
+    }
+
+    #[test]
+    fn zero_restart_delay_is_rejected() {
+        let err = with_delay(ENV_WORKER_RESTART_DELAY_MS, "0").unwrap_err();
+        assert!(
+            matches!(err, BamepdConfigError::InvalidEnv { name, .. } if name == ENV_WORKER_RESTART_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn minimum_restart_delay_is_accepted() {
+        let config = with_delay(ENV_WORKER_RESTART_DELAY_MS, &MIN_DELAY_MS.to_string())
+            .expect("valid config");
+        assert_eq!(
+            config.worker_restart_delay,
+            Duration::from_millis(MIN_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn maximum_restart_delay_is_accepted() {
+        let config = with_delay(ENV_WORKER_RESTART_DELAY_MS, &MAX_DELAY_MS.to_string())
+            .expect("valid config");
+        assert_eq!(
+            config.worker_restart_delay,
+            Duration::from_millis(MAX_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn above_maximum_restart_delay_is_rejected() {
+        let err =
+            with_delay(ENV_WORKER_RESTART_DELAY_MS, &(MAX_DELAY_MS + 1).to_string()).unwrap_err();
+        assert!(
+            matches!(err, BamepdConfigError::InvalidEnv { name, .. } if name == ENV_WORKER_RESTART_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn malformed_restart_delay_is_rejected() {
+        let err = with_delay(ENV_WORKER_RESTART_DELAY_MS, "not-a-number").unwrap_err();
+        assert!(
+            matches!(err, BamepdConfigError::InvalidEnv { name, .. } if name == ENV_WORKER_RESTART_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn zero_reconnect_delay_is_rejected() {
+        let err = with_delay(ENV_RECONNECT_DELAY_MS, "0").unwrap_err();
+        assert!(
+            matches!(err, BamepdConfigError::InvalidEnv { name, .. } if name == ENV_RECONNECT_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn above_maximum_reconnect_delay_is_rejected() {
+        let err = with_delay(ENV_RECONNECT_DELAY_MS, &(MAX_DELAY_MS + 1).to_string()).unwrap_err();
+        assert!(
+            matches!(err, BamepdConfigError::InvalidEnv { name, .. } if name == ENV_RECONNECT_DELAY_MS)
+        );
     }
 }

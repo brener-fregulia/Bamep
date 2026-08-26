@@ -45,6 +45,8 @@ pub enum TlsIdentityError {
     },
     #[error("the loaded certificate/private key pair is not usable for TLS server termination")]
     TlsConfig(#[source] rustls::Error),
+    #[error("refusing to read private key at {path}: {reason}")]
+    InsecureKeyPermissions { path: String, reason: String },
 }
 
 /// The Server TLS identity Worker loaded independently from `bamepd`
@@ -114,6 +116,7 @@ fn load_certificate_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, T
 }
 
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsIdentityError> {
+    ensure_secure_private_key_permissions(path)?;
     let bytes = std::fs::read(path).map_err(|source| TlsIdentityError::Io {
         path: path.display().to_string(),
         source,
@@ -127,6 +130,74 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsIdentityEr
         .ok_or_else(|| TlsIdentityError::NoPrivateKey {
             path: path.display().to_string(),
         })
+}
+
+/// Enforces the least-privilege Unix policy for the Server TLS *private
+/// key* path before any byte of it is read (correction audit "TLS
+/// private-key file security"). Deliberately applied only to the private
+/// key, never mechanically to the public certificate, which carries no
+/// equivalent secrecy requirement.
+///
+/// Policy, chosen to be the narrowest that still catches the realistic
+/// host-local misconfigurations for a protected-file key
+/// (ADR-0018 "TLS identity"):
+///
+/// - the path must not be a symlink — a symlink could point outside the
+///   intended protected location without that being visible from the
+///   configured path string alone;
+/// - the path must be a regular file — not a directory, device, or other
+///   special file;
+/// - the file must grant no permission bits at all to `group` or `other`
+///   (mode `& 0o077 == 0`), i.e. owner-only access. This deliberately
+///   rejects group-read as well as any write bit: a private key has no
+///   legitimate multi-principal read use case on a host-local single-
+///   product deployment, so the strictest owner-only shape is chosen
+///   over a narrower "reject only write" policy.
+///
+/// This does not require the key's Unix *owner* to equal a hardcoded
+/// username — only that the mode bits themselves are owner-only; whichever
+/// local account Worker runs as must already be able to read the file for
+/// startup to succeed at all, which is sufficient without hardcoding an
+/// identity here.
+#[cfg(unix)]
+fn ensure_secure_private_key_permissions(path: &Path) -> Result<(), TlsIdentityError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| TlsIdentityError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+
+    if metadata.file_type().is_symlink() {
+        return Err(TlsIdentityError::InsecureKeyPermissions {
+            path: path.display().to_string(),
+            reason: "private key path is a symlink, not a regular file".to_string(),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(TlsIdentityError::InsecureKeyPermissions {
+            path: path.display().to_string(),
+            reason: "private key path is not a regular file".to_string(),
+        });
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(TlsIdentityError::InsecureKeyPermissions {
+            path: path.display().to_string(),
+            reason:
+                "private key file grants group/other permissions; expected owner-only (0600 or stricter)"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Non-Unix platforms have no equivalent POSIX permission model to check
+/// here. Linux is the Worker reference/production environment
+/// (`docs/development/testing.md`); this is a compile/test portability
+/// no-op only, never a claim that it validates Linux deployment security.
+#[cfg(not(unix))]
+fn ensure_secure_private_key_permissions(_path: &Path) -> Result<(), TlsIdentityError> {
+    Ok(())
 }
 
 /// Proves the loaded identity is actually usable by rustls to terminate
@@ -194,6 +265,15 @@ mod tests {
         std::fs::File::create(&key_path)
             .and_then(|mut f| f.write_all(signing_key.serialize_pem().as_bytes()))
             .expect("write key.pem");
+        // The private key must satisfy `ensure_secure_private_key_permissions`
+        // regardless of the test process's umask — every test that expects
+        // `load_server_identity` to succeed depends on this.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("set key.pem permissions");
+        }
 
         TempPemFiles {
             dir,
@@ -284,5 +364,82 @@ mod tests {
         let missing = files.dir.join("does-not-exist.pem");
         let err = load_server_identity(&files.cert_path, &missing).unwrap_err();
         assert!(matches!(err, TlsIdentityError::Io { .. }));
+    }
+
+    #[cfg(unix)]
+    mod key_permission_tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        #[test]
+        fn secure_owner_only_key_permissions_are_accepted() {
+            // `write_pair` already sets 0600; every other passing test in
+            // this module already depends on this policy accepting it, but
+            // this test names the property explicitly.
+            let files = write_pair("secure-key-permissions.bamep.local");
+            load_server_identity(&files.cert_path, &files.key_path)
+                .expect("owner-only key permissions must be accepted");
+        }
+
+        #[test]
+        fn world_readable_key_is_rejected() {
+            let files = write_pair("world-readable-key.bamep.local");
+            std::fs::set_permissions(&files.key_path, std::fs::Permissions::from_mode(0o644))
+                .expect("relax key permissions");
+            let err = load_server_identity(&files.cert_path, &files.key_path).unwrap_err();
+            assert!(matches!(
+                err,
+                TlsIdentityError::InsecureKeyPermissions { .. }
+            ));
+        }
+
+        #[test]
+        fn group_writable_key_is_rejected() {
+            let files = write_pair("group-writable-key.bamep.local");
+            std::fs::set_permissions(&files.key_path, std::fs::Permissions::from_mode(0o660))
+                .expect("relax key permissions");
+            let err = load_server_identity(&files.cert_path, &files.key_path).unwrap_err();
+            assert!(matches!(
+                err,
+                TlsIdentityError::InsecureKeyPermissions { .. }
+            ));
+        }
+
+        #[test]
+        fn other_writable_key_is_rejected() {
+            let files = write_pair("other-writable-key.bamep.local");
+            std::fs::set_permissions(&files.key_path, std::fs::Permissions::from_mode(0o602))
+                .expect("relax key permissions");
+            let err = load_server_identity(&files.cert_path, &files.key_path).unwrap_err();
+            assert!(matches!(
+                err,
+                TlsIdentityError::InsecureKeyPermissions { .. }
+            ));
+        }
+
+        #[test]
+        fn non_regular_key_path_is_rejected() {
+            let files = write_pair("non-regular-key-path.bamep.local");
+            let dir_as_key = files.dir.join("key-is-a-directory");
+            std::fs::create_dir_all(&dir_as_key).expect("create directory standing in for a key");
+            let err = load_server_identity(&files.cert_path, &dir_as_key).unwrap_err();
+            assert!(matches!(
+                err,
+                TlsIdentityError::InsecureKeyPermissions { .. }
+            ));
+        }
+
+        #[test]
+        fn symlink_key_path_is_rejected() {
+            let files = write_pair("symlink-key-path.bamep.local");
+            let symlink_path = files.dir.join("key-symlink.pem");
+            std::os::unix::fs::symlink(&files.key_path, &symlink_path)
+                .expect("create symlink to the real key");
+            let err = load_server_identity(&files.cert_path, &symlink_path).unwrap_err();
+            assert!(matches!(
+                err,
+                TlsIdentityError::InsecureKeyPermissions { .. }
+            ));
+        }
     }
 }

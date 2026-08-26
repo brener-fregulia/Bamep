@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::envelope::{Envelope, ProtocolVersion};
+use crate::envelope::{is_uuid_v4, Envelope, ProtocolVersion};
 
 // ---------------------------------------------------------------------
 // WorkerHello — Worker -> bamepd
@@ -42,6 +42,20 @@ impl WorkerHelloMessage {
                 worker_instance_id,
             },
         }
+    }
+
+    /// Whether every normative field this received `WorkerHello` must carry
+    /// is actually present and well-formed
+    /// (`m1-worker-data-plane-control-contract.md` "Handshake"): envelope
+    /// `protocol_version`/`message_id`, plus `worker_protocol_version` and
+    /// `worker_instance_id` (UUID v4). `bamepd` must call this — and refuse
+    /// `begin_generation` on failure — before trusting a received
+    /// `WorkerHello`, never relying only on the peer's own constructor
+    /// having produced valid values.
+    pub fn is_valid(&self) -> bool {
+        self.envelope.is_valid()
+            && self.body.worker_protocol_version.is_v1()
+            && is_uuid_v4(&self.body.worker_instance_id)
     }
 }
 
@@ -81,6 +95,21 @@ impl ServerHelloMessage {
             },
         }
     }
+
+    /// Whether every normative field this received `ServerHello` must carry
+    /// is actually present, well-formed, and correlates to the `WorkerHello`
+    /// this Worker sent (`m1-worker-data-plane-control-contract.md`
+    /// "Handshake"): envelope `protocol_version`/`message_id`,
+    /// `server_protocol_version == "1"`, `compatible == true`, and
+    /// `in_reply_to` matching `sent_hello_id`. Worker must call this — and
+    /// never enter `Ready` on failure — before trusting a received
+    /// `ServerHello`.
+    pub fn is_valid_reply_to(&self, sent_hello_id: Uuid) -> bool {
+        self.envelope.is_valid()
+            && self.body.server_protocol_version.is_v1()
+            && self.body.compatible
+            && self.body.in_reply_to == sent_hello_id
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -119,6 +148,18 @@ impl HandshakeRejectedMessage {
                 reason: HandshakeRejectionReason::IncompatibleVersion,
             },
         }
+    }
+
+    /// Whether every normative field this received `HandshakeRejected` must
+    /// carry is actually present, well-formed, and correlates to the
+    /// `WorkerHello` this Worker sent
+    /// (`m1-worker-data-plane-control-contract.md` "Handshake"): envelope
+    /// `protocol_version`/`message_id` plus `in_reply_to` matching
+    /// `sent_hello_id`. `reason` is already a closed wire vocabulary
+    /// enforced at decode time by `serde` (an unrecognized value fails
+    /// deserialization), so no further check is needed here.
+    pub fn is_valid_reply_to(&self, sent_hello_id: Uuid) -> bool {
+        self.envelope.is_valid() && self.body.in_reply_to == sent_hello_id
     }
 }
 
@@ -224,5 +265,129 @@ impl From<HandshakeRejectedMessage> for WorkerProtocolMessage {
 impl From<ProtocolErrorMessage> for WorkerProtocolMessage {
     fn from(value: ProtocolErrorMessage) -> Self {
         WorkerProtocolMessage::ProtocolError(value)
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn a_freshly_constructed_worker_hello_is_valid() {
+        assert!(WorkerHelloMessage::new(Uuid::new_v4()).is_valid());
+    }
+
+    #[test]
+    fn worker_hello_with_wrong_envelope_protocol_version_is_invalid() {
+        let mut hello = WorkerHelloMessage::new(Uuid::new_v4());
+        hello.envelope.protocol_version = ProtocolVersion::new("2");
+        assert!(!hello.is_valid());
+    }
+
+    #[test]
+    fn worker_hello_with_non_v4_message_id_is_invalid() {
+        let mut hello = WorkerHelloMessage::new(Uuid::new_v4());
+        hello.envelope.message_id = Uuid::nil();
+        assert!(!hello.is_valid());
+    }
+
+    #[test]
+    fn worker_hello_with_wrong_worker_protocol_version_is_invalid() {
+        let mut hello = WorkerHelloMessage::new(Uuid::new_v4());
+        hello.body.worker_protocol_version = ProtocolVersion::new("2");
+        assert!(!hello.is_valid());
+    }
+
+    #[test]
+    fn worker_hello_with_non_v4_worker_instance_id_is_invalid() {
+        let mut hello = WorkerHelloMessage::new(Uuid::new_v4());
+        hello.body.worker_instance_id = Uuid::nil();
+        assert!(!hello.is_valid());
+    }
+
+    #[test]
+    fn a_freshly_constructed_server_hello_correlates_and_is_valid() {
+        let sent_id = Uuid::new_v4();
+        assert!(ServerHelloMessage::new(sent_id).is_valid_reply_to(sent_id));
+    }
+
+    #[test]
+    fn server_hello_with_uncorrelated_in_reply_to_is_invalid() {
+        let sent_id = Uuid::new_v4();
+        let response = ServerHelloMessage::new(Uuid::new_v4());
+        assert!(!response.is_valid_reply_to(sent_id));
+    }
+
+    #[test]
+    fn server_hello_with_wrong_envelope_protocol_version_is_invalid() {
+        let sent_id = Uuid::new_v4();
+        let mut response = ServerHelloMessage::new(sent_id);
+        response.envelope.protocol_version = ProtocolVersion::new("2");
+        assert!(!response.is_valid_reply_to(sent_id));
+    }
+
+    #[test]
+    fn server_hello_with_non_v4_message_id_is_invalid() {
+        let sent_id = Uuid::new_v4();
+        let mut response = ServerHelloMessage::new(sent_id);
+        response.envelope.message_id = Uuid::nil();
+        assert!(!response.is_valid_reply_to(sent_id));
+    }
+
+    #[test]
+    fn server_hello_with_wrong_server_protocol_version_is_invalid() {
+        let sent_id = Uuid::new_v4();
+        let mut response = ServerHelloMessage::new(sent_id);
+        response.body.server_protocol_version = ProtocolVersion::new("2");
+        assert!(!response.is_valid_reply_to(sent_id));
+    }
+
+    #[test]
+    fn server_hello_with_compatible_false_is_invalid() {
+        let sent_id = Uuid::new_v4();
+        let mut response = ServerHelloMessage::new(sent_id);
+        response.body.compatible = false;
+        assert!(!response.is_valid_reply_to(sent_id));
+    }
+
+    #[test]
+    fn a_freshly_constructed_handshake_rejected_correlates_and_is_valid() {
+        let sent_id = Uuid::new_v4();
+        assert!(HandshakeRejectedMessage::incompatible_version(sent_id).is_valid_reply_to(sent_id));
+    }
+
+    #[test]
+    fn handshake_rejected_with_uncorrelated_in_reply_to_is_invalid() {
+        let sent_id = Uuid::new_v4();
+        let response = HandshakeRejectedMessage::incompatible_version(Uuid::new_v4());
+        assert!(!response.is_valid_reply_to(sent_id));
+    }
+
+    #[test]
+    fn handshake_rejected_with_wrong_envelope_protocol_version_is_invalid() {
+        let sent_id = Uuid::new_v4();
+        let mut response = HandshakeRejectedMessage::incompatible_version(sent_id);
+        response.envelope.protocol_version = ProtocolVersion::new("2");
+        assert!(!response.is_valid_reply_to(sent_id));
+    }
+
+    #[test]
+    fn handshake_rejected_with_non_v4_message_id_is_invalid() {
+        let sent_id = Uuid::new_v4();
+        let mut response = HandshakeRejectedMessage::incompatible_version(sent_id);
+        response.envelope.message_id = Uuid::nil();
+        assert!(!response.is_valid_reply_to(sent_id));
+    }
+
+    #[test]
+    fn malformed_handshake_rejected_reason_fails_at_decode_time() {
+        let json = r#"{
+            "type":"HandshakeRejected",
+            "protocol_version":"1",
+            "message_id":"9d1c9a3e-5f3e-4a3b-8b0a-6a9b5f3a2b11",
+            "in_reply_to":"9d1c9a3e-5f3e-4a3b-8b0a-6a9b5f3a2b11",
+            "reason":"not_a_real_reason"
+        }"#;
+        assert!(crate::codec::decode(json).is_err());
     }
 }

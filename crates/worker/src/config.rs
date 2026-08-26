@@ -21,6 +21,17 @@ pub const ENV_RECONNECT_DELAY_MS: &str = "BAMEP_WORKER_RECONNECT_DELAY_MS";
 
 const DEFAULT_RECONNECT_DELAY_MS: u64 = 500;
 
+/// The reconnect delay must be strictly positive: `0` would make the
+/// reconnect loop (`crate::ipc::client::run_client_loop`) busy-spin against
+/// a `bamepd` that is down or refusing connections (correction audit
+/// "Bounded non-zero timing config").
+const MIN_RECONNECT_DELAY_MS: u64 = 1;
+/// Conservative implementation-time upper bound around the existing
+/// `500ms` default: high enough to avoid meaningfully changing normal
+/// operation, low enough that a misconfigured value cannot silently make
+/// Worker take minutes to notice `bamepd` is back.
+const MAX_RECONNECT_DELAY_MS: u64 = 30_000;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConfigError {
     #[error("missing required environment variable {0}")]
@@ -61,6 +72,14 @@ impl WorkerConfig {
                     name: ENV_RECONNECT_DELAY_MS,
                     reason: "not a valid non-negative integer".to_string(),
                 })?;
+                if !(MIN_RECONNECT_DELAY_MS..=MAX_RECONNECT_DELAY_MS).contains(&ms) {
+                    return Err(ConfigError::InvalidEnv {
+                        name: ENV_RECONNECT_DELAY_MS,
+                        reason: format!(
+                            "must be between {MIN_RECONNECT_DELAY_MS} and {MAX_RECONNECT_DELAY_MS} milliseconds, got {ms}"
+                        ),
+                    });
+                }
                 Duration::from_millis(ms)
             }
             None => Duration::from_millis(DEFAULT_RECONNECT_DELAY_MS),
@@ -145,6 +164,49 @@ mod tests {
             (ENV_RECONNECT_DELAY_MS, "not-a-number"),
         ]))
         .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidEnv { name, .. } if name == ENV_RECONNECT_DELAY_MS)
+        );
+    }
+
+    fn with_reconnect_delay(raw: &str) -> Result<WorkerConfig, ConfigError> {
+        WorkerConfig::from_lookup(lookup(&[
+            (ENV_UDS_PATH, "/run/bamep/worker.sock"),
+            (ENV_TLS_CERT_PATH, "/etc/bamep/tls/cert.pem"),
+            (ENV_TLS_KEY_PATH, "/etc/bamep/tls/key.pem"),
+            (ENV_RECONNECT_DELAY_MS, raw),
+        ]))
+    }
+
+    #[test]
+    fn zero_reconnect_delay_is_rejected() {
+        let err = with_reconnect_delay("0").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidEnv { name, .. } if name == ENV_RECONNECT_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn minimum_reconnect_delay_is_accepted() {
+        let config = with_reconnect_delay(&MIN_RECONNECT_DELAY_MS.to_string()).expect("valid");
+        assert_eq!(
+            config.reconnect_delay,
+            Duration::from_millis(MIN_RECONNECT_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn maximum_reconnect_delay_is_accepted() {
+        let config = with_reconnect_delay(&MAX_RECONNECT_DELAY_MS.to_string()).expect("valid");
+        assert_eq!(
+            config.reconnect_delay,
+            Duration::from_millis(MAX_RECONNECT_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn above_maximum_reconnect_delay_is_rejected() {
+        let err = with_reconnect_delay(&(MAX_RECONNECT_DELAY_MS + 1).to_string()).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidEnv { name, .. } if name == ENV_RECONNECT_DELAY_MS)
         );
