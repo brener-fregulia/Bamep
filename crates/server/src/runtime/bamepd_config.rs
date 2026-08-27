@@ -154,28 +154,56 @@ fn required_string(
     get(name).ok_or(BamepdConfigError::MissingEnv(name))
 }
 
-/// `data_plane_base_url` must be an HTTPS origin only — scheme, host, and
-/// port, no path (`m0-agent-protocol-contract.md` "Endpoint discovery for
-/// the data-plane listener"). This check is intentionally narrow: full URL
-/// parsing is unnecessary for a value this Work Package only threads through
-/// unmodified.
+/// `data_plane_base_url` must be an HTTPS *origin* — exactly
+/// `https://host[:port]` and nothing else (`m0-agent-protocol-contract.md`
+/// "Endpoint discovery for the data-plane listener": "the HTTPS origin
+/// (scheme, host, and port; no path)").
+///
+/// Validated through a real URI parser ([`url::Url`]) rather than
+/// progressively accreted string checks — a prefix/`contains('/')` test
+/// accepts malformed authorities, `userinfo@`, `?query`, and `#fragment`
+/// shapes it was never meant to. Rejected: a non-`https` scheme, a missing
+/// or empty host, any path segment (including a lone trailing `/`), a query,
+/// a fragment, `username[:password]@` userinfo, a malformed port, and any
+/// otherwise invalid authority. DNS, IPv4, and bracketed-IPv6 hosts are all
+/// accepted; no particular port is required.
 fn required_https_origin(
     get: &impl Fn(&str) -> Option<String>,
     name: &'static str,
 ) -> Result<String, BamepdConfigError> {
     let value = required_string(get, name)?;
-    let Some(after_scheme) = value.strip_prefix("https://") else {
-        return Err(BamepdConfigError::InvalidEnv {
-            name,
-            reason: "must be an https:// origin".to_string(),
-        });
+    let reject = |reason: &str| BamepdConfigError::InvalidEnv {
+        name,
+        reason: reason.to_string(),
     };
-    if after_scheme.is_empty() || after_scheme.contains('/') {
-        return Err(BamepdConfigError::InvalidEnv {
-            name,
-            reason: "must carry no path — scheme, host, and port only".to_string(),
-        });
+
+    let url = url::Url::parse(&value).map_err(|e| reject(&format!("not a valid URI: {e}")))?;
+    if url.scheme() != "https" {
+        return Err(reject("must use the https scheme"));
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(reject("must not carry username/password userinfo"));
+    }
+    match url.host_str() {
+        Some(host) if !host.is_empty() => {}
+        _ => return Err(reject("must carry a host")),
+    }
+    if url.query().is_some() {
+        return Err(reject("must not carry a query string"));
+    }
+    if url.fragment().is_some() {
+        return Err(reject("must not carry a fragment"));
+    }
+    // The authority ends at the first `/` after `scheme://`; anything after
+    // it — even a bare `/` — is a path segment this origin must not carry.
+    let after_authority = value
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&value);
+    if after_authority.contains('/') {
+        return Err(reject("must carry no path — scheme, host, and port only"));
+    }
+
     Ok(value)
 }
 
@@ -275,6 +303,56 @@ mod tests {
         assert!(
             matches!(err, BamepdConfigError::InvalidEnv { name, .. } if name == ENV_DATA_PLANE_BASE_URL)
         );
+    }
+
+    fn origin_result(raw: &str) -> Result<BamepdConfig, BamepdConfigError> {
+        let mut map: HashMap<String, String> = base_values()
+            .into_iter()
+            .filter(|(name, _)| *name != ENV_DATA_PLANE_BASE_URL)
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        map.insert(ENV_DATA_PLANE_BASE_URL.to_string(), raw.to_string());
+        BamepdConfig::from_lookup(move |key: &str| map.get(key).cloned())
+    }
+
+    #[test]
+    fn adversarial_data_plane_base_url_shapes_are_all_rejected() {
+        for raw in [
+            "http://server.example:8443",            // wrong scheme
+            "ftp://server.example",                  // wrong scheme
+            "https://",                              // missing host
+            "https:///api",                          // empty authority
+            "https://server.example:8443/",          // lone trailing-slash path
+            "https://server.example:8443/api",       // path segment
+            "https://server.example:8443?x=1",       // query
+            "https://server.example:8443#frag",      // fragment
+            "https://user:pass@server.example:8443", // userinfo
+            "https://user@server.example",           // username-only userinfo
+            "https://server.example:not-a-port",     // malformed port
+            "https://server .example",               // invalid authority (space)
+            "not-a-url",                             // not a URI at all
+            "//server.example:8443",                 // scheme-relative
+        ] {
+            let outcome = origin_result(raw);
+            assert!(
+                matches!(&outcome, Err(BamepdConfigError::InvalidEnv { name, .. }) if *name == ENV_DATA_PLANE_BASE_URL),
+                "{raw:?} must be rejected, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_data_plane_origin_forms_are_accepted() {
+        for raw in [
+            "https://server.example:8443",
+            "https://server.example",     // no explicit port
+            "https://10.0.0.5:8443",      // IPv4 literal
+            "https://[2001:db8::1]:8443", // bracketed IPv6 literal
+        ] {
+            let config = origin_result(raw)
+                .unwrap_or_else(|e| panic!("{raw:?} must be accepted, got {e:?}"));
+            assert_eq!(config.data_plane_base_url, raw);
+        }
     }
 
     #[test]

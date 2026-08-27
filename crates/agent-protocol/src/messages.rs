@@ -479,27 +479,29 @@ pub struct TransferAuthorizationDeniedMessage {
 }
 
 impl TransferAuthorizationDeniedMessage {
-    /// Unlike [`TransferAuthorizationGrantMessage::new`] — which only ever
-    /// fires once the presented correlation has already been verified to
-    /// equal the owning `action_id` — a denial can occur before that fact is
-    /// even resolvable (for example, an entirely unknown `transfer_id`).
-    /// `correlation_id` is therefore optional here, exactly like
-    /// [`AuthErrorMessage`]/[`ProtocolErrorMessage`]: the caller supplies the
-    /// value it was actually able to determine, via
-    /// [`Self::with_correlation_id`], rather than this crate inventing one.
-    pub fn new(transfer_id: ProtocolId, reason: impl Into<String>) -> Self {
+    /// `correlation_id` is always the owning data-plane transfer action's
+    /// `action_id` — `m0-agent-protocol-contract.md` "Correlation": *every*
+    /// `TransferAuthorizationRequest`/`Grant`/`Denied` message MUST carry
+    /// `correlation_id` equal to that `action_id`. There is deliberately no
+    /// constructor for an uncorrelated `TransferAuthorizationDenied`
+    /// (Issue #38 correction §15): a request that arrives without a
+    /// `correlation_id` is a protocol/phase violation answered with generic
+    /// `ProtocolError`, not with a wire-invalid uncorrelated denial (§16).
+    /// For a syntactically present but *wrong* correlation the Server echoes
+    /// the presented value here — it never substitutes or reveals the durable
+    /// owning `action_id` (§17).
+    pub fn new(
+        correlation_id: ProtocolId,
+        transfer_id: ProtocolId,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
-            envelope: Envelope::new(),
+            envelope: Envelope::new().with_correlation_id(correlation_id),
             body: TransferAuthorizationDeniedBody {
                 transfer_id,
                 reason: reason.into(),
             },
         }
-    }
-
-    pub fn with_correlation_id(mut self, correlation_id: ProtocolId) -> Self {
-        self.envelope = self.envelope.with_correlation_id(correlation_id);
-        self
     }
 }
 
@@ -1150,16 +1152,12 @@ mod transfer_authorization_tests {
     }
 
     #[test]
-    fn denied_carries_the_correlation_id_the_caller_supplies() {
-        let message = TransferAuthorizationDeniedMessage::new(transfer_id(), "denied")
-            .with_correlation_id(action_id());
+    fn denied_correlation_id_is_always_the_action_id_it_is_constructed_with() {
+        // Issue #38 correction §15: a valid `TransferAuthorizationDenied`
+        // always carries `correlation_id`; there is no constructor for an
+        // uncorrelated one.
+        let message = TransferAuthorizationDeniedMessage::new(action_id(), transfer_id(), "denied");
         assert_eq!(message.envelope.correlation_id, Some(action_id()));
-    }
-
-    #[test]
-    fn denied_correlation_id_is_absent_when_not_supplied() {
-        let message = TransferAuthorizationDeniedMessage::new(transfer_id(), "denied");
-        assert_eq!(message.envelope.correlation_id, None);
     }
 
     #[test]
@@ -1216,14 +1214,14 @@ mod transfer_authorization_tests {
     #[test]
     fn denied_wire_shape_carries_only_transfer_id_and_reason() {
         let message = AgentProtocolMessage::TransferAuthorizationDenied(
-            TransferAuthorizationDeniedMessage::new(transfer_id(), "denied")
-                .with_correlation_id(action_id()),
+            TransferAuthorizationDeniedMessage::new(action_id(), transfer_id(), "denied"),
         );
         let json = encode(&message).expect("encode");
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["type"], "TransferAuthorizationDenied");
         assert_eq!(value["reason"], "denied");
         assert_eq!(value["transfer_id"], transfer_id().to_string());
+        assert_eq!(value["correlation_id"], action_id().to_string());
     }
 
     #[test]

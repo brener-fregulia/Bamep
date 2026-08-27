@@ -801,13 +801,22 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
     /// `transfer_id` is the only Endpoint-adjacent value it may claim, and
     /// `TransferAuthorizationService::issue` independently re-verifies that
     /// the durable Transfer actually belongs to this exact `endpoint_id`
-    /// before granting anything. A missing `correlation_id` is not a
-    /// protocol violation here — it simply cannot succeed, because
-    /// `TransferAuthorizationService::issue` requires the presented
-    /// correlation to equal the durable owning `action_id`, and `None` can
-    /// never equal a real `action_id`; denial still responds with the
-    /// generic `TransferAuthorizationDenied`, per the non-enumerable-denial
-    /// requirement, rather than falling back to `ProtocolError`.
+    /// before granting anything.
+    ///
+    /// Correlation handling (Issue #38 correction §15–§17;
+    /// `m0-agent-protocol-contract.md` "Correlation": every
+    /// `TransferAuthorizationRequest`/`Grant`/`Denied` MUST carry
+    /// `correlation_id` equal to the owning data-plane action's `action_id`):
+    ///
+    /// - **no `correlation_id`** — the request is not a semantically valid
+    ///   authorization request at all; it is a protocol/phase violation
+    ///   answered with the repository's generic `ProtocolError`, never a
+    ///   wire-invalid uncorrelated `TransferAuthorizationDenied`;
+    /// - **a syntactically present `correlation_id`** (right or wrong) — the
+    ///   normal decision runs; on denial the response echoes exactly the
+    ///   presented `correlation_id`. The durable owning `action_id` is never
+    ///   substituted in or otherwise revealed, so a wrong-correlation denial
+    ///   stays externally indistinguishable from any other generic denial.
     async fn handle_transfer_authorization_request<W: MessageSink>(
         &self,
         write: &mut W,
@@ -820,21 +829,20 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             .ok_or(AgentGatewayError::TransferAuthorizationServiceNotConfigured)?;
 
         let transfer_id = request.body.transfer_id;
-        let correlation_id = request.envelope.correlation_id;
-
-        let outcome = match correlation_id {
-            Some(action_id) => {
-                service
-                    .issue(
-                        endpoint_id,
-                        action_id,
-                        bamep_domain::TransferId(transfer_id.as_uuid()),
-                        &request.body.proof_public_key,
-                    )
-                    .await?
-            }
-            None => TransferAuthorizationOutcome::Denied,
+        let Some(correlation_id) = request.envelope.correlation_id else {
+            return self
+                .send_protocol_error(write, Some(request.envelope.message_id))
+                .await;
         };
+
+        let outcome = service
+            .issue(
+                endpoint_id,
+                correlation_id,
+                bamep_domain::TransferId(transfer_id.as_uuid()),
+                &request.body.proof_public_key,
+            )
+            .await?;
 
         match outcome {
             TransferAuthorizationOutcome::Granted {
@@ -842,13 +850,8 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                 expires_at,
                 data_plane_base_url,
             } => {
-                // Reachable only once `issue` has already confirmed
-                // `correlation_id` equals the durable owning `action_id`, so
-                // `correlation_id` is always `Some` here.
-                let action_id = correlation_id
-                    .expect("Granted is only ever returned when a correlation_id was presented");
                 let grant = TransferAuthorizationGrantMessage::new(
-                    action_id,
+                    correlation_id,
                     transfer_id,
                     token,
                     MessageTimestamp::from_datetime(expires_at),
@@ -872,19 +875,20 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
     /// (`m0-agent-protocol-contract.md` "Renewal and restart": "V1 may use
     /// one closed generic value and must not distinguish unknown transfer,
     /// wrong Endpoint, terminal transfer, or other internal denial causes").
+    /// `correlation_id` is the exact value the client presented on its
+    /// request — always present (a request without one is handled as a
+    /// `ProtocolError` upstream).
     async fn send_transfer_authorization_denied<W: MessageSink>(
         &self,
         write: &mut W,
         transfer_id: ProtocolId,
-        correlation_id: Option<ProtocolId>,
+        correlation_id: ProtocolId,
     ) -> Result<(), AgentGatewayError> {
-        let mut denied = TransferAuthorizationDeniedMessage::new(
+        let denied = TransferAuthorizationDeniedMessage::new(
+            correlation_id,
             transfer_id,
             GENERIC_TRANSFER_AUTHORIZATION_DENIED_REASON,
         );
-        if let Some(action_id) = correlation_id {
-            denied = denied.with_correlation_id(action_id);
-        }
         let wire = encode(&AgentProtocolMessage::TransferAuthorizationDenied(denied))
             .expect("a well-formed TransferAuthorizationDenied always encodes");
         write

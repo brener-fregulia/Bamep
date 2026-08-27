@@ -18,9 +18,20 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 thiserror = "1"
 serde_json = "1"
+# Independent Agent-side data-plane proof cryptography (Issue #38): the
+# Simulator is the M1 Agent participant and constructs/signs its own
+# per-request proofs without depending on `bamep-server`/`bamep-domain`, so
+# interoperability with the Server verifier is real cross-implementation
+# evidence. These are the same well-established primitives the rest of the
+# workspace already uses.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 bamep-server = { path = "../server" }
+bamep-domain = { path = "../domain" }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "time"] }
-base64 = "0.22"

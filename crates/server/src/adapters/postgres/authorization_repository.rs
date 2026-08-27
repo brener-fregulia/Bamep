@@ -137,6 +137,8 @@ impl TransferAuthorizationRepository for PostgresTransferAuthorizationRepository
         Ok(Some(AuthorizationDurableState {
             transfer: facts.transfer,
             artifact: facts.artifact,
+            manifest: facts.manifest,
+            held_chunk_indices: facts.held_chunk_indices,
             attempt,
             endpoint,
         }))

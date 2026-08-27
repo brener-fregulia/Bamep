@@ -17,25 +17,61 @@
 //! it to match the *currently running* process's epoch, not merely "some
 //! previously issued epoch".
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use bamep_domain::{CapabilityBinding, CapabilityId, ProcessAuthorizationEpoch};
 use chrono::{DateTime, Utc};
 
+/// The default bounded capacity of the issued-capability store — the maximum
+/// number of live (not-yet-expired) capabilities held at once
+/// (`m0-data-plane-and-storage-contracts.md` "Out of scope": exact TTL and
+/// cache sizing "remain implementation-time").
+///
+/// `4096` comfortably covers M1: capabilities are 5-minute-TTL,
+/// transfer-scoped, and one-per-active-transfer plus a bounded number of
+/// renewals; the deterministic single-Endpoint vertical (#19) and even the
+/// 20–24 concurrent Simulated Endpoints of the separate scale exercise (#21)
+/// stay far below it. Overridable via [`CapabilityStore::with_capacity`] from
+/// the composition root; not a permanently fixed architectural constant.
+pub const DEFAULT_CAPABILITY_STORE_CAPACITY: usize = 4096;
+
+/// Why [`CapabilityStore::issue`] refused to record a freshly minted
+/// capability. Collapses to the single generic non-enumerable authorization
+/// denial at the Agent boundary (`m0-data-plane-and-storage-contracts.md`:
+/// denials are non-enumerable) — a caller must not surface capacity
+/// exhaustion as a distinct externally observable reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("issued-capability store is at capacity; issuance fails closed")]
+pub struct CapabilityStoreSaturated;
+
 pub struct CapabilityStore {
     epoch: ProcessAuthorizationEpoch,
+    capacity: usize,
     capabilities: Mutex<HashMap<CapabilityId, CapabilityBinding>>,
 }
 
 impl CapabilityStore {
     /// Generates a fresh [`ProcessAuthorizationEpoch`] — call exactly once
-    /// per `bamepd` process lifetime, at composition-root startup.
+    /// per `bamepd` process lifetime, at composition-root startup. Uses
+    /// [`DEFAULT_CAPABILITY_STORE_CAPACITY`].
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_CAPABILITY_STORE_CAPACITY)
+    }
+
+    /// A store with an explicit finite capacity (tests use a small value to
+    /// exercise saturation); `capacity` is clamped to at least 1.
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             epoch: ProcessAuthorizationEpoch::generate(),
+            capacity: capacity.max(1),
             capabilities: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// The authorization epoch every capability issued through this store
@@ -47,16 +83,42 @@ impl CapabilityStore {
     }
 
     /// Durably (for the process lifetime) records a freshly issued
-    /// capability. Overwrites nothing meaningful in practice — `capability_id`
-    /// is derived from a fresh CSPRNG-generated token
+    /// capability, failing closed with [`CapabilityStoreSaturated`] when the
+    /// store is already at [`capacity`](Self::capacity) and this
+    /// `capability_id` is not already present — a still-live capability is
+    /// never evicted to make room, since that would silently and
+    /// unpredictably change authorization semantics for whatever transfer it
+    /// authorized. Callers should [`evict_expired`](Self::evict_expired)
+    /// first so only genuinely live capabilities count toward the bound.
+    ///
+    /// `capability_id` is derived from a fresh CSPRNG-generated token
     /// (`bamep_domain::CapabilityToken::generate`), so a collision with an
-    /// existing entry is not a realistic event this method needs to guard
-    /// against.
-    pub fn issue(&self, capability_id: CapabilityId, binding: CapabilityBinding) {
-        self.capabilities
+    /// existing entry is not a realistic event; the `Occupied` arm exists
+    /// only for total coverage and overwrites in place without consuming a
+    /// capacity slot.
+    pub fn issue(
+        &self,
+        capability_id: CapabilityId,
+        binding: CapabilityBinding,
+    ) -> Result<(), CapabilityStoreSaturated> {
+        let mut capabilities = self
+            .capabilities
             .lock()
-            .expect("capability store lock poisoned")
-            .insert(capability_id, binding);
+            .expect("capability store lock poisoned");
+        let at_capacity = capabilities.len() >= self.capacity;
+        match capabilities.entry(capability_id) {
+            Entry::Occupied(mut slot) => {
+                slot.insert(binding);
+                Ok(())
+            }
+            Entry::Vacant(slot) => {
+                if at_capacity {
+                    return Err(CapabilityStoreSaturated);
+                }
+                slot.insert(binding);
+                Ok(())
+            }
+        }
     }
 
     /// Looks up a previously issued capability by its derived identity.
@@ -128,7 +190,7 @@ mod tests {
         let now = Utc::now();
         let binding = sample_binding(now, store.epoch());
         let id = capability_id(2);
-        store.issue(id, binding);
+        store.issue(id, binding).unwrap();
 
         let found = store
             .lookup(&id)
@@ -155,16 +217,54 @@ mod tests {
         let live_id = capability_id(3);
         let mut live = sample_binding(now, store.epoch());
         live.expires_at = now + chrono::Duration::minutes(5);
-        store.issue(live_id, live);
+        store.issue(live_id, live).unwrap();
 
         let expired_id = capability_id(4);
         let mut expired = sample_binding(now, store.epoch());
         expired.expires_at = now - chrono::Duration::seconds(1);
-        store.issue(expired_id, expired);
+        store.issue(expired_id, expired).unwrap();
 
         store.evict_expired(now);
 
         assert!(store.lookup(&live_id).is_some());
         assert!(store.lookup(&expired_id).is_none());
+    }
+
+    #[test]
+    fn issuance_fails_closed_at_capacity_without_evicting_a_live_capability() {
+        let store = CapabilityStore::with_capacity(2);
+        let now = Utc::now();
+        let a = capability_id(10);
+        let b = capability_id(11);
+        store.issue(a, sample_binding(now, store.epoch())).unwrap();
+        store.issue(b, sample_binding(now, store.epoch())).unwrap();
+
+        assert_eq!(
+            store.issue(capability_id(12), sample_binding(now, store.epoch())),
+            Err(CapabilityStoreSaturated),
+            "a genuinely new capability must fail closed at capacity"
+        );
+        // Neither live capability was evicted to make room.
+        assert!(store.lookup(&a).is_some());
+        assert!(store.lookup(&b).is_some());
+    }
+
+    #[test]
+    fn expired_capabilities_are_reclaimed_before_capacity_is_evaluated() {
+        let store = CapabilityStore::with_capacity(2);
+        let now = Utc::now();
+        let mut expired = sample_binding(now, store.epoch());
+        expired.expires_at = now - chrono::Duration::seconds(1);
+        store.issue(capability_id(20), expired).unwrap();
+        store
+            .issue(capability_id(21), sample_binding(now, store.epoch()))
+            .unwrap();
+
+        // At capacity, but one entry is expired: evicting first frees a slot.
+        store.evict_expired(now);
+        assert_eq!(
+            store.issue(capability_id(22), sample_binding(now, store.epoch())),
+            Ok(())
+        );
     }
 }

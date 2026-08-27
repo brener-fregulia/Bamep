@@ -25,6 +25,7 @@
 
 pub mod action;
 pub mod handshake;
+pub mod transfer_authorization;
 pub mod transport;
 pub mod trusted_bootstrap;
 pub mod verifier;
@@ -36,6 +37,11 @@ pub use bamep_trusted_bootstrap::ServerCertFingerprint;
 pub use handshake::{
     authenticate, send_bootstrap_evidence, send_inventory_report, SimulatorHandshakeError,
     SimulatorHandshakeOutcome,
+};
+pub use transfer_authorization::{
+    build_proof_transcript, AgentProofKey, AgentTransferAuthorization, ProofError, ProofId,
+    TransferDirection as DataPlaneTransferDirection, TransferOperation, TransferProof,
+    PROOF_TRANSCRIPT_LEN as DATA_PLANE_PROOF_TRANSCRIPT_LEN,
 };
 pub use transport::{connect_pinned_wss, SimulatorTransportError};
 pub use trusted_bootstrap::{

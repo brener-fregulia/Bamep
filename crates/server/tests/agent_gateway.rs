@@ -933,7 +933,12 @@ async fn dispatched_transfer_fixture(
         ResourceKind::new("network"),
         10,
     )]));
-    let dispatch = TransferDispatchService::new(Arc::clone(&job_repo), arbiter);
+    let dispatch = TransferDispatchService::new(Arc::clone(&job_repo), Arc::clone(&arbiter));
+    let evidence = bamep_server::application::ActionEvidenceService::new(
+        Arc::clone(&job_repo) as Arc<dyn bamep_server::ports::JobRepository>,
+        Arc::new(bamep_server::runtime::reservation_registry::AttemptReservationRegistry::new()),
+        arbiter,
+    );
 
     let job = jobs.create_workflow(endpoint_id, 1).await.unwrap();
     let step_id = job.steps[0].id;
@@ -970,6 +975,18 @@ async fn dispatched_transfer_fixture(
         .expect("a Domain ActionId is always a valid UUID v4");
     let transfer_id =
         ProtocolId::from_uuid(context.transfer.id.0).expect("TransferId is always a UUID v4");
+
+    // `m0-agent-protocol-contract.md` "Transfer authorization": the request
+    // is valid only after `ActionAck{outcome: Accepted}` — advance the
+    // Attempt to `InProgress`.
+    evidence
+        .apply(
+            action_id,
+            endpoint_id,
+            bamep_domain::ActionEvidence::AckAccepted,
+        )
+        .await
+        .expect("ActionAck{Accepted} advances the Attempt to InProgress");
 
     DispatchedTransfer {
         transfer_id,
@@ -1137,8 +1154,9 @@ async fn transfer_authorization_request_with_wrong_correlation_is_generically_de
     });
 
     // Wrong correlation_id: a syntactically valid but unrelated action_id.
+    let wrong_correlation = ProtocolId::generate();
     let request = TransferAuthorizationRequestMessage::new(
-        ProtocolId::generate(),
+        wrong_correlation,
         fixture.transfer_id,
         generate_proof_public_key_wire(),
     );
@@ -1156,6 +1174,81 @@ async fn transfer_authorization_request_with_wrong_correlation_is_generically_de
     assert_eq!(
         denied.body.reason, "denied",
         "the single closed generic V1 denial reason"
+    );
+    // Issue #38 correction §15/§17: the denial always carries a
+    // `correlation_id`, and it is exactly the value the client presented —
+    // never the durable owning `action_id`, which stays non-enumerable.
+    assert_eq!(denied.envelope.correlation_id, Some(wrong_correlation));
+    assert_ne!(
+        denied.envelope.correlation_id,
+        Some(fixture.action_id),
+        "the authoritative owning action_id must never be revealed to construct a denial"
+    );
+
+    client_ws.close(None).await.unwrap();
+    task.await.unwrap().unwrap();
+    db.teardown().await;
+}
+
+/// Issue #38 correction §16/§29: a `TransferAuthorizationRequest` with no
+/// `correlation_id` is not a semantically valid authorization request — it
+/// is a protocol/phase violation answered with the repository's generic
+/// `ProtocolError`, never a wire-invalid uncorrelated
+/// `TransferAuthorizationDenied`.
+#[tokio::test]
+async fn transfer_authorization_request_without_correlation_is_a_protocol_error() {
+    let db = TestDatabase::setup().await;
+    let clock = Arc::new(ManualClock::new(Utc::now()));
+    let (boot, enrollment) =
+        build_services(db.pool.clone(), Arc::clone(&clock), Duration::minutes(10));
+    let transfer_authorization = build_transfer_authorization_service(db.pool.clone());
+    let signer = FixtureAssertionSigner::from_seed([19; 32]);
+    let bootstrap_evidence = Arc::new(BootstrapEvidenceService::new(
+        Arc::new(PostgresEndpointRepository::new(db.pool.clone())),
+        AcceptedSiteKeys::single(signer.public_key()),
+    ));
+    let gateway = Arc::new(
+        Gateway::new(Arc::clone(&enrollment))
+            .with_bootstrap_evidence_service(bootstrap_evidence)
+            .with_transfer_authorization_service(Arc::clone(&transfer_authorization)),
+    );
+
+    let (mut client_ws, mut server_ws, session) = established_session(
+        &enrollment,
+        &boot,
+        &gateway,
+        "gw-transfer-auth-nocorr-01",
+        clock.now(),
+    )
+    .await;
+    let fixture = dispatched_transfer_fixture(db.pool.clone(), session.endpoint_id).await;
+
+    let server_gateway = Arc::clone(&gateway);
+    let task = tokio::spawn(async move {
+        server_gateway
+            .run_authenticated_session(
+                &mut server_ws,
+                session,
+                ServerCertFingerprint::from_sha256_digest([1; 32]),
+            )
+            .await
+    });
+
+    // Hand-built request JSON with the `correlation_id` field omitted
+    // entirely (the constructor always sets it).
+    let request_json = format!(
+        r#"{{"type":"TransferAuthorizationRequest","message_id":"{}","protocol_version":"1","timestamp":"{}","transfer_id":"{}","proof_public_key":"{}"}}"#,
+        Uuid::new_v4(),
+        chrono::Utc::now().to_rfc3339(),
+        fixture.transfer_id,
+        generate_proof_public_key_wire(),
+    );
+    send_text(&mut client_ws, request_json).await;
+
+    let response = recv_message(&mut client_ws).await;
+    assert!(
+        matches!(response, AgentProtocolMessage::ProtocolError(_)),
+        "a request without correlation_id must be a generic ProtocolError, got {response:?}"
     );
 
     client_ws.close(None).await.unwrap();

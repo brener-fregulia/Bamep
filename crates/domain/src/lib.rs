@@ -80,7 +80,8 @@ pub use transfer::{
     TransferContext, TransferDirection, TransferId,
 };
 pub use transfer_authorization::{
-    build_proof_transcript, capability_is_current, capability_matches_request, proof_is_fresh,
+    build_proof_transcript, capability_is_current, capability_matches_request,
+    data_plane_operation_is_current, proof_is_fresh, proof_replay_valid_until_millis,
     verify_proof_signature, AuthorizationDenialReason, AuthorizationOperation, CapabilityBinding,
     CapabilityId, CapabilityToken, ProcessAuthorizationEpoch, ProofId, ProofIdError,
     ProofKeyThumbprint, ProofPublicKey, ProofPublicKeyError, ProofSignature, ProofSignatureError,

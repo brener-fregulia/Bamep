@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::artifact::ArtifactId;
+use crate::artifact::{ArtifactId, ArtifactState};
 use crate::attempt::AttemptId;
 use crate::endpoint::EndpointId;
 use crate::transfer::{TransferDirection, TransferId};
@@ -606,6 +606,10 @@ pub enum AuthorizationDenialReason {
     WrongActionCorrelation,
     EndpointMismatch,
     CredentialNotActive,
+    /// The requested data-plane operation is not currently eligible for the
+    /// transfer's current Artifact/manifest state — see
+    /// [`data_plane_operation_is_current`].
+    OperationNotCurrentlyEligible,
 }
 
 /// Whether `binding` is still valid *as a capability instance*: bound to the
@@ -658,6 +662,65 @@ pub fn capability_matches_request(
 }
 
 // ---------------------------------------------------------------------
+// Current data-plane operation eligibility
+// ---------------------------------------------------------------------
+
+/// Whether `operation` may currently proceed for a transfer whose owning
+/// Artifact is in `artifact_state`, whose manifest's sealed flag is
+/// `manifest_sealed`, and where `chunk_index_has_durable_identity` says
+/// whether the requested `chunk_index` already has a durably recorded
+/// expected chunk identity in that manifest.
+///
+/// This decides *only whether the operation may proceed* (Issue #38); the
+/// concrete HTTP success / `409` mapping (`CHUNK_IDENTITY_CONFLICT`,
+/// `TRANSFER_NOT_CONTINUABLE`, `INCOMPLETE_MANIFEST`,
+/// `MANIFEST_ALREADY_SEALED`, `DIGEST_MISMATCH`) is owned by #39. It is
+/// derived directly from `m0-data-plane-and-storage-contracts.md`:
+///
+/// - "Artifact lifecycle": `Verified` and `Failed` are terminal and are
+///   never reopened by authorization — every operation is denied.
+/// - "Durable chunk acceptance ordering" (`seal_manifest` two-step commit):
+///   an Artifact durably in `PendingVerification` is exactly the state an
+///   idempotent `seal_manifest` retry resumes from, and `resume_discovery`
+///   reads only durable state, so both remain eligible; there is no
+///   `chunk_upload` path from `PendingVerification` (the manifest is sealed
+///   and every chunk is already held), so `chunk_upload` is denied.
+/// - "Construction and sealing" / "Capture continuation and transfer resume
+///   are distinct": while `Incomplete`, `resume_discovery` and
+///   `seal_manifest` are always eligible; `chunk_upload` is eligible for any
+///   `chunk_index` while the manifest is unsealed (continuation may add a
+///   new identity; resume satisfies an existing one), but once the manifest
+///   is sealed only a `chunk_index` already part of the sealed set may still
+///   be uploaded — a genuinely new index after sealing is denied.
+pub fn data_plane_operation_is_current(
+    operation: AuthorizationOperation,
+    artifact_state: ArtifactState,
+    manifest_sealed: bool,
+    chunk_index_has_durable_identity: bool,
+) -> Result<(), AuthorizationDenialReason> {
+    use AuthorizationOperation as Op;
+    match artifact_state {
+        ArtifactState::Verified | ArtifactState::Failed => {
+            Err(AuthorizationDenialReason::OperationNotCurrentlyEligible)
+        }
+        ArtifactState::PendingVerification => match operation {
+            Op::SealManifest | Op::ResumeDiscovery => Ok(()),
+            Op::ChunkUpload => Err(AuthorizationDenialReason::OperationNotCurrentlyEligible),
+        },
+        ArtifactState::Incomplete => match operation {
+            Op::ResumeDiscovery | Op::SealManifest => Ok(()),
+            Op::ChunkUpload => {
+                if manifest_sealed && !chunk_index_has_durable_identity {
+                    Err(AuthorizationDenialReason::OperationNotCurrentlyEligible)
+                } else {
+                    Ok(())
+                }
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------------
 // Proof freshness
 // ---------------------------------------------------------------------
 
@@ -673,6 +736,23 @@ pub const PROOF_FRESHNESS_PAST_WINDOW_MILLIS: i64 = 120_000;
 /// process's own clock (ordinary NTP-scale skew) — never unbounded "must
 /// equal now".
 pub const PROOF_FRESHNESS_FUTURE_SKEW_MILLIS: i64 = 30_000;
+
+/// The last Unix-millisecond instant at which a proof carrying
+/// `issued_at_millis` can still satisfy [`proof_is_fresh`] for *any* `now`
+/// (`proof_is_fresh` accepts exactly while `now - issued_at <=
+/// PROOF_FRESHNESS_PAST_WINDOW_MILLIS`). An accepted `proof_id` must remain
+/// replay-protected until strictly after this instant — never merely for a
+/// fixed duration measured from acceptance time, which the accepted future
+/// skew ([`PROOF_FRESHNESS_FUTURE_SKEW_MILLIS`]) would otherwise let a
+/// replay outlive (`m0-data-plane-and-storage-contracts.md` "Freshness and
+/// replay representation": "Accepted `proof_id` values remain in a bounded
+/// transient replay cache for at least the accepted freshness window").
+///
+/// Returned as `i128` millis so the caller composes it with `now` without
+/// any `u64` overflow risk.
+pub fn proof_replay_valid_until_millis(issued_at_millis: u64) -> i128 {
+    issued_at_millis as i128 + PROOF_FRESHNESS_PAST_WINDOW_MILLIS as i128
+}
 
 /// Whether `issued_at_millis` falls inside the bounded freshness window
 /// around `now`. Uses `i128` arithmetic so no realistic `u64` millisecond
@@ -1147,6 +1227,133 @@ mod tests {
         assert_eq!(
             proof_is_fresh(issued as u64, now),
             Err(AuthorizationDenialReason::ProofTooFarInFuture)
+        );
+    }
+
+    #[test]
+    fn replay_valid_until_covers_every_now_for_which_the_proof_stays_fresh() {
+        // A proof issued at the maximum accepted future skew: its replay
+        // deadline must sit strictly past the last `now` at which
+        // `proof_is_fresh` still accepts it.
+        let base = 1_700_000_000_000i64;
+        let issued = (base + PROOF_FRESHNESS_FUTURE_SKEW_MILLIS) as u64;
+        let deadline = proof_replay_valid_until_millis(issued);
+
+        // At the deadline instant the proof is still (just) fresh.
+        let at_deadline = DateTime::from_timestamp_millis(deadline as i64).unwrap();
+        assert_eq!(proof_is_fresh(issued, at_deadline), Ok(()));
+
+        // One millisecond past the deadline it can no longer be fresh for
+        // any `now` — so the replay entry may finally be evicted.
+        let past_deadline = DateTime::from_timestamp_millis(deadline as i64 + 1).unwrap();
+        assert_eq!(
+            proof_is_fresh(issued, past_deadline),
+            Err(AuthorizationDenialReason::ProofTooStale)
+        );
+    }
+
+    // -- Current data-plane operation eligibility ---------------------------
+
+    use crate::artifact::ArtifactState;
+
+    #[test]
+    fn terminal_artifact_denies_every_operation() {
+        for state in [ArtifactState::Verified, ArtifactState::Failed] {
+            for op in [
+                AuthorizationOperation::ChunkUpload,
+                AuthorizationOperation::ResumeDiscovery,
+                AuthorizationOperation::SealManifest,
+            ] {
+                assert_eq!(
+                    data_plane_operation_is_current(op, state, true, true),
+                    Err(AuthorizationDenialReason::OperationNotCurrentlyEligible),
+                    "{op:?} against {state:?} must be denied"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_unsealed_manifest_permits_chunk_upload_for_any_index() {
+        // new index (no durable identity) and known index alike
+        for known in [false, true] {
+            assert_eq!(
+                data_plane_operation_is_current(
+                    AuthorizationOperation::ChunkUpload,
+                    ArtifactState::Incomplete,
+                    false,
+                    known,
+                ),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_sealed_manifest_permits_only_a_known_chunk_index() {
+        assert_eq!(
+            data_plane_operation_is_current(
+                AuthorizationOperation::ChunkUpload,
+                ArtifactState::Incomplete,
+                true,
+                true,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            data_plane_operation_is_current(
+                AuthorizationOperation::ChunkUpload,
+                ArtifactState::Incomplete,
+                true,
+                false,
+            ),
+            Err(AuthorizationDenialReason::OperationNotCurrentlyEligible)
+        );
+    }
+
+    #[test]
+    fn incomplete_artifact_always_permits_resume_and_seal() {
+        for sealed in [false, true] {
+            for op in [
+                AuthorizationOperation::ResumeDiscovery,
+                AuthorizationOperation::SealManifest,
+            ] {
+                assert_eq!(
+                    data_plane_operation_is_current(op, ArtifactState::Incomplete, sealed, false),
+                    Ok(())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_verification_permits_seal_and_resume_but_never_chunk_upload() {
+        assert_eq!(
+            data_plane_operation_is_current(
+                AuthorizationOperation::SealManifest,
+                ArtifactState::PendingVerification,
+                true,
+                false,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            data_plane_operation_is_current(
+                AuthorizationOperation::ResumeDiscovery,
+                ArtifactState::PendingVerification,
+                true,
+                false,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            data_plane_operation_is_current(
+                AuthorizationOperation::ChunkUpload,
+                ArtifactState::PendingVerification,
+                true,
+                true,
+            ),
+            Err(AuthorizationDenialReason::OperationNotCurrentlyEligible)
         );
     }
 }

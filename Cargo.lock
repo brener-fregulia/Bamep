@@ -134,6 +134,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "url",
  "uuid",
 ]
 
@@ -142,17 +143,22 @@ name = "bamep-simulator"
 version = "0.1.0"
 dependencies = [
  "bamep-agent-protocol",
+ "bamep-domain",
  "bamep-server",
  "bamep-trusted-bootstrap",
  "base64",
+ "ed25519-dalek",
  "futures-util",
+ "rand 0.8.7",
  "rcgen",
  "rustls",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "uuid",
 ]
 
 [[package]]

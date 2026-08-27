@@ -150,7 +150,12 @@ async fn dispatched_transfer_fixture(pool: &PgPool, signal: &str) -> DispatchedT
         ResourceKind::new("network"),
         10,
     )]));
-    let dispatch = TransferDispatchService::new(Arc::clone(&job_repo), arbiter);
+    let dispatch = TransferDispatchService::new(Arc::clone(&job_repo), Arc::clone(&arbiter));
+    let evidence = bamep_server::application::ActionEvidenceService::new(
+        Arc::clone(&job_repo) as Arc<dyn bamep_server::ports::JobRepository>,
+        Arc::new(bamep_server::runtime::reservation_registry::AttemptReservationRegistry::new()),
+        arbiter,
+    );
 
     let now = Utc::now();
     let boot_nonce = bamep_domain::BootNonce::generate().expect("OS CSPRNG must be available");
@@ -209,6 +214,18 @@ async fn dispatched_transfer_fixture(pool: &PgPool, signal: &str) -> DispatchedT
     };
     let action_id = ProtocolId::from_uuid(outcome.attempt.action_id.0)
         .expect("a Domain ActionId is always a valid UUID v4");
+
+    // `m0-agent-protocol-contract.md` "Transfer authorization": the request
+    // is valid only after `ActionAck{outcome: Accepted}` — process it so the
+    // Attempt is durably `InProgress` before the WSS authorization request.
+    evidence
+        .apply(
+            action_id,
+            endpoint_id,
+            bamep_domain::ActionEvidence::AckAccepted,
+        )
+        .await
+        .expect("ActionAck{Accepted} advances the Attempt to InProgress");
 
     DispatchedTransfer {
         endpoint_id,

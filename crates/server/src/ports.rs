@@ -1348,6 +1348,19 @@ pub trait TransferRepository: Send + Sync {
 pub struct AuthorizationDurableState {
     pub transfer: Transfer,
     pub artifact: Artifact,
+    /// The owning Artifact's `ChunkManifest`, read in the *same* locked
+    /// snapshot as `transfer`/`artifact`/`attempt`/`endpoint` (Issue #38
+    /// correction §11–§12): whether it is sealed, and which `chunk_index`
+    /// values already carry a durable expected identity, decides current
+    /// data-plane operation eligibility
+    /// (`bamep_domain::data_plane_operation_is_current`) and supplies the
+    /// `expected_chunk_digest` the Worker UDS decision must carry for an
+    /// approved `chunk_upload` of an already-recorded chunk.
+    pub manifest: bamep_domain::ChunkManifest,
+    /// The `chunk_index` values `bamepd` durably holds and has individually
+    /// verified, from the same locked snapshot — never Worker-local
+    /// transient state.
+    pub held_chunk_indices: BTreeSet<ChunkIndex>,
     pub attempt: Option<Attempt>,
     pub endpoint: EndpointAggregate,
 }

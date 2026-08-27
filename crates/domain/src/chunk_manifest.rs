@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::ArtifactId;
@@ -65,6 +66,18 @@ impl Digest {
 
     pub fn into_bytes(self) -> Vec<u8> {
         self.0
+    }
+
+    /// The canonical wire encoding of this digest: the raw digest-algorithm
+    /// output as canonical RFC 4648 base64url without padding (43 ASCII
+    /// characters for a 32-byte SHA-256 digest) —
+    /// `m0-data-plane-and-storage-contracts.md` "Chunk manifest": "Every
+    /// digest value on the wire ... is the raw digest-algorithm output ...
+    /// encoded as canonical RFC 4648 base64url without padding". Used for the
+    /// `expected_chunk_digest` the Worker UDS `AuthorizationDecision` carries
+    /// (Issue #38).
+    pub fn to_wire_value(&self) -> String {
+        URL_SAFE_NO_PAD.encode(&self.0)
     }
 }
 

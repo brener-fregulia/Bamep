@@ -27,7 +27,6 @@ use bamep_domain::{
     ProofId, ProofPublicKey, ProofSignature, ProofTranscriptFields, RequestedOperation, Transfer,
     TransferDirection, TransferDispatchInputs, TransferDispatchRejection, TransferId,
     TrustedBootstrapState, DEFAULT_CAPABILITY_TTL_MILLIS, DEFAULT_CREDENTIAL_TTL,
-    PROOF_FRESHNESS_PAST_WINDOW_MILLIS,
 };
 use bamep_trusted_bootstrap::{AcceptedSiteKeys, BootstrapAssertion, ServerCertFingerprint};
 use chrono::{DateTime, Duration, Utc};
@@ -2432,18 +2431,20 @@ impl TransferAuthorizationService {
             return Ok(TransferAuthorizationOutcome::Denied);
         };
 
-        // Only a currently active (non-terminal, non-`AwaitingReconciliation`)
-        // Attempt is authorization-eligible — `AwaitingReconciliation` and
-        // every terminal state (`Succeeded`/`Failed`/`Cancelled`/`Rejected`/
-        // `Indeterminate`) are denied (Issue #38 "Terminal / reconciliation
-        // safety"; `m0-data-plane-and-storage-contracts.md`: "An Attempt in
-        // `AwaitingReconciliation` may continue only when the Job lifecycle
-        // contract still permits it" — no such explicit permission mechanism
-        // exists yet, so the fail-closed default applies).
-        if !matches!(
-            attempt.state,
-            AttemptState::Dispatched | AttemptState::InProgress
-        ) {
+        // The owning Attempt must be exactly `InProgress` — the durable phase
+        // fact that the Agent's `ActionAck{outcome: Accepted}` has been
+        // processed (`Dispatched --ActionAck{Accepted}--> InProgress`,
+        // `bamep_domain::apply_action_evidence`). `m0-agent-protocol-contract.md`
+        // "Transfer authorization": a `TransferAuthorizationRequest` is valid
+        // only "After `SessionEstablished` and `ActionAck{outcome: Accepted}`
+        // for a data-plane transfer action" — so a still-`Dispatched` Attempt
+        // is too early and is denied. `AwaitingReconciliation` and every
+        // terminal state (`Succeeded`/`Failed`/`Cancelled`/`Rejected`/
+        // `Indeterminate`) are denied too: no Job-lifecycle mechanism yet
+        // permits continuation from `AwaitingReconciliation`
+        // (`m0-data-plane-and-storage-contracts.md` "Disconnect and restart"),
+        // so the fail-closed default applies.
+        if attempt.state != AttemptState::InProgress {
             return Ok(TransferAuthorizationOutcome::Denied);
         }
 
@@ -2472,7 +2473,13 @@ impl TransferAuthorizationService {
             epoch: self.capabilities.epoch(),
         };
         self.capabilities.evict_expired(now);
-        self.capabilities.issue(capability_id, binding);
+        if self.capabilities.issue(capability_id, binding).is_err() {
+            // The bounded issued-capability store is saturated with live
+            // capabilities. Fail closed as the single generic denial —
+            // capacity exhaustion is never an externally enumerable reason
+            // (Issue #38 correction §7/§25).
+            return Ok(TransferAuthorizationOutcome::Denied);
+        }
 
         Ok(TransferAuthorizationOutcome::Granted {
             token: token.as_str().to_string(),
@@ -2493,16 +2500,25 @@ impl TransferAuthorizationService {
         &self,
         input: WorkerAuthorizationQueryInput,
     ) -> Result<WorkerAuthorizationOutcome, ApplicationError> {
+        // Logical ordering (Issue #38 correction §5): parse/lookup ->
+        // capability current/expiry/binding -> proof structural parse ->
+        // freshness -> signature -> current durable authorization (including
+        // operation eligibility) -> only then the atomic replay check+insert
+        // -> approved. A request that would otherwise be denied never
+        // permanently consumes its `proof_id`.
+
+        // 1. token / capability parse and lookup
         let capability_id = CapabilityId::from_token_bytes(input.token.as_bytes());
         let Some(binding) = self.capabilities.lookup(&capability_id) else {
             return Ok(WorkerAuthorizationOutcome::Denied);
         };
 
         let now = self.clock.now();
+
+        // 2. capability current / expiry / epoch and operation scope binding
         if capability_is_current(&binding, now, self.capabilities.epoch()).is_err() {
             return Ok(WorkerAuthorizationOutcome::Denied);
         }
-
         let requested = RequestedOperation {
             operation: input.operation,
             transfer_id: TransferId(input.transfer_id),
@@ -2514,6 +2530,7 @@ impl TransferAuthorizationService {
             return Ok(WorkerAuthorizationOutcome::Denied);
         }
 
+        // 3. proof structural parsing
         let Ok(proof_id) = ProofId::parse_wire_value(&input.proof_id) else {
             return Ok(WorkerAuthorizationOutcome::Denied);
         };
@@ -2521,6 +2538,12 @@ impl TransferAuthorizationService {
             return Ok(WorkerAuthorizationOutcome::Denied);
         };
 
+        // 4. freshness
+        if proof_is_fresh(input.issued_at_millis, now).is_err() {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        }
+
+        // 5. signature over the independently reconstructed canonical transcript
         let transcript = build_proof_transcript(
             &capability_id,
             &ProofTranscriptFields {
@@ -2537,26 +2560,10 @@ impl TransferAuthorizationService {
             return Ok(WorkerAuthorizationOutcome::Denied);
         }
 
-        if proof_is_fresh(input.issued_at_millis, now).is_err() {
-            return Ok(WorkerAuthorizationOutcome::Denied);
-        }
-
-        // Atomic check+insert (Issue #38 "concurrent duplicate proof use
-        // cannot both succeed"): retained for at least the freshness window,
-        // so a replay from within that window is always caught.
-        let retention = Duration::milliseconds(PROOF_FRESHNESS_PAST_WINDOW_MILLIS);
-        if self
-            .replay
-            .check_and_insert(proof_id, now, retention)
-            .is_err()
-        {
-            return Ok(WorkerAuthorizationOutcome::Denied);
-        }
-
-        // Current durable state, re-checked fresh for this exact request —
-        // never merely the capability-issuance-time snapshot (Issue #38
-        // "Current attempt / transfer state"; "Credential active /
-        // revocation").
+        // 6. current durable authorization, re-read fresh for this exact
+        // request in one consistent locked snapshot — never merely the
+        // capability-issuance-time snapshot (Issue #38 "Current attempt /
+        // transfer state"; "Credential active / revocation").
         let Some(state) = self
             .repo
             .load_authorization_state(requested.transfer_id)
@@ -2576,18 +2583,79 @@ impl TransferAuthorizationService {
         if attempt.id != binding.attempt_id {
             return Ok(WorkerAuthorizationOutcome::Denied);
         }
-        if !matches!(
-            attempt.state,
-            AttemptState::Dispatched | AttemptState::InProgress
-        ) {
+        // Only an `InProgress` Attempt (post-`ActionAck{Accepted}`) may
+        // continue: a regression to `Dispatched`, `AwaitingReconciliation`,
+        // or any terminal state fails closed (Issue #38 correction §8–§9;
+        // `m0-data-plane-and-storage-contracts.md` "Disconnect and restart").
+        if attempt.state != AttemptState::InProgress {
             return Ok(WorkerAuthorizationOutcome::Denied);
         }
         if state.endpoint.credential.dimension(now) != CredentialDimension::CredentialActive {
             return Ok(WorkerAuthorizationOutcome::Denied);
         }
 
+        // Current data-plane operation eligibility against the Artifact/
+        // manifest state in this same snapshot (Issue #38 correction
+        // §10–§11). A `chunk_index` beyond the manifest's 32-bit index space
+        // can never have a durable expected identity — fail closed rather
+        // than treat it as a fresh continuation.
+        let chunk_index_u32 = match input.chunk_index {
+            Some(index) => match u32::try_from(index) {
+                Ok(index) => Some(bamep_domain::ChunkIndex(index)),
+                Err(_) => return Ok(WorkerAuthorizationOutcome::Denied),
+            },
+            None => None,
+        };
+        let expected_chunk =
+            chunk_index_u32.and_then(|index| state.manifest.expected_chunk(index).cloned());
+        if bamep_domain::data_plane_operation_is_current(
+            input.operation,
+            state.artifact.state,
+            state.manifest.sealed,
+            expected_chunk.is_some(),
+        )
+        .is_err()
+        {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        }
+
+        // 7. only now that the request would otherwise be approved: the
+        // atomic replay check+insert. Retained until the proof's own signed
+        // freshness deadline (`issued_at + PROOF_FRESHNESS_PAST_WINDOW`), so
+        // every `proof_id` that could still pass `proof_is_fresh` — including
+        // one issued at the maximum accepted future skew — stays
+        // replay-protected (Issue #38 correction §3–§4). Both a replay and a
+        // bounded-capacity saturation fail closed as the same generic denial
+        // (§6).
+        let replay_valid_until = DateTime::from_timestamp_millis(
+            bamep_domain::proof_replay_valid_until_millis(input.issued_at_millis)
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+        )
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        if self
+            .replay
+            .check_and_insert(proof_id, now, replay_valid_until)
+            .is_err()
+        {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        }
+
+        // 8. approved. For an approved `chunk_upload` whose `chunk_index`
+        // already carries a durable expected identity, carry that recorded
+        // expected digest so the Worker can enforce the manifest identity
+        // (`m1-worker-data-plane-control-contract.md` "Authorization query /
+        // decision"). #38 only *carries* the expected digest; the Worker's
+        // comparison against the Agent-declared digest and the resulting
+        // HTTP `409` is #39 (correction §14).
+        let expected_chunk_digest = match input.operation {
+            AuthorizationOperation::ChunkUpload => {
+                expected_chunk.map(|chunk| chunk.digest.to_wire_value())
+            }
+            AuthorizationOperation::ResumeDiscovery | AuthorizationOperation::SealManifest => None,
+        };
+
         Ok(WorkerAuthorizationOutcome::Approved {
-            expected_chunk_digest: None,
+            expected_chunk_digest,
         })
     }
 }

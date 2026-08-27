@@ -377,8 +377,10 @@ for an existing Endpoint/Job/JobStep correlation with no Attempt — a `Transfer
 no JobStep is transitioned, and the destructive-operation gate is never evaluated by this path.
 Binding an existing Transfer to an owning Attempt exactly once, and rejecting a conflicting
 rebind, is implemented and tested; #40 (below) is the first consumer that actually commits that
-owning Attempt. Agent Protocol transfer authorization (#38), the Worker HTTPS chunk transport
-(#39), and end-to-end Simulator integration (#19) remain unimplemented. The isolated Worker
+owning Attempt. Agent Protocol transfer authorization (#38) is implemented — see
+"Sender-constrained transfer authorization" below. The Worker HTTPS chunk transport (#39) and
+the end-to-end Simulator RF-005 vertical (#19 — real WSS dispatch → authorization → Worker
+HTTPS → Artifact outcome → terminal action/workflow) remain unimplemented. The isolated Worker
 process/control boundary itself (#37) is implemented — see "Implemented isolated Worker runtime
 and control boundary" below.
 
@@ -555,35 +557,59 @@ rejects any capability whose stored epoch does not match the store's current one
 store itself is also never reconstructed across a restart, a fresh `bamepd` process both starts
 with an empty capability store *and* mints a new epoch — two independent reasons a pre-restart
 capability can never become valid again (`m0-data-plane-and-storage-contracts.md` "Server
-restart"). `ReplayCache::check_and_insert` performs its lookup-and-insert as one `HashMap::entry`
-decision under a single lock acquisition (never a separate `contains`-then-`insert`), and
-opportunistically evicts entries older than the caller-supplied retention window on every call,
-keeping memory bounded by that window rather than by daemon uptime.
+restart").
+
+Both Runtime Services are **bounded by explicit finite capacity** as well as by time.
+`ReplayCache::check_and_insert` performs its lookup-and-insert as one `HashMap::entry` decision
+under a single lock acquisition (never a separate `contains`-then-`insert`); it keys each entry
+by the exact instant past which its proof can no longer satisfy `bamep_domain::proof_is_fresh`
+(`issued_at + PROOF_FRESHNESS_PAST_WINDOW`, from `proof_replay_valid_until_millis`) and evicts
+only genuinely-expired entries — so a proof accepted at the maximum accepted future skew stays
+replay-protected for exactly as long as it could still be freshness-valid, and moving the clock
+backwards only retains entries longer. Beyond that, it carries `DEFAULT_REPLAY_CACHE_CAPACITY`
+(`2^16`) live entries maximum; at saturation a genuinely new `proof_id` is refused
+(fail-closed) rather than evicting a still-live entry. `CapabilityStore` likewise carries
+`DEFAULT_CAPABILITY_STORE_CAPACITY` (`4096`); `issue` evicts expired capabilities first and then
+fails closed if a genuinely new capability would exceed capacity — a live capability is never
+evicted to make room. Both saturations collapse to the single generic denial.
 
 `bamep_server::application::TransferAuthorizationService` is the single Application-layer owner
 of both directions of this boundary, backed by the `TransferAuthorizationRepository` Port
 (`crates/server/src/adapters/postgres/authorization_repository.rs`): `load_authorization_state`
-reads the `transfers`/`artifacts` row pair, the owning `attempts` row (when bound), and the
-`endpoints`/credential row `FOR UPDATE` inside one transaction, then rolls back — a consistent,
-read-only locking snapshot reused identically by both call sites below.
+reads the `transfers`/`artifacts` row pair, the owning Artifact's `chunk_manifests` row and its
+`chunk_identities` (expected-identity + `held` state), the owning `attempts` row (when bound),
+and the `endpoints`/credential row `FOR UPDATE` inside one transaction, then rolls back — a
+consistent, read-only locking snapshot (`AuthorizationDurableState`) reused identically by both
+call sites below.
 
 - `issue` serves the Agent WSS `TransferAuthorizationRequest`
   (`bamep_server::adapters::agent_gateway::AgentControlGateway::handle_transfer_authorization_request`):
-  the authenticated session's `endpoint_id` is authoritative (never the request body); the
-  presented `correlation_id` must equal the durable owning Attempt's `action_id`; the owning
-  Attempt must be `Dispatched` or `InProgress` (a pre-dispatch unbound Transfer, an
-  `AwaitingReconciliation` Attempt, or any terminal Attempt state is denied — no explicit
-  Job-lifecycle permission mechanism for `AwaitingReconciliation` continuation exists yet, so the
-  fail-closed default applies); the Endpoint credential must be `CredentialActive`. Renewal is
-  the same call again with a fresh proof key — it creates nothing, so it composes for free.
+  the authenticated session's `endpoint_id` is authoritative (never the request body). A request
+  with no `correlation_id` is a protocol/phase violation answered with generic `ProtocolError`
+  (never a wire-invalid uncorrelated `TransferAuthorizationDenied`); a syntactically present
+  `correlation_id` must equal the durable owning Attempt's `action_id`, and a denial echoes the
+  presented value without ever revealing the authoritative one. The owning Attempt must be
+  exactly `InProgress` — the durable phase fact that `ActionAck{outcome: Accepted}` has been
+  processed (`m0-agent-protocol-contract.md` "Transfer authorization"); a still-`Dispatched`
+  Attempt is too early, and a pre-dispatch unbound Transfer, an `AwaitingReconciliation`
+  Attempt, or any terminal Attempt state is denied. The Endpoint credential must be
+  `CredentialActive`. Renewal is the same call again with a fresh proof key — it creates
+  nothing, so it composes for free.
 - `decide` serves the Worker UDS `AuthorizationQuery`
-  (`bamep_server::adapters::worker_control_plane`): looks up the capability by
-  `CapabilityId::from_token_bytes`, checks `capability_is_current`/`capability_matches_request`,
-  reconstructs the canonical transcript and verifies the signature against the capability's
-  bound `ProofPublicKey`, checks freshness, performs the atomic replay check-and-insert, and only
-  then **re-reads current durable state** (not the issuance-time snapshot) to re-check
-  Transfer/Attempt/credential validity — so a credential revoked or an Attempt that turned
-  terminal after issuance takes effect on the very next query, not merely on the next issuance.
+  (`bamep_server::adapters::worker_control_plane`), in this order: look up the capability by
+  `CapabilityId::from_token_bytes`; check `capability_is_current`/`capability_matches_request`;
+  parse `proof_id`/`signature`; check freshness; verify the independently reconstructed canonical
+  transcript's signature against the capability's bound `ProofPublicKey`; **re-read current
+  durable state** (not the issuance-time snapshot) and re-check Transfer/Attempt(`InProgress`
+  only)/credential validity plus current data-plane operation eligibility
+  (`bamep_domain::data_plane_operation_is_current` over the Artifact state + manifest sealed
+  flag + whether the `chunk_index` already has a durable expected identity); and **only then**,
+  when the request would otherwise be approved, perform the atomic replay check-and-insert. A
+  request rejected by any earlier check never consumes its `proof_id`. An approved `chunk_upload`
+  whose `chunk_index` is already durably recorded carries that recorded expected digest as
+  `AuthorizationDecision.expected_chunk_digest` (canonical base64url-no-pad); #38 only carries
+  it — the Worker's comparison against the Agent-declared digest and the resulting HTTP `409` is
+  #39.
 
 Both directions collapse every internal denial cause into one generic outcome
 (`TransferAuthorizationOutcome::Denied` / `WorkerAuthorizationOutcome::Denied`) before it
@@ -592,8 +618,9 @@ boundaries. `bamepd`'s composition root (`crates/server/src/bin/bamepd.rs`) now 
 PostgreSQL and constructs one `TransferAuthorizationService` shared by both boundaries — the
 Worker control plane cannot answer `AuthorizationQuery` from current durable state without it,
 so `bamepd` is no longer PostgreSQL-free as the #37 architecture note originally described.
-`BAMEPD_DATABASE_URL` and `BAMEP_DATA_PLANE_BASE_URL` (a plain HTTPS-origin-no-path string,
-validated but not otherwise interpreted) are new required `bamepd` configuration.
+`BAMEPD_DATABASE_URL` and `BAMEP_DATA_PLANE_BASE_URL` are new required `bamepd` configuration;
+`BAMEP_DATA_PLANE_BASE_URL` is parsed with a real URI parser (`url::Url`) and accepted only as
+`https://host[:port]` with no userinfo, path (not even a bare `/`), query, or fragment.
 
 `bamep-agent-protocol` materializes `TransferAuthorizationRequest`/`Grant`/`Denied`
 (`transfer_id`/`action_id` as `ProtocolId`, `token`/`data_plane_base_url` opaque strings,
@@ -616,6 +643,18 @@ connection and fails every awaiting caller closed (`QueryError::Disconnected`); 
 all fails closed immediately (`QueryError::NotConnected`) — Worker can never fabricate an
 `AuthorizationDecision` locally. This mechanism is provisioned but not yet driven by production
 HTTP traffic — that remains #39's responsibility.
+
+`bamep-simulator` carries the **Agent-side** half of this boundary, since M1's Agent
+participant is the Simulated Endpoint: `bamep_simulator::transfer_authorization` independently
+generates the ephemeral Ed25519 proof keypair (`AgentProofKey`, private half redacted and never
+persisted, regenerated on restart/renewal), exposes only the canonical `proof_public_key` wire
+form, computes `CapabilityId = SHA-256(token)` itself, mints a fresh `proof_id` per operation
+attempt, and builds and signs its own copy of the exact 137-byte transcript
+(`build_proof_transcript`) — it does **not** call `bamep-server`/`bamep-domain`, so
+`bamepd`'s verifier reconstructing and accepting that signature is real cross-implementation
+interoperability evidence (`crates/simulator/tests/data_plane_proof_interop.rs`). This is the
+reusable Agent proof/authorization participant #19 will later compose into a real WSS+HTTPS
+transfer; #19 still owns that final composition.
 
 ## Maintenance rule
 
