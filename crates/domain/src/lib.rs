@@ -27,6 +27,7 @@ pub mod presented_credential;
 pub mod reconciliation;
 pub mod target_fingerprint;
 pub mod transfer;
+pub mod transfer_authorization;
 pub mod transfer_dispatch;
 pub mod transitions;
 
@@ -77,6 +78,17 @@ pub use target_fingerprint::TargetFingerprint;
 pub use transfer::{
     bind_attempt, create_transfer_context, SourceProvenance, Transfer, TransferBindingError,
     TransferContext, TransferDirection, TransferId,
+};
+pub use transfer_authorization::{
+    build_proof_transcript, capability_is_current, capability_matches_request, proof_is_fresh,
+    verify_proof_signature, AuthorizationDenialReason, AuthorizationOperation, CapabilityBinding,
+    CapabilityId, CapabilityToken, ProcessAuthorizationEpoch, ProofId, ProofIdError,
+    ProofKeyThumbprint, ProofPublicKey, ProofPublicKeyError, ProofSignature, ProofSignatureError,
+    ProofTranscriptFields, RequestedOperation, CAPABILITY_ID_BYTES, CAPABILITY_TOKEN_SECRET_BYTES,
+    DEFAULT_CAPABILITY_TTL_MILLIS, PROOF_FRESHNESS_FUTURE_SKEW_MILLIS,
+    PROOF_FRESHNESS_PAST_WINDOW_MILLIS, PROOF_ID_BYTES, PROOF_ID_WIRE_LEN,
+    PROOF_KEY_THUMBPRINT_BYTES, PROOF_PUBLIC_KEY_BYTES, PROOF_PUBLIC_KEY_WIRE_LEN,
+    PROOF_SIGNATURE_BYTES, PROOF_SIGNATURE_WIRE_LEN, PROOF_TRANSCRIPT_LEN,
 };
 pub use transfer_dispatch::{
     evaluate_transfer_dispatch, TransferDispatchDenial, TransferDispatchInputs,

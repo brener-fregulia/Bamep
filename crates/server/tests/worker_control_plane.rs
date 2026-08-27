@@ -19,7 +19,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bamep_server::adapters::worker_control_plane::{WorkerControlPlane, WorkerControlPlaneError};
+use bamep_server::application::TransferAuthorizationService;
+use bamep_server::ports::{
+    AuthorizationDurableState, RepositoryError, TransferAuthorizationRepository,
+};
+use bamep_server::runtime::capability_store::CapabilityStore;
+use bamep_server::runtime::replay_cache::ReplayCache;
 use bamep_server::runtime::worker_authority::{WorkerAuthorityRegistry, WorkerControlState};
 use bamep_worker_protocol::{
     receive, send, ProtocolErrorMessage, WorkerHelloMessage, WorkerProtocolMessage,
@@ -28,6 +35,33 @@ use tokio::net::UnixStream;
 use tokio::sync::watch;
 use tokio::time::timeout;
 use uuid::Uuid;
+
+/// This file exercises only #37-scope handshake/generation/socket semantics
+/// — no test here sends a real `AuthorizationQuery` — so a minimal fake that
+/// always reports "unknown transfer" is sufficient to construct the real
+/// `TransferAuthorizationService` `WorkerControlPlane::run` now requires.
+/// Real Worker UDS authorization-decision behavior is covered by
+/// `worker_authorization_query.rs`.
+struct AlwaysUnknownTransferAuthorizationRepository;
+
+#[async_trait]
+impl TransferAuthorizationRepository for AlwaysUnknownTransferAuthorizationRepository {
+    async fn load_authorization_state(
+        &self,
+        _transfer_id: bamep_domain::TransferId,
+    ) -> Result<Option<AuthorizationDurableState>, RepositoryError> {
+        Ok(None)
+    }
+}
+
+fn fake_transfer_authorization_service() -> Arc<TransferAuthorizationService> {
+    Arc::new(TransferAuthorizationService::new(
+        Arc::new(AlwaysUnknownTransferAuthorizationRepository),
+        Arc::new(CapabilityStore::new()),
+        Arc::new(ReplayCache::new()),
+        "https://server.example:8443",
+    ))
+}
 
 struct TempSocketPath(PathBuf);
 
@@ -99,8 +133,13 @@ async fn successful_handshake_makes_authority_available() {
     let socket = TempSocketPath::fresh();
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx,
+    ));
 
     let (_stream, worker_instance_id) = handshake(&socket.0).await;
 
@@ -123,8 +162,13 @@ async fn disconnect_invalidates_authority_immediately() {
     let socket = TempSocketPath::fresh();
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx,
+    ));
 
     let (stream, _worker_instance_id) = handshake(&socket.0).await;
     wait_until(&registry, |state| state.is_available()).await;
@@ -142,8 +186,13 @@ async fn reconnect_after_disconnect_completes_a_fresh_handshake_with_a_new_gener
     let socket = TempSocketPath::fresh();
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx,
+    ));
 
     let (stream1, _id1) = handshake(&socket.0).await;
     wait_until(&registry, |state| state.is_available()).await;
@@ -161,8 +210,13 @@ async fn a_message_before_worker_hello_is_a_pre_handshake_violation() {
     let socket = TempSocketPath::fresh();
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx,
+    ));
 
     let mut stream = UnixStream::connect(&socket.0).await.expect("connect");
     // Anything other than WorkerHello as the first message is a protocol
@@ -205,8 +259,13 @@ async fn an_unknown_top_level_message_type_receives_a_protocol_error_and_never_r
     let socket = TempSocketPath::fresh();
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx,
+    ));
 
     let mut stream = UnixStream::connect(&socket.0).await.expect("connect");
     let raw = format!(
@@ -250,8 +309,13 @@ async fn incompatible_protocol_version_is_rejected_and_never_registers_a_generat
     let socket = TempSocketPath::fresh();
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx,
+    ));
 
     let mut stream = UnixStream::connect(&socket.0).await.expect("connect");
     let mut hello = WorkerHelloMessage::new(Uuid::new_v4());
@@ -286,8 +350,13 @@ async fn worker_hello_with_wrong_envelope_protocol_version_never_registers_a_gen
     let socket = TempSocketPath::fresh();
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx,
+    ));
 
     let mut stream = UnixStream::connect(&socket.0).await.expect("connect");
     let mut hello = WorkerHelloMessage::new(Uuid::new_v4());
@@ -317,8 +386,13 @@ async fn worker_hello_with_non_v4_message_id_never_registers_a_generation() {
     let socket = TempSocketPath::fresh();
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx,
+    ));
 
     let mut stream = UnixStream::connect(&socket.0).await.expect("connect");
     let mut hello = WorkerHelloMessage::new(Uuid::new_v4());
@@ -349,8 +423,13 @@ async fn worker_hello_with_non_v4_worker_instance_id_never_registers_a_generatio
     let socket = TempSocketPath::fresh();
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx,
+    ));
 
     let mut stream = UnixStream::connect(&socket.0).await.expect("connect");
     let hello = WorkerHelloMessage::new(Uuid::nil());
@@ -377,8 +456,13 @@ async fn an_overlapping_second_handshake_supersedes_the_first_and_its_later_disc
     let socket = TempSocketPath::fresh();
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx,
+    ));
 
     let (stream_a, id_a) = handshake(&socket.0).await;
     wait_until(&registry, |state| state.is_available()).await;
@@ -423,8 +507,9 @@ async fn controlled_shutdown_removes_the_socket_file() {
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     assert!(socket.0.exists());
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(registry, shutdown_rx));
+    let run_task = tokio::spawn(plane.run(registry, transfer_authorization, shutdown_rx));
 
     shutdown_tx.send(true).expect("send shutdown");
     let result = timeout(TEST_TIMEOUT, run_task)
@@ -461,10 +546,11 @@ async fn a_still_live_socket_is_never_unlinked_or_replaced() {
     let socket = TempSocketPath::fresh();
     let first = WorkerControlPlane::bind(&socket.0).expect("first bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     // Keep the first control plane genuinely running (a live listener),
     // never dropped before the second bind attempt below.
-    let first_run_task = tokio::spawn(first.run(registry, shutdown_rx));
+    let first_run_task = tokio::spawn(first.run(registry, transfer_authorization, shutdown_rx));
 
     let err = WorkerControlPlane::bind(&socket.0)
         .err()
@@ -585,6 +671,7 @@ async fn controlled_shutdown_does_not_remove_a_pathname_replaced_after_bind() {
     let socket = TempSocketPath::fresh();
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Simulate the pathname being replaced by an unrelated object after
@@ -593,7 +680,7 @@ async fn controlled_shutdown_does_not_remove_a_pathname_replaced_after_bind() {
     std::fs::remove_file(&socket.0).expect("remove original socket file");
     std::fs::write(&socket.0, b"unrelated replacement content").expect("write replacement file");
 
-    let run_task = tokio::spawn(plane.run(registry, shutdown_rx));
+    let run_task = tokio::spawn(plane.run(registry, transfer_authorization, shutdown_rx));
     shutdown_tx.send(true).expect("send shutdown");
     let result = timeout(TEST_TIMEOUT, run_task)
         .await
@@ -610,8 +697,13 @@ async fn controlled_shutdown_disconnects_an_active_connection_before_returning()
     let socket = TempSocketPath::fresh();
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx,
+    ));
 
     let (mut stream, _worker_instance_id) = handshake(&socket.0).await;
     wait_until(&registry, |state| state.is_available()).await;
@@ -658,8 +750,13 @@ async fn repeated_connect_disconnect_cycles_keep_the_listener_promptly_responsiv
     let socket = TempSocketPath::fresh();
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx,
+    ));
 
     for _ in 0..200 {
         let (stream, _worker_instance_id) = handshake(&socket.0).await;

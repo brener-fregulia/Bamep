@@ -14,13 +14,19 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use super::authority::AuthorityTracker;
+use super::authorization_client::PendingQuery;
 
 #[cfg(unix)]
 mod imp {
     use bamep_worker_protocol::{receive, send, WorkerHelloMessage, WorkerProtocolMessage};
     use tokio::net::UnixStream;
+    use tokio::sync::{mpsc, watch};
 
     use super::*;
+
+    /// Bounded so a runaway caller cannot queue unbounded outstanding
+    /// queries against one connection generation.
+    const PENDING_QUERY_CHANNEL_CAPACITY: usize = 32;
 
     #[derive(Debug, thiserror::Error)]
     enum HandshakeError {
@@ -73,11 +79,16 @@ mod imp {
     /// One connect+handshake+connection lifetime. Returns once authority is
     /// lost (connect failure, rejected/malformed handshake, or the
     /// connection ending) so the caller's reconnect loop can apply its
-    /// bounded delay.
+    /// bounded delay. `publisher` announces this generation's fresh
+    /// request channel the instant the handshake succeeds, and clears it
+    /// back to `None` before returning — no caller can ever observe a
+    /// request channel for a generation that has already ended (Issue #38
+    /// "Generation-scoped UDS request/response routing").
     async fn run_one_connection(
         uds_path: &std::path::Path,
         worker_instance_id: Uuid,
         tracker: &AuthorityTracker,
+        publisher: &watch::Sender<Option<mpsc::Sender<PendingQuery>>>,
     ) {
         tracker.set_connecting();
         let stream = match UnixStream::connect(uds_path).await {
@@ -98,14 +109,59 @@ mod imp {
         };
 
         tracker.set_ready();
+        let (request_tx, mut request_rx) = mpsc::channel(PENDING_QUERY_CHANNEL_CAPACITY);
+        let _ = publisher.send(Some(request_tx));
 
-        // Issue #37 defines no post-handshake business message Worker
-        // consumes yet; block here so any disconnect (EOF, I/O error, or a
-        // malformed/unexpected message from bamepd) is observed immediately
-        // and authority becomes unavailable without delay
-        // (`m1-worker-data-plane-control-contract.md` "IPC loss is
-        // fail-closed").
-        let _ = receive(&mut stream).await;
+        // This connection task is the sole owner of `stream`'s serialized
+        // I/O for the rest of this generation (Issue #38 "Connection task
+        // ownership"): every send and every matching receive happens here,
+        // sequentially, one outstanding query at a time. `bamepd` never
+        // sends anything unsolicited on this boundary
+        // (`m1-worker-data-plane-control-contract.md`), so a frame observed
+        // while no query is outstanding is itself already a protocol
+        // violation/disconnect signal, exactly like Issue #37's original
+        // idle-read behavior below.
+        loop {
+            tokio::select! {
+                pending = request_rx.recv() => {
+                    let Some(pending) = pending else {
+                        // No caller can hold a `Sender` once `publisher`
+                        // stops advertising one for this generation; treated
+                        // defensively as connection end.
+                        break;
+                    };
+                    let sent_id = pending.message.envelope.message_id;
+                    if send(&mut stream, &WorkerProtocolMessage::AuthorizationQuery(pending.message))
+                        .await
+                        .is_err()
+                    {
+                        // `pending.reply` is dropped here, surfacing
+                        // `QueryError::Disconnected` to the caller — never a
+                        // fabricated decision.
+                        break;
+                    }
+                    match receive(&mut stream).await {
+                        Ok(WorkerProtocolMessage::AuthorizationDecision(decision))
+                            if decision.is_reply_to(sent_id) =>
+                        {
+                            let _ = pending.reply.send(decision);
+                        }
+                        // Anything else — a stale/uncorrelated response, an
+                        // unexpected message type, or a transport error —
+                        // cannot be trusted as this query's answer. Drop
+                        // `pending.reply` (surfacing `Disconnected`) and end
+                        // this generation rather than guessing.
+                        _ => break,
+                    }
+                }
+                idle = receive(&mut stream) => {
+                    let _ = idle;
+                    break;
+                }
+            }
+        }
+
+        let _ = publisher.send(None);
         tracker.set_disconnected();
     }
 
@@ -117,9 +173,10 @@ mod imp {
         reconnect_delay: Duration,
         worker_instance_id: Uuid,
         tracker: AuthorityTracker,
+        publisher: watch::Sender<Option<mpsc::Sender<PendingQuery>>>,
     ) -> std::convert::Infallible {
         loop {
-            run_one_connection(&uds_path, worker_instance_id, &tracker).await;
+            run_one_connection(&uds_path, worker_instance_id, &tracker, &publisher).await;
             tokio::time::sleep(reconnect_delay).await;
         }
     }
@@ -127,6 +184,8 @@ mod imp {
 
 #[cfg(not(unix))]
 mod imp {
+    use tokio::sync::{mpsc, watch};
+
     use super::*;
 
     /// Unix Domain Sockets are not available on this platform. Linux is the
@@ -139,8 +198,10 @@ mod imp {
         _reconnect_delay: Duration,
         _worker_instance_id: Uuid,
         tracker: AuthorityTracker,
+        publisher: watch::Sender<Option<mpsc::Sender<PendingQuery>>>,
     ) -> std::convert::Infallible {
         tracker.set_disconnected();
+        let _ = publisher.send(None);
         std::future::pending().await
     }
 }

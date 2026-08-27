@@ -134,13 +134,18 @@ mod imp {
     use std::time::Duration;
 
     use bamep_worker_protocol::{
-        receive, send, DecodeError, HandshakeRejectedMessage, ProtocolErrorMessage, ReceiveError,
-        ServerHelloMessage, WorkerProtocolMessage,
+        receive, send, AuthorizationDecisionMessage, AuthorizationQueryMessage, DecodeError,
+        HandshakeRejectedMessage, ProtocolErrorMessage, ReceiveError, ServerHelloMessage,
+        WorkerProtocolMessage,
     };
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::watch;
     use tokio::task::JoinSet;
     use uuid::Uuid;
+
+    use crate::application::{
+        TransferAuthorizationService, WorkerAuthorizationOutcome, WorkerAuthorizationQueryInput,
+    };
 
     use super::*;
 
@@ -310,6 +315,7 @@ mod imp {
         pub async fn run(
             self,
             registry: Arc<WorkerAuthorityRegistry>,
+            transfer_authorization: Arc<TransferAuthorizationService>,
             mut shutdown: watch::Receiver<bool>,
         ) -> Result<(), WorkerControlPlaneError> {
             let mut tasks: JoinSet<()> = JoinSet::new();
@@ -322,8 +328,14 @@ mod imp {
                             Ok((stream, _addr)) => {
                                 consecutive_accept_errors = 0;
                                 let registry = Arc::clone(&registry);
+                                let transfer_authorization = Arc::clone(&transfer_authorization);
                                 let conn_shutdown = shutdown.clone();
-                                tasks.spawn(handle_connection(stream, registry, conn_shutdown));
+                                tasks.spawn(handle_connection(
+                                    stream,
+                                    registry,
+                                    transfer_authorization,
+                                    conn_shutdown,
+                                ));
                             }
                             Err(source) => {
                                 consecutive_accept_errors += 1;
@@ -442,6 +454,7 @@ mod imp {
     async fn handle_connection(
         mut stream: UnixStream,
         registry: Arc<WorkerAuthorityRegistry>,
+        transfer_authorization: Arc<TransferAuthorizationService>,
         mut shutdown: watch::Receiver<bool>,
     ) {
         let worker_instance_id = tokio::select! {
@@ -460,43 +473,133 @@ mod imp {
             generation,
         };
 
-        // Issue #37 defines no post-handshake business message `bamepd`
-        // consumes yet; any received message is unexpected. Detecting
-        // that, an I/O error, EOF, or controlled shutdown here is exactly
-        // the fail-closed behavior (`m1-worker-data-plane-control-contract.md`
-        // "IPC loss is fail-closed"). `_guard` invalidates this generation
-        // on every exit path, including cancellation.
-        tokio::select! {
-            received = receive(&mut stream) => {
-                match received {
-                    Ok(_unexpected) => {
-                        let _ = send(
-                            &mut stream,
-                            &WorkerProtocolMessage::ProtocolError(ProtocolErrorMessage::new(
-                                "unexpected_message",
-                            )),
-                        )
-                        .await;
+        // Issue #38 extends this loop from #37's single-shot receive into a
+        // genuine per-connection request/response loop: `AuthorizationQuery`
+        // is answered in place, sequentially — this connection task is the
+        // sole owner of `stream`'s serialized I/O for its whole lifetime
+        // (`m1-worker-data-plane-control-contract.md` "Authority": Worker
+        // only requests a decision; `bamepd` alone decides). Every other
+        // received message, an I/O error, EOF, or controlled shutdown ends
+        // the loop — exactly the fail-closed behavior
+        // (`m1-worker-data-plane-control-contract.md` "IPC loss is
+        // fail-closed"). `_guard` invalidates this generation on every exit
+        // path, including cancellation.
+        loop {
+            tokio::select! {
+                received = receive(&mut stream) => {
+                    match received {
+                        Ok(WorkerProtocolMessage::AuthorizationQuery(query)) => {
+                            let response = decide_authorization_query(
+                                &transfer_authorization,
+                                &query,
+                            )
+                            .await;
+                            if send(&mut stream, &WorkerProtocolMessage::AuthorizationDecision(response))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(_unexpected) => {
+                            let _ = send(
+                                &mut stream,
+                                &WorkerProtocolMessage::ProtocolError(ProtocolErrorMessage::new(
+                                    "unexpected_message",
+                                )),
+                            )
+                            .await;
+                        }
+                        // Unknown top-level `type`: the approved contract
+                        // requires a stable `ProtocolError`, distinct from
+                        // silently dropping the connection on decode failure
+                        // (`m1-worker-data-plane-control-contract.md`: "Unknown
+                        // top-level type: rejected with ProtocolError").
+                        Err(ReceiveError::Decode(DecodeError::UnknownType(type_name))) => {
+                            let _ = send(
+                                &mut stream,
+                                &WorkerProtocolMessage::ProtocolError(
+                                    ProtocolErrorMessage::new("unknown_message_type")
+                                        .with_message(format!("unrecognized type {type_name:?}")),
+                                ),
+                            )
+                            .await;
+                        }
+                        Err(_) => break,
                     }
-                    // Unknown top-level `type`: the approved contract
-                    // requires a stable `ProtocolError`, distinct from
-                    // silently dropping the connection on decode failure
-                    // (`m1-worker-data-plane-control-contract.md`: "Unknown
-                    // top-level type: rejected with ProtocolError").
-                    Err(ReceiveError::Decode(DecodeError::UnknownType(type_name))) => {
-                        let _ = send(
-                            &mut stream,
-                            &WorkerProtocolMessage::ProtocolError(
-                                ProtocolErrorMessage::new("unknown_message_type")
-                                    .with_message(format!("unrecognized type {type_name:?}")),
-                            ),
-                        )
-                        .await;
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        break;
                     }
-                    Err(_) => {}
                 }
             }
-            _ = shutdown.changed() => {}
+        }
+    }
+
+    /// Converts a wire `AuthorizationOperation`/`WireTransferDirection` into
+    /// their Domain equivalents. Both are already closed, exhaustively
+    /// matched enums, so this conversion is total — never a parse failure.
+    fn to_domain_operation(
+        operation: bamep_worker_protocol::AuthorizationOperation,
+    ) -> bamep_domain::AuthorizationOperation {
+        match operation {
+            bamep_worker_protocol::AuthorizationOperation::ChunkUpload => {
+                bamep_domain::AuthorizationOperation::ChunkUpload
+            }
+            bamep_worker_protocol::AuthorizationOperation::ResumeDiscovery => {
+                bamep_domain::AuthorizationOperation::ResumeDiscovery
+            }
+            bamep_worker_protocol::AuthorizationOperation::SealManifest => {
+                bamep_domain::AuthorizationOperation::SealManifest
+            }
+        }
+    }
+
+    fn to_domain_direction(
+        direction: bamep_worker_protocol::WireTransferDirection,
+    ) -> bamep_domain::TransferDirection {
+        match direction {
+            bamep_worker_protocol::WireTransferDirection::AgentToServer => {
+                bamep_domain::TransferDirection::AgentToServer
+            }
+        }
+    }
+
+    /// Converts one received `AuthorizationQuery` into the Application-layer
+    /// input, delegates the authoritative decision to
+    /// [`TransferAuthorizationService::decide`], and converts the result
+    /// back into the exact wire `AuthorizationDecision` — this Adapter never
+    /// makes the decision itself (ADR-0018).
+    async fn decide_authorization_query(
+        transfer_authorization: &TransferAuthorizationService,
+        query: &AuthorizationQueryMessage,
+    ) -> AuthorizationDecisionMessage {
+        let input = WorkerAuthorizationQueryInput {
+            token: query.body.token.clone(),
+            operation: to_domain_operation(query.body.operation),
+            transfer_id: query.body.transfer_id,
+            artifact_id: query.body.artifact_id,
+            direction: to_domain_direction(query.body.direction),
+            chunk_index: query.body.chunk_index,
+            proof_id: query.body.proof_id.clone(),
+            issued_at_millis: query.body.issued_at,
+            signature: query.body.signature.clone(),
+        };
+        let request_id = query.envelope.message_id;
+        match transfer_authorization.decide(input).await {
+            Ok(WorkerAuthorizationOutcome::Approved {
+                expected_chunk_digest,
+            }) => AuthorizationDecisionMessage::approved(request_id, expected_chunk_digest),
+            Ok(WorkerAuthorizationOutcome::Denied) => {
+                AuthorizationDecisionMessage::denied(request_id)
+            }
+            // A genuine Repository/backend failure fails closed identically
+            // to an ordinary denial — Worker must never observe a more
+            // specific outcome than the generic non-enumerable shape
+            // (`m1-worker-data-plane-control-contract.md` "Security and
+            // logging").
+            Err(_) => AuthorizationDecisionMessage::denied(request_id),
         }
     }
 

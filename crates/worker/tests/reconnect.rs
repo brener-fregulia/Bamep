@@ -14,9 +14,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use bamep_worker::ipc::{run_client_loop, AuthorityTracker};
+use bamep_worker::ipc::{authorization_channel, run_client_loop, AuthorityTracker, QueryError};
 use bamep_worker_protocol::{
-    receive, send, HandshakeRejectedMessage, ProtocolVersion, ServerHelloMessage,
+    receive, send, AuthorizationDecisionMessage, AuthorizationOperation, AuthorizationQueryMessage,
+    HandshakeRejectedMessage, ProtocolVersion, ServerHelloMessage, WireTransferDirection,
     WorkerProtocolMessage,
 };
 use tokio::net::{UnixListener, UnixStream};
@@ -76,11 +77,13 @@ async fn reconnect_after_disconnect_uses_the_same_worker_instance_id_with_a_new_
 
     let worker_instance_id = Uuid::new_v4();
     let (tracker, mut authority_rx) = AuthorityTracker::new();
+    let (publisher, _authorization_client) = authorization_channel();
     let client_task = tokio::spawn(run_client_loop(
         socket.0.clone(),
         Duration::from_millis(15),
         worker_instance_id,
         tracker,
+        publisher,
     ));
 
     let (stream1, reported_id_1) = fake_bamepd_accept_and_handshake(&listener).await;
@@ -124,11 +127,13 @@ async fn a_rejected_handshake_never_becomes_available_and_the_client_keeps_retry
     let listener = UnixListener::bind(&socket.0).expect("bind fake bamepd listener");
 
     let (tracker, authority_rx) = AuthorityTracker::new();
+    let (publisher, _authorization_client) = authorization_channel();
     let client_task = tokio::spawn(run_client_loop(
         socket.0.clone(),
         Duration::from_millis(15),
         Uuid::new_v4(),
         tracker,
+        publisher,
     ));
 
     for _ in 0..2 {
@@ -188,11 +193,13 @@ async fn a_server_hello_with_wrong_envelope_protocol_version_never_becomes_avail
     let socket = TempSocketPath::fresh();
     let listener = UnixListener::bind(&socket.0).expect("bind fake bamepd listener");
     let (tracker, authority_rx) = AuthorityTracker::new();
+    let (publisher, _authorization_client) = authorization_channel();
     let client_task = tokio::spawn(run_client_loop(
         socket.0.clone(),
         Duration::from_millis(15),
         Uuid::new_v4(),
         tracker,
+        publisher,
     ));
 
     let (mut stream, hello) = accept_and_receive_hello(&listener).await;
@@ -214,11 +221,13 @@ async fn a_server_hello_with_wrong_server_protocol_version_never_becomes_availab
     let socket = TempSocketPath::fresh();
     let listener = UnixListener::bind(&socket.0).expect("bind fake bamepd listener");
     let (tracker, authority_rx) = AuthorityTracker::new();
+    let (publisher, _authorization_client) = authorization_channel();
     let client_task = tokio::spawn(run_client_loop(
         socket.0.clone(),
         Duration::from_millis(15),
         Uuid::new_v4(),
         tracker,
+        publisher,
     ));
 
     let (mut stream, hello) = accept_and_receive_hello(&listener).await;
@@ -240,11 +249,13 @@ async fn a_server_hello_with_non_v4_message_id_never_becomes_available() {
     let socket = TempSocketPath::fresh();
     let listener = UnixListener::bind(&socket.0).expect("bind fake bamepd listener");
     let (tracker, authority_rx) = AuthorityTracker::new();
+    let (publisher, _authorization_client) = authorization_channel();
     let client_task = tokio::spawn(run_client_loop(
         socket.0.clone(),
         Duration::from_millis(15),
         Uuid::new_v4(),
         tracker,
+        publisher,
     ));
 
     let (mut stream, hello) = accept_and_receive_hello(&listener).await;
@@ -267,11 +278,13 @@ async fn an_uncorrelated_server_hello_never_becomes_available() {
     let socket = TempSocketPath::fresh();
     let listener = UnixListener::bind(&socket.0).expect("bind fake bamepd listener");
     let (tracker, authority_rx) = AuthorityTracker::new();
+    let (publisher, _authorization_client) = authorization_channel();
     let client_task = tokio::spawn(run_client_loop(
         socket.0.clone(),
         Duration::from_millis(15),
         Uuid::new_v4(),
         tracker,
+        publisher,
     ));
 
     let (mut stream, _hello) = accept_and_receive_hello(&listener).await;
@@ -293,11 +306,13 @@ async fn a_malformed_handshake_rejected_never_becomes_available() {
     let socket = TempSocketPath::fresh();
     let listener = UnixListener::bind(&socket.0).expect("bind fake bamepd listener");
     let (tracker, authority_rx) = AuthorityTracker::new();
+    let (publisher, _authorization_client) = authorization_channel();
     let client_task = tokio::spawn(run_client_loop(
         socket.0.clone(),
         Duration::from_millis(15),
         Uuid::new_v4(),
         tracker,
+        publisher,
     ));
 
     let (mut stream, hello) = accept_and_receive_hello(&listener).await;
@@ -315,6 +330,123 @@ async fn a_malformed_handshake_rejected_never_becomes_available() {
     client_task.abort();
 }
 
+fn sample_authorization_query() -> AuthorizationQueryMessage {
+    AuthorizationQueryMessage::new(
+        "opaque-token",
+        AuthorizationOperation::ResumeDiscovery,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        WireTransferDirection::AgentToServer,
+        None,
+        "proof-id-value",
+        1_700_000_000_000,
+        "signature-value",
+    )
+}
+
+/// Issue #38 "Worker UDS" runtime evidence: a real Worker process (the
+/// actual `run_client_loop`) sends a real `AuthorizationQuery` over a real
+/// kernel UDS, and `AuthorizationClient::query` correctly correlates the
+/// fake `bamepd`'s `AuthorizationDecision` reply via `in_reply_to` back to
+/// the exact caller awaiting it.
+#[tokio::test]
+async fn a_query_receives_the_fake_bamepds_decision_and_correlates_via_in_reply_to() {
+    let socket = TempSocketPath::fresh();
+    let listener = UnixListener::bind(&socket.0).expect("bind fake bamepd listener");
+    let (tracker, mut authority_rx) = AuthorityTracker::new();
+    let (publisher, client) = authorization_channel();
+    let client_task = tokio::spawn(run_client_loop(
+        socket.0.clone(),
+        Duration::from_millis(15),
+        Uuid::new_v4(),
+        tracker,
+        publisher,
+    ));
+
+    let (mut stream, _worker_instance_id) = fake_bamepd_accept_and_handshake(&listener).await;
+    timeout(TEST_TIMEOUT, authority_rx.wait_for(|s| s.is_available()))
+        .await
+        .expect("no timeout")
+        .expect("watch channel open");
+
+    let query_client = client.clone();
+    let query_handle =
+        tokio::spawn(async move { query_client.query(sample_authorization_query()).await });
+
+    let received = match timeout(TEST_TIMEOUT, receive(&mut stream))
+        .await
+        .expect("no timeout")
+        .expect("receive AuthorizationQuery")
+    {
+        WorkerProtocolMessage::AuthorizationQuery(query) => query,
+        other => panic!("expected AuthorizationQuery, got {other:?}"),
+    };
+    send(
+        &mut stream,
+        &WorkerProtocolMessage::AuthorizationDecision(AuthorizationDecisionMessage::denied(
+            received.envelope.message_id,
+        )),
+    )
+    .await
+    .expect("send AuthorizationDecision");
+
+    let decision = timeout(TEST_TIMEOUT, query_handle)
+        .await
+        .expect("no timeout")
+        .expect("task join")
+        .expect("query succeeds");
+    assert_eq!(decision.body.in_reply_to, received.envelope.message_id);
+
+    client_task.abort();
+}
+
+/// Issue #38 acceptance criterion: "in-flight query + disconnect => failed/
+/// uncertain, never approved". The fake `bamepd` drops the connection after
+/// receiving the query but before answering it; the caller must observe an
+/// error, never a fabricated `Approved`.
+#[tokio::test]
+async fn a_query_in_flight_when_the_connection_drops_fails_closed() {
+    let socket = TempSocketPath::fresh();
+    let listener = UnixListener::bind(&socket.0).expect("bind fake bamepd listener");
+    let (tracker, mut authority_rx) = AuthorityTracker::new();
+    let (publisher, client) = authorization_channel();
+    let client_task = tokio::spawn(run_client_loop(
+        socket.0.clone(),
+        Duration::from_millis(15),
+        Uuid::new_v4(),
+        tracker,
+        publisher,
+    ));
+
+    let (mut stream, _worker_instance_id) = fake_bamepd_accept_and_handshake(&listener).await;
+    timeout(TEST_TIMEOUT, authority_rx.wait_for(|s| s.is_available()))
+        .await
+        .expect("no timeout")
+        .expect("watch channel open");
+
+    let query_client = client.clone();
+    let query_handle =
+        tokio::spawn(async move { query_client.query(sample_authorization_query()).await });
+
+    let _received = timeout(TEST_TIMEOUT, receive(&mut stream))
+        .await
+        .expect("no timeout")
+        .expect("receive AuthorizationQuery");
+    // Disconnect instead of answering.
+    drop(stream);
+
+    let result = timeout(TEST_TIMEOUT, query_handle)
+        .await
+        .expect("no timeout")
+        .expect("task join");
+    assert!(
+        matches!(result, Err(QueryError::Disconnected)),
+        "an in-flight query whose connection drops must fail closed, never fabricate approval; got {result:?}"
+    );
+
+    client_task.abort();
+}
+
 /// Worker validation: an uncorrelated `HandshakeRejected` (correct shape,
 /// wrong `in_reply_to`) must never be treated as this Worker's own rejected
 /// handshake.
@@ -323,11 +455,13 @@ async fn an_uncorrelated_handshake_rejected_never_becomes_available() {
     let socket = TempSocketPath::fresh();
     let listener = UnixListener::bind(&socket.0).expect("bind fake bamepd listener");
     let (tracker, authority_rx) = AuthorityTracker::new();
+    let (publisher, _authorization_client) = authorization_channel();
     let client_task = tokio::spawn(run_client_loop(
         socket.0.clone(),
         Duration::from_millis(15),
         Uuid::new_v4(),
         tracker,
+        publisher,
     ));
 
     let (mut stream, _hello) = accept_and_receive_hello(&listener).await;

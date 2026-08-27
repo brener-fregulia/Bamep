@@ -24,10 +24,17 @@ use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bamep_server::adapters::worker_control_plane::WorkerControlPlane;
+use bamep_server::application::TransferAuthorizationService;
+use bamep_server::ports::{
+    AuthorizationDurableState, RepositoryError, TransferAuthorizationRepository,
+};
 use bamep_server::runtime::bamepd_config::{
     ENV_RECONNECT_DELAY_MS, ENV_TLS_CERT_PATH, ENV_TLS_KEY_PATH, ENV_UDS_PATH,
 };
+use bamep_server::runtime::capability_store::CapabilityStore;
+use bamep_server::runtime::replay_cache::ReplayCache;
 use bamep_server::runtime::worker_authority::{WorkerAuthorityRegistry, WorkerControlState};
 use bamep_server::runtime::worker_supervisor::{
     SupervisorConfig, SupervisorEvent, WorkerSupervisor, SUPERVISOR_EVENT_CHANNEL_CAPACITY,
@@ -37,6 +44,31 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// This file exercises process-supervision/handshake semantics only — the
+/// spawned real `bamep-worker` process never sends `AuthorizationQuery` —
+/// so a minimal always-unknown fake is sufficient to construct the real
+/// `TransferAuthorizationService` `WorkerControlPlane::run` now requires.
+struct AlwaysUnknownTransferAuthorizationRepository;
+
+#[async_trait]
+impl TransferAuthorizationRepository for AlwaysUnknownTransferAuthorizationRepository {
+    async fn load_authorization_state(
+        &self,
+        _transfer_id: bamep_domain::TransferId,
+    ) -> Result<Option<AuthorizationDurableState>, RepositoryError> {
+        Ok(None)
+    }
+}
+
+fn fake_transfer_authorization_service() -> Arc<TransferAuthorizationService> {
+    Arc::new(TransferAuthorizationService::new(
+        Arc::new(AlwaysUnknownTransferAuthorizationRepository),
+        Arc::new(CapabilityStore::new()),
+        Arc::new(ReplayCache::new()),
+        "https://server.example:8443",
+    ))
+}
 
 struct TestEnv {
     dir: PathBuf,
@@ -160,8 +192,13 @@ async fn supervisor_manages_a_genuinely_separate_worker_process_through_handshak
     // supervisor (Issue #37 "Startup ordering").
     let plane = WorkerControlPlane::bind(&env.socket_path).expect("bind UDS listener");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let transfer_authorization = fake_transfer_authorization_service();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let control_plane_task = tokio::spawn(plane.run(Arc::clone(&registry), shutdown_rx.clone()));
+    let control_plane_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx.clone(),
+    ));
 
     let supervisor_env = vec![
         (

@@ -45,11 +45,13 @@ fn main() {
 
     runtime.block_on(async move {
         let (tracker, _authority_rx) = bamep_worker::ipc::AuthorityTracker::new();
+        let (publisher, _authorization_client) = bamep_worker::ipc::authorization_channel();
         let _: std::convert::Infallible = bamep_worker::ipc::run_client_loop(
             config.uds_path,
             config.reconnect_delay,
             worker_instance_id,
             tracker,
+            publisher,
         )
         .await;
     });

@@ -36,14 +36,15 @@ use bamep_agent_protocol::{
     decode, encode, ActionAckMessage, ActionAckOutcome, ActionProgressMessage, ActionResultMessage,
     ActionResultOutcome, AgentProtocolMessage, AuthErrorMessage, AuthRequestMessage,
     CancelAckMessage, CancelAckOutcome, KnownActionState, MessageTimestamp, ProtocolErrorMessage,
-    ProtocolId, SessionEstablishedMessage, StatusReportMessage,
+    ProtocolId, SessionEstablishedMessage, StatusReportMessage, TransferAuthorizationDeniedMessage,
+    TransferAuthorizationGrantMessage, TransferAuthorizationRequestMessage,
 };
 use bamep_domain::{ActionEvidence, CancelAckEvidence, EndpointId};
 use bamep_trusted_bootstrap::ServerCertFingerprint;
 
 use crate::application::{
     ActionEvidenceService, ApplicationError, BootstrapEvidenceService, CancellationService,
-    EnrollmentService, RedeemResult,
+    EnrollmentService, RedeemResult, TransferAuthorizationOutcome, TransferAuthorizationService,
 };
 use crate::ports::{
     ApplyActionEvidenceResult, ApplyReconciliationResult, CredentialRedemptionRepository,
@@ -64,6 +65,10 @@ use crate::runtime::presence::PresenceRegistry;
 const GENERIC_AUTH_ERROR_REASON: &str = "rejected";
 pub const GENERIC_PROTOCOL_ERROR_CODE: &str = "GENERIC";
 pub const GENERIC_PROTOCOL_ERROR_MESSAGE: &str = "protocol violation";
+/// `TransferAuthorizationDenied.reason`'s single closed V1 value
+/// (`m0-agent-protocol-contract.md` "Renewal and restart"): every internal
+/// denial cause collapses into this one generic value.
+pub const GENERIC_TRANSFER_AUTHORIZATION_DENIED_REASON: &str = "denied";
 
 /// The result of a successful Agent Protocol v1 handshake. `session_id` is a
 /// fresh, transient value — not persisted to PostgreSQL in WP1 (no session
@@ -146,6 +151,11 @@ pub enum AgentGatewayError {
         "authenticated session received StatusReport without a configured ReconciliationService"
     )]
     ReconciliationServiceNotConfigured,
+    #[error(
+        "authenticated session received TransferAuthorizationRequest without a configured \
+         TransferAuthorizationService"
+    )]
+    TransferAuthorizationServiceNotConfigured,
     #[error(transparent)]
     Application(#[from] ApplicationError),
 }
@@ -191,6 +201,11 @@ pub struct AgentControlGateway<R: EndpointRepository, C: CredentialRedemptionRep
     /// structurally separate from this inbound Agent Protocol message loop,
     /// mirroring `cancellation`'s identical separation requirement.
     reconciliation: Option<Arc<crate::application::ReconciliationService>>,
+    /// Serves `TransferAuthorizationRequest` (Issue #38 "Agent WSS
+    /// integration"). Deliberately not routed through any other service —
+    /// this is the sole Agent Protocol entry point into sender-constrained
+    /// transfer authorization.
+    transfer_authorization: Option<Arc<TransferAuthorizationService>>,
     /// The Runtime Presence Registry this Gateway's authenticated sessions
     /// register with/unregister from (`m0-stack-and-boundaries-baseline.md`
     /// "Runtime Presence Registry"). Owned by the Gateway by default so every
@@ -217,6 +232,7 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             action_evidence: None,
             cancellation: None,
             reconciliation: None,
+            transfer_authorization: None,
             presence: Arc::new(PresenceRegistry::new()),
             outbound_sessions: Arc::new(OutboundSessionDirectory::new()),
         }
@@ -253,6 +269,14 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
         service: Arc<crate::application::ReconciliationService>,
     ) -> Self {
         self.reconciliation = Some(service);
+        self
+    }
+
+    pub fn with_transfer_authorization_service(
+        mut self,
+        service: Arc<TransferAuthorizationService>,
+    ) -> Self {
+        self.transfer_authorization = Some(service);
         self
     }
 
@@ -521,10 +545,20 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                                     )
                                     .await?;
                                 }
+                                AgentProtocolMessage::TransferAuthorizationRequest(request) => {
+                                    self.handle_transfer_authorization_request(
+                                        write,
+                                        session.endpoint_id,
+                                        request,
+                                    )
+                                    .await?;
+                                }
                                 AgentProtocolMessage::ProtocolError(_) => {}
                                 AgentProtocolMessage::AuthRequest(_)
                                 | AgentProtocolMessage::SessionEstablished(_)
                                 | AgentProtocolMessage::AuthError(_)
+                                | AgentProtocolMessage::TransferAuthorizationGrant(_)
+                                | AgentProtocolMessage::TransferAuthorizationDenied(_)
                                 | AgentProtocolMessage::ActionDispatch(_)
                                 | AgentProtocolMessage::CancelAction(_)
                                 | AgentProtocolMessage::StatusQuery(_) => {
@@ -758,6 +792,105 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             Err(ApplicationError::UnknownAction) => Ok(()),
             Err(e) => Err(AgentGatewayError::Application(e)),
         }
+    }
+
+    /// Serves `TransferAuthorizationRequest`
+    /// (`m0-agent-protocol-contract.md` "Transfer authorization"; Issue #38
+    /// "Agent authorization request handling"). `endpoint_id` comes only
+    /// from the already-authenticated session — the request body's
+    /// `transfer_id` is the only Endpoint-adjacent value it may claim, and
+    /// `TransferAuthorizationService::issue` independently re-verifies that
+    /// the durable Transfer actually belongs to this exact `endpoint_id`
+    /// before granting anything. A missing `correlation_id` is not a
+    /// protocol violation here — it simply cannot succeed, because
+    /// `TransferAuthorizationService::issue` requires the presented
+    /// correlation to equal the durable owning `action_id`, and `None` can
+    /// never equal a real `action_id`; denial still responds with the
+    /// generic `TransferAuthorizationDenied`, per the non-enumerable-denial
+    /// requirement, rather than falling back to `ProtocolError`.
+    async fn handle_transfer_authorization_request<W: MessageSink>(
+        &self,
+        write: &mut W,
+        endpoint_id: EndpointId,
+        request: TransferAuthorizationRequestMessage,
+    ) -> Result<(), AgentGatewayError> {
+        let service = self
+            .transfer_authorization
+            .as_ref()
+            .ok_or(AgentGatewayError::TransferAuthorizationServiceNotConfigured)?;
+
+        let transfer_id = request.body.transfer_id;
+        let correlation_id = request.envelope.correlation_id;
+
+        let outcome = match correlation_id {
+            Some(action_id) => {
+                service
+                    .issue(
+                        endpoint_id,
+                        action_id,
+                        bamep_domain::TransferId(transfer_id.as_uuid()),
+                        &request.body.proof_public_key,
+                    )
+                    .await?
+            }
+            None => TransferAuthorizationOutcome::Denied,
+        };
+
+        match outcome {
+            TransferAuthorizationOutcome::Granted {
+                token,
+                expires_at,
+                data_plane_base_url,
+            } => {
+                // Reachable only once `issue` has already confirmed
+                // `correlation_id` equals the durable owning `action_id`, so
+                // `correlation_id` is always `Some` here.
+                let action_id = correlation_id
+                    .expect("Granted is only ever returned when a correlation_id was presented");
+                let grant = TransferAuthorizationGrantMessage::new(
+                    action_id,
+                    transfer_id,
+                    token,
+                    MessageTimestamp::from_datetime(expires_at),
+                    data_plane_base_url,
+                );
+                let wire = encode(&AgentProtocolMessage::TransferAuthorizationGrant(grant))
+                    .expect("a well-formed TransferAuthorizationGrant always encodes");
+                write
+                    .send(Message::text(wire))
+                    .await
+                    .map_err(AgentGatewayError::Send)
+            }
+            TransferAuthorizationOutcome::Denied => {
+                self.send_transfer_authorization_denied(write, transfer_id, correlation_id)
+                    .await
+            }
+        }
+    }
+
+    /// `reason` is intentionally the single generic constant
+    /// (`m0-agent-protocol-contract.md` "Renewal and restart": "V1 may use
+    /// one closed generic value and must not distinguish unknown transfer,
+    /// wrong Endpoint, terminal transfer, or other internal denial causes").
+    async fn send_transfer_authorization_denied<W: MessageSink>(
+        &self,
+        write: &mut W,
+        transfer_id: ProtocolId,
+        correlation_id: Option<ProtocolId>,
+    ) -> Result<(), AgentGatewayError> {
+        let mut denied = TransferAuthorizationDeniedMessage::new(
+            transfer_id,
+            GENERIC_TRANSFER_AUTHORIZATION_DENIED_REASON,
+        );
+        if let Some(action_id) = correlation_id {
+            denied = denied.with_correlation_id(action_id);
+        }
+        let wire = encode(&AgentProtocolMessage::TransferAuthorizationDenied(denied))
+            .expect("a well-formed TransferAuthorizationDenied always encodes");
+        write
+            .send(Message::text(wire))
+            .await
+            .map_err(AgentGatewayError::Send)
     }
 
     /// Transient/advisory only — never persisted, never mutates Attempt/

@@ -16,13 +16,18 @@ use bamep_agent_protocol::{
 use bamep_domain::credential::{CredentialDimension, CredentialHash};
 use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_domain::{
-    evaluate_final_destructive_dispatch, evaluate_transfer_dispatch, transitions, ActionEvidence,
-    ActionEvidenceOutcome, ActionId, Actor, Attempt, AttemptState, AuditRecord, BootContext,
-    BootNonce, CancelAckEvidence, CancellationRequestOutcome, DestructiveIntent, DigestAlgorithm,
-    EmptyWorkflow, EndpointId, FinalDispatchInputs, FinalDispatchOutcome, FinalDispatchRejection,
-    IdentityState, InvalidIdentityTransition, InventoryRevision, InventorySnapshot, Job, JobId,
-    JobStepId, Transfer, TransferDirection, TransferDispatchInputs, TransferDispatchRejection,
-    TransferId, TrustedBootstrapState, DEFAULT_CREDENTIAL_TTL,
+    build_proof_transcript, capability_is_current, capability_matches_request,
+    evaluate_final_destructive_dispatch, evaluate_transfer_dispatch, proof_is_fresh, transitions,
+    verify_proof_signature, ActionEvidence, ActionEvidenceOutcome, ActionId, Actor, ArtifactId,
+    Attempt, AttemptState, AuditRecord, AuthorizationOperation, BootContext, BootNonce,
+    CancelAckEvidence, CancellationRequestOutcome, CapabilityBinding, CapabilityId,
+    CapabilityToken, DestructiveIntent, DigestAlgorithm, EmptyWorkflow, EndpointId,
+    FinalDispatchInputs, FinalDispatchOutcome, FinalDispatchRejection, IdentityState,
+    InvalidIdentityTransition, InventoryRevision, InventorySnapshot, Job, JobId, JobStepId,
+    ProofId, ProofPublicKey, ProofSignature, ProofTranscriptFields, RequestedOperation, Transfer,
+    TransferDirection, TransferDispatchInputs, TransferDispatchRejection, TransferId,
+    TrustedBootstrapState, DEFAULT_CAPABILITY_TTL_MILLIS, DEFAULT_CREDENTIAL_TTL,
+    PROOF_FRESHNESS_PAST_WINDOW_MILLIS,
 };
 use bamep_trusted_bootstrap::{AcceptedSiteKeys, BootstrapAssertion, ServerCertFingerprint};
 use chrono::{DateTime, Duration, Utc};
@@ -40,10 +45,12 @@ use crate::ports::{
     FinalDispatchLockedFacts, InventoryRepository, JobRepository, RedemptionDecision,
     RedemptionTarget, RepositoryError, RequestCancellationDecision, RequestCancellationError,
     RequestCancellationLockedFacts, RequestCancellationResult, SatisfyStepPreconditionsDecision,
-    SatisfyStepPreconditionsError, TargetRevalidationPort, TransferDispatchDecision,
-    TransferDispatchLockedFacts, TransferRepository,
+    SatisfyStepPreconditionsError, TargetRevalidationPort, TransferAuthorizationRepository,
+    TransferDispatchDecision, TransferDispatchLockedFacts, TransferRepository,
 };
+use crate::runtime::capability_store::CapabilityStore;
 use crate::runtime::presence::PresenceRegistry;
+use crate::runtime::replay_cache::ReplayCache;
 use crate::runtime::reservation_registry::{AttemptReservationRegistry, RegistrationOutcome};
 use crate::runtime::resource_arbiter::{
     InsufficientCapacity, ReservationId, ResourceClaim, TechnicalResourceArbiter,
@@ -2274,6 +2281,314 @@ impl<T: TransferRepository> TransferService<T> {
             .bind_attempt(transfer_id, decide)
             .await
             .map_err(ApplicationError::from)
+    }
+}
+
+// ---------------------------------------------------------------------
+// Transfer authorization (Issue #38)
+// ---------------------------------------------------------------------
+
+/// Outcome of [`TransferAuthorizationService::issue`], shaped for the Agent
+/// Control Gateway to translate directly into
+/// `TransferAuthorizationGrant`/`TransferAuthorizationDenied`
+/// (`m0-agent-protocol-contract.md` "Transfer authorization"). `Denied`
+/// deliberately carries no reason — every internal denial cause (unknown
+/// transfer, wrong Endpoint, pre-dispatch unbound Transfer, terminal Attempt,
+/// wrong action correlation, inactive credential, malformed proof key)
+/// collapses into this one generic outcome before it ever reaches the
+/// Gateway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferAuthorizationOutcome {
+    Granted {
+        token: String,
+        expires_at: DateTime<Utc>,
+        data_plane_base_url: String,
+    },
+    Denied,
+}
+
+/// The exact fields Worker forwards from one `AuthorizationQuery`
+/// (`m1-worker-data-plane-control-contract.md` "Authorization query /
+/// decision"), already converted from wire types into this layer's working
+/// representation by the UDS Adapter — this struct itself carries no
+/// `bamep-worker-protocol` dependency.
+#[derive(Debug, Clone)]
+pub struct WorkerAuthorizationQueryInput {
+    pub token: String,
+    pub operation: AuthorizationOperation,
+    pub transfer_id: uuid::Uuid,
+    pub artifact_id: uuid::Uuid,
+    pub direction: TransferDirection,
+    pub chunk_index: Option<u64>,
+    pub proof_id: String,
+    pub issued_at_millis: u64,
+    pub signature: String,
+}
+
+/// Outcome of [`TransferAuthorizationService::decide`]
+/// (`m1-worker-data-plane-control-contract.md` "Authorization query /
+/// decision"). `Denied` never carries a reason, mirroring
+/// [`TransferAuthorizationOutcome::Denied`] — Worker must never be able to
+/// observe why. `expected_chunk_digest` is never populated by this Work
+/// Package (durable chunk-identity lookup is #39's
+/// `ChunkAcceptanceRequest`/`ChunkAcceptanceDecision` scope); the field
+/// exists so a future #39 change extends this outcome rather than
+/// introducing a second one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerAuthorizationOutcome {
+    Approved {
+        expected_chunk_digest: Option<String>,
+    },
+    Denied,
+}
+
+/// Issues and later authoritatively decides sender-constrained transfer
+/// authorization (`m0-data-plane-and-storage-contracts.md` "Transfer
+/// authorization"; Issue #38). The single Application-layer owner of both
+/// directions of this boundary: [`Self::issue`] serves the authenticated
+/// Agent WSS `TransferAuthorizationRequest`, and [`Self::decide`] serves the
+/// Worker UDS `AuthorizationQuery` — the same [`CapabilityStore`]/
+/// [`ReplayCache`]/[`TransferAuthorizationRepository`] back both, so a
+/// capability issued through one path is exactly what the other later
+/// validates. Business authorization logic lives here and in
+/// `bamep_domain::transfer_authorization`, never in the Worker protocol
+/// codec, UDS transport, or PostgreSQL Adapter (`AGENTS.md` "Application /
+/// Port / Adapter boundary").
+pub struct TransferAuthorizationService {
+    repo: Arc<dyn TransferAuthorizationRepository>,
+    capabilities: Arc<CapabilityStore>,
+    replay: Arc<ReplayCache>,
+    clock: Arc<dyn Clock>,
+    capability_ttl: Duration,
+    data_plane_base_url: String,
+}
+
+impl TransferAuthorizationService {
+    pub fn new(
+        repo: Arc<dyn TransferAuthorizationRepository>,
+        capabilities: Arc<CapabilityStore>,
+        replay: Arc<ReplayCache>,
+        data_plane_base_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            repo,
+            capabilities,
+            replay,
+            clock: Arc::new(SystemClock),
+            capability_ttl: Duration::milliseconds(DEFAULT_CAPABILITY_TTL_MILLIS),
+            data_plane_base_url: data_plane_base_url.into(),
+        }
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub fn with_capability_ttl(mut self, ttl: Duration) -> Self {
+        self.capability_ttl = ttl;
+        self
+    }
+
+    /// Serves an authenticated Agent's `TransferAuthorizationRequest`
+    /// (`m0-agent-protocol-contract.md` "Transfer authorization"): the
+    /// authenticated session's `endpoint_id` and the message's own
+    /// `correlation_id` are the caller's responsibility to supply from
+    /// already-trusted transport/session state, never from anything else the
+    /// request body could claim (`m0-agent-protocol-contract.md`; Issue #38
+    /// "Agent authorization request handling": "The authenticated transport/
+    /// session Endpoint identity is authoritative. Do NOT allow the request
+    /// body to select another Endpoint").
+    ///
+    /// Also the exact renewal path (`m0-agent-protocol-contract.md` "Renewal
+    /// and restart"): a second call for the same still-eligible `transfer_id`
+    /// — with the same or a fresh `proof_public_key` — mints a fresh
+    /// capability without creating any new Attempt/Artifact/Transfer, because
+    /// this method never creates any of them; it only reads current durable
+    /// state and issues transient authorization material.
+    pub async fn issue(
+        &self,
+        endpoint_id: EndpointId,
+        presented_action_id: ProtocolId,
+        transfer_id: TransferId,
+        proof_public_key_wire: &str,
+    ) -> Result<TransferAuthorizationOutcome, ApplicationError> {
+        let Ok(public_key) = ProofPublicKey::parse_wire_value(proof_public_key_wire) else {
+            return Ok(TransferAuthorizationOutcome::Denied);
+        };
+
+        let Some(state) = self.repo.load_authorization_state(transfer_id).await? else {
+            return Ok(TransferAuthorizationOutcome::Denied);
+        };
+
+        if state.transfer.endpoint_id != endpoint_id {
+            return Ok(TransferAuthorizationOutcome::Denied);
+        }
+
+        // Pre-dispatch: `Transfer.attempt_id == None` is always denied
+        // (`m0-data-plane-and-storage-contracts.md`; Issue #36 scope; Issue
+        // #38 acceptance criteria).
+        let Some(attempt) = state.attempt else {
+            return Ok(TransferAuthorizationOutcome::Denied);
+        };
+
+        // Only a currently active (non-terminal, non-`AwaitingReconciliation`)
+        // Attempt is authorization-eligible — `AwaitingReconciliation` and
+        // every terminal state (`Succeeded`/`Failed`/`Cancelled`/`Rejected`/
+        // `Indeterminate`) are denied (Issue #38 "Terminal / reconciliation
+        // safety"; `m0-data-plane-and-storage-contracts.md`: "An Attempt in
+        // `AwaitingReconciliation` may continue only when the Job lifecycle
+        // contract still permits it" — no such explicit permission mechanism
+        // exists yet, so the fail-closed default applies).
+        if !matches!(
+            attempt.state,
+            AttemptState::Dispatched | AttemptState::InProgress
+        ) {
+            return Ok(TransferAuthorizationOutcome::Denied);
+        }
+
+        let expected_action_id = ProtocolId::from_uuid(attempt.action_id.0)
+            .expect("a Domain ActionId is always a valid UUID v4");
+        if presented_action_id != expected_action_id {
+            return Ok(TransferAuthorizationOutcome::Denied);
+        }
+
+        let now = self.clock.now();
+        if state.endpoint.credential.dimension(now) != CredentialDimension::CredentialActive {
+            return Ok(TransferAuthorizationOutcome::Denied);
+        }
+
+        let token = CapabilityToken::generate();
+        let capability_id = CapabilityId::from_token(&token);
+        let expires_at = now + self.capability_ttl;
+        let binding = CapabilityBinding {
+            endpoint_id,
+            transfer_id,
+            artifact_id: state.transfer.artifact_id,
+            direction: state.transfer.direction,
+            attempt_id: attempt.id,
+            proof_public_key: public_key,
+            expires_at,
+            epoch: self.capabilities.epoch(),
+        };
+        self.capabilities.evict_expired(now);
+        self.capabilities.issue(capability_id, binding);
+
+        Ok(TransferAuthorizationOutcome::Granted {
+            token: token.as_str().to_string(),
+            expires_at,
+            data_plane_base_url: self.data_plane_base_url.clone(),
+        })
+    }
+
+    /// Serves Worker's `AuthorizationQuery` (`m1-worker-data-plane-control-
+    /// contract.md` "Authorization query / decision"): the authoritative
+    /// decision `bamepd` alone may make (ADR-0018) — Worker only forwards
+    /// mechanical request facts and consumes the result. Re-checks current
+    /// durable state on every call (never trusts the capability-issuance-time
+    /// snapshot alone), so `CredentialRevoked`/a newly terminal Attempt take
+    /// effect immediately, per-request (Issue #38 "Credential active /
+    /// revocation").
+    pub async fn decide(
+        &self,
+        input: WorkerAuthorizationQueryInput,
+    ) -> Result<WorkerAuthorizationOutcome, ApplicationError> {
+        let capability_id = CapabilityId::from_token_bytes(input.token.as_bytes());
+        let Some(binding) = self.capabilities.lookup(&capability_id) else {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        };
+
+        let now = self.clock.now();
+        if capability_is_current(&binding, now, self.capabilities.epoch()).is_err() {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        }
+
+        let requested = RequestedOperation {
+            operation: input.operation,
+            transfer_id: TransferId(input.transfer_id),
+            artifact_id: ArtifactId(input.artifact_id),
+            direction: input.direction,
+            chunk_index: input.chunk_index,
+        };
+        if capability_matches_request(&binding, &requested).is_err() {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        }
+
+        let Ok(proof_id) = ProofId::parse_wire_value(&input.proof_id) else {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        };
+        let Ok(signature) = ProofSignature::parse_wire_value(&input.signature) else {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        };
+
+        let transcript = build_proof_transcript(
+            &capability_id,
+            &ProofTranscriptFields {
+                operation: input.operation,
+                transfer_id: requested.transfer_id,
+                artifact_id: requested.artifact_id,
+                direction: input.direction,
+                chunk_index: input.chunk_index,
+                proof_id,
+                issued_at_millis: input.issued_at_millis,
+            },
+        );
+        if !verify_proof_signature(&binding.proof_public_key, &transcript, &signature) {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        }
+
+        if proof_is_fresh(input.issued_at_millis, now).is_err() {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        }
+
+        // Atomic check+insert (Issue #38 "concurrent duplicate proof use
+        // cannot both succeed"): retained for at least the freshness window,
+        // so a replay from within that window is always caught.
+        let retention = Duration::milliseconds(PROOF_FRESHNESS_PAST_WINDOW_MILLIS);
+        if self
+            .replay
+            .check_and_insert(proof_id, now, retention)
+            .is_err()
+        {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        }
+
+        // Current durable state, re-checked fresh for this exact request —
+        // never merely the capability-issuance-time snapshot (Issue #38
+        // "Current attempt / transfer state"; "Credential active /
+        // revocation").
+        let Some(state) = self
+            .repo
+            .load_authorization_state(requested.transfer_id)
+            .await?
+        else {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        };
+        if state.transfer.endpoint_id != binding.endpoint_id
+            || state.transfer.artifact_id != binding.artifact_id
+            || state.transfer.direction != binding.direction
+        {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        }
+        let Some(attempt) = state.attempt else {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        };
+        if attempt.id != binding.attempt_id {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        }
+        if !matches!(
+            attempt.state,
+            AttemptState::Dispatched | AttemptState::InProgress
+        ) {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        }
+        if state.endpoint.credential.dimension(now) != CredentialDimension::CredentialActive {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        }
+
+        Ok(WorkerAuthorizationOutcome::Approved {
+            expected_chunk_digest: None,
+        })
     }
 }
 

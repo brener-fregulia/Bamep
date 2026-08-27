@@ -5,8 +5,10 @@
 //! orchestration).
 
 pub mod bamepd_config;
+pub mod capability_store;
 pub mod outbound_sessions;
 pub mod presence;
+pub mod replay_cache;
 pub mod reservation_registry;
 pub mod resource_arbiter;
 pub mod worker_authority;

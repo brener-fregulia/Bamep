@@ -35,3 +35,5 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 bamep-simulator = { path = "../simulator" }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+rand = "0.8"

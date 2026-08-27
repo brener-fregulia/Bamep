@@ -422,21 +422,24 @@ path is unchanged.
 ## Implemented isolated Worker runtime and control boundary
 
 Issue #37 materializes the process/runtime boundary ADR-0001/ADR-0003/ADR-0018 require, and
-the M1 Worker IPC handshake slice `m1-worker-data-plane-control-contract.md` defines. It does
-not implement transfer authorization, capability/proof cryptography, replay protection, chunk
-HTTP routes, body transfer, storage I/O, or Artifact verification — those remain future Work
-Packages (#38/#39/#19).
+the M1 Worker IPC handshake slice `m1-worker-data-plane-control-contract.md` defines. Issue #38
+adds sender-constrained transfer authorization on top of it — capability/proof cryptography,
+freshness, replay protection, and the `AuthorizationQuery`/`AuthorizationDecision` exchange over
+the same UDS boundary (see "Sender-constrained transfer authorization" below). Chunk HTTP
+routes, body transfer, storage I/O, and Artifact verification remain future Work Packages
+(#39/#19).
 
 **Process topology.** `bamepd` (a new `[[bin]]` target on the `bamep-server` package,
 `crates/server/src/bin/bamepd.rs`) is the minimal Server daemon composition root: it binds the
-Worker UDS listener, supervises the Worker OS process, and forwards Worker configuration/TLS
-identity paths through the child process environment. It owns nothing else — no PostgreSQL
-startup, Administrative API, Agent WSS listener, Web, scheduler workflows, transfer
-authorization, Worker HTTPS, or storage — so `bamepd` is currently only a *partial*
-composition root; those existing/future responsibilities remain wired through their own
-Application/Adapter boundaries until their own composition-root work requires integration.
-`bamep-worker` (`crates/worker`, package `bamep-worker`) is a genuinely separate Rust
-crate/binary: `bamepd` spawns it as a real child OS process (`tokio::process`), never an
+Worker UDS listener, supervises the Worker OS process, forwards Worker configuration/TLS
+identity paths through the child process environment, and — since Issue #38 — connects to
+PostgreSQL and constructs the shared `TransferAuthorizationService` the Worker control plane
+needs to answer `AuthorizationQuery` with current durable state. It still owns nothing else — no
+Administrative API, Agent WSS listener, Web, scheduler workflows, or Worker HTTPS — so `bamepd`
+remains only a *partial* composition root; those existing/future responsibilities remain wired
+through their own Application/Adapter boundaries until their own composition-root work requires
+integration. `bamep-worker` (`crates/worker`, package `bamep-worker`) is a genuinely separate
+Rust crate/binary: `bamepd` spawns it as a real child OS process (`tokio::process`), never an
 in-process task.
 
 **Worker IPC v1.** `bamep-worker-protocol` implements the explicit u32be-length-prefixed
@@ -479,11 +482,13 @@ never deleted. It accepts each connection, performs the handshake, and hands the
 in-process (never PostgreSQL-durable) Runtime Service, mirroring `presence`/`outbound_sessions`,
 that tracks the single current connection generation. A newer successful handshake always
 supersedes the previous one; a superseded generation's later disconnect is a no-op against the
-now-current generation. This registry is the narrow readiness/control-connection seam #38/#39
-are expected to consume rather than inventing another notion of Worker authority. The accept
+now-current generation. This registry is the narrow readiness/control-connection seam #39
+is expected to consume rather than inventing another notion of Worker authority. The accept
 loop drains completed connection-handler tasks during normal operation, not only at shutdown.
-On `bamepd` shutdown, the control plane stops accepting new connections and removes the socket
-file.
+Since #38, the per-connection handler is a genuine loop, not a single-shot receive: it answers
+`AuthorizationQuery` messages sequentially, in place, for the connection's entire lifetime,
+sending the corresponding `AuthorizationDecision` before reading the next frame. On `bamepd`
+shutdown, the control plane stops accepting new connections and removes the socket file.
 
 **Worker-side reconnecting client.** `bamep_worker::ipc::client::run_client_loop` connects to
 the configured UDS as a client, performs the handshake, and then blocks until the connection
@@ -527,6 +532,90 @@ configuration shape) before considering itself ready. `bamep_worker::tls::identi
 implements a manual (never derived) `Debug` that redacts the private key. No production HTTPS
 data-plane listener is bound anywhere in this Work Package — that remains #39's
 responsibility; a temporary rustls `ServerConfig` is built only to validate loadability.
+
+**Sender-constrained transfer authorization (Issue #38).**
+`bamep_domain::transfer_authorization` implements the M1 proof-key/capability/transcript
+primitives materialized by Issue #35: `ProofPublicKey`/`ProofId`/`ProofSignature` (raw
+byte types with strict canonical base64url-no-pad wire encoding, mirroring
+`bamep_trusted_bootstrap::BootNonce`'s discipline), `CapabilityToken` (CSPRNG-generated,
+opaque, `Debug`-redacted) and its derived `CapabilityId = SHA-256(UTF-8 token bytes)`,
+`build_proof_transcript` (the exact 137-byte domain-separated transcript), and
+`verify_proof_signature` (strict Ed25519, no prehash/context, via `ed25519-dalek`, mirroring
+the site-key verification discipline). `capability_is_current`/`capability_matches_request`
+are pure predicates over a `CapabilityBinding`; `proof_is_fresh` enforces a bounded freshness
+window (120s past / 30s future skew, both implementation-time constants). Domain performs no
+I/O, caching, or clock access of its own.
+
+`bamep_server::runtime::capability_store::CapabilityStore` and `::replay_cache::ReplayCache`
+are the process-local Runtime Services holding transient authorization state — never
+PostgreSQL-durable, mirroring `presence`/`reservation_registry`. `CapabilityStore` generates a
+fresh `ProcessAuthorizationEpoch` once per construction (i.e. once per `bamepd` process
+lifetime) and stamps it into every capability it issues; `bamep_domain::capability_is_current`
+rejects any capability whose stored epoch does not match the store's current one. Because the
+store itself is also never reconstructed across a restart, a fresh `bamepd` process both starts
+with an empty capability store *and* mints a new epoch — two independent reasons a pre-restart
+capability can never become valid again (`m0-data-plane-and-storage-contracts.md` "Server
+restart"). `ReplayCache::check_and_insert` performs its lookup-and-insert as one `HashMap::entry`
+decision under a single lock acquisition (never a separate `contains`-then-`insert`), and
+opportunistically evicts entries older than the caller-supplied retention window on every call,
+keeping memory bounded by that window rather than by daemon uptime.
+
+`bamep_server::application::TransferAuthorizationService` is the single Application-layer owner
+of both directions of this boundary, backed by the `TransferAuthorizationRepository` Port
+(`crates/server/src/adapters/postgres/authorization_repository.rs`): `load_authorization_state`
+reads the `transfers`/`artifacts` row pair, the owning `attempts` row (when bound), and the
+`endpoints`/credential row `FOR UPDATE` inside one transaction, then rolls back — a consistent,
+read-only locking snapshot reused identically by both call sites below.
+
+- `issue` serves the Agent WSS `TransferAuthorizationRequest`
+  (`bamep_server::adapters::agent_gateway::AgentControlGateway::handle_transfer_authorization_request`):
+  the authenticated session's `endpoint_id` is authoritative (never the request body); the
+  presented `correlation_id` must equal the durable owning Attempt's `action_id`; the owning
+  Attempt must be `Dispatched` or `InProgress` (a pre-dispatch unbound Transfer, an
+  `AwaitingReconciliation` Attempt, or any terminal Attempt state is denied — no explicit
+  Job-lifecycle permission mechanism for `AwaitingReconciliation` continuation exists yet, so the
+  fail-closed default applies); the Endpoint credential must be `CredentialActive`. Renewal is
+  the same call again with a fresh proof key — it creates nothing, so it composes for free.
+- `decide` serves the Worker UDS `AuthorizationQuery`
+  (`bamep_server::adapters::worker_control_plane`): looks up the capability by
+  `CapabilityId::from_token_bytes`, checks `capability_is_current`/`capability_matches_request`,
+  reconstructs the canonical transcript and verifies the signature against the capability's
+  bound `ProofPublicKey`, checks freshness, performs the atomic replay check-and-insert, and only
+  then **re-reads current durable state** (not the issuance-time snapshot) to re-check
+  Transfer/Attempt/credential validity — so a credential revoked or an Attempt that turned
+  terminal after issuance takes effect on the very next query, not merely on the next issuance.
+
+Both directions collapse every internal denial cause into one generic outcome
+(`TransferAuthorizationOutcome::Denied` / `WorkerAuthorizationOutcome::Denied`) before it
+reaches the wire, satisfying the non-enumerable-denial requirement identically on both
+boundaries. `bamepd`'s composition root (`crates/server/src/bin/bamepd.rs`) now connects to
+PostgreSQL and constructs one `TransferAuthorizationService` shared by both boundaries — the
+Worker control plane cannot answer `AuthorizationQuery` from current durable state without it,
+so `bamepd` is no longer PostgreSQL-free as the #37 architecture note originally described.
+`BAMEPD_DATABASE_URL` and `BAMEP_DATA_PLANE_BASE_URL` (a plain HTTPS-origin-no-path string,
+validated but not otherwise interpreted) are new required `bamepd` configuration.
+
+`bamep-agent-protocol` materializes `TransferAuthorizationRequest`/`Grant`/`Denied`
+(`transfer_id`/`action_id` as `ProtocolId`, `token`/`data_plane_base_url` opaque strings,
+`token` `Debug`-redacted); `bamep-worker-protocol` materializes `AuthorizationQuery`/
+`AuthorizationDecision` (opaque `token`/`proof_id`/`signature`, closed `AuthorizationOperation`/
+`WireTransferDirection` wire enums, manual `Debug` redaction of every secret field) — neither
+wire crate depends on `bamep-domain`; both treat capability/proof material as opaque bytes to be
+forwarded, per ADR-0003/ADR-0018.
+
+`bamep_worker::ipc::authorization_client` extends the Worker UDS client with generation-scoped
+request/response routing: `run_client_loop` publishes a fresh `mpsc` sender for the pending-query
+channel over a `watch<Option<Sender>>` the instant a handshake succeeds, and clears it back to
+`None` the instant that connection ends. `AuthorizationClient::query` sends a query and awaits a
+paired `oneshot` reply; the same connection task that owns the socket for the rest of Issue #37's
+handshake/authority lifetime also owns sending each query and receiving its correlated
+`AuthorizationDecision` (`in_reply_to`-checked) — one outstanding query at a time, no detached
+tasks, no second reader/writer on the stream. A send failure, a non-matching reply, or the idle
+socket producing any frame at all (`bamepd` never pushes anything unsolicited) ends the
+connection and fails every awaiting caller closed (`QueryError::Disconnected`); no connection at
+all fails closed immediately (`QueryError::NotConnected`) — Worker can never fabricate an
+`AuthorizationDecision` locally. This mechanism is provisioned but not yet driven by production
+HTTP traffic — that remains #39's responsibility.
 
 ## Maintenance rule
 

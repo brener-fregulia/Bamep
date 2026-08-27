@@ -22,22 +22,32 @@ use std::sync::Arc;
 use bamep_agent_protocol::{
     decode, encode, AgentProtocolMessage, AuthRequestMessage, BootstrapEvidenceMessage, Envelope,
     InventoryReportMessage, ProtocolErrorMessage, ProtocolId, ProtocolVersion,
+    TransferAuthorizationRequestMessage,
 };
 use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
+use bamep_domain::{ChunkSize, DigestAlgorithm, SourceProvenance, TransferDirection};
 use bamep_server::adapters::agent_gateway::{
     AgentControlGateway, AgentGatewayError, HandshakeOutcome,
 };
 use bamep_server::adapters::postgres::{
     PostgresBootContextRepository, PostgresCredentialRedemptionRepository,
-    PostgresEndpointRepository,
+    PostgresEndpointRepository, PostgresJobRepository, PostgresTransferAuthorizationRepository,
+    PostgresTransferRepository,
 };
 use bamep_server::application::{
     ApplicationError, BootOrchestrationService, BootstrapEvidenceService, Clock, EnrollmentService,
-    RedeemResult,
+    RedeemResult, TransferAuthorizationService, TransferDispatchResult, TransferDispatchService,
+    TransferService,
+};
+use bamep_server::runtime::capability_store::CapabilityStore;
+use bamep_server::runtime::replay_cache::ReplayCache;
+use bamep_server::runtime::resource_arbiter::{
+    ResourceClaim, ResourceKind, TechnicalResourceArbiter,
 };
 use bamep_trusted_bootstrap::ServerCertFingerprint;
 use bamep_trusted_bootstrap::{fixture::FixtureAssertionSigner, AcceptedSiteKeys};
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use sqlx::PgPool;
@@ -892,5 +902,263 @@ async fn session_loop_error_path_still_removes_presence() {
         "cleanup on an error exit path must still remove presence"
     );
 
+    db.teardown().await;
+}
+
+// ---------------------------------------------------------------------
+// TransferAuthorizationRequest (Issue #38 "Agent WSS integration")
+// ---------------------------------------------------------------------
+
+const DATA_PLANE_BASE_URL: &str = "https://server.example:8443";
+
+struct DispatchedTransfer {
+    transfer_id: ProtocolId,
+    action_id: ProtocolId,
+}
+
+/// Enrolled+approved Endpoint (via the already-authenticated `endpoint_id`),
+/// `Running` Job, `PreconditionsSatisfied` JobStep, pre-dispatch Transfer,
+/// then a committed `Attempt{Dispatched}` bound to it — mirroring
+/// `transfer_authorization_service.rs`'s identical fixture, reused here to
+/// prove the same Application boundary through the real Agent WSS Gateway.
+async fn dispatched_transfer_fixture(
+    pool: PgPool,
+    endpoint_id: bamep_domain::EndpointId,
+) -> DispatchedTransfer {
+    let job_repo = Arc::new(PostgresJobRepository::new(pool.clone()));
+    let jobs = bamep_server::application::JobService::new(Arc::clone(&job_repo));
+    let scheduling = bamep_server::application::JobSchedulingService::new(Arc::clone(&job_repo));
+    let transfers = TransferService::new(Arc::new(PostgresTransferRepository::new(pool.clone())));
+    let arbiter = Arc::new(TechnicalResourceArbiter::new([(
+        ResourceKind::new("network"),
+        10,
+    )]));
+    let dispatch = TransferDispatchService::new(Arc::clone(&job_repo), arbiter);
+
+    let job = jobs.create_workflow(endpoint_id, 1).await.unwrap();
+    let step_id = job.steps[0].id;
+    scheduling.admit(job.id).await.unwrap();
+    scheduling
+        .satisfy_current_step_preconditions(job.id, step_id)
+        .await
+        .unwrap();
+    let context = transfers
+        .create_transfer_context(
+            endpoint_id,
+            job.id,
+            step_id,
+            TransferDirection::AgentToServer,
+            DigestAlgorithm::Sha256,
+            ChunkSize::new(4096).unwrap(),
+            SourceProvenance::new("disk-0"),
+        )
+        .await
+        .unwrap();
+    let result = dispatch
+        .commit_transfer_dispatch(
+            job.id,
+            step_id,
+            context.transfer.id,
+            vec![ResourceClaim::new(ResourceKind::new("network"), 1)],
+        )
+        .await
+        .unwrap();
+    let TransferDispatchResult::Committed { outcome, .. } = result else {
+        panic!("expected a successful dispatch commitment");
+    };
+    let action_id = ProtocolId::from_uuid(outcome.attempt.action_id.0)
+        .expect("a Domain ActionId is always a valid UUID v4");
+    let transfer_id =
+        ProtocolId::from_uuid(context.transfer.id.0).expect("TransferId is always a UUID v4");
+
+    DispatchedTransfer {
+        transfer_id,
+        action_id,
+    }
+}
+
+fn generate_proof_public_key_wire() -> String {
+    let signing_key = SigningKey::from_bytes(&rand::random());
+    bamep_domain::ProofPublicKey::from_bytes(signing_key.verifying_key().to_bytes())
+        .unwrap()
+        .to_wire_value()
+}
+
+fn build_transfer_authorization_service(pool: PgPool) -> Arc<TransferAuthorizationService> {
+    Arc::new(TransferAuthorizationService::new(
+        Arc::new(PostgresTransferAuthorizationRepository::new(pool)),
+        Arc::new(CapabilityStore::new()),
+        Arc::new(ReplayCache::new()),
+        DATA_PLANE_BASE_URL,
+    ))
+}
+
+/// Establishes a real authenticated session (real handshake over the
+/// in-memory WSS pair) and returns it alongside the client/server socket
+/// halves and the durable `endpoint_id`, ready for `run_authenticated_session`.
+async fn established_session(
+    enrollment: &Arc<Enrollment>,
+    boot: &BootOrchestration,
+    gateway: &Gateway,
+    signal: &str,
+    now: DateTime<Utc>,
+) -> (
+    WebSocketStream<tokio::io::DuplexStream>,
+    WebSocketStream<tokio::io::DuplexStream>,
+    bamep_server::adapters::agent_gateway::AuthenticatedSession,
+) {
+    let e1 = issue_e1(boot, signal, now).await;
+    let (mut client_ws, mut server_ws) = websocket_pair().await;
+    let auth_request = AuthRequestMessage::new(e1.to_wire_value());
+    send_text(
+        &mut client_ws,
+        encode(&AgentProtocolMessage::AuthRequest(auth_request)).unwrap(),
+    )
+    .await;
+    let HandshakeOutcome::Established(session) = gateway.handshake(&mut server_ws).await.unwrap()
+    else {
+        panic!("expected Established");
+    };
+    let _ = recv_message(&mut client_ws).await; // SessionEstablished
+    enrollment
+        .approve_enrollment(
+            session.endpoint_id,
+            bamep_domain::Actor::Operator {
+                label: "agent-gateway-transfer-authorization-harness".into(),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    (client_ws, server_ws, session)
+}
+
+#[tokio::test]
+async fn transfer_authorization_request_over_authenticated_session_grants_a_capability() {
+    let db = TestDatabase::setup().await;
+    let clock = Arc::new(ManualClock::new(Utc::now()));
+    let (boot, enrollment) =
+        build_services(db.pool.clone(), Arc::clone(&clock), Duration::minutes(10));
+    let transfer_authorization = build_transfer_authorization_service(db.pool.clone());
+    let signer = FixtureAssertionSigner::from_seed([11; 32]);
+    let bootstrap_evidence = Arc::new(BootstrapEvidenceService::new(
+        Arc::new(PostgresEndpointRepository::new(db.pool.clone())),
+        AcceptedSiteKeys::single(signer.public_key()),
+    ));
+    let gateway = Arc::new(
+        Gateway::new(Arc::clone(&enrollment))
+            .with_bootstrap_evidence_service(bootstrap_evidence)
+            .with_transfer_authorization_service(Arc::clone(&transfer_authorization)),
+    );
+
+    let (mut client_ws, mut server_ws, session) = established_session(
+        &enrollment,
+        &boot,
+        &gateway,
+        "gw-transfer-auth-01",
+        clock.now(),
+    )
+    .await;
+    let fixture = dispatched_transfer_fixture(db.pool.clone(), session.endpoint_id).await;
+
+    let server_gateway = Arc::clone(&gateway);
+    let task = tokio::spawn(async move {
+        server_gateway
+            .run_authenticated_session(
+                &mut server_ws,
+                session,
+                ServerCertFingerprint::from_sha256_digest([1; 32]),
+            )
+            .await
+    });
+
+    let request = TransferAuthorizationRequestMessage::new(
+        fixture.action_id,
+        fixture.transfer_id,
+        generate_proof_public_key_wire(),
+    );
+    send_text(
+        &mut client_ws,
+        encode(&AgentProtocolMessage::TransferAuthorizationRequest(request)).unwrap(),
+    )
+    .await;
+
+    let response = recv_message(&mut client_ws).await;
+    let AgentProtocolMessage::TransferAuthorizationGrant(grant) = response else {
+        panic!("expected TransferAuthorizationGrant, got {response:?}");
+    };
+    assert_eq!(grant.envelope.correlation_id, Some(fixture.action_id));
+    assert_eq!(grant.body.transfer_id, fixture.transfer_id);
+    assert_eq!(grant.body.data_plane_base_url, DATA_PLANE_BASE_URL);
+    assert!(!grant.body.token.is_empty());
+
+    client_ws.close(None).await.unwrap();
+    task.await.unwrap().unwrap();
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn transfer_authorization_request_with_wrong_correlation_is_generically_denied() {
+    let db = TestDatabase::setup().await;
+    let clock = Arc::new(ManualClock::new(Utc::now()));
+    let (boot, enrollment) =
+        build_services(db.pool.clone(), Arc::clone(&clock), Duration::minutes(10));
+    let transfer_authorization = build_transfer_authorization_service(db.pool.clone());
+    let signer = FixtureAssertionSigner::from_seed([12; 32]);
+    let bootstrap_evidence = Arc::new(BootstrapEvidenceService::new(
+        Arc::new(PostgresEndpointRepository::new(db.pool.clone())),
+        AcceptedSiteKeys::single(signer.public_key()),
+    ));
+    let gateway = Arc::new(
+        Gateway::new(Arc::clone(&enrollment))
+            .with_bootstrap_evidence_service(bootstrap_evidence)
+            .with_transfer_authorization_service(Arc::clone(&transfer_authorization)),
+    );
+
+    let (mut client_ws, mut server_ws, session) = established_session(
+        &enrollment,
+        &boot,
+        &gateway,
+        "gw-transfer-auth-wrong-01",
+        clock.now(),
+    )
+    .await;
+    let fixture = dispatched_transfer_fixture(db.pool.clone(), session.endpoint_id).await;
+
+    let server_gateway = Arc::clone(&gateway);
+    let task = tokio::spawn(async move {
+        server_gateway
+            .run_authenticated_session(
+                &mut server_ws,
+                session,
+                ServerCertFingerprint::from_sha256_digest([1; 32]),
+            )
+            .await
+    });
+
+    // Wrong correlation_id: a syntactically valid but unrelated action_id.
+    let request = TransferAuthorizationRequestMessage::new(
+        ProtocolId::generate(),
+        fixture.transfer_id,
+        generate_proof_public_key_wire(),
+    );
+    send_text(
+        &mut client_ws,
+        encode(&AgentProtocolMessage::TransferAuthorizationRequest(request)).unwrap(),
+    )
+    .await;
+
+    let response = recv_message(&mut client_ws).await;
+    let AgentProtocolMessage::TransferAuthorizationDenied(denied) = response else {
+        panic!("expected TransferAuthorizationDenied, got {response:?}");
+    };
+    assert_eq!(denied.body.transfer_id, fixture.transfer_id);
+    assert_eq!(
+        denied.body.reason, "denied",
+        "the single closed generic V1 denial reason"
+    );
+
+    client_ws.close(None).await.unwrap();
+    task.await.unwrap().unwrap();
     db.teardown().await;
 }

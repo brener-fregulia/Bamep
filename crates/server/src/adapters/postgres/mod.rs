@@ -7,6 +7,7 @@
 //! `repository.rs`, and the `BootContextRepository` implementation lives in
 //! `boot_context_repository.rs`.
 
+mod authorization_repository;
 mod boot_context_repository;
 mod credential_redemption_repository;
 mod inventory_repository;
@@ -15,6 +16,7 @@ mod repository;
 mod shared;
 mod transfer_repository;
 
+pub use authorization_repository::PostgresTransferAuthorizationRepository;
 pub use boot_context_repository::PostgresBootContextRepository;
 pub use credential_redemption_repository::PostgresCredentialRedemptionRepository;
 pub use inventory_repository::PostgresInventoryRepository;

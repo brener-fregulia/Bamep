@@ -18,6 +18,8 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
@@ -27,12 +29,26 @@ use bamep_server::adapters::worker_runtime_ownership::{
     LockError, RuntimeOwnershipLock, TrustedRuntimeDir,
 };
 use rcgen::{generate_simple_self_signed, CertifiedKey};
+use support::TestDatabase;
 
 struct TestEnv {
     dir: PathBuf,
     socket_path: PathBuf,
     cert_path: PathBuf,
     key_path: PathBuf,
+    /// A real, migrated per-test PostgreSQL database (Issue #38: `bamepd`
+    /// now connects to PostgreSQL at startup so the Worker control plane can
+    /// answer `AuthorizationQuery` traffic with current durable state — see
+    /// `bamepd.rs`). Always `Some` after [`TestEnv::new`]; `Drop::drop`
+    /// takes it to hand an owned value to `TestDatabase::teardown`, which
+    /// consumes `self`.
+    db: Option<TestDatabase>,
+    /// A dedicated single-threaded runtime this test-support type owns, used
+    /// only to drive the async `TestDatabase` setup/teardown from otherwise
+    /// synchronous `#[test]` functions — this file's own subject
+    /// (`RuntimeOwnershipLock`/real-process `bamepd` behavior) requires no
+    /// async runtime of its own.
+    db_runtime: tokio::runtime::Runtime,
 }
 
 impl TestEnv {
@@ -59,17 +75,32 @@ impl TestEnv {
         // subdirectory under `dir`, created fresh by `bamepd` itself.
         let runtime_dir = dir.join("run");
 
+        let db_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test database runtime");
+        let db = db_runtime.block_on(TestDatabase::setup());
+
         Self {
             socket_path: runtime_dir.join("worker.sock"),
             cert_path,
             key_path,
             dir,
+            db: Some(db),
+            db_runtime,
         }
+    }
+
+    fn db_url(&self) -> &str {
+        &self.db.as_ref().expect("db present until Drop").db_url
     }
 }
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
+        if let Some(db) = self.db.take() {
+            self.db_runtime.block_on(db.teardown());
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -127,6 +158,8 @@ fn spawn_bamepd(binary: &Path, env: &TestEnv) -> std::process::Child {
         .env("BAMEP_WORKER_TLS_KEY_PATH", &env.key_path)
         .env("BAMEPD_WORKER_RESTART_DELAY_MS", "500")
         .env("BAMEP_WORKER_RECONNECT_DELAY_MS", "500")
+        .env("BAMEPD_DATABASE_URL", env.db_url())
+        .env("BAMEP_DATA_PLANE_BASE_URL", "https://server.example:8443")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

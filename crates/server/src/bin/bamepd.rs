@@ -1,23 +1,34 @@
-//! `bamepd` binary entrypoint (Issue #37): the minimal Server daemon
-//! composition root proving real Worker supervision. Owns only:
+//! `bamepd` binary entrypoint (Issue #37, extended by Issue #38): the
+//! minimal Server daemon composition root proving real Worker supervision
+//! and sender-constrained transfer authorization. Owns only:
 //!
 //! - the Worker UDS control-plane listener;
 //! - the Worker process supervisor;
 //! - Worker executable location/config and TLS identity path forwarding;
+//! - the minimum PostgreSQL connection needed to answer Worker
+//!   `AuthorizationQuery` traffic with current durable state (Issue #38 —
+//!   the Worker control plane cannot decide authorization without it);
+//! - the process-lifetime capability store and replay cache;
 //! - shutdown coordination.
 //!
-//! Deliberately does NOT wire PostgreSQL startup, the Administrative API,
-//! the Agent WSS listener, Web, scheduler workflows, transfer
-//! authorization, Worker HTTPS, or storage — those existing/future
-//! responsibilities remain tested through their own Application/Adapter
-//! boundaries until their own composition-root work requires integration.
-//! `bamepd` is currently only a *partial* composition root.
+//! Still deliberately does NOT wire the Administrative API, the Agent WSS
+//! listener (`TransferAuthorizationService::issue` is exercised directly by
+//! its own Application/Adapter-level tests, not through a real WSS listener
+//! here), Web, scheduler workflows, Worker HTTPS, or storage — those
+//! existing/future responsibilities remain tested through their own
+//! Application/Adapter boundaries until their own composition-root work
+//! requires integration. `bamepd` is currently only a *partial* composition
+//! root.
 
 use std::sync::Arc;
 
+use bamep_server::adapters::postgres::PostgresTransferAuthorizationRepository;
 use bamep_server::adapters::worker_control_plane::WorkerControlPlane;
 use bamep_server::adapters::worker_runtime_ownership::{RuntimeOwnershipLock, TrustedRuntimeDir};
+use bamep_server::application::TransferAuthorizationService;
 use bamep_server::runtime::bamepd_config::BamepdConfig;
+use bamep_server::runtime::capability_store::CapabilityStore;
+use bamep_server::runtime::replay_cache::ReplayCache;
 use bamep_server::runtime::worker_authority::WorkerAuthorityRegistry;
 use bamep_server::runtime::worker_supervisor::{
     SupervisorConfig, SupervisorEvent, WorkerSupervisor, SUPERVISOR_EVENT_CHANNEL_CAPACITY,
@@ -71,6 +82,25 @@ async fn run(config: BamepdConfig) {
         std::process::exit(1);
     });
 
+    // Issue #38: the Worker control plane cannot answer `AuthorizationQuery`
+    // without current durable state, so `bamepd` must connect to PostgreSQL
+    // before it can honestly claim the control plane is ready to serve.
+    let pool = bamep_server::adapters::postgres::connect(&config.database_url)
+        .await
+        .unwrap_or_else(|err| {
+            eprintln!("bamepd: failed to connect to PostgreSQL: {err}");
+            std::process::exit(1);
+        });
+    let authorization_repo = Arc::new(PostgresTransferAuthorizationRepository::new(pool));
+    let capability_store = Arc::new(CapabilityStore::new());
+    let replay_cache = Arc::new(ReplayCache::new());
+    let transfer_authorization = Arc::new(TransferAuthorizationService::new(
+        authorization_repo,
+        Arc::clone(&capability_store),
+        replay_cache,
+        config.data_plane_base_url.clone(),
+    ));
+
     let registry = Arc::new(WorkerAuthorityRegistry::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (events_tx, mut events_rx) = mpsc::channel(SUPERVISOR_EVENT_CHANNEL_CAPACITY);
@@ -102,11 +132,15 @@ async fn run(config: BamepdConfig) {
     });
 
     // `control_plane.run` accepts Worker's connection, performs the
-    // handshake, and registers the resulting connection generation with
-    // `registry` — the narrow readiness/control-connection seam #38/#39
-    // consume through `registry.current()`.
-    let mut control_plane_task =
-        tokio::spawn(control_plane.run(Arc::clone(&registry), shutdown_rx));
+    // handshake, registers the resulting connection generation with
+    // `registry`, and answers `AuthorizationQuery` traffic through
+    // `transfer_authorization` — the narrow readiness/control-connection
+    // seam #39 consumes through `registry.current()`.
+    let mut control_plane_task = tokio::spawn(control_plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&transfer_authorization),
+        shutdown_rx,
+    ));
 
     // Wait for either a controlled shutdown request or the Worker
     // control-plane task terminating on its own — a persistent `accept()`

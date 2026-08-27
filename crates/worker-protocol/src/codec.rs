@@ -21,6 +21,8 @@ const KNOWN_MESSAGE_TYPES: &[&str] = &[
     "WorkerHello",
     "ServerHello",
     "HandshakeRejected",
+    "AuthorizationQuery",
+    "AuthorizationDecision",
     "ProtocolError",
 ];
 
@@ -146,7 +148,10 @@ mod tests {
     /// `DecodeError::UnknownType`.
     #[test]
     fn every_real_message_variant_round_trips_without_being_classified_unknown() {
-        use crate::messages::{HandshakeRejectedMessage, ServerHelloMessage};
+        use crate::messages::{
+            AuthorizationDecisionMessage, AuthorizationOperation, AuthorizationQueryMessage,
+            HandshakeRejectedMessage, ServerHelloMessage, WireTransferDirection,
+        };
 
         let variants = [
             WorkerProtocolMessage::WorkerHello(WorkerHelloMessage::new(Uuid::new_v4())),
@@ -154,6 +159,21 @@ mod tests {
             WorkerProtocolMessage::HandshakeRejected(
                 HandshakeRejectedMessage::incompatible_version(Uuid::new_v4()),
             ),
+            WorkerProtocolMessage::AuthorizationQuery(AuthorizationQueryMessage::new(
+                "t",
+                AuthorizationOperation::ChunkUpload,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                WireTransferDirection::AgentToServer,
+                Some(0),
+                "p",
+                1,
+                "s",
+            )),
+            WorkerProtocolMessage::AuthorizationDecision(AuthorizationDecisionMessage::approved(
+                Uuid::new_v4(),
+                None,
+            )),
             WorkerProtocolMessage::ProtocolError(ProtocolErrorMessage::new("some_code")),
         ];
         for variant in variants {

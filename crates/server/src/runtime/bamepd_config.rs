@@ -29,6 +29,18 @@ pub const ENV_TLS_KEY_PATH: &str = "BAMEP_WORKER_TLS_KEY_PATH";
 pub const ENV_RECONNECT_DELAY_MS: &str = "BAMEP_WORKER_RECONNECT_DELAY_MS";
 pub const ENV_WORKER_EXECUTABLE: &str = "BAMEPD_WORKER_EXECUTABLE";
 pub const ENV_WORKER_RESTART_DELAY_MS: &str = "BAMEPD_WORKER_RESTART_DELAY_MS";
+/// PostgreSQL connection string (ADR-0013). Required starting with Issue
+/// #38: the Worker control plane's `AuthorizationQuery` handler needs
+/// current durable Transfer/Attempt/Endpoint-credential state to decide
+/// authorization at all — `bamepd` can no longer avoid PostgreSQL startup
+/// once that boundary is wired.
+pub const ENV_DATABASE_URL: &str = "BAMEPD_DATABASE_URL";
+/// The current Worker-owned data-plane HTTPS origin `bamepd` reports in
+/// every `TransferAuthorizationGrant`
+/// (`m0-agent-protocol-contract.md` "Endpoint discovery for the data-plane
+/// listener"). Issue #38 only carries this value through; it binds no
+/// listener of its own (#39).
+pub const ENV_DATA_PLANE_BASE_URL: &str = "BAMEP_DATA_PLANE_BASE_URL";
 
 const DEFAULT_RESTART_DELAY_MS: u64 = 500;
 const DEFAULT_RECONNECT_DELAY_MS: u64 = 500;
@@ -68,6 +80,8 @@ pub struct BamepdConfig {
     pub tls_key_path: PathBuf,
     pub worker_restart_delay: Duration,
     pub worker_reconnect_delay: Duration,
+    pub database_url: String,
+    pub data_plane_base_url: String,
 }
 
 impl BamepdConfig {
@@ -84,6 +98,8 @@ impl BamepdConfig {
             optional_millis(&get, ENV_WORKER_RESTART_DELAY_MS, DEFAULT_RESTART_DELAY_MS)?;
         let worker_reconnect_delay =
             optional_millis(&get, ENV_RECONNECT_DELAY_MS, DEFAULT_RECONNECT_DELAY_MS)?;
+        let database_url = required_string(&get, ENV_DATABASE_URL)?;
+        let data_plane_base_url = required_https_origin(&get, ENV_DATA_PLANE_BASE_URL)?;
 
         Ok(Self {
             uds_path,
@@ -92,6 +108,8 @@ impl BamepdConfig {
             tls_key_path,
             worker_restart_delay,
             worker_reconnect_delay,
+            database_url,
+            data_plane_base_url,
         })
     }
 
@@ -127,6 +145,38 @@ fn required_path(
     get(name)
         .map(PathBuf::from)
         .ok_or(BamepdConfigError::MissingEnv(name))
+}
+
+fn required_string(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+) -> Result<String, BamepdConfigError> {
+    get(name).ok_or(BamepdConfigError::MissingEnv(name))
+}
+
+/// `data_plane_base_url` must be an HTTPS origin only — scheme, host, and
+/// port, no path (`m0-agent-protocol-contract.md` "Endpoint discovery for
+/// the data-plane listener"). This check is intentionally narrow: full URL
+/// parsing is unnecessary for a value this Work Package only threads through
+/// unmodified.
+fn required_https_origin(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+) -> Result<String, BamepdConfigError> {
+    let value = required_string(get, name)?;
+    let Some(after_scheme) = value.strip_prefix("https://") else {
+        return Err(BamepdConfigError::InvalidEnv {
+            name,
+            reason: "must be an https:// origin".to_string(),
+        });
+    };
+    if after_scheme.is_empty() || after_scheme.contains('/') {
+        return Err(BamepdConfigError::InvalidEnv {
+            name,
+            reason: "must carry no path — scheme, host, and port only".to_string(),
+        });
+    }
+    Ok(value)
 }
 
 fn optional_millis(
@@ -173,6 +223,8 @@ mod tests {
             (ENV_WORKER_EXECUTABLE, "/opt/bamep/bin/bamep-worker"),
             (ENV_TLS_CERT_PATH, "/etc/bamep/tls/cert.pem"),
             (ENV_TLS_KEY_PATH, "/etc/bamep/tls/key.pem"),
+            (ENV_DATABASE_URL, "postgres://bamep@localhost/bamep"),
+            (ENV_DATA_PLANE_BASE_URL, "https://server.example:8443"),
         ]
     }
 
@@ -187,6 +239,41 @@ mod tests {
         assert_eq!(
             config.worker_reconnect_delay,
             Duration::from_millis(DEFAULT_RECONNECT_DELAY_MS)
+        );
+        assert_eq!(config.database_url, "postgres://bamep@localhost/bamep");
+        assert_eq!(config.data_plane_base_url, "https://server.example:8443");
+    }
+
+    #[test]
+    fn missing_database_url_is_rejected() {
+        let mut values = base_values();
+        values.retain(|(name, _)| *name != ENV_DATABASE_URL);
+        let err = BamepdConfig::from_lookup(lookup(&values)).unwrap_err();
+        assert_eq!(err, BamepdConfigError::MissingEnv(ENV_DATABASE_URL));
+    }
+
+    #[test]
+    fn a_non_https_data_plane_base_url_is_rejected() {
+        let mut values = base_values();
+        values.retain(|(name, _)| *name != ENV_DATA_PLANE_BASE_URL);
+        values.push((ENV_DATA_PLANE_BASE_URL, "http://server.example:8443"));
+        let err = BamepdConfig::from_lookup(lookup(&values)).unwrap_err();
+        assert!(
+            matches!(err, BamepdConfigError::InvalidEnv { name, .. } if name == ENV_DATA_PLANE_BASE_URL)
+        );
+    }
+
+    #[test]
+    fn a_data_plane_base_url_carrying_a_path_is_rejected() {
+        let mut values = base_values();
+        values.retain(|(name, _)| *name != ENV_DATA_PLANE_BASE_URL);
+        values.push((
+            ENV_DATA_PLANE_BASE_URL,
+            "https://server.example:8443/api/data/v1/",
+        ));
+        let err = BamepdConfig::from_lookup(lookup(&values)).unwrap_err();
+        assert!(
+            matches!(err, BamepdConfigError::InvalidEnv { name, .. } if name == ENV_DATA_PLANE_BASE_URL)
         );
     }
 

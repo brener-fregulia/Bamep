@@ -1335,3 +1335,38 @@ pub trait TransferRepository: Send + Sync {
         decide: BindAttemptDecision,
     ) -> Result<Transfer, BindAttemptError>;
 }
+
+/// The complete current durable authorization-relevant state for one
+/// Transfer, read consistently in a single bounded transaction (Issue #38
+/// "PostgreSQL transaction/repository composition": "Transfer, Attempt,
+/// Endpoint credential, Artifact must not be independently loaded in a way
+/// that permits a contradictory cross-transaction snapshot to authorize
+/// unsafe work"). `attempt` is `None` exactly when `transfer.attempt_id` is
+/// `None` — a pre-dispatch Transfer never eligible for authorization
+/// (`m0-data-plane-and-storage-contracts.md`; Issue #36 scope).
+#[derive(Debug, Clone)]
+pub struct AuthorizationDurableState {
+    pub transfer: Transfer,
+    pub artifact: Artifact,
+    pub attempt: Option<Attempt>,
+    pub endpoint: EndpointAggregate,
+}
+
+/// Read-only current-authorization-state Port (Issue #38). Deliberately
+/// separate from [`TransferRepository`] (Issue #36's own narrower scope) and
+/// from [`EndpointRepository`]/[`JobRepository`]: this Port exists purely to
+/// give the Application authorization services one consistent snapshot
+/// composed from all three underlying aggregates, reused identically by both
+/// the Agent WSS capability-issuance path and the Worker UDS per-request
+/// decision path.
+#[async_trait]
+pub trait TransferAuthorizationRepository: Send + Sync {
+    /// `None` when no Transfer with `transfer_id` was ever created. Every
+    /// authorization caller must treat "unknown transfer" and every other
+    /// denial cause identically at the external boundary — this Port itself
+    /// only reports the fact.
+    async fn load_authorization_state(
+        &self,
+        transfer_id: TransferId,
+    ) -> Result<Option<AuthorizationDurableState>, RepositoryError>;
+}

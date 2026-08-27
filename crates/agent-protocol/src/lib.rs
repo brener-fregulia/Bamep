@@ -34,5 +34,8 @@ pub use messages::{
     CancelActionMessage, EmptyActionProgress, InventoryReportBody, InventoryReportMessage,
     KnownActionState, LocalBootTrust, ProtocolErrorBody, ProtocolErrorMessage,
     SessionEstablishedBody, SessionEstablishedMessage, StatusQueryBody, StatusQueryMessage,
-    StatusReportBody, StatusReportMessage,
+    StatusReportBody, StatusReportMessage, TransferAuthorizationDeniedBody,
+    TransferAuthorizationDeniedMessage, TransferAuthorizationGrantBody,
+    TransferAuthorizationGrantMessage, TransferAuthorizationRequestBody,
+    TransferAuthorizationRequestMessage,
 };
