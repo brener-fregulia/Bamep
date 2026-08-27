@@ -12,6 +12,7 @@ mod support;
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bamep_agent_protocol::ProtocolId;
 use bamep_domain::{
     ActionEvidence, ArtifactId, ChunkSize, DigestAlgorithm, EndpointId, JobStepId,
@@ -23,10 +24,14 @@ use bamep_server::adapters::postgres::{
     PostgresTransferRepository,
 };
 use bamep_server::application::{
-    ActionEvidenceService, BootOrchestrationService, EnrollmentService, RedeemResult,
-    TransferAuthorizationOutcome, TransferAuthorizationService, TransferDispatchResult,
-    TransferDispatchService, TransferService, WorkerAuthorizationOutcome,
+    ActionEvidenceService, BootOrchestrationService, EnrollmentService, ReconciliationService,
+    RedeemResult, TransferAuthorizationOutcome, TransferAuthorizationService,
+    TransferDispatchResult, TransferDispatchService, TransferService, WorkerAuthorizationOutcome,
     WorkerAuthorizationQueryInput,
+};
+use bamep_server::ports::{
+    AgentDispatchError, AgentDispatchPort, AuthorizationDurableState, RepositoryError,
+    TransferAuthorizationRepository,
 };
 use bamep_server::runtime::capability_store::CapabilityStore;
 use bamep_server::runtime::replay_cache::ReplayCache;
@@ -374,8 +379,15 @@ async fn unknown_transfer_is_denied() {
     db.teardown().await;
 }
 
+/// Issue #38 final correction: once the request has already passed the
+/// ownership/context checks that make the comparison legitimate for this
+/// authenticated Endpoint (the Transfer belongs to it and its owning Attempt
+/// is `InProgress`), a wrong presented `correlation_id`/`action_id` is a
+/// protocol violation, not a semantic denial — `m0-agent-protocol-
+/// contract.md` "Correlation" requires the exact owning `action_id`, and a
+/// `TransferAuthorizationDenied` cannot legitimately carry anything else.
 #[tokio::test]
-async fn wrong_action_id_is_denied() {
+async fn wrong_action_id_is_a_protocol_violation() {
     let db = TestDatabase::setup().await;
     let services = build_services(db.pool.clone());
     let fixture = in_progress_transfer_fixture(&services, "auth-wrongaction-01").await;
@@ -392,7 +404,7 @@ async fn wrong_action_id_is_denied() {
         .await
         .unwrap();
 
-    assert_eq!(outcome, TransferAuthorizationOutcome::Denied);
+    assert_eq!(outcome, TransferAuthorizationOutcome::ProtocolViolation);
     db.teardown().await;
 }
 
@@ -1306,6 +1318,242 @@ async fn capability_store_saturation_denies_generically() {
         second,
         TransferAuthorizationOutcome::Denied,
         "capacity exhaustion is the single generic non-enumerable denial"
+    );
+
+    db.teardown().await;
+}
+
+// ---------------------------------------------------------------------
+// Issue #38 final correction §11 — insertion-order regressions: a request
+// denied by a check that runs before the replay check+insert must never
+// permanently consume its proof_id, whether the denial is a durable-state
+// denial or a repository error.
+// ---------------------------------------------------------------------
+
+fn arbiter() -> Arc<TechnicalResourceArbiter> {
+    Arc::new(TechnicalResourceArbiter::new([(
+        ResourceKind::new("network"),
+        10,
+    )]))
+}
+
+/// `AgentDispatchPort` fake for constructing a [`ReconciliationService`] in
+/// these tests — only [`ReconciliationService::mark_endpoint_uncertain`]/
+/// [`ReconciliationService::apply_status_report`] are exercised, neither of
+/// which transmits anything, so every method here is unreachable.
+struct UnreachableDispatchPort;
+
+#[async_trait]
+impl AgentDispatchPort for UnreachableDispatchPort {
+    async fn dispatch_action(
+        &self,
+        _endpoint_id: EndpointId,
+        _dispatch: bamep_agent_protocol::ActionDispatchMessage,
+    ) -> Result<(), AgentDispatchError> {
+        unreachable!("this test never dispatches an action")
+    }
+
+    async fn cancel_action(
+        &self,
+        _endpoint_id: EndpointId,
+        _cancel: bamep_agent_protocol::CancelActionMessage,
+    ) -> Result<(), AgentDispatchError> {
+        unreachable!("this test never cancels an action")
+    }
+
+    async fn status_query(
+        &self,
+        _endpoint_id: EndpointId,
+        _query: bamep_agent_protocol::StatusQueryMessage,
+    ) -> Result<(), AgentDispatchError> {
+        unreachable!("this test never issues a StatusQuery")
+    }
+}
+
+fn reconciliation_service(pool: PgPool) -> ReconciliationService {
+    let job_repo = Arc::new(PostgresJobRepository::new(pool));
+    ReconciliationService::new(
+        job_repo as Arc<dyn bamep_server::ports::JobRepository>,
+        Arc::new(AttemptReservationRegistry::new()),
+        arbiter(),
+        Arc::new(UnreachableDispatchPort) as Arc<dyn AgentDispatchPort>,
+    )
+}
+
+/// §11.A — a durable denial (here: the owning Attempt regressing out of
+/// `InProgress`) occurring after signature verification but before the
+/// replay check+insert must not consume the proof; the same proof succeeds
+/// exactly once after the durable state legitimately becomes eligible again,
+/// then fails closed as a replay on a third identical call.
+#[tokio::test]
+async fn a_durable_denial_does_not_consume_its_proof_id() {
+    let db = TestDatabase::setup().await;
+    let services = build_services(db.pool.clone());
+    let fixture = in_progress_transfer_fixture(&services, "durable-denial-01").await;
+    let signing_key = SigningKey::from_bytes(&rand::random());
+    let token = issued_token(&services, &fixture, &signing_key).await;
+    let reconciliation = reconciliation_service(db.pool.clone());
+
+    let issued_at = Utc::now().timestamp_millis() as u64;
+    let proof_id = bamep_domain::ProofId::generate();
+    let query = || {
+        signed_query_for(
+            &signing_key,
+            &token,
+            fixture.transfer_id,
+            fixture.artifact_id,
+            bamep_domain::AuthorizationOperation::ResumeDiscovery,
+            None,
+            issued_at,
+            proof_id,
+        )
+    };
+
+    // InProgress -> AwaitingReconciliation: the exact real transition a
+    // connection loss produces. `decide` now denies at the current-durable-
+    // authorization check (`attempt.state != InProgress`), which runs after
+    // signature verification but before the replay check+insert.
+    reconciliation
+        .mark_endpoint_uncertain(fixture.endpoint_id, fixture.action_id)
+        .await
+        .unwrap()
+        .expect("an InProgress Attempt must become AwaitingReconciliation");
+    assert_eq!(
+        services.authorization.decide(query()).await.unwrap(),
+        WorkerAuthorizationOutcome::Denied,
+        "AwaitingReconciliation is not InProgress"
+    );
+
+    // AwaitingReconciliation -> InProgress: the exact real transition a
+    // StatusReport{Running} produces — legitimate, and it mutates no signed
+    // proof field.
+    reconciliation
+        .apply_status_report(
+            fixture.action_id,
+            fixture.endpoint_id,
+            bamep_domain::StatusReportEvidence::Running,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            services.authorization.decide(query()).await.unwrap(),
+            WorkerAuthorizationOutcome::Approved { .. }
+        ),
+        "the same proof_id must approve exactly once the durable state is legitimately eligible again"
+    );
+
+    assert_eq!(
+        services.authorization.decide(query()).await.unwrap(),
+        WorkerAuthorizationOutcome::Denied,
+        "the same proof_id must now be rejected as a replay"
+    );
+
+    db.teardown().await;
+}
+
+/// A `TransferAuthorizationRepository` wrapper whose first
+/// `load_authorization_state` call fails, then delegates normally to a real
+/// `PostgresTransferAuthorizationRepository` — simulates a transient
+/// repository/Application error occurring exactly where `decide` calls it:
+/// after signature verification, before the replay check+insert.
+struct FailFirstLoadRepository {
+    inner: PostgresTransferAuthorizationRepository,
+    fail_next: std::sync::atomic::AtomicBool,
+}
+
+impl FailFirstLoadRepository {
+    fn new(pool: PgPool) -> Self {
+        Self {
+            inner: PostgresTransferAuthorizationRepository::new(pool),
+            fail_next: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+}
+
+#[async_trait]
+impl TransferAuthorizationRepository for FailFirstLoadRepository {
+    async fn load_authorization_state(
+        &self,
+        transfer_id: TransferId,
+    ) -> Result<Option<AuthorizationDurableState>, RepositoryError> {
+        if self
+            .fail_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RepositoryError::Backend(
+                "simulated transient repository failure".into(),
+            ));
+        }
+        self.inner.load_authorization_state(transfer_id).await
+    }
+}
+
+/// §11.B — a repository error occurring after signature verification but
+/// before the replay check+insert must not consume the proof; the same
+/// proof succeeds exactly once the repository behaves normally again, then
+/// fails closed as a replay on a third identical call.
+#[tokio::test]
+async fn a_repository_error_does_not_consume_its_proof_id() {
+    let db = TestDatabase::setup().await;
+    let capabilities = Arc::new(CapabilityStore::new());
+    let replay = Arc::new(ReplayCache::new());
+
+    let mut services = build_services(db.pool.clone());
+    services.authorization = TransferAuthorizationService::new(
+        Arc::new(PostgresTransferAuthorizationRepository::new(
+            db.pool.clone(),
+        )),
+        Arc::clone(&capabilities),
+        Arc::clone(&replay),
+        DATA_PLANE_BASE_URL,
+    );
+    let fixture = in_progress_transfer_fixture(&services, "repo-error-01").await;
+    let signing_key = SigningKey::from_bytes(&rand::random());
+    let token = issued_token(&services, &fixture, &signing_key).await;
+
+    // Same capability/replay state, but `decide`'s repository now fails on
+    // its first `load_authorization_state` call.
+    let deciding = TransferAuthorizationService::new(
+        Arc::new(FailFirstLoadRepository::new(db.pool.clone())),
+        Arc::clone(&capabilities),
+        Arc::clone(&replay),
+        DATA_PLANE_BASE_URL,
+    );
+
+    let issued_at = Utc::now().timestamp_millis() as u64;
+    let proof_id = bamep_domain::ProofId::generate();
+    let query = || {
+        signed_query_for(
+            &signing_key,
+            &token,
+            fixture.transfer_id,
+            fixture.artifact_id,
+            bamep_domain::AuthorizationOperation::ResumeDiscovery,
+            None,
+            issued_at,
+            proof_id,
+        )
+    };
+
+    assert!(
+        deciding.decide(query()).await.is_err(),
+        "a repository failure must surface as an error, not a silent denial"
+    );
+
+    assert!(
+        matches!(
+            deciding.decide(query()).await.unwrap(),
+            WorkerAuthorizationOutcome::Approved { .. }
+        ),
+        "the same proof_id must approve exactly once the repository behaves normally again"
+    );
+
+    assert_eq!(
+        deciding.decide(query()).await.unwrap(),
+        WorkerAuthorizationOutcome::Denied,
+        "the same proof_id must now be rejected as a replay"
     );
 
     db.teardown().await;

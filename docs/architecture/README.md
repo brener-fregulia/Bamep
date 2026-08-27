@@ -585,10 +585,13 @@ call sites below.
 - `issue` serves the Agent WSS `TransferAuthorizationRequest`
   (`bamep_server::adapters::agent_gateway::AgentControlGateway::handle_transfer_authorization_request`):
   the authenticated session's `endpoint_id` is authoritative (never the request body). A request
-  with no `correlation_id` is a protocol/phase violation answered with generic `ProtocolError`
-  (never a wire-invalid uncorrelated `TransferAuthorizationDenied`); a syntactically present
-  `correlation_id` must equal the durable owning Attempt's `action_id`, and a denial echoes the
-  presented value without ever revealing the authoritative one. The owning Attempt must be
+  with no `correlation_id`, or with a syntactically present `correlation_id` that is known-wrong
+  once the Transfer/Attempt ownership checks below have already run, is a protocol violation
+  answered with generic `ProtocolError` correlated to the request's own `message_id` (never a
+  wire-invalid `TransferAuthorizationDenied` carrying anything other than the owning `action_id`,
+  and never revealing that authoritative value either). Only a request presenting the exact
+  owning `action_id` reaches the semantic decision below, whose denial echoes that same value.
+  The owning Attempt must be
   exactly `InProgress` — the durable phase fact that `ActionAck{outcome: Accepted}` has been
   processed (`m0-agent-protocol-contract.md` "Transfer authorization"); a still-`Dispatched`
   Attempt is too early, and a pre-dispatch unbound Transfer, an `AwaitingReconciliation`
@@ -611,11 +614,15 @@ call sites below.
   it — the Worker's comparison against the Agent-declared digest and the resulting HTTP `409` is
   #39.
 
-Both directions collapse every internal denial cause into one generic outcome
+Both directions collapse every internal *semantic* denial cause into one generic outcome
 (`TransferAuthorizationOutcome::Denied` / `WorkerAuthorizationOutcome::Denied`) before it
 reaches the wire, satisfying the non-enumerable-denial requirement identically on both
-boundaries. `bamepd`'s composition root (`crates/server/src/bin/bamepd.rs`) now connects to
-PostgreSQL and constructs one `TransferAuthorizationService` shared by both boundaries — the
+boundaries. `issue` additionally distinguishes a known-wrong action-scoped `correlation_id`
+as `TransferAuthorizationOutcome::ProtocolViolation`, mapped to generic `ProtocolError` rather
+than `TransferAuthorizationDenied` (see above) — a separate case from semantic denial, not an
+additional externally enumerable reason within it. `bamepd`'s composition root
+(`crates/server/src/bin/bamepd.rs`) now connects to PostgreSQL and constructs one
+`TransferAuthorizationService` shared by both boundaries — the
 Worker control plane cannot answer `AuthorizationQuery` from current durable state without it,
 so `bamepd` is no longer PostgreSQL-free as the #37 architecture note originally described.
 `BAMEPD_DATABASE_URL` and `BAMEP_DATA_PLANE_BASE_URL` are new required `bamepd` configuration;

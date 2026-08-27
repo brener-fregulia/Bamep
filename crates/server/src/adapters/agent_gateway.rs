@@ -803,20 +803,30 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
     /// the durable Transfer actually belongs to this exact `endpoint_id`
     /// before granting anything.
     ///
-    /// Correlation handling (Issue #38 correction §15–§17;
-    /// `m0-agent-protocol-contract.md` "Correlation": every
-    /// `TransferAuthorizationRequest`/`Grant`/`Denied` MUST carry
-    /// `correlation_id` equal to the owning data-plane action's `action_id`):
+    /// Correlation handling (Issue #38 final correction; `m0-agent-protocol-
+    /// contract.md` "Correlation": every `TransferAuthorizationRequest`/
+    /// `Grant`/`Denied` MUST carry `correlation_id` equal to the owning
+    /// data-plane action's `action_id`):
     ///
     /// - **no `correlation_id`** — the request is not a semantically valid
     ///   authorization request at all; it is a protocol/phase violation
-    ///   answered with the repository's generic `ProtocolError`, never a
-    ///   wire-invalid uncorrelated `TransferAuthorizationDenied`;
-    /// - **a syntactically present `correlation_id`** (right or wrong) — the
-    ///   normal decision runs; on denial the response echoes exactly the
-    ///   presented `correlation_id`. The durable owning `action_id` is never
-    ///   substituted in or otherwise revealed, so a wrong-correlation denial
-    ///   stays externally indistinguishable from any other generic denial.
+    ///   answered with the generic `ProtocolError`, correlated to the
+    ///   request's own `message_id`, never a wire-invalid uncorrelated
+    ///   `TransferAuthorizationDenied`;
+    /// - **a syntactically present but known-wrong `correlation_id`** (the
+    ///   Transfer belongs to this Endpoint and its owning Attempt exists and
+    ///   is current, but the presented value is not that Attempt's own
+    ///   `action_id`) — also a generic `ProtocolError`, correlated to the
+    ///   request's `message_id`. Emitting `TransferAuthorizationDenied`
+    ///   correlated to the presented value here would itself violate the
+    ///   same wire rule (a `Denied` message MUST carry the owning
+    ///   `action_id`), and substituting the durable owning `action_id` in
+    ///   would unnecessarily reveal it — so this case is a protocol
+    ///   violation, not a denial, and the durable owning `action_id` is never
+    ///   sent;
+    /// - **the correct `correlation_id`** — the normal decision runs; on
+    ///   semantic denial the response echoes exactly that `correlation_id`
+    ///   (which is, by construction, the owning `action_id`).
     async fn handle_transfer_authorization_request<W: MessageSink>(
         &self,
         write: &mut W,
@@ -866,6 +876,10 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             }
             TransferAuthorizationOutcome::Denied => {
                 self.send_transfer_authorization_denied(write, transfer_id, correlation_id)
+                    .await
+            }
+            TransferAuthorizationOutcome::ProtocolViolation => {
+                self.send_protocol_error(write, Some(request.envelope.message_id))
                     .await
             }
         }

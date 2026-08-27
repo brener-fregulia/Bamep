@@ -2289,13 +2289,26 @@ impl<T: TransferRepository> TransferService<T> {
 
 /// Outcome of [`TransferAuthorizationService::issue`], shaped for the Agent
 /// Control Gateway to translate directly into
-/// `TransferAuthorizationGrant`/`TransferAuthorizationDenied`
-/// (`m0-agent-protocol-contract.md` "Transfer authorization"). `Denied`
-/// deliberately carries no reason — every internal denial cause (unknown
-/// transfer, wrong Endpoint, pre-dispatch unbound Transfer, terminal Attempt,
-/// wrong action correlation, inactive credential, malformed proof key)
-/// collapses into this one generic outcome before it ever reaches the
+/// `TransferAuthorizationGrant`/`TransferAuthorizationDenied`/generic
+/// `ProtocolError` (`m0-agent-protocol-contract.md` "Transfer authorization",
+/// "Correlation"). `Denied` deliberately carries no reason — every internal
+/// *semantic* denial cause (unknown transfer, wrong Endpoint, pre-dispatch
+/// unbound Transfer, terminal Attempt, inactive credential, malformed proof
+/// key) collapses into this one generic outcome before it ever reaches the
 /// Gateway.
+///
+/// `ProtocolViolation` is the separate, narrower case where the request is
+/// already known to belong to this authenticated Endpoint's exact Transfer
+/// and current non-terminal Attempt, but presents a `correlation_id` that is
+/// not that Attempt's own `action_id` (Issue #38 final correction: a wrong
+/// action-scoped correlation is a protocol violation per
+/// `m0-agent-protocol-contract.md` "Correlation"/"Message envelope", never a
+/// `TransferAuthorizationDenied` — a `Denied` message wire-invalidly carrying
+/// a `correlation_id` other than the owning `action_id` would itself violate
+/// that same rule). The Gateway maps this to a generic `ProtocolError`
+/// correlated to the offending request's `message_id`, never to the
+/// presented `correlation_id` and never to the durable owning `action_id`,
+/// which stays non-enumerable either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferAuthorizationOutcome {
     Granted {
@@ -2304,6 +2317,7 @@ pub enum TransferAuthorizationOutcome {
         data_plane_base_url: String,
     },
     Denied,
+    ProtocolViolation,
 }
 
 /// The exact fields Worker forwards from one `AuthorizationQuery`
@@ -2448,10 +2462,19 @@ impl TransferAuthorizationService {
             return Ok(TransferAuthorizationOutcome::Denied);
         }
 
+        // The request has already passed ownership/context checks that make
+        // this comparison legitimate for this exact authenticated Endpoint
+        // (Transfer belongs to `endpoint_id`, an owning Attempt exists and is
+        // `InProgress`) — only now is a wrong presented `correlation_id`
+        // classified as a protocol violation rather than folded into the
+        // generic semantic denial (Issue #38 final correction §5: this
+        // ordering is what prevents a cross-Endpoint/cross-Transfer oracle —
+        // a request that has not yet proven it may legitimately compare
+        // against this owning `action_id` never reaches this branch).
         let expected_action_id = ProtocolId::from_uuid(attempt.action_id.0)
             .expect("a Domain ActionId is always a valid UUID v4");
         if presented_action_id != expected_action_id {
-            return Ok(TransferAuthorizationOutcome::Denied);
+            return Ok(TransferAuthorizationOutcome::ProtocolViolation);
         }
 
         let now = self.clock.now();
@@ -2474,10 +2497,13 @@ impl TransferAuthorizationService {
         };
         self.capabilities.evict_expired(now);
         if self.capabilities.issue(capability_id, binding).is_err() {
-            // The bounded issued-capability store is saturated with live
-            // capabilities. Fail closed as the single generic denial —
-            // capacity exhaustion is never an externally enumerable reason
-            // (Issue #38 correction §7/§25).
+            // Either the bounded issued-capability store is saturated with
+            // live capabilities, or (cryptographically negligible) this
+            // freshly minted `capability_id` collided with a still-live
+            // binding — `CapabilityStore::issue` never overwrites it either
+            // way. Fail closed as the single generic denial — neither cause
+            // is ever an externally enumerable reason (Issue #38 correction
+            // §7/§25; final correction §9).
             return Ok(TransferAuthorizationOutcome::Denied);
         }
 

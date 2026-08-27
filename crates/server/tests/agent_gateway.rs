@@ -1114,8 +1114,20 @@ async fn transfer_authorization_request_over_authenticated_session_grants_a_capa
     db.teardown().await;
 }
 
+/// Issue #38 final correction: a `TransferAuthorizationRequest` whose
+/// `correlation_id` is syntactically present but known-wrong — the Transfer
+/// belongs to this authenticated Endpoint and its owning Attempt exists and
+/// is currently `InProgress`, but the presented value is not that Attempt's
+/// own `action_id` — is a protocol violation, not a semantic denial.
+/// `m0-agent-protocol-contract.md` "Correlation" requires every
+/// `TransferAuthorizationDenied` to carry `correlation_id == action_id`,
+/// so a `Denied` echoing the wrong presented value would itself be
+/// wire-invalid, and substituting the durable owning `action_id` in would
+/// unnecessarily reveal it. The generic `ProtocolError` is correlated to the
+/// offending request's own `message_id` instead, and the durable owning
+/// `action_id` is never sent.
 #[tokio::test]
-async fn transfer_authorization_request_with_wrong_correlation_is_generically_denied() {
+async fn transfer_authorization_request_with_wrong_correlation_is_a_protocol_error() {
     let db = TestDatabase::setup().await;
     let clock = Arc::new(ManualClock::new(Utc::now()));
     let (boot, enrollment) =
@@ -1160,6 +1172,7 @@ async fn transfer_authorization_request_with_wrong_correlation_is_generically_de
         fixture.transfer_id,
         generate_proof_public_key_wire(),
     );
+    let request_message_id = request.envelope.message_id;
     send_text(
         &mut client_ws,
         encode(&AgentProtocolMessage::TransferAuthorizationRequest(request)).unwrap(),
@@ -1167,22 +1180,18 @@ async fn transfer_authorization_request_with_wrong_correlation_is_generically_de
     .await;
 
     let response = recv_message(&mut client_ws).await;
-    let AgentProtocolMessage::TransferAuthorizationDenied(denied) = response else {
-        panic!("expected TransferAuthorizationDenied, got {response:?}");
+    let AgentProtocolMessage::ProtocolError(error) = response else {
+        panic!("expected ProtocolError, got {response:?}");
     };
-    assert_eq!(denied.body.transfer_id, fixture.transfer_id);
-    assert_eq!(
-        denied.body.reason, "denied",
-        "the single closed generic V1 denial reason"
-    );
-    // Issue #38 correction §15/§17: the denial always carries a
-    // `correlation_id`, and it is exactly the value the client presented —
-    // never the durable owning `action_id`, which stays non-enumerable.
-    assert_eq!(denied.envelope.correlation_id, Some(wrong_correlation));
+    // Correlated to the offending request's own message_id — never to the
+    // presented wrong correlation_id, and never to the durable owning
+    // action_id, which stays non-enumerable.
+    assert_eq!(error.envelope.correlation_id, Some(request_message_id));
+    assert_ne!(error.envelope.correlation_id, Some(wrong_correlation));
     assert_ne!(
-        denied.envelope.correlation_id,
+        error.envelope.correlation_id,
         Some(fixture.action_id),
-        "the authoritative owning action_id must never be revealed to construct a denial"
+        "the authoritative owning action_id must never be revealed"
     );
 
     client_ws.close(None).await.unwrap();

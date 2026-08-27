@@ -38,13 +38,23 @@ use chrono::{DateTime, Utc};
 pub const DEFAULT_CAPABILITY_STORE_CAPACITY: usize = 4096;
 
 /// Why [`CapabilityStore::issue`] refused to record a freshly minted
-/// capability. Collapses to the single generic non-enumerable authorization
-/// denial at the Agent boundary (`m0-data-plane-and-storage-contracts.md`:
-/// denials are non-enumerable) — a caller must not surface capacity
-/// exhaustion as a distinct externally observable reason.
+/// capability. Both variants collapse to the single generic non-enumerable
+/// authorization denial at the Agent boundary
+/// (`m0-data-plane-and-storage-contracts.md`: denials are non-enumerable) —
+/// a caller must not surface either cause as a distinct externally
+/// observable reason. Kept as two internal variants (Issue #38 final
+/// correction §9) so the two causes are never confused with each other
+/// internally: capacity saturation is an expected, load-dependent condition,
+/// while an `IdCollision` would mean a fresh CSPRNG-derived `CapabilityId`
+/// collided with a still-live binding — cryptographically negligible, but
+/// never silently overwritten if it ever happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("issued-capability store is at capacity; issuance fails closed")]
-pub struct CapabilityStoreSaturated;
+pub enum CapabilityIssueError {
+    #[error("issued-capability store is at capacity; issuance fails closed")]
+    Saturated,
+    #[error("capability_id collides with a still-live binding; issuance fails closed")]
+    IdCollision,
+}
 
 pub struct CapabilityStore {
     epoch: ProcessAuthorizationEpoch,
@@ -83,8 +93,8 @@ impl CapabilityStore {
     }
 
     /// Durably (for the process lifetime) records a freshly issued
-    /// capability, failing closed with [`CapabilityStoreSaturated`] when the
-    /// store is already at [`capacity`](Self::capacity) and this
+    /// capability, failing closed with [`CapabilityIssueError::Saturated`]
+    /// when the store is already at [`capacity`](Self::capacity) and this
     /// `capability_id` is not already present — a still-live capability is
     /// never evicted to make room, since that would silently and
     /// unpredictably change authorization semantics for whatever transfer it
@@ -93,27 +103,26 @@ impl CapabilityStore {
     ///
     /// `capability_id` is derived from a fresh CSPRNG-generated token
     /// (`bamep_domain::CapabilityToken::generate`), so a collision with an
-    /// existing entry is not a realistic event; the `Occupied` arm exists
-    /// only for total coverage and overwrites in place without consuming a
-    /// capacity slot.
+    /// existing entry is not a realistic event; the `Occupied` arm exists for
+    /// total coverage and fails closed with
+    /// [`CapabilityIssueError::IdCollision`] instead — a live binding is
+    /// never overwritten with different newly-issued authorization material
+    /// (Issue #38 final correction §9).
     pub fn issue(
         &self,
         capability_id: CapabilityId,
         binding: CapabilityBinding,
-    ) -> Result<(), CapabilityStoreSaturated> {
+    ) -> Result<(), CapabilityIssueError> {
         let mut capabilities = self
             .capabilities
             .lock()
             .expect("capability store lock poisoned");
         let at_capacity = capabilities.len() >= self.capacity;
         match capabilities.entry(capability_id) {
-            Entry::Occupied(mut slot) => {
-                slot.insert(binding);
-                Ok(())
-            }
+            Entry::Occupied(_) => Err(CapabilityIssueError::IdCollision),
             Entry::Vacant(slot) => {
                 if at_capacity {
-                    return Err(CapabilityStoreSaturated);
+                    return Err(CapabilityIssueError::Saturated);
                 }
                 slot.insert(binding);
                 Ok(())
@@ -241,12 +250,39 @@ mod tests {
 
         assert_eq!(
             store.issue(capability_id(12), sample_binding(now, store.epoch())),
-            Err(CapabilityStoreSaturated),
+            Err(CapabilityIssueError::Saturated),
             "a genuinely new capability must fail closed at capacity"
         );
         // Neither live capability was evicted to make room.
         assert!(store.lookup(&a).is_some());
         assert!(store.lookup(&b).is_some());
+    }
+
+    #[test]
+    fn a_capability_id_collision_never_overwrites_the_live_binding() {
+        let store = CapabilityStore::new();
+        let now = Utc::now();
+        let id = capability_id(30);
+        let original = sample_binding(now, store.epoch());
+        store.issue(id, original).unwrap();
+
+        // A deliberately repeated `CapabilityId` presenting a different
+        // binding must fail closed rather than silently replace the live
+        // one.
+        let mut colliding = sample_binding(now, store.epoch());
+        colliding.transfer_id = TransferId::new();
+        assert_eq!(
+            store.issue(id, colliding),
+            Err(CapabilityIssueError::IdCollision),
+        );
+
+        let found = store
+            .lookup(&id)
+            .expect("the original live binding must remain");
+        assert_eq!(
+            found.transfer_id, original.transfer_id,
+            "the original binding must be completely unchanged"
+        );
     }
 
     #[test]

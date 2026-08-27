@@ -66,15 +66,20 @@ use chrono::{DateTime, Utc};
 /// a bounded transient replay cache"; "replay-cache capacity remain[s]
 /// implementation-time").
 ///
-/// `2^16` is chosen as a defensible M1 value: with the 120 s freshness window,
-/// it accommodates well over 500 accepted proofs per second sustained —
-/// comfortably beyond any realistic aggregate M1 chunk-request rate across the
-/// deterministic single-Endpoint vertical (#19) and even the 20–24 concurrent
-/// Simulated Endpoints of the separate scale exercise (#21), each of which
-/// mints one `proof_id` per HTTP round trip over a LAN — while capping
-/// worst-case memory at a few MiB. Larger deployments override it via
-/// [`ReplayCache::with_capacity`] from the composition root; this constant is
-/// not a permanently fixed architectural constant.
+/// `2^16` is chosen as a defensible M1 value. An entry's actual worst-case
+/// retention is not the 120 s past window alone (see "Retention model"
+/// above): a proof accepted at the maximum accepted future skew (`proof
+/// freshness future skew`, 30 s) stays freshness-valid, and therefore
+/// cache-resident, for up to `120 s + 30 s = 150 s` from first acceptance. At
+/// capacity that bounds sustained throughput at `65536 / 150 s ≈ 436`
+/// accepted proofs per second — comfortably beyond any realistic aggregate
+/// M1 chunk-request rate across the deterministic single-Endpoint vertical
+/// (#19) and even the 20–24 concurrent Simulated Endpoints of the separate
+/// scale exercise (#21), each of which mints one `proof_id` per HTTP round
+/// trip over a LAN — while capping worst-case memory at a few MiB. Larger
+/// deployments override it via [`ReplayCache::with_capacity`] from the
+/// composition root; this constant is not a permanently fixed architectural
+/// constant.
 pub const DEFAULT_REPLAY_CACHE_CAPACITY: usize = 1 << 16;
 
 /// Why a `check_and_insert` call refused to record a `proof_id`. Both
