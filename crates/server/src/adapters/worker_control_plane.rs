@@ -77,6 +77,13 @@ pub enum WorkerControlPlaneError {
 impl From<RuntimeDirError> for WorkerControlPlaneError {
     fn from(err: RuntimeDirError) -> Self {
         match err {
+            RuntimeDirError::RelativePath { path } => {
+                WorkerControlPlaneError::UnsafeParentDirectory {
+                    path,
+                    reason: "path must be absolute for the trusted runtime-directory boundary"
+                        .to_string(),
+                }
+            }
             RuntimeDirError::Symlink { path } => WorkerControlPlaneError::UnsafeParentDirectory {
                 path,
                 reason: "parent path is a symlink, not a real directory".to_string(),

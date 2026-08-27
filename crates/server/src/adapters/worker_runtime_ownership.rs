@@ -51,6 +51,8 @@ const LOCK_FILE_NAME: &str = "bamepd.lock";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeDirError {
+    #[error("{path} must be an absolute path for the trusted runtime-directory boundary")]
+    RelativePath { path: String },
     #[error("{path} is a symlink, not a real directory")]
     Symlink { path: String },
     #[error("{path} is not a directory")]
@@ -106,6 +108,12 @@ impl TrustedRuntimeDir {
     /// UID running `bamepd` (correction audit "Owner check") — it is never
     /// blindly `chmod`ed or `chown`ed into compliance.
     pub fn validate_or_create(path: &Path) -> Result<Self, RuntimeDirError> {
+        if !path.is_absolute() {
+            return Err(RuntimeDirError::RelativePath {
+                path: path.display().to_string(),
+            });
+        }
+
         ensure_trusted_ancestor(path)?;
 
         match std::fs::symlink_metadata(path) {
@@ -177,41 +185,69 @@ fn validate_shape(path: &Path, metadata: &std::fs::Metadata) -> Result<(), Runti
     Ok(())
 }
 
-/// Validates the *immediate parent* of the runtime directory carries enough
-/// replacement-authority trust that an unrelated principal could not delete
-/// or replace the runtime directory entry out from under `bamepd`. Does not
-/// recurse further up the filesystem tree.
+/// Validates the *complete* ancestor chain of the runtime directory — its
+/// parent, grandparent, and so on up to (and including) the filesystem root
+/// — carries enough replacement-authority trust that no unrelated principal
+/// could delete or replace any pathname component needed to reach the
+/// runtime directory (correction audit "runtime-directory ancestry trust
+/// validates only the immediate parent"). Validating only the immediate
+/// parent leaves an arbitrary configured path such as
+/// `/untrusted-grandparent/trusted-looking-parent/bamep` exposed: an
+/// unrelated principal with write+execute authority over
+/// `untrusted-grandparent` can rename/replace `trusted-looking-parent`
+/// itself, handing a second process a different pathname tree — and
+/// therefore a different lock file — while `bamepd`'s own immediate-parent
+/// check still passes.
+///
+/// `path` must already be absolute (`validate_or_create` enforces this
+/// before calling here), so every ancestor produced by [`Path::ancestors`]
+/// is itself absolute and unambiguous — never resolved against a mutable,
+/// untrusted current working directory.
+///
+/// Each ancestor is inspected with non-following (`symlink_metadata`)
+/// semantics and rejected outright if it is a symlink (correction audit
+/// "Symlink components"): the simplest fail-closed policy, rather than
+/// resolving through it. Existing ancestors only: a missing ancestor above
+/// an already-missing immediate parent surfaces through the same
+/// `RuntimeDirError::Inspect` path the immediate-parent check already used,
+/// and a missing higher ancestor cannot occur once the immediate parent is
+/// confirmed to exist (a directory cannot exist without its own parent
+/// chain existing).
 fn ensure_trusted_ancestor(path: &Path) -> Result<(), RuntimeDirError> {
-    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
-        return Ok(());
-    };
+    let euid = effective_uid();
 
-    let metadata =
-        std::fs::symlink_metadata(parent).map_err(|source| RuntimeDirError::Inspect {
-            path: parent.display().to_string(),
-            source,
-        })?;
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
 
-    if metadata.file_type().is_symlink() {
-        return Err(RuntimeDirError::UnsafeAncestor {
-            path: parent.display().to_string(),
-            reason: "ancestor path is a symlink, not a real directory".to_string(),
-        });
-    }
-    if !metadata.is_dir() {
-        return Err(RuntimeDirError::UnsafeAncestor {
-            path: parent.display().to_string(),
-            reason: "ancestor path is not a directory".to_string(),
-        });
-    }
-    if !ancestor_is_trusted(metadata.mode(), metadata.uid(), effective_uid()) {
-        return Err(RuntimeDirError::UnsafeAncestor {
-            path: parent.display().to_string(),
-            reason: "ancestor directory can be replaced by an untrusted principal (owned by \
-                      neither root nor the effective uid running bamepd, or group/other-writable \
-                      without the sticky bit)"
-                .to_string(),
-        });
+        let metadata =
+            std::fs::symlink_metadata(ancestor).map_err(|source| RuntimeDirError::Inspect {
+                path: ancestor.display().to_string(),
+                source,
+            })?;
+
+        if metadata.file_type().is_symlink() {
+            return Err(RuntimeDirError::UnsafeAncestor {
+                path: ancestor.display().to_string(),
+                reason: "ancestor path is a symlink, not a real directory".to_string(),
+            });
+        }
+        if !metadata.is_dir() {
+            return Err(RuntimeDirError::UnsafeAncestor {
+                path: ancestor.display().to_string(),
+                reason: "ancestor path is not a directory".to_string(),
+            });
+        }
+        if !ancestor_is_trusted(metadata.mode(), metadata.uid(), euid) {
+            return Err(RuntimeDirError::UnsafeAncestor {
+                path: ancestor.display().to_string(),
+                reason: "ancestor directory can be replaced by an untrusted principal (owned by \
+                          neither root nor the effective uid running bamepd, or group/other-writable \
+                          without the sticky bit)"
+                    .to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -364,6 +400,12 @@ mod unit_tests {
     fn ancestor_owned_by_an_unrelated_uid_is_untrusted_even_if_not_writable() {
         assert!(!ancestor_is_trusted(0o755, 4242, 1000));
     }
+
+    #[test]
+    fn a_relative_runtime_path_is_rejected_before_any_filesystem_access() {
+        let err = TrustedRuntimeDir::validate_or_create(Path::new("relative/bamep")).unwrap_err();
+        assert!(matches!(err, RuntimeDirError::RelativePath { .. }));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -451,6 +493,98 @@ mod fs_tests {
             .expect("a legitimate service-style runtime directory must succeed");
 
         std::fs::remove_dir_all(&parent).ok();
+    }
+
+    /// The exact regression the immediate-parent-only check lacked
+    /// (correction audit "runtime-directory ancestry trust validates only
+    /// the immediate parent"): a grandparent that grants unrelated
+    /// principals write+execute authority — and carries no sticky bit — can
+    /// rename/replace an otherwise-trusted-looking parent directory. The
+    /// parent here passes its own local owner/mode check in isolation; only
+    /// walking the complete ancestor chain catches the untrusted
+    /// grandparent above it.
+    #[test]
+    fn a_writable_non_sticky_grandparent_is_rejected_even_when_the_immediate_parent_is_trusted() {
+        let grandparent = fresh_dir();
+        std::fs::create_dir_all(&grandparent).expect("create grandparent");
+        std::fs::set_permissions(&grandparent, std::fs::Permissions::from_mode(0o777))
+            .expect("relax grandparent");
+
+        let parent = grandparent.join("trusted-looking-parent");
+        std::fs::create_dir(&parent).expect("create parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
+            .expect("set locally-trusted parent mode");
+
+        let runtime_dir = parent.join("bamep");
+        let err = TrustedRuntimeDir::validate_or_create(&runtime_dir).unwrap_err();
+        match err {
+            RuntimeDirError::UnsafeAncestor { path, .. } => {
+                assert_eq!(
+                    path,
+                    grandparent.display().to_string(),
+                    "the untrusted grandparent itself must be the ancestor named in the error, \
+                     not the locally-trusted parent"
+                );
+            }
+            other => panic!("expected UnsafeAncestor naming the grandparent, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&grandparent).ok();
+    }
+
+    /// Mirrors `/tmp`'s real-world shape end to end: a root-owned, sticky,
+    /// world-writable ancestor (the actual system temp directory here) with
+    /// an effective-UID-owned child directory beneath it, and the runtime
+    /// directory beneath that. The complete ancestor walk must still accept
+    /// this — sticky semantics are what make a shared writable ancestor safe
+    /// (correction audit "Ancestor trust rule").
+    #[test]
+    fn an_owned_child_of_the_sticky_shared_temp_directory_is_trusted() {
+        let owned_child = fresh_dir();
+        std::fs::create_dir_all(&owned_child).expect("create owned child under sticky temp dir");
+        std::fs::set_permissions(&owned_child, std::fs::Permissions::from_mode(0o755))
+            .expect("set owned child mode");
+
+        let runtime_dir = owned_child.join("bamep");
+        TrustedRuntimeDir::validate_or_create(&runtime_dir)
+            .expect("a self-owned child under the sticky shared temp directory must be trusted");
+
+        std::fs::remove_dir_all(&owned_child).ok();
+    }
+
+    /// Fail-closed symlink-component policy (correction audit "Symlink
+    /// components"): an intermediate ancestor that is itself a symlink is
+    /// rejected outright, even though the final runtime directory path is
+    /// not a symlink and the symlink's target is a perfectly trustworthy
+    /// real directory. No general symlink-resolution framework is
+    /// introduced — the ancestor is simply refused.
+    #[test]
+    fn an_intermediate_symlink_ancestor_is_rejected() {
+        let trusted_parent = fresh_dir();
+        std::fs::create_dir_all(&trusted_parent).expect("create trusted parent");
+        std::fs::set_permissions(&trusted_parent, std::fs::Permissions::from_mode(0o755))
+            .expect("set trusted parent mode");
+
+        let link_target = fresh_dir();
+        std::fs::create_dir_all(&link_target).expect("create link target");
+        std::fs::set_permissions(&link_target, std::fs::Permissions::from_mode(0o755))
+            .expect("set link target mode");
+
+        let link_path = trusted_parent.join("link");
+        std::os::unix::fs::symlink(&link_target, &link_path).expect("symlink");
+
+        let runtime_dir = link_path.join("bamep");
+        let err = TrustedRuntimeDir::validate_or_create(&runtime_dir).unwrap_err();
+        match err {
+            RuntimeDirError::UnsafeAncestor { path, .. } => {
+                assert_eq!(path, link_path.display().to_string());
+            }
+            other => panic!("expected UnsafeAncestor naming the symlinked ancestor, got {other:?}"),
+        }
+
+        std::fs::remove_file(&link_path).ok();
+        std::fs::remove_dir_all(&link_target).ok();
+        std::fs::remove_dir_all(&trusted_parent).ok();
     }
 
     #[test]

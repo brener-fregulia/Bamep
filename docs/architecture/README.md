@@ -456,8 +456,11 @@ RFC4122/RFC9562 standard variant.
 **Worker control-boundary lifetime ownership.** Before touching the Worker UDS socket
 pathname at all, `bamepd` validates/creates the trusted runtime directory
 (`bamep_server::adapters::worker_runtime_ownership::TrustedRuntimeDir`: a real, non-symlink,
-owner-only-mode directory owned by the effective UID running `bamepd`, under an ancestor that
-cannot be replaced by an untrusted principal) and acquires an exclusive, non-blocking advisory
+owner-only-mode directory owned by the effective UID running `bamepd`, whose configured path
+must be absolute and whose *complete* ancestor chain up to the filesystem root — not just the
+immediate parent — cannot be replaced by an untrusted principal: every ancestor must be a real,
+non-symlink directory that is root-owned or effective-UID-owned, and not group/other-writable
+unless it also carries the sticky bit) and acquires an exclusive, non-blocking advisory
 lock (`flock(LOCK_EX | LOCK_NB)` via `rustix`) on a dedicated lock file inside it
 (`RuntimeOwnershipLock`), held for the entire daemon lifetime. A second `bamepd` targeting the
 same runtime directory fails at lock acquisition — before it ever inspects, probes, or attempts
