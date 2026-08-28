@@ -56,6 +56,14 @@ pub enum DecodeError {
     /// not match any message this crate recognizes.
     #[error("unknown top-level message type {0:?}")]
     UnknownType(String),
+    /// `serde` parsed a known message type, but the decoded body is not a
+    /// legal instance of its own declared outcome/decision shape (for
+    /// example `AuthorizationDecision{decision: "denied", chunk_size: 4096}`)
+    /// — [`WorkerProtocolMessage::validate_shape`] rejected it. Fails closed
+    /// like any other malformed message; the diagnostic strings are fixed,
+    /// never derived from received content.
+    #[error(transparent)]
+    InvalidShape(#[from] crate::messages::InvalidMessageShape),
 }
 
 /// Serializes a message to its UTF-8 JSON wire representation (one JSON
@@ -72,6 +80,12 @@ pub fn encode(message: &WorkerProtocolMessage) -> Result<String, EncodeError> {
 /// handshake and post-handshake handlers) can answer it with a stable
 /// `ProtocolError` rather than silently closing the connection. It is never
 /// silently interpreted as some fallback variant.
+///
+/// After `serde` accepts a known message type, its normative conditional
+/// shape is validated ([`WorkerProtocolMessage::validate_shape`]): a
+/// contract-invalid combination of *known* fields is
+/// [`DecodeError::InvalidShape`], while genuinely unknown forward-compatible
+/// fields are still ignored.
 pub fn decode(json: &str) -> Result<WorkerProtocolMessage, DecodeError> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(DecodeError::Malformed)?;
     let type_name = value.get("type").and_then(|t| t.as_str());
@@ -80,7 +94,10 @@ pub fn decode(json: &str) -> Result<WorkerProtocolMessage, DecodeError> {
             return Err(DecodeError::UnknownType(type_name.to_string()));
         }
     }
-    serde_json::from_value(value).map_err(DecodeError::Malformed)
+    let message: WorkerProtocolMessage =
+        serde_json::from_value(value).map_err(DecodeError::Malformed)?;
+    message.validate_shape()?;
+    Ok(message)
 }
 
 #[cfg(test)]

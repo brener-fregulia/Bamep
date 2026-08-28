@@ -1191,6 +1191,347 @@ impl ProtocolErrorMessage {
 }
 
 // ---------------------------------------------------------------------
+// Semantic shape validation
+// ---------------------------------------------------------------------
+//
+// `serde` alone accepts any combination of the `Option<T>` conditional
+// fields, so a *received* JSON object can deserialize into a known message
+// type whose `outcome`/`decision` combination the authoritative Specification
+// says cannot exist (for example `AuthorizationDecision{decision: "denied",
+// chunk_size: 4096}`). The constructors above never *emit* such a shape, but
+// `codec::decode` must not *admit* one either. After `serde` parses a known
+// message, [`WorkerProtocolMessage::validate_shape`] checks that the decoded
+// body is a legal instance of its own declared outcome/decision — using only
+// fields the message already carries, so genuinely unknown forward-compatible
+// fields are still ignored (`m1-worker-data-plane-control-contract.md`
+// "Compatibility and unknown fields").
+//
+// This is a distinct concern from envelope validity, `in_reply_to`
+// correlation, and connection-generation ownership — each of those remains
+// its own check.
+
+/// Why a successfully deserialized, known Worker Protocol v1 message is not a
+/// legal instance of its own declared outcome/decision shape.
+///
+/// `message_type` and `detail` are fixed diagnostic strings — never derived
+/// from received content — so surfacing this error cannot leak arbitrary
+/// wire data.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message_type} is not a legal instance of its declared shape: {detail}")]
+pub struct InvalidMessageShape {
+    pub message_type: &'static str,
+    pub detail: &'static str,
+}
+
+fn shape(message_type: &'static str, detail: &'static str) -> InvalidMessageShape {
+    InvalidMessageShape {
+        message_type,
+        detail,
+    }
+}
+
+impl AuthorizationDecisionBody {
+    /// `approved` requires `digest_algorithm` + `chunk_size` +
+    /// `acceptance_handle` (`expected_chunk_digest` stays optional);
+    /// `denied` requires every one of those four fields absent, and there is
+    /// no `reason` field (`m1-worker-data-plane-control-contract.md`
+    /// "Chunk-upload authorization").
+    fn validate_shape(&self) -> Result<(), InvalidMessageShape> {
+        match self.decision {
+            AuthorizationDecisionOutcome::Approved => {
+                if self.digest_algorithm.is_none()
+                    || self.chunk_size.is_none()
+                    || self.acceptance_handle.is_none()
+                {
+                    return Err(shape(
+                        "AuthorizationDecision",
+                        "an approved decision must carry digest_algorithm, chunk_size, and \
+                         acceptance_handle",
+                    ));
+                }
+            }
+            AuthorizationDecisionOutcome::Denied => {
+                if self.digest_algorithm.is_some()
+                    || self.chunk_size.is_some()
+                    || self.acceptance_handle.is_some()
+                    || self.expected_chunk_digest.is_some()
+                {
+                    return Err(shape(
+                        "AuthorizationDecision",
+                        "a denied decision must carry nothing beyond `decision`",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ChunkAcceptanceDecisionBody {
+    /// `committed`/`already_committed` require `reason` absent; `rejected`
+    /// requires `reason` present (`m1-worker-data-plane-control-contract.md`
+    /// "Verified-chunk durable acceptance").
+    fn validate_shape(&self) -> Result<(), InvalidMessageShape> {
+        match self.outcome {
+            ChunkAcceptanceOutcome::Committed | ChunkAcceptanceOutcome::AlreadyCommitted => {
+                if self.reason.is_some() {
+                    return Err(shape(
+                        "ChunkAcceptanceDecision",
+                        "a committed/already_committed outcome must not carry a reason",
+                    ));
+                }
+            }
+            ChunkAcceptanceOutcome::Rejected => {
+                if self.reason.is_none() {
+                    return Err(shape(
+                        "ChunkAcceptanceDecision",
+                        "a rejected outcome must carry a reason",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ResumeDiscoveryPageBody {
+    /// The generic invariant `codec::decode` enforces on every
+    /// `ResumeDiscoveryPage`, independent of whether the consumer expects a
+    /// first page or a continuation page:
+    ///
+    /// - `denied` carries none of the durable/state fields;
+    /// - `approved` carries `held_chunks`, and `expected_chunk_count` is
+    ///   present iff `sealed == true` (so a continuation page, which omits
+    ///   `sealed`, must also omit `expected_chunk_count`).
+    ///
+    /// First-page-vs-continuation-specific requirements are enforced by the
+    /// explicit [`ResumeDiscoveryPageMessage::approved_first_page`] /
+    /// [`ResumeDiscoveryPageMessage::approved_continuation_page`] validators
+    /// the Phase C/E consumers call, not here
+    /// (`m1-worker-data-plane-control-contract.md` "Resume-discovery
+    /// authorization and first page" / "Resume-discovery pagination").
+    fn validate_shape(&self) -> Result<(), InvalidMessageShape> {
+        match self.decision {
+            ResumeDiscoveryDecision::Denied => {
+                if self.transfer_id.is_some()
+                    || self.sealed.is_some()
+                    || self.digest_algorithm.is_some()
+                    || self.chunk_size.is_some()
+                    || self.expected_chunk_count.is_some()
+                    || self.held_chunks.is_some()
+                    || self.resume_cursor.is_some()
+                {
+                    return Err(shape(
+                        "ResumeDiscoveryPage",
+                        "a denied resume-discovery page must carry no durable/state field",
+                    ));
+                }
+            }
+            ResumeDiscoveryDecision::Approved => {
+                if self.held_chunks.is_none() {
+                    return Err(shape(
+                        "ResumeDiscoveryPage",
+                        "an approved resume-discovery page must carry held_chunks",
+                    ));
+                }
+                if self.expected_chunk_count.is_some() != (self.sealed == Some(true)) {
+                    return Err(shape(
+                        "ResumeDiscoveryPage",
+                        "expected_chunk_count must be present iff sealed == true",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The validated fields of an **approved first** `ResumeDiscoveryPage`
+/// (`m1-worker-data-plane-control-contract.md` "Resume-discovery
+/// authorization and first page"). Every manifest-level field is guaranteed
+/// present; `expected_chunk_count` is `Some` iff `sealed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeFirstPage {
+    pub transfer_id: Uuid,
+    pub sealed: bool,
+    pub digest_algorithm: WireDigestAlgorithm,
+    pub chunk_size: u32,
+    pub expected_chunk_count: Option<u64>,
+    pub held_chunks: Vec<HeldChunk>,
+    pub resume_cursor: Option<String>,
+}
+
+/// The validated fields of an **approved continuation** `ResumeDiscoveryPage`
+/// (`m1-worker-data-plane-control-contract.md` "Resume-discovery
+/// pagination"): `held_chunks` present, every manifest-level field absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeContinuationPage {
+    pub held_chunks: Vec<HeldChunk>,
+    pub resume_cursor: Option<String>,
+}
+
+impl ResumeDiscoveryPageMessage {
+    /// Interprets this page as an **approved first page**, enforcing that
+    /// `decision == approved` and that `transfer_id`, `sealed`,
+    /// `digest_algorithm`, `chunk_size`, and `held_chunks` are all present,
+    /// with `expected_chunk_count` present iff `sealed == true`. A Phase C/E
+    /// consumer expecting the first page calls this so it cannot accidentally
+    /// accept a denied page or a continuation-shaped page.
+    pub fn approved_first_page(&self) -> Result<ResumeFirstPage, InvalidMessageShape> {
+        let b = &self.body;
+        if b.decision != ResumeDiscoveryDecision::Approved {
+            return Err(shape(
+                "ResumeDiscoveryPage",
+                "expected an approved first page, got a denied page",
+            ));
+        }
+        let (
+            Some(transfer_id),
+            Some(sealed),
+            Some(digest_algorithm),
+            Some(chunk_size),
+            Some(held_chunks),
+        ) = (
+            b.transfer_id,
+            b.sealed,
+            b.digest_algorithm,
+            b.chunk_size,
+            b.held_chunks.clone(),
+        )
+        else {
+            return Err(shape(
+                "ResumeDiscoveryPage",
+                "an approved first page must carry transfer_id, sealed, digest_algorithm, \
+                 chunk_size, and held_chunks",
+            ));
+        };
+        if b.expected_chunk_count.is_some() != sealed {
+            return Err(shape(
+                "ResumeDiscoveryPage",
+                "expected_chunk_count must be present iff sealed == true",
+            ));
+        }
+        Ok(ResumeFirstPage {
+            transfer_id,
+            sealed,
+            digest_algorithm,
+            chunk_size,
+            expected_chunk_count: b.expected_chunk_count,
+            held_chunks,
+            resume_cursor: b.resume_cursor.clone(),
+        })
+    }
+
+    /// Interprets this page as an **approved continuation page**, enforcing
+    /// that `decision == approved`, `held_chunks` is present, and no
+    /// manifest-level field (`transfer_id`, `sealed`, `digest_algorithm`,
+    /// `chunk_size`, `expected_chunk_count`) is carried.
+    pub fn approved_continuation_page(
+        &self,
+    ) -> Result<ResumeContinuationPage, InvalidMessageShape> {
+        let b = &self.body;
+        if b.decision != ResumeDiscoveryDecision::Approved {
+            return Err(shape(
+                "ResumeDiscoveryPage",
+                "expected an approved continuation page, got a denied page",
+            ));
+        }
+        let Some(held_chunks) = b.held_chunks.clone() else {
+            return Err(shape(
+                "ResumeDiscoveryPage",
+                "an approved continuation page must carry held_chunks",
+            ));
+        };
+        if b.transfer_id.is_some()
+            || b.sealed.is_some()
+            || b.digest_algorithm.is_some()
+            || b.chunk_size.is_some()
+            || b.expected_chunk_count.is_some()
+        {
+            return Err(shape(
+                "ResumeDiscoveryPage",
+                "a continuation page must not carry any manifest-level field",
+            ));
+        }
+        Ok(ResumeContinuationPage {
+            held_chunks,
+            resume_cursor: b.resume_cursor.clone(),
+        })
+    }
+}
+
+impl ManifestSealDecisionBody {
+    /// `sealed`/`already_pending_verification` require `reason` absent and the
+    /// complete sealed-manifest fact bundle present (`verification_handle`,
+    /// `artifact_id`, `digest_algorithm`, `chunk_size`, `chunk_count`,
+    /// `expected_artifact_digest`). `rejected` requires `reason` present and
+    /// no success field. `denied` requires `reason` absent and no success
+    /// field (`m1-worker-data-plane-control-contract.md` "Seal-manifest first
+    /// durable commit").
+    fn validate_shape(&self) -> Result<(), InvalidMessageShape> {
+        let any_success_field = self.verification_handle.is_some()
+            || self.artifact_id.is_some()
+            || self.digest_algorithm.is_some()
+            || self.chunk_size.is_some()
+            || self.chunk_count.is_some()
+            || self.expected_artifact_digest.is_some();
+        let all_success_fields = self.verification_handle.is_some()
+            && self.artifact_id.is_some()
+            && self.digest_algorithm.is_some()
+            && self.chunk_size.is_some()
+            && self.chunk_count.is_some()
+            && self.expected_artifact_digest.is_some();
+        match self.outcome {
+            ManifestSealOutcome::Sealed | ManifestSealOutcome::AlreadyPendingVerification => {
+                if self.reason.is_some() {
+                    return Err(shape(
+                        "ManifestSealDecision",
+                        "a sealed/already_pending_verification outcome must not carry a reason",
+                    ));
+                }
+                if !all_success_fields {
+                    return Err(shape(
+                        "ManifestSealDecision",
+                        "a sealed/already_pending_verification outcome must carry the complete \
+                         sealed-manifest fact bundle (verification_handle, artifact_id, \
+                         digest_algorithm, chunk_size, chunk_count, expected_artifact_digest)",
+                    ));
+                }
+            }
+            ManifestSealOutcome::Rejected => {
+                if self.reason.is_none() {
+                    return Err(shape(
+                        "ManifestSealDecision",
+                        "a rejected outcome must carry a reason",
+                    ));
+                }
+                if any_success_field {
+                    return Err(shape(
+                        "ManifestSealDecision",
+                        "a rejected outcome must not carry any sealed-manifest fact",
+                    ));
+                }
+            }
+            ManifestSealOutcome::Denied => {
+                if self.reason.is_some() {
+                    return Err(shape(
+                        "ManifestSealDecision",
+                        "a denied outcome must not carry a reason",
+                    ));
+                }
+                if any_success_field {
+                    return Err(shape(
+                        "ManifestSealDecision",
+                        "a denied outcome must not carry any sealed-manifest fact",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------
 // Top-level closed message union
 // ---------------------------------------------------------------------
 
@@ -1243,6 +1584,26 @@ impl WorkerProtocolMessage {
             WorkerProtocolMessage::ArtifactVerificationReport(m) => &m.envelope,
             WorkerProtocolMessage::ArtifactVerificationAck(m) => &m.envelope,
             WorkerProtocolMessage::ProtocolError(m) => &m.envelope,
+        }
+    }
+
+    /// Validates that this decoded message is a legal instance of its own
+    /// declared outcome/decision shape — the invariants the authoritative
+    /// Specification expresses over the message's own conditional fields
+    /// (approved-vs-denied, committed-vs-rejected, sealed-vs-denied, …).
+    /// `codec::decode` calls this after `serde` parsing so a contract-invalid
+    /// combination of *known* fields fails closed, while genuinely unknown
+    /// forward-compatible fields are still ignored. Message types with no
+    /// conditional shape (the handshake messages, request messages whose
+    /// fields are all mandatory, `ProtocolError`, `ArtifactVerificationAck`)
+    /// are always shape-valid once `serde` has accepted them.
+    pub fn validate_shape(&self) -> Result<(), InvalidMessageShape> {
+        match self {
+            WorkerProtocolMessage::AuthorizationDecision(m) => m.body.validate_shape(),
+            WorkerProtocolMessage::ChunkAcceptanceDecision(m) => m.body.validate_shape(),
+            WorkerProtocolMessage::ResumeDiscoveryPage(m) => m.body.validate_shape(),
+            WorkerProtocolMessage::ManifestSealDecision(m) => m.body.validate_shape(),
+            _ => Ok(()),
         }
     }
 }
@@ -1855,6 +2216,428 @@ mod validation_tests {
             Uuid::new_v4()
         );
         assert!(codec::decode(&json).is_ok());
+    }
+}
+
+/// Negative tests for `codec::decode`'s semantic-shape validation: a JSON
+/// object that `serde` parses into a known message type but whose
+/// outcome/decision + field combination the authoritative Specification says
+/// cannot exist must decode as [`codec::DecodeError::InvalidShape`], never as
+/// a valid message (`m1-worker-data-plane-control-contract.md` — the
+/// per-message "present only when …" rules).
+#[cfg(test)]
+mod shape_validation_tests {
+    use super::*;
+    use crate::codec::{self, DecodeError};
+
+    fn env() -> String {
+        format!(
+            r#""protocol_version":"1","message_id":"{}","in_reply_to":"{}""#,
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        )
+    }
+
+    #[track_caller]
+    fn assert_invalid_shape(json: &str) {
+        match codec::decode(json) {
+            Err(DecodeError::InvalidShape(_)) => {}
+            other => panic!("expected DecodeError::InvalidShape, got {other:?}\njson: {json}"),
+        }
+    }
+
+    #[track_caller]
+    fn assert_decodes(json: &str) {
+        codec::decode(json)
+            .unwrap_or_else(|e| panic!("expected a valid decode, got {e:?}\njson: {json}"));
+    }
+
+    // -- AuthorizationDecision -----------------------------------------
+
+    #[test]
+    fn denied_authorization_decision_with_manifest_facts_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"AuthorizationDecision",{},"decision":"denied","digest_algorithm":"sha256","chunk_size":4096,"acceptance_handle":"acc_x"}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn denied_authorization_decision_with_only_expected_chunk_digest_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"AuthorizationDecision",{},"decision":"denied","expected_chunk_digest":"d"}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn approved_authorization_decision_missing_digest_algorithm_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"AuthorizationDecision",{},"decision":"approved","chunk_size":4096,"acceptance_handle":"acc_x"}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn approved_authorization_decision_missing_chunk_size_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"AuthorizationDecision",{},"decision":"approved","digest_algorithm":"sha256","acceptance_handle":"acc_x"}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn approved_authorization_decision_missing_acceptance_handle_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"AuthorizationDecision",{},"decision":"approved","digest_algorithm":"sha256","chunk_size":4096}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn well_formed_approved_and_denied_authorization_decisions_decode() {
+        assert_decodes(&format!(
+            r#"{{"type":"AuthorizationDecision",{},"decision":"approved","digest_algorithm":"sha256","chunk_size":4096,"acceptance_handle":"acc_x"}}"#,
+            env()
+        ));
+        assert_decodes(&format!(
+            r#"{{"type":"AuthorizationDecision",{},"decision":"denied"}}"#,
+            env()
+        ));
+    }
+
+    // -- ChunkAcceptanceDecision --------------------------------------
+
+    #[test]
+    fn rejected_chunk_acceptance_without_reason_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ChunkAcceptanceDecision",{},"outcome":"rejected"}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn committed_chunk_acceptance_with_reason_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ChunkAcceptanceDecision",{},"outcome":"committed","reason":"chunk_identity_conflict"}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn already_committed_chunk_acceptance_with_reason_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ChunkAcceptanceDecision",{},"outcome":"already_committed","reason":"transfer_not_continuable"}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn unknown_chunk_acceptance_reason_still_fails_as_malformed_not_invalid_shape() {
+        let json = format!(
+            r#"{{"type":"ChunkAcceptanceDecision",{},"outcome":"rejected","reason":"not_a_reason"}}"#,
+            env()
+        );
+        match codec::decode(&json) {
+            Err(DecodeError::Malformed(_)) => {}
+            other => panic!("expected Malformed for an unknown enum value, got {other:?}"),
+        }
+    }
+
+    // -- ResumeDiscoveryPage: generic decode-time validation ----------
+
+    #[test]
+    fn denied_resume_page_with_held_chunks_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ResumeDiscoveryPage",{},"decision":"denied","held_chunks":[{{"chunk_index":0,"digest":"d"}}]}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn denied_resume_page_with_manifest_metadata_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ResumeDiscoveryPage",{},"decision":"denied","digest_algorithm":"sha256","chunk_size":4096}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn approved_resume_page_without_held_chunks_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ResumeDiscoveryPage",{},"decision":"approved","transfer_id":"{}","sealed":false,"digest_algorithm":"sha256","chunk_size":4096}}"#,
+            env(),
+            Uuid::new_v4()
+        ));
+    }
+
+    #[test]
+    fn approved_resume_page_with_expected_count_but_not_sealed_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ResumeDiscoveryPage",{},"decision":"approved","transfer_id":"{}","sealed":false,"digest_algorithm":"sha256","chunk_size":4096,"expected_chunk_count":3,"held_chunks":[]}}"#,
+            env(),
+            Uuid::new_v4()
+        ));
+    }
+
+    #[test]
+    fn approved_resume_page_sealed_but_missing_expected_count_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ResumeDiscoveryPage",{},"decision":"approved","transfer_id":"{}","sealed":true,"digest_algorithm":"sha256","chunk_size":4096,"held_chunks":[]}}"#,
+            env(),
+            Uuid::new_v4()
+        ));
+    }
+
+    #[test]
+    fn well_formed_resume_pages_decode() {
+        // denied
+        assert_decodes(&format!(
+            r#"{{"type":"ResumeDiscoveryPage",{},"decision":"denied"}}"#,
+            env()
+        ));
+        // approved first page (sealed)
+        assert_decodes(&format!(
+            r#"{{"type":"ResumeDiscoveryPage",{},"decision":"approved","transfer_id":"{}","sealed":true,"digest_algorithm":"sha256","chunk_size":4096,"expected_chunk_count":2,"held_chunks":[{{"chunk_index":0,"digest":"d"}}]}}"#,
+            env(),
+            Uuid::new_v4()
+        ));
+        // approved continuation page
+        assert_decodes(&format!(
+            r#"{{"type":"ResumeDiscoveryPage",{},"decision":"approved","held_chunks":[{{"chunk_index":5,"digest":"d"}}]}}"#,
+            env()
+        ));
+    }
+
+    // -- ResumeDiscoveryPage: explicit first/continuation validators ---
+
+    fn first_page_message() -> ResumeDiscoveryPageMessage {
+        ResumeDiscoveryPageMessage::first_page(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            true,
+            WireDigestAlgorithm::Sha256,
+            4096,
+            Some(3),
+            vec![HeldChunk {
+                chunk_index: 0,
+                digest: "d".to_string(),
+            }],
+            Some("cur".to_string()),
+        )
+    }
+
+    #[test]
+    fn first_page_validator_accepts_a_real_first_page_and_rejects_a_denied_one() {
+        let page = first_page_message();
+        let view = page.approved_first_page().expect("valid first page");
+        assert!(view.sealed);
+        assert_eq!(view.expected_chunk_count, Some(3));
+
+        let denied = ResumeDiscoveryPageMessage::denied(Uuid::new_v4());
+        assert!(denied.approved_first_page().is_err());
+    }
+
+    #[test]
+    fn first_page_validator_rejects_missing_required_manifest_fields() {
+        let mut page = first_page_message();
+        page.body.digest_algorithm = None;
+        assert!(page.approved_first_page().is_err());
+
+        let mut page = first_page_message();
+        page.body.transfer_id = None;
+        assert!(page.approved_first_page().is_err());
+    }
+
+    #[test]
+    fn first_page_validator_enforces_expected_chunk_count_iff_sealed() {
+        let mut page = first_page_message();
+        page.body.sealed = Some(false); // still has expected_chunk_count -> invalid
+        assert!(page.approved_first_page().is_err());
+
+        let mut page = first_page_message();
+        page.body.expected_chunk_count = None; // sealed true but no count -> invalid
+        assert!(page.approved_first_page().is_err());
+    }
+
+    #[test]
+    fn continuation_validator_requires_held_chunks_and_rejects_manifest_fields() {
+        let ok = ResumeDiscoveryPageMessage::continuation_page(
+            Uuid::new_v4(),
+            vec![HeldChunk {
+                chunk_index: 9,
+                digest: "d".to_string(),
+            }],
+            None,
+        );
+        assert!(ok.approved_continuation_page().is_ok());
+
+        // a first page must not pass the continuation validator (it carries
+        // manifest-level fields)
+        assert!(first_page_message().approved_continuation_page().is_err());
+
+        // approved but no held_chunks at all
+        let mut missing =
+            ResumeDiscoveryPageMessage::continuation_page(Uuid::new_v4(), vec![], None);
+        missing.body.held_chunks = None;
+        assert!(missing.approved_continuation_page().is_err());
+    }
+
+    // -- ManifestSealDecision ----------------------------------------
+
+    fn seal_success_fields(uuid: Uuid) -> String {
+        format!(
+            r#""verification_handle":"vh","artifact_id":"{uuid}","digest_algorithm":"sha256","chunk_size":4096,"chunk_count":3,"expected_artifact_digest":"ead""#
+        )
+    }
+
+    #[test]
+    fn denied_seal_decision_with_success_fields_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ManifestSealDecision",{},"outcome":"denied",{}}}"#,
+            env(),
+            seal_success_fields(Uuid::new_v4())
+        ));
+    }
+
+    #[test]
+    fn denied_seal_decision_with_a_reason_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ManifestSealDecision",{},"outcome":"denied","reason":"incomplete_manifest"}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn rejected_seal_decision_without_reason_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ManifestSealDecision",{},"outcome":"rejected"}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn rejected_seal_decision_with_success_fields_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ManifestSealDecision",{},"outcome":"rejected","reason":"incomplete_manifest","chunk_count":3}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn sealed_decision_missing_each_required_success_dimension_is_rejected() {
+        let all = [
+            "verification_handle",
+            "artifact_id",
+            "digest_algorithm",
+            "chunk_size",
+            "chunk_count",
+            "expected_artifact_digest",
+        ];
+        for omitted in all {
+            let uuid = Uuid::new_v4();
+            let fields: Vec<String> = all
+                .iter()
+                .filter(|f| **f != omitted)
+                .map(|f| match *f {
+                    "verification_handle" => r#""verification_handle":"vh""#.to_string(),
+                    "artifact_id" => format!(r#""artifact_id":"{uuid}""#),
+                    "digest_algorithm" => r#""digest_algorithm":"sha256""#.to_string(),
+                    "chunk_size" => r#""chunk_size":4096"#.to_string(),
+                    "chunk_count" => r#""chunk_count":3"#.to_string(),
+                    "expected_artifact_digest" => r#""expected_artifact_digest":"ead""#.to_string(),
+                    _ => unreachable!(),
+                })
+                .collect();
+            assert_invalid_shape(&format!(
+                r#"{{"type":"ManifestSealDecision",{},"outcome":"sealed",{}}}"#,
+                env(),
+                fields.join(",")
+            ));
+        }
+    }
+
+    #[test]
+    fn sealed_decision_with_a_reason_is_rejected() {
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ManifestSealDecision",{},"outcome":"sealed","reason":"incomplete_manifest",{}}}"#,
+            env(),
+            seal_success_fields(Uuid::new_v4())
+        ));
+    }
+
+    #[test]
+    fn already_pending_verification_obeys_the_same_success_field_requirements() {
+        // complete bundle -> ok
+        assert_decodes(&format!(
+            r#"{{"type":"ManifestSealDecision",{},"outcome":"already_pending_verification",{}}}"#,
+            env(),
+            seal_success_fields(Uuid::new_v4())
+        ));
+        // missing one dimension -> rejected
+        assert_invalid_shape(&format!(
+            r#"{{"type":"ManifestSealDecision",{},"outcome":"already_pending_verification","verification_handle":"vh","digest_algorithm":"sha256","chunk_size":4096,"chunk_count":3,"expected_artifact_digest":"ead"}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn well_formed_seal_decisions_decode() {
+        assert_decodes(&format!(
+            r#"{{"type":"ManifestSealDecision",{},"outcome":"sealed",{}}}"#,
+            env(),
+            seal_success_fields(Uuid::new_v4())
+        ));
+        assert_decodes(&format!(
+            r#"{{"type":"ManifestSealDecision",{},"outcome":"rejected","reason":"manifest_already_sealed"}}"#,
+            env()
+        ));
+        assert_decodes(&format!(
+            r#"{{"type":"ManifestSealDecision",{},"outcome":"denied"}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn unknown_seal_rejection_reason_still_fails_decode() {
+        let json = format!(
+            r#"{{"type":"ManifestSealDecision",{},"outcome":"rejected","reason":"not_a_reason"}}"#,
+            env()
+        );
+        assert!(codec::decode(&json).is_err());
+    }
+
+    // -- Cross-cutting guarantees preserved -------------------------
+
+    #[test]
+    fn unknown_optional_future_field_on_a_conditionally_shaped_message_is_still_ignored() {
+        assert_decodes(&format!(
+            r#"{{"type":"AuthorizationDecision",{},"decision":"denied","some_future_optional":"x"}}"#,
+            env()
+        ));
+        assert_decodes(&format!(
+            r#"{{"type":"ManifestSealDecision",{},"outcome":"denied","some_future_optional":42}}"#,
+            env()
+        ));
+    }
+
+    #[test]
+    fn every_constructor_emitted_message_passes_shape_validation() {
+        for message in super::tests_support::one_of_each_variant() {
+            message.validate_shape().unwrap_or_else(|e| {
+                panic!("constructor emitted an invalid shape: {e} for {message:?}")
+            });
+            // and a full encode -> decode round trip must not reject it
+            let wire = codec::encode(&message).expect("encode");
+            codec::decode(&wire).expect("valid constructor output must decode");
+        }
+    }
+
+    #[test]
+    fn protocol_version_stays_one_through_every_shape_validated_message() {
+        for message in super::tests_support::one_of_each_variant() {
+            assert_eq!(message.envelope().protocol_version.as_str(), "1");
+        }
     }
 }
 
