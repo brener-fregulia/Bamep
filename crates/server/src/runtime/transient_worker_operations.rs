@@ -13,13 +13,18 @@
 //!
 //! This store is owned by one Worker control-plane connection generation
 //! (`bamep_server::adapters::worker_control_plane`): a fresh empty store per
-//! successful handshake, dropped when that connection ends. It additionally
-//! self-checks generation currency against
-//! [`WorkerAuthorityRegistry`](crate::runtime::worker_authority::WorkerAuthorityRegistry)
-//! on every operation, so a stale generation whose task still holds an `Arc`
-//! to this store — for example after a newer overlapping handshake
-//! superseded it — can no longer mint or consume anything
-//! ([`TransientOperationError::StaleGeneration`]).
+//! successful handshake, dropped when that connection ends. Every operation
+//! runs inside
+//! [`WorkerAuthorityRegistry::with_current_generation`](crate::runtime::worker_authority::WorkerAuthorityRegistry::with_current_generation),
+//! which verifies generation currency and holds the registry `state` lock
+//! **shared for the whole critical section**. Because a new handshake takes
+//! that lock **exclusively** in
+//! [`begin_generation`](crate::runtime::worker_authority::WorkerAuthorityRegistry::begin_generation),
+//! the currency check and the store mutation linearize as one step against
+//! supersession — a stale generation whose task still holds an `Arc` to this
+//! store can no longer mint, consume, advance, or read anything
+//! ([`TransientOperationError::StaleGeneration`]), with no check-then-act
+//! race.
 //!
 //! Phase B prepares only this transient machinery. The durable Phase C
 //! business operations that will *use* the consume APIs
@@ -232,8 +237,10 @@ impl fmt::Debug for TransientWorkerOperationStore {
 impl TransientWorkerOperationStore {
     /// A fresh, empty store for connection `generation`, bounded to
     /// `capacity` live bindings (clamped to at least 1). `authority` is the
-    /// same registry that minted `generation`; every operation first checks
-    /// `authority.is_current(generation)`.
+    /// same registry that minted `generation`; every operation runs inside
+    /// [`WorkerAuthorityRegistry::with_current_generation`], which verifies
+    /// `generation` is still current and holds the registry `state` lock
+    /// shared for the whole critical section.
     pub fn new(
         generation: ConnectionGeneration,
         authority: Arc<WorkerAuthorityRegistry>,
@@ -279,55 +286,78 @@ impl TransientWorkerOperationStore {
     /// only. `0` once the owning generation is superseded, since every
     /// operation then fails closed regardless of the map contents.
     pub fn live_count(&self) -> usize {
-        if self.is_generation_current() {
-            self.bindings
-                .lock()
-                .expect("transient store lock poisoned")
-                .len()
-        } else {
-            0
-        }
+        self.with_bindings_read(|map| map.len()).unwrap_or(0)
     }
 
-    fn is_generation_current(&self) -> bool {
-        self.authority.is_current(self.generation)
+    /// Runs `op` against the live bindings map **iff** this store's generation
+    /// is still current, with the registry `state` lock held **shared** for
+    /// the whole critical section (Issue #39 Phase B concurrency correction).
+    /// The generation-currency check and the map mutation therefore linearize
+    /// as **one** step against
+    /// [`WorkerAuthorityRegistry::begin_generation`] /
+    /// [`end_generation`](WorkerAuthorityRegistry::end_generation): there is no
+    /// window in which this store observed its generation current and then
+    /// mutated after a newer generation had already taken over. A
+    /// superseded/ended generation yields
+    /// [`TransientOperationError::StaleGeneration`] and `op` never runs.
+    ///
+    /// Lock order (see [`crate::runtime::worker_authority`] module docs):
+    /// registry `state` (shared, via
+    /// [`WorkerAuthorityRegistry::with_current_generation`]) →
+    /// `self.bindings`. `op` never touches the registry.
+    fn with_bindings<T>(
+        &self,
+        op: impl FnOnce(&mut HashMap<String, Binding>) -> Result<T, TransientOperationError>,
+    ) -> Result<T, TransientOperationError> {
+        self.authority
+            .with_current_generation(self.generation, || {
+                let mut map = self.bindings.lock().expect("transient store lock poisoned");
+                op(&mut map)
+            })
+            .and_then(|inner| inner)
     }
 
-    fn require_current(&self) -> Result<(), TransientOperationError> {
-        if self.is_generation_current() {
-            Ok(())
-        } else {
-            Err(TransientOperationError::StaleGeneration)
-        }
+    /// Non-consuming counterpart of [`Self::with_bindings`]: `op` cannot fail,
+    /// but the read still happens only while the generation is current, so a
+    /// superseded generation's bindings are never surfaced. `None` once
+    /// superseded/ended.
+    fn with_bindings_read<T>(&self, op: impl FnOnce(&HashMap<String, Binding>) -> T) -> Option<T> {
+        self.authority
+            .with_current_generation(self.generation, || {
+                let map = self.bindings.lock().expect("transient store lock poisoned");
+                op(&map)
+            })
+            .ok()
     }
 
     /// Inserts `binding` under a fresh opaque id, failing closed at capacity
     /// ([`Saturated`](TransientOperationError::Saturated)) and on a repeated
     /// id ([`IdCollision`](TransientOperationError::IdCollision)). Neither
-    /// failure ever evicts or overwrites a live binding.
+    /// failure ever evicts or overwrites a live binding. Runs entirely inside
+    /// the generation-linearized critical section (see [`Self::with_bindings`]).
     fn insert_fresh(
         &self,
         kind: HandleKind,
         binding: Binding,
     ) -> Result<String, TransientOperationError> {
-        self.require_current()?;
-        let mut map = self.bindings.lock().expect("transient store lock poisoned");
-        if map.len() >= self.capacity {
-            return Err(TransientOperationError::Saturated);
-        }
-        let mut chosen: Option<String> = None;
-        for _ in 0..MINT_ATTEMPTS {
-            let candidate = (self.id_source)(kind);
-            if !map.contains_key(&candidate) {
-                chosen = Some(candidate);
-                break;
+        self.with_bindings(|map| {
+            if map.len() >= self.capacity {
+                return Err(TransientOperationError::Saturated);
             }
-        }
-        let Some(id) = chosen else {
-            return Err(TransientOperationError::IdCollision);
-        };
-        map.insert(id.clone(), binding);
-        Ok(id)
+            let mut chosen: Option<String> = None;
+            for _ in 0..MINT_ATTEMPTS {
+                let candidate = (self.id_source)(kind);
+                if !map.contains_key(&candidate) {
+                    chosen = Some(candidate);
+                    break;
+                }
+            }
+            let Some(id) = chosen else {
+                return Err(TransientOperationError::IdCollision);
+            };
+            map.insert(id.clone(), binding);
+            Ok(id)
+        })
     }
 
     // -- acceptance --------------------------------------------------
@@ -365,38 +395,33 @@ impl TransientWorkerOperationStore {
         transfer_id: TransferId,
         chunk_index: u64,
     ) -> Result<AcceptanceBinding, TransientOperationError> {
-        self.require_current()?;
-        let mut map = self.bindings.lock().expect("transient store lock poisoned");
-        let matches = match map.get(handle) {
-            None => return Err(TransientOperationError::UnknownHandle),
-            Some(Binding::Acceptance(b)) => {
-                b.transfer_id == transfer_id && b.chunk_index == chunk_index
+        self.with_bindings(|map| {
+            let matches = match map.get(handle) {
+                None => return Err(TransientOperationError::UnknownHandle),
+                Some(Binding::Acceptance(b)) => {
+                    b.transfer_id == transfer_id && b.chunk_index == chunk_index
+                }
+                Some(_) => return Err(TransientOperationError::WrongKind),
+            };
+            if !matches {
+                return Err(TransientOperationError::BindingMismatch);
             }
-            Some(_) => return Err(TransientOperationError::WrongKind),
-        };
-        if !matches {
-            return Err(TransientOperationError::BindingMismatch);
-        }
-        match map.remove(handle) {
-            Some(Binding::Acceptance(b)) => Ok(b),
-            _ => unreachable!("verified under the same lock immediately above"),
-        }
+            match map.remove(handle) {
+                Some(Binding::Acceptance(b)) => Ok(b),
+                _ => unreachable!("verified under the same lock immediately above"),
+            }
+        })
     }
 
     /// Non-consuming read of an acceptance binding (diagnostics/tests, and a
     /// legitimate Phase C peek). `None` for an unknown handle, a handle of
     /// another kind, or once the owning generation is superseded.
     pub fn acceptance_binding(&self, handle: &str) -> Option<AcceptanceBinding> {
-        self.require_current().ok()?;
-        match self
-            .bindings
-            .lock()
-            .expect("transient store lock poisoned")
-            .get(handle)
-        {
+        self.with_bindings_read(|map| match map.get(handle) {
             Some(Binding::Acceptance(b)) => Some(b.clone()),
             _ => None,
-        }
+        })
+        .flatten()
     }
 
     // -- verification ---------------------------------------------
@@ -426,36 +451,31 @@ impl TransientWorkerOperationStore {
         transfer_id: TransferId,
         artifact_id: ArtifactId,
     ) -> Result<VerificationBinding, TransientOperationError> {
-        self.require_current()?;
-        let mut map = self.bindings.lock().expect("transient store lock poisoned");
-        let matches = match map.get(handle) {
-            None => return Err(TransientOperationError::UnknownHandle),
-            Some(Binding::Verification(b)) => {
-                b.transfer_id == transfer_id && b.artifact_id == artifact_id
+        self.with_bindings(|map| {
+            let matches = match map.get(handle) {
+                None => return Err(TransientOperationError::UnknownHandle),
+                Some(Binding::Verification(b)) => {
+                    b.transfer_id == transfer_id && b.artifact_id == artifact_id
+                }
+                Some(_) => return Err(TransientOperationError::WrongKind),
+            };
+            if !matches {
+                return Err(TransientOperationError::BindingMismatch);
             }
-            Some(_) => return Err(TransientOperationError::WrongKind),
-        };
-        if !matches {
-            return Err(TransientOperationError::BindingMismatch);
-        }
-        match map.remove(handle) {
-            Some(Binding::Verification(b)) => Ok(b),
-            _ => unreachable!("verified under the same lock immediately above"),
-        }
+            match map.remove(handle) {
+                Some(Binding::Verification(b)) => Ok(b),
+                _ => unreachable!("verified under the same lock immediately above"),
+            }
+        })
     }
 
     /// Non-consuming read of a verification binding.
     pub fn verification_binding(&self, handle: &str) -> Option<VerificationBinding> {
-        self.require_current().ok()?;
-        match self
-            .bindings
-            .lock()
-            .expect("transient store lock poisoned")
-            .get(handle)
-        {
+        self.with_bindings_read(|map| match map.get(handle) {
             Some(Binding::Verification(b)) => Some(b.clone()),
             _ => None,
-        }
+        })
+        .flatten()
     }
 
     // -- resume cursor ------------------------------------------
@@ -496,63 +516,64 @@ impl TransientWorkerOperationStore {
         transfer_id: TransferId,
         next: Option<ResumeCursorState>,
     ) -> Result<Option<String>, TransientOperationError> {
-        self.require_current()?;
-        let mut map = self.bindings.lock().expect("transient store lock poisoned");
-
-        match map.get(cursor) {
-            None => return Err(TransientOperationError::UnknownHandle),
-            Some(Binding::ResumeCursor(b)) => {
-                if b.transfer_id != transfer_id {
-                    return Err(TransientOperationError::BindingMismatch);
-                }
-            }
-            Some(_) => return Err(TransientOperationError::WrongKind),
-        }
-
-        let successor = match next {
-            None => None,
-            Some(state) => {
-                let mut chosen: Option<String> = None;
-                for _ in 0..MINT_ATTEMPTS {
-                    let candidate = (self.id_source)(HandleKind::ResumeCursor);
-                    if candidate != cursor && !map.contains_key(&candidate) {
-                        chosen = Some(candidate);
-                        break;
+        // The whole authoritative advance — currency check, successor mint,
+        // and current-cursor removal — runs inside one
+        // [`Self::with_bindings`] critical section: generation protection
+        // surrounds it end to end (Issue #39 Phase B concurrency correction),
+        // and the successor is still chosen *before* the current cursor is
+        // removed under the single `bindings` lock, so a collision leaves the
+        // current cursor completely intact with no gap and no duplicate.
+        self.with_bindings(|map| {
+            match map.get(cursor) {
+                None => return Err(TransientOperationError::UnknownHandle),
+                Some(Binding::ResumeCursor(b)) => {
+                    if b.transfer_id != transfer_id {
+                        return Err(TransientOperationError::BindingMismatch);
                     }
                 }
-                let Some(id) = chosen else {
-                    // Current cursor untouched — no gap, no duplicate.
-                    return Err(TransientOperationError::IdCollision);
-                };
-                Some((
-                    id,
-                    Binding::ResumeCursor(ResumeCursorBinding { transfer_id, state }),
-                ))
+                Some(_) => return Err(TransientOperationError::WrongKind),
             }
-        };
 
-        map.remove(cursor);
-        match successor {
-            None => Ok(None),
-            Some((id, binding)) => {
-                map.insert(id.clone(), binding);
-                Ok(Some(id))
+            let successor = match next {
+                None => None,
+                Some(state) => {
+                    let mut chosen: Option<String> = None;
+                    for _ in 0..MINT_ATTEMPTS {
+                        let candidate = (self.id_source)(HandleKind::ResumeCursor);
+                        if candidate != cursor && !map.contains_key(&candidate) {
+                            chosen = Some(candidate);
+                            break;
+                        }
+                    }
+                    let Some(id) = chosen else {
+                        // Current cursor untouched — no gap, no duplicate.
+                        return Err(TransientOperationError::IdCollision);
+                    };
+                    Some((
+                        id,
+                        Binding::ResumeCursor(ResumeCursorBinding { transfer_id, state }),
+                    ))
+                }
+            };
+
+            map.remove(cursor);
+            match successor {
+                None => Ok(None),
+                Some((id, binding)) => {
+                    map.insert(id.clone(), binding);
+                    Ok(Some(id))
+                }
             }
-        }
+        })
     }
 
     /// Non-consuming read of a resume-cursor binding.
     pub fn resume_cursor_binding(&self, cursor: &str) -> Option<ResumeCursorBinding> {
-        self.require_current().ok()?;
-        match self
-            .bindings
-            .lock()
-            .expect("transient store lock poisoned")
-            .get(cursor)
-        {
+        self.with_bindings_read(|map| match map.get(cursor) {
             Some(Binding::ResumeCursor(b)) => Some(b.clone()),
             _ => None,
-        }
+        })
+        .flatten()
     }
 }
 
@@ -613,6 +634,30 @@ mod tests {
                 q.pop_front();
             }
             front
+        })
+    }
+
+    /// An id source whose **first** invocation signals on `entered` and then
+    /// blocks until `release` fires, so a test can hold a store operation open
+    /// *inside* its generation-linearized critical section (registry `state`
+    /// read lock held, `bindings` lock held) with no sleeps. Later
+    /// invocations behave normally.
+    fn parking_id_source(
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> IdSource {
+        let armed = std::sync::atomic::AtomicBool::new(true);
+        let release = StdMutex::new(release);
+        Box::new(move |kind| {
+            if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                entered.send(()).expect("test receiver alive");
+                release
+                    .lock()
+                    .expect("release channel mutex")
+                    .recv()
+                    .expect("test sender alive");
+            }
+            format!("{}_{}", kind.prefix(), Uuid::new_v4().simple())
         })
     }
 
@@ -948,6 +993,142 @@ mod tests {
             Err(TransientOperationError::StaleGeneration)
         );
         assert!(store.verification_binding(&handle).is_none());
+    }
+
+    #[test]
+    fn every_authority_operation_fails_closed_once_the_generation_is_superseded() {
+        let registry = Arc::new(WorkerAuthorityRegistry::new());
+        let gen_a = registry.begin_generation(Uuid::new_v4());
+        let store = TransientWorkerOperationStore::new(gen_a, Arc::clone(&registry), 64);
+
+        // One live binding of each kind, minted while generation A is current.
+        let acc = store.mint_acceptance(acceptance(0)).unwrap();
+        let ver = store.mint_verification(verification()).unwrap();
+        let res = store.mint_resume_cursor(cursor(0)).unwrap();
+
+        // A newer overlapping handshake supersedes generation A.
+        let _gen_b = registry.begin_generation(Uuid::new_v4());
+
+        // Every mint / consume / advance now fails closed.
+        assert_eq!(
+            store.mint_acceptance(acceptance(1)),
+            Err(TransientOperationError::StaleGeneration)
+        );
+        assert_eq!(
+            store.mint_verification(verification()),
+            Err(TransientOperationError::StaleGeneration)
+        );
+        assert_eq!(
+            store.mint_resume_cursor(cursor(1)),
+            Err(TransientOperationError::StaleGeneration)
+        );
+        assert_eq!(
+            store.consume_acceptance(&acc, TransferId::new(), 0),
+            Err(TransientOperationError::StaleGeneration)
+        );
+        assert_eq!(
+            store.consume_verification(&ver, TransferId::new(), ArtifactId::new()),
+            Err(TransientOperationError::StaleGeneration)
+        );
+        assert_eq!(
+            store.advance_resume_cursor(&res, TransferId::new(), None),
+            Err(TransientOperationError::StaleGeneration)
+        );
+
+        // Non-consuming reads also refuse to surface a superseded binding.
+        assert!(store.acceptance_binding(&acc).is_none());
+        assert!(store.verification_binding(&ver).is_none());
+        assert!(store.resume_cursor_binding(&res).is_none());
+        assert_eq!(store.live_count(), 0);
+    }
+
+    /// Deterministic proof (no sleeps, no timeouts) that a transient-authority
+    /// operation holds the registry `state` lock **shared for its whole
+    /// critical section**, so generation supersession cannot linearize in the
+    /// middle of it (Issue #39 Phase B concurrency correction; contract
+    /// "transient handles are valid only on the current connection
+    /// generation").
+    ///
+    /// Thread A parks *inside* `mint_acceptance`, between the currency check
+    /// and the map mutation. The main thread then probes the `state` lock
+    /// with a **non-blocking** `try_write`:
+    ///
+    /// * with the fix, A holds `state` shared across the whole critical
+    ///   section, so the probe reports the lock contended — and a concurrent
+    ///   `begin_generation` is provably blocked;
+    /// * with the former check-then-act race, A would hold only the `bindings`
+    ///   lock here and the probe would find `state` free — the assertion
+    ///   fails, catching the regression.
+    ///
+    /// The probe is non-blocking, so the main thread cannot deadlock behind
+    /// the pending writer (`std` `RwLock` is write-preferring: a blocking
+    /// `read` would stall while B waits for `write`).
+    #[test]
+    fn a_newer_generation_cannot_supersede_while_an_authority_operation_is_in_flight() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let registry = Arc::new(WorkerAuthorityRegistry::new());
+        let gen_a = registry.begin_generation(Uuid::new_v4());
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let store = Arc::new(TransientWorkerOperationStore::with_id_source(
+            gen_a,
+            Arc::clone(&registry),
+            64,
+            parking_id_source(entered_tx, release_rx),
+        ));
+
+        // Thread A: enters mint_acceptance and parks deep inside the
+        // generation-linearized critical section.
+        let store_a = Arc::clone(&store);
+        let a = thread::spawn(move || {
+            store_a.mint_acceptance(AcceptanceBinding {
+                transfer_id: TransferId::new(),
+                chunk_index: 0,
+                proof_id: "p".to_string(),
+            })
+        });
+        entered_rx.recv().expect("A reached its critical section");
+
+        // Thread B: tries to supersede generation A.
+        let registry_b = Arc::clone(&registry);
+        let (b_started_tx, b_started_rx) = mpsc::channel();
+        let b = thread::spawn(move || {
+            b_started_tx.send(()).expect("test receiver alive");
+            registry_b.begin_generation(Uuid::new_v4())
+        });
+        b_started_rx.recv().expect("B is attempting supersession");
+
+        // Deterministic: while A's mint is in flight, the state lock is held
+        // shared and cannot be write-locked. Probed repeatedly to rule out
+        // any sneak-through window.
+        for _ in 0..10_000 {
+            assert!(
+                !registry.state_lock_is_uncontended(),
+                "the in-flight mint must hold the state lock for its whole critical section"
+            );
+        }
+
+        // Release A; its mint completes under generation A.
+        release_tx.send(()).expect("A still parked");
+        let handle = a
+            .join()
+            .expect("A thread")
+            .expect("A minted while generation A was current");
+
+        // Only now can B supersede.
+        let gen_b = b.join().expect("B thread");
+        assert!(registry.is_current(gen_b));
+        assert!(!registry.is_current(gen_a));
+
+        // A's handle is now non-authoritative on every path.
+        assert_eq!(
+            store.consume_acceptance(&handle, TransferId::new(), 0),
+            Err(TransientOperationError::StaleGeneration)
+        );
+        assert!(store.acceptance_binding(&handle).is_none());
     }
 
     // -- redaction --------------------------------------------

@@ -14,6 +14,24 @@
 //! can never revert state back from a newer generation, because
 //! [`WorkerAuthorityRegistry::end_generation`] only clears state that still
 //! matches the generation it names.
+//!
+//! # Lock order (Issue #39 Phase B concurrency correction)
+//!
+//! One order only, never the reverse:
+//!
+//! 1. [`WorkerAuthorityRegistry`] `state`, then
+//! 2. [`WorkerAuthorityRegistry`] `observed_operations`, or a
+//!    [`TransientWorkerOperationStore`]'s internal `bindings` mutex.
+//!
+//! [`WorkerAuthorityRegistry::begin_generation`] and
+//! [`WorkerAuthorityRegistry::end_generation`] take `state` **exclusively**;
+//! every transient-authority operation — mint, consume, advance, and every
+//! non-consuming read — takes `state` **shared** for the whole critical
+//! section through [`WorkerAuthorityRegistry::with_current_generation`], so
+//! the generation-currency check and the store mutation linearize as one
+//! step against supersession. Nothing that holds `bindings` or
+//! `observed_operations` ever reaches back for `state`, so the single order
+//! cannot deadlock.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
@@ -21,7 +39,8 @@ use std::sync::{Arc, RwLock, Weak};
 use uuid::Uuid;
 
 use crate::runtime::transient_worker_operations::{
-    TransientWorkerOperationStore, DEFAULT_TRANSIENT_WORKER_OPERATION_STORE_CAPACITY,
+    TransientOperationError, TransientWorkerOperationStore,
+    DEFAULT_TRANSIENT_WORKER_OPERATION_STORE_CAPACITY,
 };
 
 /// Opaque connection-generation handle
@@ -91,22 +110,75 @@ impl WorkerAuthorityRegistry {
         self.operations_capacity
     }
 
+    /// Runs `critical` exactly once **iff** `generation` is the current one,
+    /// holding the registry `state` lock in **shared** mode for the entire
+    /// duration of `critical`; returns `None` — running nothing — once
+    /// `generation` has been superseded or ended.
+    ///
+    /// This is the generation-linearization primitive (Issue #39 Phase B
+    /// concurrency correction). Because [`Self::begin_generation`] and
+    /// [`Self::end_generation`] take `state` **exclusively**, no supersession
+    /// can linearize between the currency check here and the completion of
+    /// `critical`: either `critical` runs to completion while `generation` is
+    /// still authoritative and only *then* may a newer generation supersede
+    /// it, or supersession already happened and `critical` never runs. There
+    /// is no `checked-then-mutated-anyway` window.
+    ///
+    /// Lock order (see module docs): `state` (shared) → the caller's inner
+    /// lock. `critical` MUST NOT call back into any [`WorkerAuthorityRegistry`]
+    /// method that takes `state`.
+    fn linearized_on<T>(
+        &self,
+        generation: ConnectionGeneration,
+        critical: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let guard = self.state.read().expect("worker authority lock poisoned");
+        match *guard {
+            WorkerControlState::Active {
+                generation: current,
+                ..
+            } if current == generation => {
+                let out = critical();
+                drop(guard);
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Runs `op` under [`Self::linearized_on`] for `generation`, mapping a
+    /// superseded/ended generation to
+    /// [`TransientOperationError::StaleGeneration`]. Every
+    /// [`TransientWorkerOperationStore`] mint / consume / advance and every
+    /// non-consuming read routes its authority-sensitive work through here so
+    /// the generation-currency check and the store mutation are one
+    /// linearized step (Issue #39 Phase B concurrency correction).
+    pub(crate) fn with_current_generation<T>(
+        &self,
+        generation: ConnectionGeneration,
+        op: impl FnOnce() -> T,
+    ) -> Result<T, TransientOperationError> {
+        self.linearized_on(generation, op)
+            .ok_or(TransientOperationError::StaleGeneration)
+    }
+
     /// Publishes `store` as the current generation's observable
-    /// transient-operation store — a no-op unless `generation` is still the
-    /// current one, so a stale generation's late publish can never clobber a
-    /// newer generation's store, mirroring [`Self::end_generation`].
+    /// transient-operation store. The currency check and the publication are
+    /// **one** linearized step (via [`Self::linearized_on`]), so a stale
+    /// generation whose task belatedly publishes after a newer generation has
+    /// begun cannot clobber the newer generation's slot: [`Self::begin_generation`]
+    /// holds `state` exclusively for the whole check-and-publish window.
     pub fn set_current_operations(
         &self,
         generation: ConnectionGeneration,
         store: Weak<TransientWorkerOperationStore>,
     ) {
-        if !self.is_current(generation) {
-            return;
-        }
-        *self
-            .observed_operations
-            .write()
-            .expect("worker authority lock poisoned") = Some(store);
+        self.linearized_on(generation, || {
+            *self
+                .observed_operations
+                .write()
+                .expect("worker authority lock poisoned") = Some(store);
+        });
     }
 
     /// The current generation's transient-operation store, if one has been
@@ -173,6 +245,18 @@ impl WorkerAuthorityRegistry {
             self.current(),
             WorkerControlState::Active { generation: current, .. } if current == generation
         )
+    }
+
+    /// Test-only, non-blocking probe: `true` when the `state` lock is
+    /// currently uncontended (no reader or writer holds it). Concurrency
+    /// tests use it to prove that a transient-authority operation really does
+    /// hold `state` **shared for its whole critical section** — the property
+    /// the former check-then-act race lacked. `try_write` never blocks, even
+    /// with a writer pending, so this is safe to call from a thread that must
+    /// not deadlock.
+    #[cfg(test)]
+    pub(crate) fn state_lock_is_uncontended(&self) -> bool {
+        self.state.try_write().is_ok()
     }
 }
 
@@ -334,5 +418,105 @@ mod tests {
         // The owning connection task dropped its `Arc`; the registry's `Weak`
         // can no longer upgrade.
         assert!(registry.current_operations().is_none());
+    }
+
+    /// Deterministic proof (no sleeps) that the currency check and the
+    /// publication in [`WorkerAuthorityRegistry::set_current_operations`] are
+    /// **one** linearized step relative to
+    /// [`WorkerAuthorityRegistry::begin_generation`] (Issue #39 Phase B
+    /// concurrency correction — the former `set_current_operations` TOCTOU).
+    ///
+    /// Thread P parks holding the `state` read lock as generation A, using the
+    /// very same [`WorkerAuthorityRegistry::with_current_generation`]
+    /// primitive that `set_current_operations` and every store op route
+    /// through. While P is parked, `RwLock` exclusion makes it a hard
+    /// invariant that a concurrent `begin_generation` for B cannot complete,
+    /// and a concurrent stale `set_current_operations(gen_a, …)` cannot land
+    /// after B. When the dust settles, the newer generation's store owns the
+    /// observed slot and no stale publish clobbered it.
+    #[test]
+    fn a_stale_generation_cannot_publish_over_a_newer_one_under_concurrency() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let registry = Arc::new(WorkerAuthorityRegistry::new());
+        let gen_a = registry.begin_generation(Uuid::new_v4());
+        let store_a = Arc::new(TransientWorkerOperationStore::new(
+            gen_a,
+            Arc::clone(&registry),
+            registry.operations_capacity(),
+        ));
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        // Thread P: parks holding the state read lock as generation A.
+        let registry_p = Arc::clone(&registry);
+        let p = thread::spawn(move || {
+            registry_p.with_current_generation(gen_a, || {
+                entered_tx.send(()).expect("test receiver alive");
+                release_rx.recv().expect("test sender alive");
+            })
+        });
+        entered_rx
+            .recv()
+            .expect("P holds the state read lock as generation A");
+
+        // Thread B: supersede generation A and publish B's own store.
+        let registry_b = Arc::clone(&registry);
+        let (b_started_tx, b_started_rx) = mpsc::channel();
+        let b = thread::spawn(move || {
+            b_started_tx.send(()).expect("test receiver alive");
+            let gen_b = registry_b.begin_generation(Uuid::new_v4());
+            let store_b = Arc::new(TransientWorkerOperationStore::new(
+                gen_b,
+                Arc::clone(&registry_b),
+                registry_b.operations_capacity(),
+            ));
+            registry_b.set_current_operations(gen_b, Arc::downgrade(&store_b));
+            (gen_b, store_b)
+        });
+        b_started_rx.recv().expect("B is attempting supersession");
+
+        // Thread S: a stale publisher for generation A, racing B.
+        let registry_s = Arc::clone(&registry);
+        let store_a_s = Arc::clone(&store_a);
+        let s = thread::spawn(move || {
+            registry_s.set_current_operations(gen_a, Arc::downgrade(&store_a_s));
+        });
+
+        // Deterministic, non-blocking: while P's linearized section is open
+        // the state lock is held shared and cannot be write-locked, so B's
+        // begin_generation is provably blocked and generation A has not been
+        // superseded. (A blocking `is_current` read would deadlock behind the
+        // pending writer, so only the non-blocking probe is used here.)
+        for _ in 0..10_000 {
+            assert!(
+                !registry.state_lock_is_uncontended(),
+                "P's linearized section must hold the state lock for its whole duration"
+            );
+        }
+
+        // Release P; B and S may now make progress.
+        release_tx.send(()).expect("P still parked");
+        p.join()
+            .expect("P thread")
+            .expect("P ran under generation A");
+        s.join().expect("S thread");
+        let (gen_b, store_b) = b.join().expect("B thread");
+
+        // A further belated stale publish from generation A must also be a
+        // no-op now that B is current.
+        registry.set_current_operations(gen_a, Arc::downgrade(&store_a));
+
+        assert!(registry.is_current(gen_b));
+        assert!(!registry.is_current(gen_a));
+        let observed = registry
+            .current_operations()
+            .expect("the newer generation published a store");
+        assert!(
+            Arc::ptr_eq(&observed, &store_b),
+            "generation B's store owns the observed slot; no stale publish clobbered it"
+        );
     }
 }
