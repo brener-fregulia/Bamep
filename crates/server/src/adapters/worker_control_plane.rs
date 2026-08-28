@@ -146,6 +146,9 @@ mod imp {
     use crate::application::{
         TransferAuthorizationService, WorkerAuthorizationOutcome, WorkerAuthorizationQueryInput,
     };
+    use crate::runtime::transient_worker_operations::{
+        AcceptanceBinding, TransientWorkerOperationStore,
+    };
 
     use super::*;
 
@@ -473,6 +476,21 @@ mod imp {
             generation,
         };
 
+        // This generation's transient Worker-operation state (Issue #39
+        // Phase B): a fresh empty store, owned here for exactly this
+        // connection's lifetime and dropped when this function returns. It is
+        // additionally published to `registry` as a non-owning `Weak` so the
+        // authoritative generation's store is reachable through the same
+        // registry `bamepd` already shares, and self-checks generation
+        // currency on every operation so a superseded generation whose task
+        // still holds this `Arc` can no longer mint or consume anything.
+        let operations = Arc::new(TransientWorkerOperationStore::new(
+            generation,
+            Arc::clone(&registry),
+            registry.operations_capacity(),
+        ));
+        registry.set_current_operations(generation, Arc::downgrade(&operations));
+
         // Issue #38 extends this loop from #37's single-shot receive into a
         // genuine per-connection request/response loop: `AuthorizationQuery`
         // is answered in place, sequentially — this connection task is the
@@ -490,6 +508,7 @@ mod imp {
                     match received {
                         Ok(WorkerProtocolMessage::AuthorizationQuery(query)) => {
                             let response = decide_authorization_query(
+                                &operations,
                                 &transfer_authorization,
                                 &query,
                             )
@@ -543,27 +562,15 @@ mod imp {
         }
     }
 
-    /// Mints one transient, generation-scoped `acceptance_handle`
-    /// (`m1-worker-data-plane-control-contract.md` "Transient operation
-    /// handles"): opaque to the Worker, minted by `bamepd` in the response to
-    /// an authorizing request.
-    ///
-    /// v4 UUIDs draw 122 bits from the OS CSPRNG (`getrandom`), so a fresh
-    /// value is collision-safe as an opaque token. The generation-scoped
-    /// single-use *store* that binds this handle to one `(transfer_id,
-    /// chunk_index, proof_id)` and rejects a foreign/stale one on the
-    /// matching `ChunkAcceptanceRequest` is added by #39 Phase B; no
-    /// `ChunkAcceptanceRequest` handler consumes it yet.
-    fn mint_acceptance_handle() -> String {
-        format!("acc_{}", Uuid::new_v4().simple())
-    }
-
     /// Converts one received `AuthorizationQuery` into the Application-layer
     /// input, delegates the authoritative decision to
-    /// [`TransferAuthorizationService::decide`], and converts the result
-    /// back into the exact wire `AuthorizationDecision` — this Adapter never
-    /// makes the decision itself (ADR-0018).
+    /// [`TransferAuthorizationService::decide`], mints the transient
+    /// `acceptance_handle` into this generation's
+    /// [`TransientWorkerOperationStore`], and converts the result back into
+    /// the exact wire `AuthorizationDecision` — this Adapter never makes the
+    /// authorization decision itself (ADR-0018).
     async fn decide_authorization_query(
+        operations: &TransientWorkerOperationStore,
         transfer_authorization: &TransferAuthorizationService,
         query: &AuthorizationQueryMessage,
     ) -> AuthorizationDecisionMessage {
@@ -586,13 +593,36 @@ mod imp {
                 digest_algorithm,
                 chunk_size,
                 expected_chunk_digest,
-            }) => AuthorizationDecisionMessage::approved(
-                request_id,
-                to_wire_digest_algorithm(digest_algorithm),
-                chunk_size,
-                mint_acceptance_handle(),
-                expected_chunk_digest,
-            ),
+            }) => {
+                // The proof has already been accepted — and its `proof_id`
+                // recorded in the replay cache — inside `decide`. If minting
+                // the transient acceptance binding now fails closed (the
+                // store is saturated, the freshly minted opaque id collided
+                // with a live binding, or this connection generation is no
+                // longer current), the Worker must NOT receive an approved
+                // decision carrying an unusable handle
+                // (`m1-worker-data-plane-control-contract.md` "Transient
+                // operation handles"). We deliberately do not roll back the
+                // consumed replay record: a retry with the *same* proof
+                // legitimately fails replay, and the Agent mints a fresh
+                // proof per "Idempotent retry is not proof reuse". The
+                // failure cause is never surfaced to the Worker — it maps to
+                // the same generic non-enumerable denial as any other.
+                match operations.mint_acceptance(AcceptanceBinding {
+                    transfer_id: bamep_domain::TransferId(query.body.transfer_id),
+                    chunk_index: query.body.chunk_index,
+                    proof_id: query.body.proof_id.clone(),
+                }) {
+                    Ok(acceptance_handle) => AuthorizationDecisionMessage::approved(
+                        request_id,
+                        to_wire_digest_algorithm(digest_algorithm),
+                        chunk_size,
+                        acceptance_handle,
+                        expected_chunk_digest,
+                    ),
+                    Err(_) => AuthorizationDecisionMessage::denied(request_id),
+                }
+            }
             Ok(WorkerAuthorizationOutcome::Denied) => {
                 AuthorizationDecisionMessage::denied(request_id)
             }

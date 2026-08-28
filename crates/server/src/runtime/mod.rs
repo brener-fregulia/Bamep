@@ -11,5 +11,6 @@ pub mod presence;
 pub mod replay_cache;
 pub mod reservation_registry;
 pub mod resource_arbiter;
+pub mod transient_worker_operations;
 pub mod worker_authority;
 pub mod worker_supervisor;
