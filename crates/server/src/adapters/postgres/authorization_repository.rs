@@ -56,7 +56,13 @@ impl From<PgAttemptState> for bamep_domain::AttemptState {
     }
 }
 
-async fn load_attempt_for_update(
+/// Locks the `attempts` row `FOR UPDATE` and reconstructs the Domain
+/// [`Attempt`], or `None` when it does not exist. `pub(crate)` so a sibling
+/// Adapter transaction (Issue #39 Phase C1's `commit_chunk_acceptance`) can
+/// lock the owning Attempt in the *same* transaction it locks the Transfer,
+/// mirroring `super::transfer_repository::load_locked_facts` being reachable
+/// for the same composition reason.
+pub(crate) async fn load_attempt_for_update(
     tx: &mut Transaction<'_, Postgres>,
     attempt_id: AttemptId,
 ) -> Result<Option<Attempt>, RepositoryError> {

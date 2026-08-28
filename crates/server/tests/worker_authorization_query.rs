@@ -17,268 +17,49 @@
 
 mod support;
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bamep_agent_protocol::ProtocolId;
-use bamep_domain::{
-    ArtifactId, ChunkSize, DigestAlgorithm, EndpointId, SourceProvenance, TransferDirection,
-    TransferId,
-};
-use bamep_server::adapters::postgres::{
-    PostgresBootContextRepository, PostgresCredentialRedemptionRepository,
-    PostgresEndpointRepository, PostgresJobRepository, PostgresTransferAuthorizationRepository,
-    PostgresTransferRepository,
-};
 use bamep_server::adapters::worker_control_plane::WorkerControlPlane;
-use bamep_server::application::{
-    BootOrchestrationService, EnrollmentService, RedeemResult, TransferAuthorizationOutcome,
-    TransferAuthorizationService, TransferDispatchResult, TransferDispatchService, TransferService,
-};
-use bamep_server::runtime::capability_store::CapabilityStore;
-use bamep_server::runtime::replay_cache::ReplayCache;
-use bamep_server::runtime::resource_arbiter::{
-    ResourceClaim, ResourceKind, TechnicalResourceArbiter,
-};
 use bamep_server::runtime::transient_worker_operations::TransientOperationError;
 use bamep_server::runtime::worker_authority::WorkerAuthorityRegistry;
 use bamep_worker_protocol::{
-    receive, send, AuthorizationDecisionOutcome, AuthorizationQueryMessage, ServerHelloMessage,
-    WireDigestAlgorithm, WorkerHelloMessage, WorkerProtocolMessage,
+    receive, send, AuthorizationDecisionOutcome, AuthorizationQueryMessage, WireDigestAlgorithm,
+    WorkerProtocolMessage,
 };
-use chrono::Utc;
-use ed25519_dalek::{Signer, SigningKey};
-use sqlx::PgPool;
-use support::TestDatabase;
-use tokio::net::UnixStream;
+use ed25519_dalek::SigningKey;
 use tokio::sync::watch;
 use tokio::time::timeout;
-use uuid::Uuid;
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(5);
-const DATA_PLANE_BASE_URL: &str = "https://server.example:8443";
-
-struct TempSocketPath(std::path::PathBuf);
-
-impl TempSocketPath {
-    fn fresh() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "bamep-worker-authorization-query-tests-{}",
-            Uuid::new_v4()
-        ));
-        Self(dir.join("worker.sock"))
-    }
-}
-
-impl Drop for TempSocketPath {
-    fn drop(&mut self) {
-        if let Some(parent) = self.0.parent() {
-            let _ = std::fs::remove_dir_all(parent);
-        }
-    }
-}
-
-struct DispatchedTransfer {
-    endpoint_id: EndpointId,
-    transfer_id: TransferId,
-    artifact_id: ArtifactId,
-    action_id: ProtocolId,
-}
-
-async fn dispatched_transfer_fixture(pool: &PgPool, signal: &str) -> DispatchedTransfer {
-    let boot = BootOrchestrationService::new(
-        Arc::new(PostgresBootContextRepository::new(pool.clone())),
-        chrono::Duration::minutes(5),
-    );
-    let enrollment = EnrollmentService::new(
-        Arc::new(PostgresEndpointRepository::new(pool.clone())),
-        Arc::new(PostgresCredentialRedemptionRepository::new(pool.clone())),
-    );
-    let job_repo = Arc::new(PostgresJobRepository::new(pool.clone()));
-    let jobs = bamep_server::application::JobService::new(Arc::clone(&job_repo));
-    let scheduling = bamep_server::application::JobSchedulingService::new(Arc::clone(&job_repo));
-    let transfers = TransferService::new(Arc::new(PostgresTransferRepository::new(pool.clone())));
-    let arbiter = Arc::new(TechnicalResourceArbiter::new([(
-        ResourceKind::new("network"),
-        10,
-    )]));
-    let dispatch = TransferDispatchService::new(Arc::clone(&job_repo), Arc::clone(&arbiter));
-    let evidence = bamep_server::application::ActionEvidenceService::new(
-        Arc::clone(&job_repo) as Arc<dyn bamep_server::ports::JobRepository>,
-        Arc::new(bamep_server::runtime::reservation_registry::AttemptReservationRegistry::new()),
-        arbiter,
-    );
-
-    let now = Utc::now();
-    let boot_nonce = bamep_domain::BootNonce::generate().expect("OS CSPRNG must be available");
-    let credential = boot
-        .issue_enrollment_credential(signal, boot_nonce, now)
-        .await
-        .expect("issuance must succeed");
-    let RedeemResult::Established { endpoint_id, .. } = enrollment
-        .redeem(&credential.to_wire_value())
-        .await
-        .unwrap()
-    else {
-        panic!("first contact must establish a session");
-    };
-    enrollment
-        .approve_enrollment(
-            endpoint_id,
-            bamep_domain::Actor::Operator {
-                label: "worker-authorization-query-harness".into(),
-            },
-            now,
-        )
-        .await
-        .unwrap();
-
-    let job = jobs.create_workflow(endpoint_id, 1).await.unwrap();
-    let step_id = job.steps[0].id;
-    scheduling.admit(job.id).await.unwrap();
-    scheduling
-        .satisfy_current_step_preconditions(job.id, step_id)
-        .await
-        .unwrap();
-
-    let context = transfers
-        .create_transfer_context(
-            endpoint_id,
-            job.id,
-            step_id,
-            TransferDirection::AgentToServer,
-            DigestAlgorithm::Sha256,
-            ChunkSize::new(4096).unwrap(),
-            SourceProvenance::new("disk-0"),
-        )
-        .await
-        .unwrap();
-
-    let result = dispatch
-        .commit_transfer_dispatch(
-            job.id,
-            step_id,
-            context.transfer.id,
-            vec![ResourceClaim::new(ResourceKind::new("network"), 1)],
-        )
-        .await
-        .unwrap();
-    let TransferDispatchResult::Committed { outcome, .. } = result else {
-        panic!("expected a successful dispatch commitment");
-    };
-    let action_id = ProtocolId::from_uuid(outcome.attempt.action_id.0)
-        .expect("a Domain ActionId is always a valid UUID v4");
-
-    // `m0-agent-protocol-contract.md` "Transfer authorization": valid only
-    // after `ActionAck{outcome: Accepted}` — advance the Attempt to
-    // `InProgress`.
-    evidence
-        .apply(
-            action_id,
-            endpoint_id,
-            bamep_domain::ActionEvidence::AckAccepted,
-        )
-        .await
-        .expect("ActionAck{Accepted} advances the Attempt to InProgress");
-
-    DispatchedTransfer {
-        endpoint_id,
-        transfer_id: context.transfer.id,
-        artifact_id: context.transfer.artifact_id,
-        action_id,
-    }
-}
-
-fn build_authorization_service(pool: PgPool) -> Arc<TransferAuthorizationService> {
-    Arc::new(TransferAuthorizationService::new(
-        Arc::new(PostgresTransferAuthorizationRepository::new(pool)),
-        Arc::new(CapabilityStore::new()),
-        Arc::new(ReplayCache::new()),
-        DATA_PLANE_BASE_URL,
-    ))
-}
-
-async fn issue_capability(
-    authorization: &TransferAuthorizationService,
-    fixture: &DispatchedTransfer,
-    signing_key: &SigningKey,
-) -> String {
-    let public =
-        bamep_domain::ProofPublicKey::from_bytes(signing_key.verifying_key().to_bytes()).unwrap();
-    let outcome = authorization
-        .issue(
-            fixture.endpoint_id,
-            fixture.action_id,
-            fixture.transfer_id,
-            &public.to_wire_value(),
-        )
-        .await
-        .unwrap();
-    let TransferAuthorizationOutcome::Granted { token, .. } = outcome else {
-        panic!("expected Granted");
-    };
-    token
-}
+use support::{
+    build_authorization_service, build_chunk_acceptance_service, dispatched_transfer_fixture,
+    handshake, issue_capability, sign_proof, DispatchedTransfer, TempSocketPath, TestDatabase,
+    IPC_TEST_TIMEOUT as TEST_TIMEOUT,
+};
 
 /// A real, byte-identical `chunk_upload` `AuthorizationQuery` for
-/// `chunk_index 0`. `artifact_id`/`direction` are signed into the 137-byte
-/// transcript (that layout is unchanged) but never carried on the v1 wire
-/// message — `bamepd` reconstructs them from the capability binding. Returns
-/// the message plus the exact `proof_id` wire value it signed, so a test can
-/// assert the transient acceptance binding `bamepd` records carries it.
+/// `chunk_index 0`, plus the exact `proof_id` wire value it signed.
 fn signed_authorization_query(
     signing_key: &SigningKey,
     token: &str,
     fixture: &DispatchedTransfer,
 ) -> (AuthorizationQueryMessage, String) {
-    let capability_id = bamep_domain::CapabilityId::from_token_bytes(token.as_bytes());
-    let proof_id = bamep_domain::ProofId::generate();
-    let issued_at_millis = Utc::now().timestamp_millis() as u64;
-    let fields = bamep_domain::ProofTranscriptFields {
-        operation: bamep_domain::AuthorizationOperation::ChunkUpload,
-        transfer_id: fixture.transfer_id,
-        artifact_id: fixture.artifact_id,
-        direction: TransferDirection::AgentToServer,
-        chunk_index: Some(0),
-        proof_id,
-        issued_at_millis,
-    };
-    let transcript = bamep_domain::build_proof_transcript(&capability_id, &fields);
-    let signature = signing_key.sign(&transcript);
-    let signature = bamep_domain::ProofSignature::from_bytes(signature.to_bytes());
-
-    let proof_id_wire = proof_id.to_wire_value();
+    let (proof_id_wire, issued_at, signature_wire) = sign_proof(
+        signing_key,
+        token,
+        fixture,
+        bamep_domain::AuthorizationOperation::ChunkUpload,
+        Some(0),
+    );
     let message = AuthorizationQueryMessage::new(
         token,
         fixture.transfer_id.0,
         0,
         proof_id_wire.clone(),
-        issued_at_millis,
-        signature.to_wire_value(),
+        issued_at,
+        signature_wire,
     );
     (message, proof_id_wire)
-}
-
-async fn handshake(path: &Path) -> UnixStream {
-    let mut stream = UnixStream::connect(path).await.expect("connect");
-    let hello = WorkerHelloMessage::new(Uuid::new_v4());
-    let sent_id = hello.envelope.message_id;
-    send(&mut stream, &WorkerProtocolMessage::WorkerHello(hello))
-        .await
-        .expect("send WorkerHello");
-    match timeout(TEST_TIMEOUT, receive(&mut stream))
-        .await
-        .expect("no timeout")
-        .expect("receive ServerHello")
-    {
-        WorkerProtocolMessage::ServerHello(ServerHelloMessage { body, .. }) => {
-            assert_eq!(body.in_reply_to, sent_id);
-            assert!(body.compatible);
-        }
-        other => panic!("expected ServerHello, got {other:?}"),
-    }
-    stream
 }
 
 #[tokio::test]
@@ -296,6 +77,7 @@ async fn a_real_signed_query_over_a_real_uds_socket_is_approved() {
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&authorization),
+        build_chunk_acceptance_service(db.pool.clone()),
         shutdown_rx,
     ));
 
@@ -369,6 +151,7 @@ async fn a_query_signed_by_the_wrong_key_over_a_real_uds_socket_is_denied() {
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&authorization),
+        build_chunk_acceptance_service(db.pool.clone()),
         shutdown_rx,
     ));
 
@@ -427,7 +210,12 @@ async fn a_new_connection_after_a_prior_ones_mid_query_disconnect_still_works() 
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(registry, Arc::clone(&authorization), shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        registry,
+        Arc::clone(&authorization),
+        build_chunk_acceptance_service(db.pool.clone()),
+        shutdown_rx,
+    ));
 
     // First generation: send a query, then disconnect immediately without
     // waiting for the reply.
@@ -495,6 +283,7 @@ async fn an_acceptance_handle_loses_all_authority_when_its_generation_ends() {
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&authorization),
+        build_chunk_acceptance_service(db.pool.clone()),
         shutdown_rx,
     ));
 
@@ -571,6 +360,7 @@ async fn a_saturated_transient_store_denies_an_otherwise_authorized_query() {
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&authorization),
+        build_chunk_acceptance_service(db.pool.clone()),
         shutdown_rx,
     ));
 

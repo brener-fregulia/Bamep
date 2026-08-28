@@ -1189,6 +1189,57 @@ pub enum AcceptChunkError {
     Repository(#[from] RepositoryError),
 }
 
+/// The durable outcome of one authorized `ChunkAcceptanceRequest`
+/// (`m1-worker-data-plane-control-contract.md` "Verified-chunk durable
+/// acceptance"; Issue #39 Phase C1). `FailClosed` is **not** a wire outcome —
+/// `bamepd` sends no `ChunkAcceptanceDecision` and the Worker fails the HTTP
+/// request closed. It covers a contract-violating follow-up (a `size` outside
+/// the manifest bound, a non-canonical `digest`) that the Specification's
+/// closed `rejected` vocabulary (`chunk_identity_conflict`,
+/// `transfer_not_continuable`) deliberately does not describe, and that must
+/// never become an enumerable reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkAcceptanceCommit {
+    Committed,
+    AlreadyCommitted,
+    RejectedConflict,
+    RejectedNotContinuable,
+    FailClosed,
+}
+
+/// What the Application decided one authorized `ChunkAcceptanceRequest`
+/// should durably do, over freshly locked [`TransferLockedFacts`] plus the
+/// owning `Attempt` (both locked in the same transaction). The Adapter turns
+/// this into the atomic persistence and the [`ChunkAcceptanceCommit`] it
+/// reports — it never makes this decision itself.
+pub enum ChunkAcceptanceDecided {
+    /// Record the expected identity if new and mark it durably held, in one
+    /// transaction. Carries the Domain outcome
+    /// (`bamep_domain::ChunkManifest::record_expected_chunk`) so the Adapter
+    /// knows whether to insert a new identity row (`Added`) or only flip
+    /// `held` on an existing one (`AlreadyRecorded`).
+    Commit(ChunkRecordOutcome),
+    /// A *different* digest is already durable for this `chunk_index`.
+    RejectConflict,
+    /// The owning Transfer/Artifact/Attempt is terminal, or the manifest is
+    /// sealed and this `chunk_index` was never part of the sealed set.
+    RejectNotContinuable,
+    /// The request is not a legal follow-up at all (see
+    /// [`ChunkAcceptanceCommit::FailClosed`]).
+    FailClosed,
+}
+
+pub type CommitChunkAcceptanceDecision =
+    Box<dyn FnOnce(&TransferLockedFacts, Option<&Attempt>) -> ChunkAcceptanceDecided + Send>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CommitChunkAcceptanceError {
+    #[error("transfer {0:?} not found")]
+    TransferNotFound(TransferId),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SealManifestError {
     #[error("transfer {0:?} not found")]
@@ -1277,6 +1328,26 @@ pub trait TransferRepository: Send + Sync {
         index: ChunkIndex,
         decide: AcceptChunkDecision,
     ) -> Result<AcceptChunkOutcome, AcceptChunkError>;
+
+    /// Locks exactly the `Transfer` identified by `transfer_id` **and its
+    /// owning `Attempt`** in one transaction, invokes `decide` with the
+    /// freshly locked [`TransferLockedFacts`] plus that `Attempt`, and
+    /// atomically persists the durable chunk acceptance the closure decided —
+    /// recording a new expected identity as first-writer and/or marking the
+    /// `chunk_index` durably held — before committing (Issue #39 Phase C1;
+    /// `m1-worker-data-plane-control-contract.md` "Verified-chunk durable
+    /// acceptance"; `m0-data-plane-and-storage-contracts.md` "Durable chunk
+    /// acceptance ordering" step 6–7). The `chunk_index` and its verified
+    /// `size`/`digest` are captured by `decide`; `index` is passed
+    /// separately only so the Adapter can address the `held` write. A lost
+    /// response after this commits is recovered by a fresh retry reaching
+    /// `AlreadyCommitted`, never a second commit.
+    async fn commit_chunk_acceptance(
+        &self,
+        transfer_id: TransferId,
+        index: ChunkIndex,
+        decide: CommitChunkAcceptanceDecision,
+    ) -> Result<ChunkAcceptanceCommit, CommitChunkAcceptanceError>;
 
     /// Locks exactly the `Transfer` identified by `transfer_id`, invokes
     /// `decide` with its freshly locked [`TransferLockedFacts`], and — only

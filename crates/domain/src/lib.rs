@@ -47,8 +47,8 @@ pub use cancellation::{
 };
 pub use chunk_manifest::{
     validate_verified_chunk, ChunkAcceptError, ChunkIndex, ChunkManifest, ChunkRecordError,
-    ChunkRecordOutcome, ChunkSize, Digest, DigestAlgorithm, ExpectedChunk, InvalidChunkSize,
-    InvalidDigestLength, SealError, SealOutcome,
+    ChunkRecordOutcome, ChunkSize, Digest, DigestAlgorithm, DigestParseError, ExpectedChunk,
+    InvalidChunkSize, InvalidDigestLength, SealError, SealOutcome,
 };
 pub use credential::{AuthOutcome, CredentialChain, CredentialDimension, DEFAULT_CREDENTIAL_TTL};
 pub use current_boot::{CurrentBoot, TrustedBootstrapState};

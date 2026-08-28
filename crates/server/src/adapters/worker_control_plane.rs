@@ -134,8 +134,11 @@ mod imp {
     use std::time::Duration;
 
     use bamep_worker_protocol::{
-        receive, send, AuthorizationDecisionMessage, AuthorizationQueryMessage, DecodeError,
-        HandshakeRejectedMessage, ProtocolErrorMessage, ReceiveError, ServerHelloMessage,
+        receive, send, AuthorizationDecisionMessage, AuthorizationQueryMessage,
+        ChunkAcceptanceDecisionMessage, ChunkAcceptanceRejectionReason,
+        ChunkAcceptanceRequestMessage, DecodeError, HandshakeRejectedMessage, HeldChunk,
+        ProtocolErrorMessage, ReceiveError, ResumeDiscoveryContinueMessage,
+        ResumeDiscoveryPageMessage, ResumeDiscoveryQueryMessage, ServerHelloMessage,
         WireDigestAlgorithm, WorkerProtocolMessage,
     };
     use tokio::net::{UnixListener, UnixStream};
@@ -144,13 +147,29 @@ mod imp {
     use uuid::Uuid;
 
     use crate::application::{
-        TransferAuthorizationService, WorkerAuthorizationOutcome, WorkerAuthorizationQueryInput,
+        ChunkAcceptanceService, ResumeAuthorizationOutcome, TransferAuthorizationService,
+        WorkerAuthorizationOutcome, WorkerAuthorizationQueryInput,
     };
+    use crate::ports::ChunkAcceptanceCommit;
     use crate::runtime::transient_worker_operations::{
-        AcceptanceBinding, TransientWorkerOperationStore,
+        AcceptanceBinding, HeldChunkEntry, ResumeCursorBinding, ResumeCursorState, ResumeSnapshot,
+        TransientWorkerOperationStore,
     };
 
     use super::*;
+
+    /// The bounded number of `held_chunks` entries one `ResumeDiscoveryPage`
+    /// frame carries (`m1-worker-data-plane-control-contract.md`
+    /// "Resume-manifest pagination": "`bamepd` chooses a bounded page size
+    /// such that every `ResumeDiscoveryPage` frame ... stays safely within
+    /// 1 MiB"). Each entry encodes to at most ~82 UTF-8 bytes
+    /// (`{"chunk_index":<=10 digits,"digest":"<43 chars>"}` plus a comma);
+    /// `8192 * 82` ≈ 672 KiB leaves the first page's manifest-level fields,
+    /// envelope, and cursor comfortable headroom under
+    /// [`bamep_worker_protocol::MAX_FRAME_PAYLOAD_BYTES`] (proven by
+    /// `resume_page_frame_stays_within_the_1_mib_limit`). The universal frame
+    /// limit is never raised to fit a page.
+    pub(crate) const RESUME_PAGE_MAX_HELD_CHUNKS: usize = 8192;
 
     /// After this many consecutive `accept()` failures, the listener is
     /// treated as terminally failed rather than retried
@@ -205,6 +224,7 @@ mod imp {
         listener: UnixListener,
         socket_path: PathBuf,
         socket_identity: SocketIdentity,
+        resume_page_size: usize,
     }
 
     impl WorkerControlPlane {
@@ -298,7 +318,20 @@ mod imp {
                 listener,
                 socket_path: path.to_path_buf(),
                 socket_identity: SocketIdentity::of(&bound_metadata),
+                resume_page_size: RESUME_PAGE_MAX_HELD_CHUNKS,
             })
+        }
+
+        /// Overrides the `held_chunks`-per-`ResumeDiscoveryPage` bound
+        /// (default [`RESUME_PAGE_MAX_HELD_CHUNKS`], clamped to at least 1).
+        /// The page size is `bamepd`'s implementation choice
+        /// (`m1-worker-data-plane-control-contract.md` "Resume-manifest
+        /// pagination"); this builder lets a test force multi-page pagination
+        /// with a small held-chunk set. Never used to *raise* the frame
+        /// limit.
+        pub fn with_resume_page_size(mut self, page_size: usize) -> Self {
+            self.resume_page_size = page_size.max(1);
+            self
         }
 
         /// Runs the accept loop until `shutdown` becomes `true` or the
@@ -319,8 +352,10 @@ mod imp {
             self,
             registry: Arc<WorkerAuthorityRegistry>,
             transfer_authorization: Arc<TransferAuthorizationService>,
+            chunk_acceptance: Arc<ChunkAcceptanceService>,
             mut shutdown: watch::Receiver<bool>,
         ) -> Result<(), WorkerControlPlaneError> {
+            let resume_page_size = self.resume_page_size;
             let mut tasks: JoinSet<()> = JoinSet::new();
             let mut consecutive_accept_errors: u32 = 0;
 
@@ -332,11 +367,14 @@ mod imp {
                                 consecutive_accept_errors = 0;
                                 let registry = Arc::clone(&registry);
                                 let transfer_authorization = Arc::clone(&transfer_authorization);
+                                let chunk_acceptance = Arc::clone(&chunk_acceptance);
                                 let conn_shutdown = shutdown.clone();
                                 tasks.spawn(handle_connection(
                                     stream,
                                     registry,
                                     transfer_authorization,
+                                    chunk_acceptance,
+                                    resume_page_size,
                                     conn_shutdown,
                                 ));
                             }
@@ -454,10 +492,13 @@ mod imp {
     /// first. Never remains detached after `WorkerControlPlane::run`
     /// returns — every blocking point here is raced against `shutdown`
     /// through `tokio::select!` (correction audit "Connection shutdown").
+    #[allow(clippy::too_many_arguments)]
     async fn handle_connection(
         mut stream: UnixStream,
         registry: Arc<WorkerAuthorityRegistry>,
         transfer_authorization: Arc<TransferAuthorizationService>,
+        chunk_acceptance: Arc<ChunkAcceptanceService>,
+        resume_page_size: usize,
         mut shutdown: watch::Receiver<bool>,
     ) {
         let worker_instance_id = tokio::select! {
@@ -514,6 +555,61 @@ mod imp {
                             )
                             .await;
                             if send(&mut stream, &WorkerProtocolMessage::AuthorizationDecision(response))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        // A `ChunkAcceptanceRequest` with an invalid transient
+                        // `acceptance_handle`, or a contract-violating one, is
+                        // discarded with no response — the Worker fails the
+                        // HTTP request closed
+                        // (`m1-worker-data-plane-control-contract.md` "Stale
+                        // response / unknown correlation"; Issue #39 Phase C1
+                        // items 7–8). Only a durable outcome produces a
+                        // `ChunkAcceptanceDecision`.
+                        Ok(WorkerProtocolMessage::ChunkAcceptanceRequest(request)) => {
+                            if let Some(decision) = handle_chunk_acceptance(
+                                &operations,
+                                &chunk_acceptance,
+                                &request,
+                            )
+                            .await
+                            {
+                                if send(
+                                    &mut stream,
+                                    &WorkerProtocolMessage::ChunkAcceptanceDecision(decision),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(WorkerProtocolMessage::ResumeDiscoveryQuery(query)) => {
+                            let page = handle_resume_discovery_query(
+                                &operations,
+                                &transfer_authorization,
+                                resume_page_size,
+                                &query,
+                            )
+                            .await;
+                            if send(&mut stream, &WorkerProtocolMessage::ResumeDiscoveryPage(page))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(WorkerProtocolMessage::ResumeDiscoveryContinue(cont)) => {
+                            let page = handle_resume_discovery_continue(
+                                &operations,
+                                resume_page_size,
+                                &cont,
+                            );
+                            if send(&mut stream, &WorkerProtocolMessage::ResumeDiscoveryPage(page))
                                 .await
                                 .is_err()
                             {
@@ -632,6 +728,297 @@ mod imp {
             // (`m1-worker-data-plane-control-contract.md` "Security and
             // logging").
             Err(_) => AuthorizationDecisionMessage::denied(request_id),
+        }
+    }
+
+    /// One received `ChunkAcceptanceRequest`. Returns `Some(decision)` only
+    /// when a durable outcome exists to report; `None` means the message is
+    /// discarded with no response (invalid/stale/contract-violating
+    /// follow-up) and the Worker's HTTP request fails closed
+    /// (`m1-worker-data-plane-control-contract.md` "Verified-chunk durable
+    /// acceptance", "Stale response / unknown correlation"; Issue #39 Phase
+    /// C1).
+    async fn handle_chunk_acceptance(
+        operations: &TransientWorkerOperationStore,
+        chunk_acceptance: &ChunkAcceptanceService,
+        request: &ChunkAcceptanceRequestMessage,
+    ) -> Option<ChunkAcceptanceDecisionMessage> {
+        let in_reply_to = request.envelope.message_id;
+        let transfer_id = bamep_domain::TransferId(request.body.transfer_id);
+
+        // Consuming the `acceptance_handle` is THE generation-scoped
+        // authorization-correlation linearization point (`m1` §2). A stale
+        // (prior-generation), unknown, already-consumed, wrong-kind, or
+        // transfer/chunk-mismatched handle is discarded — never mapped to an
+        // enumerable `rejected` reason (Issue #39 Phase C1 item 7), never a
+        // durable mutation.
+        let binding = match operations.consume_acceptance(
+            &request.body.acceptance_handle,
+            transfer_id,
+            request.body.chunk_index,
+        ) {
+            Ok(binding) => binding,
+            Err(_) => {
+                eprintln!(
+                    "bamepd: discarded a ChunkAcceptanceRequest presenting an invalid or stale \
+                     transient acceptance handle (no response, no durable mutation)"
+                );
+                return None;
+            }
+        };
+        // `binding.proof_id` is internal acceptance metadata only — never
+        // echoed to the Worker, never logged (`m1` §2; "Security and
+        // logging"). The successful consume is single-use: it stays consumed
+        // regardless of the durable outcome below (item 8).
+        debug_assert_eq!(binding.transfer_id, transfer_id);
+        debug_assert_eq!(binding.chunk_index, request.body.chunk_index);
+
+        match chunk_acceptance
+            .commit_chunk_acceptance(
+                transfer_id,
+                request.body.chunk_index,
+                request.body.digest.clone(),
+                request.body.size,
+            )
+            .await
+        {
+            Ok(ChunkAcceptanceCommit::Committed) => {
+                Some(ChunkAcceptanceDecisionMessage::committed(in_reply_to))
+            }
+            Ok(ChunkAcceptanceCommit::AlreadyCommitted) => Some(
+                ChunkAcceptanceDecisionMessage::already_committed(in_reply_to),
+            ),
+            Ok(ChunkAcceptanceCommit::RejectedConflict) => {
+                Some(ChunkAcceptanceDecisionMessage::rejected(
+                    in_reply_to,
+                    ChunkAcceptanceRejectionReason::ChunkIdentityConflict,
+                ))
+            }
+            Ok(ChunkAcceptanceCommit::RejectedNotContinuable) => {
+                Some(ChunkAcceptanceDecisionMessage::rejected(
+                    in_reply_to,
+                    ChunkAcceptanceRejectionReason::TransferNotContinuable,
+                ))
+            }
+            Ok(ChunkAcceptanceCommit::FailClosed) => {
+                eprintln!(
+                    "bamepd: discarded a contract-violating ChunkAcceptanceRequest (no durable \
+                     mutation, no response)"
+                );
+                None
+            }
+            Err(_) => {
+                // Internal persistence failure: nothing was durably
+                // committed. No response — a fresh retry (fresh proof, fresh
+                // handle) recovers idempotently via `already_committed`
+                // (item 8).
+                eprintln!(
+                    "bamepd: a ChunkAcceptanceRequest durable commit failed internally; no \
+                     response sent"
+                );
+                None
+            }
+        }
+    }
+
+    fn held_chunk_wire(entry: &HeldChunkEntry) -> HeldChunk {
+        HeldChunk {
+            chunk_index: entry.chunk_index,
+            digest: entry.digest.clone(),
+        }
+    }
+
+    /// One received `ResumeDiscoveryQuery`: authorize `resume_discovery` with
+    /// the identical discipline as `AuthorizationQuery`, then return the first
+    /// page of the consistent authorization-time durable snapshot. When the
+    /// held-chunk set exceeds `page_size` the snapshot is materialized into
+    /// this generation's process-local state and a `resume_cursor` is minted;
+    /// otherwise the whole set ships in one page with no cursor
+    /// (`m1-worker-data-plane-control-contract.md` "Resume-discovery
+    /// authorization and first page", "Resume-manifest pagination"; Issue #39
+    /// Phase C1).
+    async fn handle_resume_discovery_query(
+        operations: &TransientWorkerOperationStore,
+        transfer_authorization: &TransferAuthorizationService,
+        page_size: usize,
+        query: &ResumeDiscoveryQueryMessage,
+    ) -> ResumeDiscoveryPageMessage {
+        let in_reply_to = query.envelope.message_id;
+        let input = WorkerAuthorizationQueryInput {
+            token: query.body.token.clone(),
+            operation: bamep_domain::AuthorizationOperation::ResumeDiscovery,
+            transfer_id: query.body.transfer_id,
+            chunk_index: None,
+            proof_id: query.body.proof_id.clone(),
+            issued_at_millis: query.body.issued_at,
+            signature: query.body.signature.clone(),
+        };
+
+        let snapshot = match transfer_authorization
+            .authorize_resume_discovery(input)
+            .await
+        {
+            Ok(ResumeAuthorizationOutcome::Approved(snapshot)) => snapshot,
+            // A denied authorization and an internal backend failure fail
+            // closed identically — the Worker never observes a more specific
+            // outcome than `denied` (`m1` "Security and logging").
+            Ok(ResumeAuthorizationOutcome::Denied) | Err(_) => {
+                return ResumeDiscoveryPageMessage::denied(in_reply_to);
+            }
+        };
+
+        let transfer_id = bamep_domain::TransferId(query.body.transfer_id);
+        let algorithm = to_wire_digest_algorithm(snapshot.digest_algorithm);
+        let held: Vec<HeldChunkEntry> = snapshot
+            .held
+            .iter()
+            .map(|h| HeldChunkEntry {
+                chunk_index: h.chunk_index,
+                digest: h.digest_wire.clone(),
+            })
+            .collect();
+
+        let page_end = page_size.min(held.len());
+        let first_slice: Vec<HeldChunk> = held[..page_end].iter().map(held_chunk_wire).collect();
+        let more_remain = page_end < held.len();
+
+        if !more_remain {
+            // The entire held-chunk set fits one page: no snapshot
+            // registration, no cursor.
+            return ResumeDiscoveryPageMessage::first_page(
+                in_reply_to,
+                transfer_id.0,
+                snapshot.sealed,
+                algorithm,
+                snapshot.chunk_size,
+                snapshot.expected_chunk_count,
+                first_slice,
+                None,
+            );
+        }
+
+        let next_chunk_index = held[page_end - 1].chunk_index + 1;
+        let stored = ResumeSnapshot {
+            transfer_id,
+            sealed: snapshot.sealed,
+            digest_algorithm: snapshot.digest_algorithm,
+            chunk_size: snapshot.chunk_size,
+            expected_chunk_count: snapshot.expected_chunk_count,
+            held,
+        };
+
+        // First cursor mint failure (snapshot registry saturated, opaque-id
+        // collision, or a superseded generation) fails closed as the generic
+        // `denied` — the Saturated/IdCollision cause is never exposed, and the
+        // consumed replay state is NOT rolled back (Issue #39 Phase C1 item
+        // 31); a fresh logical retry mints a fresh proof/snapshot/cursor.
+        let snapshot_id = match operations.register_resume_snapshot(stored) {
+            Ok(id) => id,
+            Err(_) => return ResumeDiscoveryPageMessage::denied(in_reply_to),
+        };
+        let cursor = match operations.mint_resume_cursor(ResumeCursorBinding {
+            transfer_id,
+            state: ResumeCursorState {
+                snapshot_id,
+                next_chunk_index,
+            },
+        }) {
+            Ok(cursor) => cursor,
+            Err(_) => {
+                operations.drop_resume_snapshot(snapshot_id);
+                return ResumeDiscoveryPageMessage::denied(in_reply_to);
+            }
+        };
+
+        ResumeDiscoveryPageMessage::first_page(
+            in_reply_to,
+            transfer_id.0,
+            snapshot.sealed,
+            algorithm,
+            snapshot.chunk_size,
+            snapshot.expected_chunk_count,
+            first_slice,
+            Some(cursor),
+        )
+    }
+
+    /// One received `ResumeDiscoveryContinue`: its authority is the
+    /// current-generation `resume_cursor` from the already-authorized
+    /// `ResumeDiscoveryQuery` — no fresh proof. A stale, wrong-generation,
+    /// unknown, or already-consumed cursor returns `denied` and the Worker
+    /// discards the aggregate (`m1-worker-data-plane-control-contract.md`
+    /// "Resume-discovery pagination"; Issue #39 Phase C1 item 33). Never a
+    /// durable mutation.
+    fn handle_resume_discovery_continue(
+        operations: &TransientWorkerOperationStore,
+        page_size: usize,
+        cont: &ResumeDiscoveryContinueMessage,
+    ) -> ResumeDiscoveryPageMessage {
+        let in_reply_to = cont.envelope.message_id;
+        let cursor = cont.body.resume_cursor.as_str();
+
+        let Some(binding) = operations.resume_cursor_binding(cursor) else {
+            return ResumeDiscoveryPageMessage::denied(in_reply_to);
+        };
+        let ResumeCursorState {
+            snapshot_id,
+            next_chunk_index,
+        } = binding.state;
+        let Some(snapshot) = operations.resume_snapshot(snapshot_id) else {
+            return ResumeDiscoveryPageMessage::denied(in_reply_to);
+        };
+
+        // The immutable snapshot's `held` is ascending by `chunk_index`; this
+        // page is exactly the next ascending slice with no gap and no repeat.
+        let start = snapshot
+            .held
+            .partition_point(|entry| entry.chunk_index < next_chunk_index);
+        let end = (start + page_size).min(snapshot.held.len());
+        let slice: Vec<HeldChunk> = snapshot.held[start..end]
+            .iter()
+            .map(held_chunk_wire)
+            .collect();
+        let more_remain = end < snapshot.held.len();
+
+        if more_remain {
+            let new_next = snapshot.held[end - 1].chunk_index + 1;
+            // Advance atomically (Phase B `advance_resume_cursor`: the
+            // successor is minted before the current cursor is removed, so a
+            // collision leaves the current cursor intact — no gap, no
+            // duplicate). The page is only constructed *after* the successor
+            // materializes, so the response never carries a cursor that
+            // failed to mint (item 35).
+            match operations.advance_resume_cursor(
+                cursor,
+                binding.transfer_id,
+                Some(ResumeCursorState {
+                    snapshot_id,
+                    next_chunk_index: new_next,
+                }),
+            ) {
+                Ok(Some(next_cursor)) => ResumeDiscoveryPageMessage::continuation_page(
+                    in_reply_to,
+                    slice,
+                    Some(next_cursor),
+                ),
+                Ok(None) | Err(_) => {
+                    operations.drop_resume_snapshot(snapshot_id);
+                    ResumeDiscoveryPageMessage::denied(in_reply_to)
+                }
+            }
+        } else {
+            // Final page: consume the current cursor, mint no successor, and
+            // release the snapshot (item 36).
+            match operations.advance_resume_cursor(cursor, binding.transfer_id, None) {
+                Ok(None) => {
+                    operations.drop_resume_snapshot(snapshot_id);
+                    ResumeDiscoveryPageMessage::continuation_page(in_reply_to, slice, None)
+                }
+                _ => {
+                    operations.drop_resume_snapshot(snapshot_id);
+                    ResumeDiscoveryPageMessage::denied(in_reply_to)
+                }
+            }
         }
     }
 
@@ -780,6 +1167,50 @@ mod imp {
             assert!(tasks.is_empty());
         }
 
+        /// Issue #39 Phase C1 item 39: the largest `ResumeDiscoveryPage` the
+        /// C1 pagination logic can produce — a full first page of
+        /// [`RESUME_PAGE_MAX_HELD_CHUNKS`] worst-case `HeldChunk` entries
+        /// (10-digit `chunk_index`, 43-char `digest`), `sealed` so
+        /// `expected_chunk_count` is also carried, plus an opaque
+        /// `resume_cursor` — must encode strictly below the universal 1 MiB
+        /// frame limit through the *real* Worker Protocol codec, never by
+        /// prose arithmetic. The limit is never raised to fit a page.
+        #[test]
+        fn resume_page_frame_stays_within_the_1_mib_limit() {
+            let held: Vec<HeldChunk> = (0..RESUME_PAGE_MAX_HELD_CHUNKS)
+                .map(|_| HeldChunk {
+                    chunk_index: u64::from(u32::MAX),
+                    digest: "A".repeat(43),
+                })
+                .collect();
+            let page = ResumeDiscoveryPageMessage::first_page(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                true,
+                WireDigestAlgorithm::Sha256,
+                u32::MAX,
+                Some(u64::from(u32::MAX)),
+                held,
+                Some(format!("res_{}", "f".repeat(32))),
+            );
+            let encoded =
+                bamep_worker_protocol::encode(&WorkerProtocolMessage::ResumeDiscoveryPage(page))
+                    .expect("encode");
+            assert!(
+                encoded.len() < bamep_worker_protocol::MAX_FRAME_PAYLOAD_BYTES as usize,
+                "worst-case resume page is {} bytes, must be < 1 MiB ({})",
+                encoded.len(),
+                bamep_worker_protocol::MAX_FRAME_PAYLOAD_BYTES
+            );
+            // And with comfortable headroom (>= 10%) so a future minor field
+            // addition does not silently cross the limit.
+            assert!(
+                encoded.len() < (bamep_worker_protocol::MAX_FRAME_PAYLOAD_BYTES as usize) * 9 / 10,
+                "worst-case resume page {} bytes leaves < 10% headroom under 1 MiB",
+                encoded.len()
+            );
+        }
+
         #[test]
         fn fewer_than_the_threshold_is_not_terminal() {
             assert!(!accept_failure_is_terminal(
@@ -876,9 +1307,15 @@ mod imp {
             Err(WorkerControlPlaneError::UnsupportedPlatform)
         }
 
+        pub fn with_resume_page_size(self, _page_size: usize) -> Self {
+            self
+        }
+
         pub async fn run(
             self,
             _registry: Arc<WorkerAuthorityRegistry>,
+            _transfer_authorization: Arc<crate::application::TransferAuthorizationService>,
+            _chunk_acceptance: Arc<crate::application::ChunkAcceptanceService>,
             _shutdown: watch::Receiver<bool>,
         ) -> Result<(), WorkerControlPlaneError> {
             Ok(())

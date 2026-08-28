@@ -342,8 +342,15 @@ async fn agent_issued_capability_is_approved_by_a_real_worker_uds_query() {
     let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
     let registry = Arc::new(WorkerAuthorityRegistry::new());
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let control_plane_task =
-        tokio::spawn(plane.run(registry, Arc::clone(&transfer_authorization), shutdown_rx));
+    let chunk_acceptance = Arc::new(bamep_server::application::ChunkAcceptanceService::new(
+        Arc::new(PostgresTransferRepository::new(db.pool.clone())),
+    ));
+    let control_plane_task = tokio::spawn(plane.run(
+        registry,
+        Arc::clone(&transfer_authorization),
+        chunk_acceptance,
+        shutdown_rx,
+    ));
 
     let mut worker_stream = UnixStream::connect(&socket.0).await.expect("connect");
     let hello = WorkerHelloMessage::new(Uuid::new_v4());

@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bamep_server::adapters::worker_control_plane::{WorkerControlPlane, WorkerControlPlaneError};
-use bamep_server::application::TransferAuthorizationService;
+use bamep_server::application::{ChunkAcceptanceService, TransferAuthorizationService};
 use bamep_server::ports::{
-    AuthorizationDurableState, RepositoryError, TransferAuthorizationRepository,
+    AuthorizationDurableState, RepositoryError, TransferAuthorizationRepository, TransferRepository,
 };
 use bamep_server::runtime::capability_store::CapabilityStore;
 use bamep_server::runtime::replay_cache::ReplayCache;
@@ -61,6 +61,104 @@ fn fake_transfer_authorization_service() -> Arc<TransferAuthorizationService> {
         Arc::new(ReplayCache::new()),
         "https://server.example:8443",
     ))
+}
+
+/// No test in this file (#37-scope handshake/generation/socket semantics)
+/// sends a `ChunkAcceptanceRequest`, `ResumeDiscoveryQuery`, or
+/// `ResumeDiscoveryContinue`, so the durable chunk-acceptance service
+/// `WorkerControlPlane::run` now requires is never actually invoked. Real
+/// C1 durable behavior is covered by `chunk_acceptance_vertical.rs` /
+/// `resume_discovery_vertical.rs` / `chunk_acceptance_repository.rs`.
+struct UnreachableTransferRepository;
+
+#[async_trait]
+impl TransferRepository for UnreachableTransferRepository {
+    async fn create_transfer_context(
+        &self,
+        _: &bamep_domain::TransferContext,
+    ) -> Result<(), bamep_server::ports::CreateTransferError> {
+        unreachable!("no #37-scope test drives durable chunk acceptance")
+    }
+    async fn find_transfer_context(
+        &self,
+        _: bamep_domain::TransferId,
+    ) -> Result<
+        Option<(
+            bamep_domain::TransferContext,
+            std::collections::BTreeSet<bamep_domain::ChunkIndex>,
+        )>,
+        RepositoryError,
+    > {
+        unreachable!()
+    }
+    async fn record_expected_chunk(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::RecordChunkDecision,
+    ) -> Result<bamep_domain::ChunkRecordOutcome, bamep_server::ports::RecordChunkError> {
+        unreachable!()
+    }
+    async fn accept_verified_chunk(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_domain::ChunkIndex,
+        _: bamep_server::ports::AcceptChunkDecision,
+    ) -> Result<bamep_server::ports::AcceptChunkOutcome, bamep_server::ports::AcceptChunkError>
+    {
+        unreachable!()
+    }
+    async fn commit_chunk_acceptance(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_domain::ChunkIndex,
+        _: bamep_server::ports::CommitChunkAcceptanceDecision,
+    ) -> Result<
+        bamep_server::ports::ChunkAcceptanceCommit,
+        bamep_server::ports::CommitChunkAcceptanceError,
+    > {
+        unreachable!()
+    }
+    async fn seal_manifest(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::SealManifestDecision,
+    ) -> Result<bamep_domain::SealOutcome, bamep_server::ports::SealManifestError> {
+        unreachable!()
+    }
+    async fn begin_artifact_verification(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::ArtifactTransitionDecision,
+    ) -> Result<bamep_domain::Artifact, bamep_server::ports::ArtifactTransitionRepoError> {
+        unreachable!()
+    }
+    async fn complete_artifact_verification(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::ArtifactTransitionDecision,
+    ) -> Result<bamep_domain::Artifact, bamep_server::ports::ArtifactTransitionRepoError> {
+        unreachable!()
+    }
+    async fn fail_incomplete_artifact(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::ArtifactTransitionDecision,
+    ) -> Result<bamep_domain::Artifact, bamep_server::ports::ArtifactTransitionRepoError> {
+        unreachable!()
+    }
+    async fn bind_attempt(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::BindAttemptDecision,
+    ) -> Result<bamep_domain::Transfer, bamep_server::ports::BindAttemptError> {
+        unreachable!()
+    }
+}
+
+fn fake_chunk_acceptance_service() -> Arc<ChunkAcceptanceService> {
+    Arc::new(ChunkAcceptanceService::new(Arc::new(
+        UnreachableTransferRepository,
+    )))
 }
 
 struct TempSocketPath(PathBuf);
@@ -138,6 +236,7 @@ async fn successful_handshake_makes_authority_available() {
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        fake_chunk_acceptance_service(),
         shutdown_rx,
     ));
 
@@ -167,6 +266,7 @@ async fn disconnect_invalidates_authority_immediately() {
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        fake_chunk_acceptance_service(),
         shutdown_rx,
     ));
 
@@ -191,6 +291,7 @@ async fn reconnect_after_disconnect_completes_a_fresh_handshake_with_a_new_gener
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        fake_chunk_acceptance_service(),
         shutdown_rx,
     ));
 
@@ -215,6 +316,7 @@ async fn a_message_before_worker_hello_is_a_pre_handshake_violation() {
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        fake_chunk_acceptance_service(),
         shutdown_rx,
     ));
 
@@ -264,6 +366,7 @@ async fn an_unknown_top_level_message_type_receives_a_protocol_error_and_never_r
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        fake_chunk_acceptance_service(),
         shutdown_rx,
     ));
 
@@ -314,6 +417,7 @@ async fn incompatible_protocol_version_is_rejected_and_never_registers_a_generat
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        fake_chunk_acceptance_service(),
         shutdown_rx,
     ));
 
@@ -355,6 +459,7 @@ async fn worker_hello_with_wrong_envelope_protocol_version_never_registers_a_gen
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        fake_chunk_acceptance_service(),
         shutdown_rx,
     ));
 
@@ -391,6 +496,7 @@ async fn worker_hello_with_non_v4_message_id_never_registers_a_generation() {
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        fake_chunk_acceptance_service(),
         shutdown_rx,
     ));
 
@@ -428,6 +534,7 @@ async fn worker_hello_with_non_v4_worker_instance_id_never_registers_a_generatio
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        fake_chunk_acceptance_service(),
         shutdown_rx,
     ));
 
@@ -461,6 +568,7 @@ async fn an_overlapping_second_handshake_supersedes_the_first_and_its_later_disc
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        fake_chunk_acceptance_service(),
         shutdown_rx,
     ));
 
@@ -509,7 +617,12 @@ async fn controlled_shutdown_removes_the_socket_file() {
     let registry = Arc::new(WorkerAuthorityRegistry::new());
     let transfer_authorization = fake_transfer_authorization_service();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run_task = tokio::spawn(plane.run(registry, transfer_authorization, shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        registry,
+        transfer_authorization,
+        fake_chunk_acceptance_service(),
+        shutdown_rx,
+    ));
 
     shutdown_tx.send(true).expect("send shutdown");
     let result = timeout(TEST_TIMEOUT, run_task)
@@ -550,7 +663,12 @@ async fn a_still_live_socket_is_never_unlinked_or_replaced() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     // Keep the first control plane genuinely running (a live listener),
     // never dropped before the second bind attempt below.
-    let first_run_task = tokio::spawn(first.run(registry, transfer_authorization, shutdown_rx));
+    let first_run_task = tokio::spawn(first.run(
+        registry,
+        transfer_authorization,
+        fake_chunk_acceptance_service(),
+        shutdown_rx,
+    ));
 
     let err = WorkerControlPlane::bind(&socket.0)
         .err()
@@ -680,7 +798,12 @@ async fn controlled_shutdown_does_not_remove_a_pathname_replaced_after_bind() {
     std::fs::remove_file(&socket.0).expect("remove original socket file");
     std::fs::write(&socket.0, b"unrelated replacement content").expect("write replacement file");
 
-    let run_task = tokio::spawn(plane.run(registry, transfer_authorization, shutdown_rx));
+    let run_task = tokio::spawn(plane.run(
+        registry,
+        transfer_authorization,
+        fake_chunk_acceptance_service(),
+        shutdown_rx,
+    ));
     shutdown_tx.send(true).expect("send shutdown");
     let result = timeout(TEST_TIMEOUT, run_task)
         .await
@@ -702,6 +825,7 @@ async fn controlled_shutdown_disconnects_an_active_connection_before_returning()
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        fake_chunk_acceptance_service(),
         shutdown_rx,
     ));
 
@@ -755,6 +879,7 @@ async fn repeated_connect_disconnect_cycles_keep_the_listener_promptly_responsiv
     let run_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        fake_chunk_acceptance_service(),
         shutdown_rx,
     ));
 

@@ -37,15 +37,16 @@ use crate::ports::{
     AgentDispatchError, AgentDispatchPort, ApplyActionEvidenceDecision,
     ApplyActionEvidenceDecisionOutcome, ApplyActionEvidenceError, ApplyActionEvidenceResult,
     ApplyCancelAckDecision, ApplyCancelAckDecisionOutcome, ApplyCancelAckResult,
-    AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError, BootContextRepository,
-    CancelAckCommit, CancellationRequestDecided, CommitDestructiveDispatchError,
+    AuthorizationDurableState, AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError,
+    BootContextRepository, CancelAckCommit, CancellationRequestDecided, ChunkAcceptanceCommit,
+    ChunkAcceptanceDecided, CommitChunkAcceptanceError, CommitDestructiveDispatchError,
     CommitTransferDispatchError, CreateWorkflowError, CredentialRedemptionRepository,
     EndpointRepository, EndpointUpdateError, FinalDispatchCommit, FinalDispatchDecision,
     FinalDispatchLockedFacts, InventoryRepository, JobRepository, RedemptionDecision,
     RedemptionTarget, RepositoryError, RequestCancellationDecision, RequestCancellationError,
     RequestCancellationLockedFacts, RequestCancellationResult, SatisfyStepPreconditionsDecision,
     SatisfyStepPreconditionsError, TargetRevalidationPort, TransferAuthorizationRepository,
-    TransferDispatchDecision, TransferDispatchLockedFacts, TransferRepository,
+    TransferDispatchDecision, TransferDispatchLockedFacts, TransferLockedFacts, TransferRepository,
 };
 use crate::runtime::capability_store::CapabilityStore;
 use crate::runtime::presence::PresenceRegistry;
@@ -2363,6 +2364,168 @@ pub enum WorkerAuthorizationOutcome {
     Denied,
 }
 
+/// One durably-held-and-individually-verified chunk identity in a
+/// [`ResumeSnapshotFacts`] (`m1-worker-data-plane-control-contract.md`
+/// "Resume-discovery authorization and first page"; Issue #39 Phase C1).
+/// `digest_wire` is the canonical base64url-no-pad value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeHeldChunk {
+    pub chunk_index: u64,
+    pub digest_wire: String,
+}
+
+/// The consistent durable snapshot of one authorized Transfer's resume state,
+/// captured at `ResumeDiscoveryQuery` authorization time from the same locked
+/// read the authorization decision used (`m1-worker-data-plane-control-
+/// contract.md` "Resume-discovery pagination"). The Adapter materializes this
+/// into generation-scoped process-local state and paginates it; the
+/// Application never holds a database transaction across pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeSnapshotFacts {
+    pub transfer_id: TransferId,
+    pub sealed: bool,
+    pub digest_algorithm: DigestAlgorithm,
+    pub chunk_size: u32,
+    /// Present iff `sealed`.
+    pub expected_chunk_count: Option<u64>,
+    /// Ascending `chunk_index`, no duplicate — only chunks `bamepd` durably
+    /// holds and has individually verified.
+    pub held: Vec<ResumeHeldChunk>,
+}
+
+/// Outcome of [`TransferAuthorizationService::authorize_resume_discovery`].
+/// `Denied` never carries a reason — the same generic non-enumerable denial
+/// as every other authorizing request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeAuthorizationOutcome {
+    Approved(ResumeSnapshotFacts),
+    Denied,
+}
+
+/// Durable coordination of one authorized `ChunkAcceptanceRequest`
+/// (`m1-worker-data-plane-control-contract.md` "Verified-chunk durable
+/// acceptance"; `m0-data-plane-and-storage-contracts.md` "Durable chunk
+/// acceptance ordering" steps 6–8; Issue #39 Phase C1). The narrow
+/// Application owner of the durable first-writer / idempotent-confirmation /
+/// conflict decision for a chunk whose bytes the Worker has already verified.
+///
+/// It performs **no** authorization of its own — the transient
+/// `acceptance_handle` (consumed by the Adapter against the generation-scoped
+/// Phase B store *before* this is called) already correlates the request to a
+/// just-authorized `chunk_upload`. This service independently re-checks
+/// current durable state (Transfer/Artifact/Attempt eligibility, manifest
+/// compatibility, no conflicting existing identity, `size` within the
+/// manifest bound) inside one race-safe transaction the `TransferRepository`
+/// owns (`m1` "Transient operation handles": "`bamepd` still independently
+/// validates current durable state on every durable commit").
+pub struct ChunkAcceptanceService {
+    repo: Arc<dyn TransferRepository>,
+}
+
+impl ChunkAcceptanceService {
+    pub fn new(repo: Arc<dyn TransferRepository>) -> Self {
+        Self { repo }
+    }
+
+    /// Durably commits (or idempotently confirms, or rejects) one authorized
+    /// chunk acceptance. `chunk_index`/`size` are the mechanical facts the
+    /// Worker reported; `digest` is the Worker-verified chunk digest as the
+    /// canonical wire string. Returns the [`ChunkAcceptanceCommit`] the
+    /// Adapter maps to a `ChunkAcceptanceDecision` (or, for `FailClosed`, to
+    /// no response at all).
+    ///
+    /// A `chunk_index` beyond the manifest's 32-bit index space, a
+    /// non-canonical `digest`, or a `size` outside `1..=chunk_size` is a
+    /// contract-violating follow-up: it fails closed as
+    /// [`ChunkAcceptanceCommit::FailClosed`] and is never mapped to one of
+    /// the two enumerable `rejected` reasons (Issue #39 Phase C1 items 11,
+    /// 14, 15).
+    pub async fn commit_chunk_acceptance(
+        &self,
+        transfer_id: TransferId,
+        chunk_index: u64,
+        digest: String,
+        size: u32,
+    ) -> Result<ChunkAcceptanceCommit, ApplicationError> {
+        let Ok(index_u32) = u32::try_from(chunk_index) else {
+            return Ok(ChunkAcceptanceCommit::FailClosed);
+        };
+        let index = bamep_domain::ChunkIndex(index_u32);
+
+        let decide: crate::ports::CommitChunkAcceptanceDecision =
+            Box::new(move |facts: &TransferLockedFacts, attempt| {
+                // Independent current-durable-state re-check (m1 "Transient
+                // operation handles"; item 10). The handle does not replace
+                // any of this.
+                let has_identity = facts.manifest.expected_chunk(index).is_some();
+                if bamep_domain::data_plane_operation_is_current(
+                    bamep_domain::AuthorizationOperation::ChunkUpload,
+                    facts.artifact.state,
+                    facts.manifest.sealed,
+                    has_identity,
+                )
+                .is_err()
+                {
+                    return ChunkAcceptanceDecided::RejectNotContinuable;
+                }
+                // The owning Transfer/Artifact/Attempt being terminal is
+                // `transfer_not_continuable` at this stage (m1 §2), unlike the
+                // authorization layer.
+                match attempt {
+                    Some(a) if a.state == bamep_domain::AttemptState::InProgress => {}
+                    _ => return ChunkAcceptanceDecided::RejectNotContinuable,
+                }
+
+                // `size` is the exact raw verified byte count; revalidate it
+                // against the authoritative manifest bound — never trust it
+                // just because the Worker sent it (m1 §2; item 11). "Final
+                // chunk" length is not decided here.
+                if size == 0 || u64::from(size) > u64::from(facts.manifest.chunk_size.get()) {
+                    return ChunkAcceptanceDecided::FailClosed;
+                }
+
+                let Ok(digest) = bamep_domain::Digest::parse_wire_value(
+                    facts.manifest.digest_algorithm,
+                    &digest,
+                ) else {
+                    return ChunkAcceptanceDecided::FailClosed;
+                };
+
+                match facts
+                    .manifest
+                    .record_expected_chunk(index, size, digest.into_bytes())
+                {
+                    Ok(outcome) => ChunkAcceptanceDecided::Commit(outcome),
+                    Err(bamep_domain::ChunkRecordError::Conflict(_)) => {
+                        ChunkAcceptanceDecided::RejectConflict
+                    }
+                    Err(bamep_domain::ChunkRecordError::NotContinuable) => {
+                        ChunkAcceptanceDecided::RejectNotContinuable
+                    }
+                    Err(bamep_domain::ChunkRecordError::InvalidDigestLength(_)) => {
+                        ChunkAcceptanceDecided::FailClosed
+                    }
+                }
+            });
+
+        match self
+            .repo
+            .commit_chunk_acceptance(transfer_id, index, decide)
+            .await
+        {
+            Ok(commit) => Ok(commit),
+            Err(CommitChunkAcceptanceError::TransferNotFound(_)) => {
+                // An authorized handle for a transfer that no longer resolves
+                // is a contract violation, not a durable business conflict.
+                Ok(ChunkAcceptanceCommit::FailClosed)
+            }
+            Err(CommitChunkAcceptanceError::Repository(err)) => {
+                Err(ApplicationError::Repository(err))
+            }
+        }
+    }
+}
+
 /// Issues and later authoritatively decides sender-constrained transfer
 /// authorization (`m0-data-plane-and-storage-contracts.md` "Transfer
 /// authorization"; Issue #38). The single Application-layer owner of both
@@ -2534,17 +2697,112 @@ impl TransferAuthorizationService {
         &self,
         input: WorkerAuthorizationQueryInput,
     ) -> Result<WorkerAuthorizationOutcome, ApplicationError> {
-        // Logical ordering (Issue #38 correction §5): parse/lookup ->
-        // capability current/expiry/binding -> proof structural parse ->
-        // freshness -> signature -> current durable authorization (including
-        // operation eligibility) -> only then the atomic replay check+insert
-        // -> approved. A request that would otherwise be denied never
-        // permanently consumes its `proof_id`.
+        let Some(state) = self.authorize_request(&input).await? else {
+            return Ok(WorkerAuthorizationOutcome::Denied);
+        };
 
+        // Approved. Carry the authoritative durable manifest facts
+        // (`digest_algorithm`, `chunk_size`) the Worker MUST use to enforce
+        // the `413 CHUNK_TOO_LARGE` bound and compute the chunk digest, and —
+        // when `chunk_index` already carries a durable expected identity —
+        // that recorded expected digest so the Worker can enforce the
+        // manifest identity before reading the body
+        // (`m1-worker-data-plane-control-contract.md` "Chunk-upload
+        // authorization"). A `chunk_index` beyond the manifest's 32-bit index
+        // space was already denied inside `authorize_request`.
+        let expected_chunk_digest = match input.chunk_index.and_then(|i| u32::try_from(i).ok()) {
+            Some(index) => state
+                .manifest
+                .expected_chunk(bamep_domain::ChunkIndex(index))
+                .map(|chunk| chunk.digest.to_wire_value()),
+            None => None,
+        };
+        Ok(WorkerAuthorizationOutcome::Approved {
+            digest_algorithm: state.manifest.digest_algorithm,
+            chunk_size: state.manifest.chunk_size.get(),
+            expected_chunk_digest,
+        })
+    }
+
+    /// Serves Worker's `ResumeDiscoveryQuery`
+    /// (`m1-worker-data-plane-control-contract.md` "Resume-discovery
+    /// authorization and first page"; Issue #39 Phase C1): authorizes
+    /// `operation = resume_discovery` with the **identical** discipline as
+    /// [`Self::decide`] — the same [`Self::authorize_request`] core — then, on
+    /// approval, captures one consistent durable snapshot of the Transfer's
+    /// held-and-verified chunk set from the same locked read, for the Adapter
+    /// to paginate. The Adapter must supply `input.operation =
+    /// AuthorizationOperation::ResumeDiscovery` and `input.chunk_index = None`.
+    pub async fn authorize_resume_discovery(
+        &self,
+        input: WorkerAuthorizationQueryInput,
+    ) -> Result<ResumeAuthorizationOutcome, ApplicationError> {
+        debug_assert_eq!(input.operation, AuthorizationOperation::ResumeDiscovery);
+        debug_assert!(input.chunk_index.is_none());
+
+        let Some(state) = self.authorize_request(&input).await? else {
+            return Ok(ResumeAuthorizationOutcome::Denied);
+        };
+
+        // `held_chunk_indices` is a `BTreeSet` — already ascending, no
+        // duplicate — and every index in it has a durable expected identity
+        // in `state.manifest` from the *same* locked snapshot
+        // (`m1-worker-data-plane-control-contract.md`: `held_chunks` reflects
+        // only chunk identities `bamepd` durably holds and has individually
+        // verified).
+        let mut held = Vec::with_capacity(state.held_chunk_indices.len());
+        for index in &state.held_chunk_indices {
+            let expected = state.manifest.expected_chunk(*index).ok_or_else(|| {
+                ApplicationError::Repository(crate::ports::RepositoryError::Backend(format!(
+                    "held chunk {index:?} has no durable expected identity in the same snapshot"
+                )))
+            })?;
+            held.push(ResumeHeldChunk {
+                chunk_index: u64::from(index.0),
+                digest_wire: expected.digest.to_wire_value(),
+            });
+        }
+
+        Ok(ResumeAuthorizationOutcome::Approved(ResumeSnapshotFacts {
+            transfer_id: state.transfer.id,
+            sealed: state.manifest.sealed,
+            digest_algorithm: state.manifest.digest_algorithm,
+            chunk_size: state.manifest.chunk_size.get(),
+            expected_chunk_count: if state.manifest.sealed {
+                state.manifest.chunk_count.map(u64::from)
+            } else {
+                None
+            },
+            held,
+        }))
+    }
+
+    /// The shared authoritative authorization core for every Worker UDS
+    /// authorizing request (`m1-worker-data-plane-control-contract.md`:
+    /// `resume_discovery` uses "identical discipline to `AuthorizationQuery`").
+    /// `Some(state)` is an approval carrying the exact consistent locked
+    /// durable snapshot the decision was made against; `None` is the single
+    /// generic non-enumerable denial. Used by both [`Self::decide`]
+    /// (`chunk_upload`) and [`Self::authorize_resume_discovery`]
+    /// (`resume_discovery`) so capability lookup, proof reconstruction,
+    /// signature/freshness/replay, current-durable-state re-read, and
+    /// operation eligibility are implemented once
+    /// (`AGENTS.md` "Architecture and dependencies").
+    ///
+    /// Logical ordering (Issue #38 correction §5): parse/lookup -> capability
+    /// current/expiry/binding -> proof structural parse -> freshness ->
+    /// signature -> current durable authorization (including operation
+    /// eligibility) -> only then the atomic replay check+insert -> approved. A
+    /// request that would otherwise be denied never permanently consumes its
+    /// `proof_id`.
+    async fn authorize_request(
+        &self,
+        input: &WorkerAuthorizationQueryInput,
+    ) -> Result<Option<AuthorizationDurableState>, ApplicationError> {
         // 1. token / capability parse and lookup
         let capability_id = CapabilityId::from_token_bytes(input.token.as_bytes());
         let Some(binding) = self.capabilities.lookup(&capability_id) else {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         };
 
         let now = self.clock.now();
@@ -2558,7 +2816,7 @@ impl TransferAuthorizationService {
         // meaningfully rejects a `token` presented for a different Transfer,
         // and still enforces the operation/`chunk_index` presence rule.
         if capability_is_current(&binding, now, self.capabilities.epoch()).is_err() {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         }
         let operation = input.operation;
         let requested = RequestedOperation {
@@ -2569,20 +2827,20 @@ impl TransferAuthorizationService {
             chunk_index: input.chunk_index,
         };
         if capability_matches_request(&binding, &requested).is_err() {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         }
 
         // 3. proof structural parsing
         let Ok(proof_id) = ProofId::parse_wire_value(&input.proof_id) else {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         };
         let Ok(signature) = ProofSignature::parse_wire_value(&input.signature) else {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         };
 
         // 4. freshness
         if proof_is_fresh(input.issued_at_millis, now).is_err() {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         }
 
         // 5. signature over the independently reconstructed canonical
@@ -2605,7 +2863,7 @@ impl TransferAuthorizationService {
             },
         );
         if !verify_proof_signature(&binding.proof_public_key, &transcript, &signature) {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         }
 
         // 6. current durable authorization, re-read fresh for this exact
@@ -2617,55 +2875,56 @@ impl TransferAuthorizationService {
             .load_authorization_state(requested.transfer_id)
             .await?
         else {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         };
         if state.transfer.endpoint_id != binding.endpoint_id
             || state.transfer.artifact_id != binding.artifact_id
             || state.transfer.direction != binding.direction
         {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         }
-        let Some(attempt) = state.attempt else {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+        let Some(attempt) = state.attempt.as_ref() else {
+            return Ok(None);
         };
         if attempt.id != binding.attempt_id {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         }
         // Only an `InProgress` Attempt (post-`ActionAck{Accepted}`) may
         // continue: a regression to `Dispatched`, `AwaitingReconciliation`,
         // or any terminal state fails closed (Issue #38 correction §8–§9;
         // `m0-data-plane-and-storage-contracts.md` "Disconnect and restart").
         if attempt.state != AttemptState::InProgress {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         }
         if state.endpoint.credential.dimension(now) != CredentialDimension::CredentialActive {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         }
 
         // Current data-plane operation eligibility against the Artifact/
         // manifest state in this same snapshot (Issue #38 correction
         // §10–§11). A `chunk_index` beyond the manifest's 32-bit index space
         // can never have a durable expected identity — fail closed rather
-        // than treat it as a fresh continuation.
-        let expected_chunk = match input.chunk_index {
+        // than treat it as a fresh continuation. For `resume_discovery`
+        // `chunk_index` is always `None`.
+        let chunk_index_has_identity = match input.chunk_index {
             Some(index) => match u32::try_from(index) {
                 Ok(index) => state
                     .manifest
                     .expected_chunk(bamep_domain::ChunkIndex(index))
-                    .cloned(),
-                Err(_) => return Ok(WorkerAuthorizationOutcome::Denied),
+                    .is_some(),
+                Err(_) => return Ok(None),
             },
-            None => None,
+            None => false,
         };
         if bamep_domain::data_plane_operation_is_current(
             operation,
             state.artifact.state,
             state.manifest.sealed,
-            expected_chunk.is_some(),
+            chunk_index_has_identity,
         )
         .is_err()
         {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         }
 
         // 7. only now that the request would otherwise be approved: the
@@ -2686,22 +2945,10 @@ impl TransferAuthorizationService {
             .check_and_insert(proof_id, now, replay_valid_until)
             .is_err()
         {
-            return Ok(WorkerAuthorizationOutcome::Denied);
+            return Ok(None);
         }
 
-        // 8. approved. Carry the authoritative durable manifest facts
-        // (`digest_algorithm`, `chunk_size`) the Worker MUST use to enforce
-        // the `413 CHUNK_TOO_LARGE` bound and compute the chunk digest, and —
-        // when `chunk_index` already carries a durable expected identity —
-        // that recorded expected digest so the Worker can enforce the
-        // manifest identity before reading the body
-        // (`m1-worker-data-plane-control-contract.md` "Chunk-upload
-        // authorization").
-        Ok(WorkerAuthorizationOutcome::Approved {
-            digest_algorithm: state.manifest.digest_algorithm,
-            chunk_size: state.manifest.chunk_size.get(),
-            expected_chunk_digest: expected_chunk.map(|chunk| chunk.digest.to_wire_value()),
-        })
+        Ok(Some(state))
     }
 }
 

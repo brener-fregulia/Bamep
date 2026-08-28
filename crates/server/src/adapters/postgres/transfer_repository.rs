@@ -32,17 +32,18 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use bamep_domain::{
     Artifact, ArtifactId, ArtifactState, CaptureConsistency, ChunkIndex, ChunkManifest,
-    DigestAlgorithm, EndpointId, JobId, JobStepId, SourceProvenance, Transfer, TransferContext,
-    TransferDirection, TransferId,
+    ChunkRecordOutcome, DigestAlgorithm, EndpointId, JobId, JobStepId, SourceProvenance, Transfer,
+    TransferContext, TransferDirection, TransferId,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use super::shared::to_backend_err;
 use crate::ports::{
     AcceptChunkDecision, AcceptChunkError, AcceptChunkOutcome, ArtifactTransitionDecision,
-    ArtifactTransitionRepoError, BindAttemptDecision, BindAttemptError, CreateTransferError,
-    RecordChunkDecision, RecordChunkError, RepositoryError, SealManifestDecision,
-    SealManifestError, TransferLockedFacts, TransferRepository,
+    ArtifactTransitionRepoError, BindAttemptDecision, BindAttemptError, ChunkAcceptanceCommit,
+    ChunkAcceptanceDecided, CommitChunkAcceptanceDecision, CommitChunkAcceptanceError,
+    CreateTransferError, RecordChunkDecision, RecordChunkError, RepositoryError,
+    SealManifestDecision, SealManifestError, TransferLockedFacts, TransferRepository,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
@@ -519,6 +520,103 @@ impl TransferRepository for PostgresTransferRepository {
 
         tx.commit().await.map_err(to_backend_err)?;
         Ok(AcceptChunkOutcome::Accepted)
+    }
+
+    async fn commit_chunk_acceptance(
+        &self,
+        transfer_id: TransferId,
+        index: ChunkIndex,
+        decide: CommitChunkAcceptanceDecision,
+    ) -> Result<ChunkAcceptanceCommit, CommitChunkAcceptanceError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+        let Some(facts) = load_locked_facts(&mut tx, transfer_id).await? else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(CommitChunkAcceptanceError::TransferNotFound(transfer_id));
+        };
+
+        // Lock the owning Attempt in this same transaction so a concurrent
+        // reconciliation cannot move it terminal between this read and the
+        // commit (Issue #39 Phase C1 item 16; Issue #38 "PostgreSQL
+        // transaction/repository composition").
+        let attempt = match facts.transfer.attempt_id {
+            Some(attempt_id) => {
+                super::authorization_repository::load_attempt_for_update(&mut tx, attempt_id)
+                    .await?
+            }
+            None => None,
+        };
+
+        let already_held = facts.held_chunk_indices.contains(&index);
+
+        let record = match decide(&facts, attempt.as_ref()) {
+            ChunkAcceptanceDecided::RejectConflict => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Ok(ChunkAcceptanceCommit::RejectedConflict);
+            }
+            ChunkAcceptanceDecided::RejectNotContinuable => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Ok(ChunkAcceptanceCommit::RejectedNotContinuable);
+            }
+            ChunkAcceptanceDecided::FailClosed => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                return Ok(ChunkAcceptanceCommit::FailClosed);
+            }
+            ChunkAcceptanceDecided::Commit(record) => record,
+        };
+
+        match record {
+            ChunkRecordOutcome::Added(ref manifest) => {
+                // First-writer for a new `chunk_index`: record the immutable
+                // expected identity *and* mark it durably held in one
+                // transaction. The `transfers` row lock this method holds is
+                // the sole serialization anchor, so a concurrent same-index
+                // acceptance either waits and then sees this identity
+                // (`AlreadyRecorded`/`Conflict`) or lost the race outright —
+                // an already-recorded digest is never rewritten.
+                let expected = manifest.expected_chunk(index).ok_or_else(|| {
+                    RepositoryError::Backend(
+                        "decided manifest is missing the accepted chunk identity".into(),
+                    )
+                })?;
+                sqlx::query(
+                    "INSERT INTO chunk_identities (artifact_id, chunk_index, size, digest, held) \
+                     VALUES ($1, $2, $3, $4, TRUE)",
+                )
+                .bind(facts.artifact.id.0)
+                .bind(index.0 as i32)
+                .bind(expected.size as i32)
+                .bind(expected.digest.as_bytes())
+                .execute(&mut *tx)
+                .await
+                .map_err(to_backend_err)?;
+                tx.commit().await.map_err(to_backend_err)?;
+                Ok(ChunkAcceptanceCommit::Committed)
+            }
+            ChunkRecordOutcome::AlreadyRecorded => {
+                if already_held {
+                    // Identical `(transfer_id, chunk_index, digest)` already
+                    // durably held — no second semantic commit.
+                    tx.rollback().await.map_err(to_backend_err)?;
+                    Ok(ChunkAcceptanceCommit::AlreadyCommitted)
+                } else {
+                    // The expected identity is durable but not yet held (only
+                    // reachable via a non-C1 `record_expected_chunk` path):
+                    // the Worker has now verified matching bytes, so this
+                    // acceptance is what makes it durably held.
+                    sqlx::query(
+                        "UPDATE chunk_identities SET held = TRUE \
+                         WHERE artifact_id = $1 AND chunk_index = $2",
+                    )
+                    .bind(facts.artifact.id.0)
+                    .bind(index.0 as i32)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+                    tx.commit().await.map_err(to_backend_err)?;
+                    Ok(ChunkAcceptanceCommit::Committed)
+                }
+            }
+        }
     }
 
     async fn seal_manifest(

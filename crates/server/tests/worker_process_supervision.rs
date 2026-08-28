@@ -26,9 +26,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bamep_server::adapters::worker_control_plane::WorkerControlPlane;
-use bamep_server::application::TransferAuthorizationService;
+use bamep_server::application::{ChunkAcceptanceService, TransferAuthorizationService};
 use bamep_server::ports::{
-    AuthorizationDurableState, RepositoryError, TransferAuthorizationRepository,
+    AuthorizationDurableState, RepositoryError, TransferAuthorizationRepository, TransferRepository,
 };
 use bamep_server::runtime::bamepd_config::{
     ENV_RECONNECT_DELAY_MS, ENV_TLS_CERT_PATH, ENV_TLS_KEY_PATH, ENV_UDS_PATH,
@@ -68,6 +68,102 @@ fn fake_transfer_authorization_service() -> Arc<TransferAuthorizationService> {
         Arc::new(ReplayCache::new()),
         "https://server.example:8443",
     ))
+}
+
+/// The spawned real `bamep-worker` never sends a `ChunkAcceptanceRequest` or
+/// `ResumeDiscovery*` in this process-supervision test, so the durable
+/// chunk-acceptance service `WorkerControlPlane::run` requires is never
+/// invoked (mirrors `AlwaysUnknownTransferAuthorizationRepository` above).
+struct UnreachableTransferRepository;
+
+#[async_trait]
+impl TransferRepository for UnreachableTransferRepository {
+    async fn create_transfer_context(
+        &self,
+        _: &bamep_domain::TransferContext,
+    ) -> Result<(), bamep_server::ports::CreateTransferError> {
+        unreachable!()
+    }
+    async fn find_transfer_context(
+        &self,
+        _: bamep_domain::TransferId,
+    ) -> Result<
+        Option<(
+            bamep_domain::TransferContext,
+            std::collections::BTreeSet<bamep_domain::ChunkIndex>,
+        )>,
+        RepositoryError,
+    > {
+        unreachable!()
+    }
+    async fn record_expected_chunk(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::RecordChunkDecision,
+    ) -> Result<bamep_domain::ChunkRecordOutcome, bamep_server::ports::RecordChunkError> {
+        unreachable!()
+    }
+    async fn accept_verified_chunk(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_domain::ChunkIndex,
+        _: bamep_server::ports::AcceptChunkDecision,
+    ) -> Result<bamep_server::ports::AcceptChunkOutcome, bamep_server::ports::AcceptChunkError>
+    {
+        unreachable!()
+    }
+    async fn commit_chunk_acceptance(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_domain::ChunkIndex,
+        _: bamep_server::ports::CommitChunkAcceptanceDecision,
+    ) -> Result<
+        bamep_server::ports::ChunkAcceptanceCommit,
+        bamep_server::ports::CommitChunkAcceptanceError,
+    > {
+        unreachable!()
+    }
+    async fn seal_manifest(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::SealManifestDecision,
+    ) -> Result<bamep_domain::SealOutcome, bamep_server::ports::SealManifestError> {
+        unreachable!()
+    }
+    async fn begin_artifact_verification(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::ArtifactTransitionDecision,
+    ) -> Result<bamep_domain::Artifact, bamep_server::ports::ArtifactTransitionRepoError> {
+        unreachable!()
+    }
+    async fn complete_artifact_verification(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::ArtifactTransitionDecision,
+    ) -> Result<bamep_domain::Artifact, bamep_server::ports::ArtifactTransitionRepoError> {
+        unreachable!()
+    }
+    async fn fail_incomplete_artifact(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::ArtifactTransitionDecision,
+    ) -> Result<bamep_domain::Artifact, bamep_server::ports::ArtifactTransitionRepoError> {
+        unreachable!()
+    }
+    async fn bind_attempt(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::BindAttemptDecision,
+    ) -> Result<bamep_domain::Transfer, bamep_server::ports::BindAttemptError> {
+        unreachable!()
+    }
+}
+
+fn fake_chunk_acceptance_service() -> Arc<ChunkAcceptanceService> {
+    Arc::new(ChunkAcceptanceService::new(Arc::new(
+        UnreachableTransferRepository,
+    )))
 }
 
 struct TestEnv {
@@ -197,6 +293,7 @@ async fn supervisor_manages_a_genuinely_separate_worker_process_through_handshak
     let control_plane_task = tokio::spawn(plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        fake_chunk_acceptance_service(),
         shutdown_rx.clone(),
     ));
 

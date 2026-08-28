@@ -79,6 +79,39 @@ impl Digest {
     pub fn to_wire_value(&self) -> String {
         URL_SAFE_NO_PAD.encode(&self.0)
     }
+
+    /// Strict inverse of [`Self::to_wire_value`], mirroring
+    /// `bamep_domain::ProofId::parse_wire_value`'s discipline
+    /// (`m0-data-plane-and-storage-contracts.md` "Chunk manifest": reject
+    /// padding, the standard-base64 `+`/`/` alphabet, whitespace, wrong
+    /// length, non-canonical trailing bits, or any value that does not
+    /// round-trip byte-for-byte through the canonical encoder). Used to
+    /// validate the `digest` a Worker `ChunkAcceptanceRequest` reports
+    /// (Issue #39 Phase C1) — `bamepd` never recomputes the digest (it holds
+    /// no bytes), it validates the reported integrity identity.
+    pub fn parse_wire_value(
+        algorithm: DigestAlgorithm,
+        value: &str,
+    ) -> Result<Self, DigestParseError> {
+        let decoded = URL_SAFE_NO_PAD
+            .decode(value.as_bytes())
+            .map_err(|_| DigestParseError::InvalidEncoding)?;
+        let digest = Self::new(algorithm, decoded).map_err(DigestParseError::Length)?;
+        if digest.to_wire_value() != value {
+            return Err(DigestParseError::NonCanonical);
+        }
+        Ok(digest)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DigestParseError {
+    #[error("digest wire value is not valid base64url-no-pad")]
+    InvalidEncoding,
+    #[error(transparent)]
+    Length(#[from] InvalidDigestLength),
+    #[error("digest wire value is not the canonical re-encoding of its own bytes")]
+    NonCanonical,
 }
 
 /// A fixed, positive chunk size for one manifest, immutable once the
@@ -611,6 +644,54 @@ mod tests {
         assert!(
             !m.sealed,
             "the original manifest value must remain unsealed"
+        );
+    }
+
+    #[test]
+    fn digest_parse_wire_value_round_trips_and_rejects_non_canonical() {
+        let digest = Digest::new(DigestAlgorithm::Sha256, digest32(7)).unwrap();
+        let wire = digest.to_wire_value();
+        assert_eq!(wire.len(), 43);
+        assert_eq!(
+            Digest::parse_wire_value(DigestAlgorithm::Sha256, &wire).unwrap(),
+            digest
+        );
+
+        // padding
+        assert_eq!(
+            Digest::parse_wire_value(DigestAlgorithm::Sha256, &format!("{wire}=")),
+            Err(DigestParseError::InvalidEncoding)
+        );
+        // standard-base64 alphabet (`+`/`/` are not canonical base64url)
+        assert_eq!(
+            Digest::parse_wire_value(DigestAlgorithm::Sha256, &format!("/{}", &wire[1..])),
+            Err(DigestParseError::InvalidEncoding)
+        );
+        assert_eq!(
+            Digest::parse_wire_value(DigestAlgorithm::Sha256, &format!("+{}", &wire[1..])),
+            Err(DigestParseError::InvalidEncoding)
+        );
+        // wrong length (31 bytes)
+        let short = URL_SAFE_NO_PAD.encode([0u8; 31]);
+        assert!(matches!(
+            Digest::parse_wire_value(DigestAlgorithm::Sha256, &short),
+            Err(DigestParseError::Length(_))
+        ));
+        // non-canonical trailing bits: 32 zero bytes canonically end in "AAA";
+        // "AAB" decodes to the same 32 bytes but is not the canonical form.
+        let canonical_zero = URL_SAFE_NO_PAD.encode([0u8; 32]);
+        let non_canonical = format!("{}B", &canonical_zero[..canonical_zero.len() - 1]);
+        assert!(
+            matches!(
+                Digest::parse_wire_value(DigestAlgorithm::Sha256, &non_canonical),
+                Err(DigestParseError::NonCanonical) | Err(DigestParseError::InvalidEncoding)
+            ),
+            "non-canonical trailing bits must be rejected"
+        );
+        // whitespace
+        assert_eq!(
+            Digest::parse_wire_value(DigestAlgorithm::Sha256, &format!(" {wire}")),
+            Err(DigestParseError::InvalidEncoding)
         );
     }
 

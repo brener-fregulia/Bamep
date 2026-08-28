@@ -22,10 +22,12 @@
 
 use std::sync::Arc;
 
-use bamep_server::adapters::postgres::PostgresTransferAuthorizationRepository;
+use bamep_server::adapters::postgres::{
+    PostgresTransferAuthorizationRepository, PostgresTransferRepository,
+};
 use bamep_server::adapters::worker_control_plane::WorkerControlPlane;
 use bamep_server::adapters::worker_runtime_ownership::{RuntimeOwnershipLock, TrustedRuntimeDir};
-use bamep_server::application::TransferAuthorizationService;
+use bamep_server::application::{ChunkAcceptanceService, TransferAuthorizationService};
 use bamep_server::runtime::bamepd_config::BamepdConfig;
 use bamep_server::runtime::capability_store::CapabilityStore;
 use bamep_server::runtime::replay_cache::ReplayCache;
@@ -91,7 +93,7 @@ async fn run(config: BamepdConfig) {
             eprintln!("bamepd: failed to connect to PostgreSQL: {err}");
             std::process::exit(1);
         });
-    let authorization_repo = Arc::new(PostgresTransferAuthorizationRepository::new(pool));
+    let authorization_repo = Arc::new(PostgresTransferAuthorizationRepository::new(pool.clone()));
     let capability_store = Arc::new(CapabilityStore::new());
     let replay_cache = Arc::new(ReplayCache::new());
     let transfer_authorization = Arc::new(TransferAuthorizationService::new(
@@ -100,6 +102,11 @@ async fn run(config: BamepdConfig) {
         replay_cache,
         config.data_plane_base_url.clone(),
     ));
+    // Issue #39 Phase C1: `ChunkAcceptanceRequest` durable coordination.
+    // `resume_discovery` reuses `transfer_authorization` directly.
+    let chunk_acceptance = Arc::new(ChunkAcceptanceService::new(Arc::new(
+        PostgresTransferRepository::new(pool),
+    )));
 
     let registry = Arc::new(WorkerAuthorityRegistry::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -139,6 +146,7 @@ async fn run(config: BamepdConfig) {
     let mut control_plane_task = tokio::spawn(control_plane.run(
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
+        Arc::clone(&chunk_acceptance),
         shutdown_rx,
     ));
 

@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use bamep_domain::{ArtifactId, TransferId};
+use bamep_domain::{ArtifactId, DigestAlgorithm, TransferId};
 use uuid::Uuid;
 
 use crate::runtime::worker_authority::{ConnectionGeneration, WorkerAuthorityRegistry};
@@ -197,6 +197,53 @@ enum Binding {
     ResumeCursor(ResumeCursorBinding),
 }
 
+/// The default bound on how many live resume snapshots one connection
+/// generation may hold at once (Issue #39 Phase C1). Each snapshot is the
+/// immutable authorization-time materialization of one authorized
+/// `ResumeDiscoveryQuery`'s durable held-chunk set — released as soon as its
+/// pagination completes or its generation ends. `64` is generous defensive
+/// headroom for the number of `GET .../chunks` operations one Worker
+/// connection could have paginating concurrently; it is process-local
+/// fail-closed bounding, not a product tuning surface (compare
+/// [`DEFAULT_TRANSIENT_WORKER_OPERATION_STORE_CAPACITY`]). A snapshot whose
+/// held-chunk set fits one page is never registered at all.
+pub const DEFAULT_RESUME_SNAPSHOT_CAPACITY: usize = 64;
+
+/// One held-and-individually-verified chunk in a [`ResumeSnapshot`]: exactly
+/// what `m1-worker-data-plane-control-contract.md` "Resume-discovery
+/// authorization and first page" `held_chunks` carries — never Worker-local
+/// staged bytes. `digest` is the canonical base64url-no-pad wire value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldChunkEntry {
+    pub chunk_index: u64,
+    pub digest: String,
+}
+
+/// The immutable, process-local, generation-scoped materialization of one
+/// authorized `ResumeDiscoveryQuery`'s consistent durable snapshot
+/// (`m1-worker-data-plane-control-contract.md` "Resume-discovery pagination":
+/// "`bamepd` serves every page of one resume query from a consistent durable
+/// snapshot taken at authorization time"; Issue #39 Phase C1).
+///
+/// It is **not** business authority and **never** PostgreSQL-persisted: it
+/// exists only so continuation pages for one HTTP `GET .../chunks` operation
+/// come from the exact set of chunks durably held at authorization time — a
+/// chunk accepted afterwards is simply absent (safe, because re-submitting an
+/// already-held chunk is idempotent). `held` is ordered strictly ascending by
+/// `chunk_index`, with no duplicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeSnapshot {
+    pub transfer_id: TransferId,
+    pub sealed: bool,
+    pub digest_algorithm: DigestAlgorithm,
+    pub chunk_size: u32,
+    /// Present iff `sealed` (`m1-worker-data-plane-control-contract.md`).
+    pub expected_chunk_count: Option<u64>,
+    /// Every durably held and individually verified chunk identity belonging
+    /// to this snapshot, ascending `chunk_index`.
+    pub held: Vec<HeldChunkEntry>,
+}
+
 // ---------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------
@@ -216,8 +263,15 @@ pub struct TransientWorkerOperationStore {
     generation: ConnectionGeneration,
     authority: Arc<WorkerAuthorityRegistry>,
     capacity: usize,
+    resume_snapshot_capacity: usize,
     id_source: IdSource,
     bindings: Mutex<HashMap<String, Binding>>,
+    /// Immutable resume snapshots keyed by `snapshot_id` (referenced by a
+    /// [`ResumeCursorState`]). A separate `Mutex` from `bindings`; every
+    /// access is generation-linearized the same way (see
+    /// [`Self::with_snapshots`]). Lock order is `state` → this — never held
+    /// together with `bindings`.
+    resume_snapshots: Mutex<HashMap<Uuid, Arc<ResumeSnapshot>>>,
 }
 
 impl fmt::Debug for TransientWorkerOperationStore {
@@ -226,10 +280,16 @@ impl fmt::Debug for TransientWorkerOperationStore {
         // (`m1-worker-data-plane-control-contract.md` "Security and logging":
         // handles "carry no diagnostic value and SHOULD be redacted").
         let live = self.bindings.lock().map(|b| b.len()).unwrap_or(usize::MAX);
+        let snapshots = self
+            .resume_snapshots
+            .lock()
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
         f.debug_struct("TransientWorkerOperationStore")
             .field("generation", &self.generation)
             .field("capacity", &self.capacity)
             .field("live_bindings", &live)
+            .field("live_resume_snapshots", &snapshots)
             .finish()
     }
 }
@@ -250,9 +310,19 @@ impl TransientWorkerOperationStore {
             generation,
             authority,
             capacity: capacity.max(1),
+            resume_snapshot_capacity: DEFAULT_RESUME_SNAPSHOT_CAPACITY,
             id_source: csprng_id_source(),
             bindings: Mutex::new(HashMap::new()),
+            resume_snapshots: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A store with a non-default resume-snapshot bound, so a test can
+    /// exercise the fail-closed `Saturated` path without registering
+    /// [`DEFAULT_RESUME_SNAPSHOT_CAPACITY`] snapshots.
+    pub fn with_resume_snapshot_capacity(mut self, resume_snapshot_capacity: usize) -> Self {
+        self.resume_snapshot_capacity = resume_snapshot_capacity.max(1);
+        self
     }
 
     /// A store with a deterministic id source, for exercising the
@@ -269,8 +339,10 @@ impl TransientWorkerOperationStore {
             generation,
             authority,
             capacity: capacity.max(1),
+            resume_snapshot_capacity: DEFAULT_RESUME_SNAPSHOT_CAPACITY,
             id_source,
             bindings: Mutex::new(HashMap::new()),
+            resume_snapshots: Mutex::new(HashMap::new()),
         }
     }
 
@@ -328,6 +400,96 @@ impl TransientWorkerOperationStore {
                 op(&map)
             })
             .ok()
+    }
+
+    // -- resume snapshots (Issue #39 Phase C1) -----------------------
+
+    fn with_snapshots<T>(
+        &self,
+        op: impl FnOnce(&mut HashMap<Uuid, Arc<ResumeSnapshot>>) -> Result<T, TransientOperationError>,
+    ) -> Result<T, TransientOperationError> {
+        self.authority
+            .with_current_generation(self.generation, || {
+                let mut map = self
+                    .resume_snapshots
+                    .lock()
+                    .expect("transient store lock poisoned");
+                op(&mut map)
+            })
+            .and_then(|inner| inner)
+    }
+
+    fn with_snapshots_read<T>(
+        &self,
+        op: impl FnOnce(&HashMap<Uuid, Arc<ResumeSnapshot>>) -> T,
+    ) -> Option<T> {
+        self.authority
+            .with_current_generation(self.generation, || {
+                let map = self
+                    .resume_snapshots
+                    .lock()
+                    .expect("transient store lock poisoned");
+                op(&map)
+            })
+            .ok()
+    }
+
+    /// Materializes one authorized `ResumeDiscoveryQuery`'s consistent durable
+    /// snapshot into this generation's process-local state, returning its
+    /// fresh opaque `snapshot_id` (`m1-worker-data-plane-control-contract.md`
+    /// "Resume-discovery pagination"). Fails closed
+    /// ([`Saturated`](TransientOperationError::Saturated) /
+    /// [`IdCollision`](TransientOperationError::IdCollision) /
+    /// [`StaleGeneration`](TransientOperationError::StaleGeneration)); the
+    /// Adapter maps any failure to the same generic denial. Only call this
+    /// when the held-chunk set does not fit one page — a single-page snapshot
+    /// needs no registration and no cursor.
+    pub fn register_resume_snapshot(
+        &self,
+        snapshot: ResumeSnapshot,
+    ) -> Result<Uuid, TransientOperationError> {
+        self.with_snapshots(|map| {
+            if map.len() >= self.resume_snapshot_capacity {
+                return Err(TransientOperationError::Saturated);
+            }
+            let mut chosen: Option<Uuid> = None;
+            for _ in 0..MINT_ATTEMPTS {
+                let candidate = Uuid::new_v4();
+                if !map.contains_key(&candidate) {
+                    chosen = Some(candidate);
+                    break;
+                }
+            }
+            let Some(id) = chosen else {
+                return Err(TransientOperationError::IdCollision);
+            };
+            map.insert(id, Arc::new(snapshot));
+            Ok(id)
+        })
+    }
+
+    /// A live resume snapshot by id, or `None` for an unknown id or once the
+    /// owning generation is superseded. Non-consuming.
+    pub fn resume_snapshot(&self, snapshot_id: Uuid) -> Option<Arc<ResumeSnapshot>> {
+        self.with_snapshots_read(|map| map.get(&snapshot_id).map(Arc::clone))
+            .flatten()
+    }
+
+    /// Releases the snapshot for `snapshot_id` — called when its pagination
+    /// completes (final page). A no-op for an unknown id or a superseded
+    /// generation. Generation end drops the whole store, reclaiming every
+    /// still-live snapshot regardless.
+    pub fn drop_resume_snapshot(&self, snapshot_id: Uuid) {
+        let _ = self.with_snapshots(|map| {
+            map.remove(&snapshot_id);
+            Ok(())
+        });
+    }
+
+    /// The number of live resume snapshots currently held — diagnostics/tests
+    /// only. `0` once the owning generation is superseded.
+    pub fn live_resume_snapshot_count(&self) -> usize {
+        self.with_snapshots_read(|map| map.len()).unwrap_or(0)
     }
 
     /// Inserts `binding` under a fresh opaque id, failing closed at capacity
@@ -1169,5 +1331,85 @@ mod tests {
         assert_ne!(v, r);
         // a UUID simple form is 32 hex chars; "<pfx>_" adds 4
         assert_eq!(a.len(), 4 + 32);
+    }
+
+    // -- resume snapshots (Issue #39 Phase C1) ----------------------
+
+    fn snapshot(held_indices: &[u64]) -> ResumeSnapshot {
+        ResumeSnapshot {
+            transfer_id: TransferId::new(),
+            sealed: false,
+            digest_algorithm: DigestAlgorithm::Sha256,
+            chunk_size: 4096,
+            expected_chunk_count: None,
+            held: held_indices
+                .iter()
+                .map(|i| HeldChunkEntry {
+                    chunk_index: *i,
+                    digest: format!("digest-{i}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_resume_snapshot_is_registered_readable_then_dropped() {
+        let (_r, store) = store();
+        let snap = snapshot(&[0, 2, 5]);
+        let id = store.register_resume_snapshot(snap.clone()).unwrap();
+
+        let read = store.resume_snapshot(id).expect("live snapshot");
+        assert_eq!(*read, snap);
+        assert_eq!(store.live_resume_snapshot_count(), 1);
+
+        store.drop_resume_snapshot(id);
+        assert!(store.resume_snapshot(id).is_none());
+        assert_eq!(store.live_resume_snapshot_count(), 0);
+        // dropping an unknown id is a harmless no-op
+        store.drop_resume_snapshot(Uuid::new_v4());
+    }
+
+    #[test]
+    fn the_resume_snapshot_registry_fails_closed_at_capacity_without_evicting() {
+        let (registry, generation) = generation();
+        let store = TransientWorkerOperationStore::new(generation, Arc::clone(&registry), 64)
+            .with_resume_snapshot_capacity(2);
+        let a = store.register_resume_snapshot(snapshot(&[0])).unwrap();
+        let b = store.register_resume_snapshot(snapshot(&[1])).unwrap();
+        assert_eq!(
+            store.register_resume_snapshot(snapshot(&[2])),
+            Err(TransientOperationError::Saturated)
+        );
+        assert!(store.resume_snapshot(a).is_some());
+        assert!(store.resume_snapshot(b).is_some());
+    }
+
+    #[test]
+    fn resume_snapshots_are_invisible_once_the_generation_is_superseded() {
+        let registry = Arc::new(WorkerAuthorityRegistry::new());
+        let gen_a = registry.begin_generation(Uuid::new_v4());
+        let store = TransientWorkerOperationStore::new(gen_a, Arc::clone(&registry), 64);
+        let id = store.register_resume_snapshot(snapshot(&[0, 1])).unwrap();
+        assert!(store.resume_snapshot(id).is_some());
+
+        let _gen_b = registry.begin_generation(Uuid::new_v4());
+
+        assert!(store.resume_snapshot(id).is_none());
+        assert_eq!(store.live_resume_snapshot_count(), 0);
+        assert_eq!(
+            store.register_resume_snapshot(snapshot(&[2])),
+            Err(TransientOperationError::StaleGeneration)
+        );
+    }
+
+    #[test]
+    fn debug_reports_the_live_resume_snapshot_count_without_leaking_contents() {
+        let (_r, store) = store();
+        store
+            .register_resume_snapshot(snapshot(&[0, 1, 2]))
+            .unwrap();
+        let debug = format!("{store:?}");
+        assert!(debug.contains("live_resume_snapshots"));
+        assert!(!debug.contains("digest-0"));
     }
 }
