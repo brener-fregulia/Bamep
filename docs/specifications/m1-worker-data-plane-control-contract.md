@@ -33,22 +33,24 @@ future non-M1 Worker responsibility (for example, compression) may eventually re
 
 ## Protocol version
 
-The current wire `protocol_version` for this contract is **`"2"`**.
+The current wire `protocol_version` for this contract is **`"1"`**.
 
-`protocol_version "1"` was the pre-#39 baseline. It defined only handshake/`ProtocolError`
-and a single `AuthorizationQuery`/`AuthorizationDecision` pair that was insufficient to
-implement the complete `m0-data-plane-and-storage-contracts.md` "HTTPS data-plane v1
-contract": it carried no resume-discovery retrieval path, no `seal_manifest` first-commit
-message, and no way for Worker to learn the durable `chunk_size`/`digest_algorithm` it must
-enforce. `protocol_version "1"` is superseded and incomplete; the complete M1 Agent -> Worker
-HTTPS -> `bamepd` control path requires `protocol_version "2"`.
+The complete message catalog documented here is **Worker Protocol v1** — the first supported
+Worker IPC baseline for the MVP. There is no released or supported Worker Protocol below it:
+no deployed Worker consumes an earlier version, no compatibility promise covers one, and no
+independently deployed old Worker must stay interoperable. An earlier development-time catalog
+(handshake/`ProtocolError` plus a single `AuthorizationQuery`/`AuthorizationDecision` pair
+partially materialized under #37/#38) was an incomplete in-progress rendering of this same
+first protocol, not a separate released generation; it is development history, not a
+compatibility baseline, and this Specification carries no artificial `v1 -> v2` history for
+it.
 
-`bamepd` MAY accept more than one `protocol_version` for a bounded compatibility window
-(below), but M1 requires only `"2"`: no `bamepd` build is required to keep accepting `"1"`,
-and a `"1"`-only Worker connecting to a `"2"` `bamepd` (or the reverse) is rejected at
-handshake like any other incompatible version. This is a contract-catalog revision, not an
-architectural change — ADR-0018 explicitly leaves "the concrete IPC message catalog" to this
-Specification — so no ADR changes.
+`bamepd` MAY accept more than one `protocol_version` once a later version exists (see
+"Compatibility and unknown fields"), but the MVP defines and requires only `"1"`. A peer
+speaking an incompatible `protocol_version` is rejected at handshake like any other
+version mismatch. This is a contract-catalog revision, not an architectural change —
+ADR-0018 explicitly leaves "the concrete IPC message catalog" to this Specification — so no
+ADR changes.
 
 ## Transport, framing, and versioning
 
@@ -81,7 +83,7 @@ Specification — so no ADR changes.
 
   ```text
   {
-    "protocol_version": "2",
+    "protocol_version": "1",
     "message_id": "<uuid v4>",
     "type": "<MessageType>",
     ...type-specific fields...
@@ -89,7 +91,7 @@ Specification — so no ADR changes.
   ```
 
   A response additionally carries `"in_reply_to": "<message_id of the request>"`.
-- `protocol_version` is `"2"` for this contract version. An incompatible version is rejected
+- `protocol_version` is `"1"` for this contract version. An incompatible version is rejected
   explicitly at handshake (below), never best-effort interpreted.
 - Unknown top-level `type` (after a compatible handshake): rejected with `ProtocolError`
   (below). Unknown fields inside an otherwise valid known message type are ignored, for
@@ -112,21 +114,27 @@ bamepd -> Worker: ServerHello{server_protocol_version, compatible: bool}
                    | HandshakeRejected{reason}
 ```
 
-- `worker_protocol_version` and `server_protocol_version` are `"2"` for this contract version.
+- `worker_protocol_version` and `server_protocol_version` are `"1"` for this contract version.
 - `worker_instance_id` is a UUID v4 the Worker generates fresh at process start, identifying
   one Worker process lifetime; it changes across every Worker restart and lets `bamepd`
   recognize a new connection generation.
 - `compatible` is `true` only when `bamepd` supports `worker_protocol_version`. `bamepd` MAY
-  support more than one version for a bounded compatibility window; this contract does not
-  define that window, and M1 requires only `"2"`.
+  support more than one version once a later version exists; this contract does not define
+  that window, and the MVP requires only `"1"`. For the MVP, a `"1"` Worker against a `"1"`
+  `bamepd` is compatible. If a future `"2"` is introduced, a `"1"` Worker against a
+  `"2"`-only `bamepd` (one that has dropped `"1"` support) is rejected with
+  `HandshakeRejected{ reason: "incompatible_version" }`; there is no such incompatibility to
+  handle today because `"2"` does not yet exist.
 - `HandshakeRejected{reason}` uses one closed generic value (`"incompatible_version"`); no
-  other message is valid on that connection afterward, and `bamepd` closes it. A `"1"` Worker
-  and a `"2"`-only `bamepd` (or the reverse) reach exactly this outcome — a `"1"` peer never
-  silently interprets a `"2"` message type, because the version mismatch is caught first.
+  other message is valid on that connection afterward, and `bamepd` closes it. A peer
+  speaking a `protocol_version` the other side does not support reaches exactly this
+  outcome — a mismatched peer never silently interprets a message type from a version it does
+  not support, because the version mismatch is caught first. No such incompatibility exists
+  within the MVP, where every participant speaks `"1"`.
 - Every message sent before a successful handshake, other than `WorkerHello` itself, is a
   protocol violation (`ProtocolError`, below).
 - There is no per-message feature negotiation: a compatible handshake establishes the full
-  `protocol_version "2"` catalog for that connection generation.
+  `protocol_version "1"` catalog for that connection generation.
 
 ## Connection generations and correlation
 
@@ -622,18 +630,43 @@ falsely admit a replay; neither is acceptable.
 
 ## Compatibility and unknown fields
 
+### Version lifecycle
+
+- Before a `protocol_version` has become an implemented supported baseline, corrections needed
+  to complete its first functional contract — including materially new message types, new
+  required fields, or a change to which participant authoritatively supplies a required
+  value — may be incorporated without incrementing `protocol_version`. The contract is still
+  being brought to its first complete form.
+- Once a `protocol_version` has become an implemented supported baseline, any incompatible
+  wire change requires a `protocol_version` increment. After that freeze point, all of the
+  following require a new protocol version: materially new message types; removing existing
+  fields; changing the meaning of a required field; adding a new required field; changing
+  which participant authoritatively supplies a required value; any other incompatible wire
+  semantics.
+- A compatible addition — an optional field the unaware peer can safely ignore — may be made
+  within the same `protocol_version` at any time, per the forward-compatibility rule below.
+  This is not an elaborate SemVer scheme: there is one `protocol_version` string, incremented
+  only on an incompatible change to a frozen baseline.
+
+### Freeze point for v1
+
+- The complete contract documented here is the **Worker Protocol v1 MVP baseline**. Its first
+  production implementation is being delivered by #39.
+- Until #39 establishes this complete catalog as the implemented baseline, `protocol_version`
+  stays `"1"` even as the contract is corrected to its first complete functional form — the
+  earlier partial #37/#38 rendering never constituted a supported baseline that a later
+  change would break.
+- Once #39 establishes this v1 protocol as the implemented supported baseline, any future
+  incompatible Worker IPC change requires `protocol_version = "2"`. "Implemented supported
+  baseline" — not any customer-release milestone — is the boundary that freezes v1.
+
+### Forward compatibility
+
 - Adding an optional field to a message in this catalog, where the unaware peer can safely
-  ignore it, is a forward-compatible minor change within `protocol_version "2"`.
+  ignore it, is a forward-compatible minor change within the current `protocol_version`.
 - A materially new message *type*, a new required field, or a change to which participant
-  authoritatively derives a value is a `protocol_version` change, handled explicitly at
-  handshake rather than silently negotiated per-message. The `"1" -> "2"` revision in this
-  document is exactly such a change: new message types (`ResumeDiscoveryQuery`,
-  `ResumeDiscoveryContinue`, `ManifestSealRequest`), new required response fields
-  (`digest_algorithm`/`chunk_size`/`acceptance_handle` on an approved `AuthorizationDecision`;
-  `artifact_id` and the sealed manifest facts on a `sealed`/`already_pending_verification`
-  `ManifestSealDecision`; `artifact_status` on `ArtifactVerificationAck`), removed request
-  fields (`operation`/`artifact_id`/`direction` from `AuthorizationQuery`), and a changed
-  `matches_expected` semantic (`bamepd` now compares digests authoritatively).
+  authoritatively derives a value is — once the baseline is frozen — a `protocol_version`
+  change, handled explicitly at handshake rather than silently negotiated per-message.
 - The optional-field allowance must not be used to overload `AuthorizationQuery`/
   `AuthorizationDecision` (or any authorizing request) with unrelated durable-mutation or
   generic-query semantics merely to avoid a version bump: authorization stays authorization,
@@ -689,8 +722,9 @@ falsely admit a replay; neither is acceptable.
 
 At minimum:
 
-- handshake success and incompatible-version rejection, including a `"1"` peer against a
-  `"2"`-only peer, and the pre-handshake protocol violation for any other message type;
+- handshake success on matching `protocol_version "1"`, incompatible-version rejection for a
+  peer offering any other `protocol_version`, and the pre-handshake protocol violation for any
+  other message type;
 - frame length-prefix parsing, including the oversized-frame rejection boundary;
 - unknown `type` rejection (after a compatible handshake) and unknown-field forward
   compatibility;

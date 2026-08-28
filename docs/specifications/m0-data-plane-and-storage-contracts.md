@@ -871,7 +871,7 @@ Issue #19 owns deterministic M1 implementation/fail-closed validation. Issue #21
 - `m1-simulated-vertical-slice-and-baseline-validation.md` — RF-005 concrete M1 action and
   digest-algorithm/chunk-size communication.
 - `m1-worker-data-plane-control-contract.md` — Server↔Worker UDS contract (`protocol_version
-  "2"`) that authorizes each HTTP operation, relays the proof-transcript inputs, retrieves
+  "1"`) that authorizes each HTTP operation, relays the proof-transcript inputs, retrieves
   paginated durable resume state, and coordinates the seal and full-Artifact verification
   commits referenced above.
 - `docs/reference/transfer-resumability-spike.md` — empirical resumability evidence.
