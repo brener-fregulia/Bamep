@@ -370,6 +370,9 @@ bamepd -> Worker: ManifestSealDecision{
     reason?,                    // present only when outcome = "rejected"; closed vocabulary below
     // the following are present only when outcome ∈ {"sealed", "already_pending_verification"}:
     verification_handle,        // transient, generation-scoped; see "Transient operation handles"
+    artifact_id,               // the durable Artifact owned by transfer_id; opaque response
+                               //   data the Worker needs for the HTTP seal response, not
+                               //   independent authority
     digest_algorithm,          // e.g. "sha256"
     chunk_size,                // positive integer bytes
     chunk_count,               // the authoritative durable sealed chunk_count
@@ -407,6 +410,17 @@ the **authoritative durable sealed values**. The Worker MUST verify against thes
 against the values it sent in the HTTP body — which matters especially for an idempotent
 retry, where the durable sealed values are authoritative and the request body is only an
 idempotency assertion.
+
+`artifact_id` is the exact durable Artifact `bamepd` bound to `transfer_id`; it is not on the
+HTTP route or in any header, and the `token` is opaque, so this decision is the Worker's only
+source for the `artifact_id` field of the HTTP seal response
+(`m0-data-plane-and-storage-contracts.md` "HTTPS data-plane v1 contract" operation 3). For
+`already_pending_verification`, `bamepd` MUST return the same authoritative durable
+`artifact_id` as the original `sealed` decision, so a Worker restart followed by an idempotent
+seal retry can reconstruct the exact final HTTP response with no pre-restart transient state.
+The Worker holds this `artifact_id` for the lifetime of that one HTTP operation and treats it
+as opaque response data, never as independent authority (`ArtifactVerificationAck` does not
+repeat it).
 
 ### 6. Full-Artifact verification result (`ArtifactVerificationReport` / `ArtifactVerificationAck`)
 
@@ -615,9 +629,10 @@ falsely admit a replay; neither is acceptable.
   handshake rather than silently negotiated per-message. The `"1" -> "2"` revision in this
   document is exactly such a change: new message types (`ResumeDiscoveryQuery`,
   `ResumeDiscoveryContinue`, `ManifestSealRequest`), new required response fields
-  (`digest_algorithm`/`chunk_size`/`acceptance_handle` on an approved `AuthorizationDecision`,
-  `artifact_status` on `ArtifactVerificationAck`), removed request fields
-  (`operation`/`artifact_id`/`direction` from `AuthorizationQuery`), and a changed
+  (`digest_algorithm`/`chunk_size`/`acceptance_handle` on an approved `AuthorizationDecision`;
+  `artifact_id` and the sealed manifest facts on a `sealed`/`already_pending_verification`
+  `ManifestSealDecision`; `artifact_status` on `ArtifactVerificationAck`), removed request
+  fields (`operation`/`artifact_id`/`direction` from `AuthorizationQuery`), and a changed
   `matches_expected` semantic (`bamepd` now compares digests authoritatively).
 - The optional-field allowance must not be used to overload `AuthorizationQuery`/
   `AuthorizationDecision` (or any authorizing request) with unrelated durable-mutation or
@@ -695,8 +710,10 @@ At minimum:
   request closed with no partial list;
 - `ManifestSealRequest`/`ManifestSealDecision` for first `sealed`, idempotent
   `already_pending_verification`, `incomplete_manifest`, `manifest_already_sealed`, and
-  `denied` for a terminal owning Attempt; authoritative `expected_artifact_digest`/
-  `chunk_count` returned on success;
+  `denied` for a terminal owning Attempt; authoritative `artifact_id`/`expected_artifact_digest`/
+  `chunk_count` returned on success, with `already_pending_verification` returning the same
+  `artifact_id` as the original `sealed` decision so a restart + retry rebuilds the exact
+  HTTP seal response;
 - `ArtifactVerificationReport`/`ArtifactVerificationAck`: `bamepd` compares
   `computed_artifact_digest` to its own durable expected value and returns the authoritative
   `artifact_status`; a report cannot drive `Verified` by assertion;

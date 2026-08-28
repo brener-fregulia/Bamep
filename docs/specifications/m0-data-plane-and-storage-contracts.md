@@ -501,7 +501,8 @@ no variation and no `message`, to guarantee the required non-enumerable shape.
   `200` response (a completed operation reporting a `Failed` Artifact), not a `409`. The Worker
   authorizes and triggers the first commit through the `ManifestSealRequest` control message
   and verifies against the authoritative sealed `chunk_count`/`artifact_digest` `bamepd`
-  returns, never the values in this request body
+  returns, never the values in this request body; the response `artifact_id` also comes from
+  that `ManifestSealDecision` (it is not on the route or in a header)
   (`m1-worker-data-plane-control-contract.md` "Seal-manifest first durable commit"). `bamepd`
   separately sends the terminal `ActionResult` over the Agent Protocol WSS session once its
   own commit exists — the HTTP response never substitutes for that message.
@@ -568,7 +569,8 @@ For `seal_manifest`, the equivalent two-step commit is: the Worker sends `Manife
 (authorizing the operation and carrying the Agent-declared `chunk_count`/`artifact_digest`);
 `bamepd` first durably commits `Incomplete -> PendingVerification` (sealing plus confirming
 every declared chunk is already durable and individually verified) as one transaction and
-returns the authoritative sealed `chunk_count`/`artifact_digest` plus a `verification_handle`;
+returns the authoritative durable `artifact_id`, sealed `chunk_count`/`artifact_digest`, and a
+`verification_handle`;
 only afterward does the Worker reconstruct and verify the full Artifact bytes and send
 `ArtifactVerificationReport{computed_artifact_digest}`, and `bamepd` — comparing that reported
 digest against its own durable expected value, never trusting a Worker verdict — commits the
