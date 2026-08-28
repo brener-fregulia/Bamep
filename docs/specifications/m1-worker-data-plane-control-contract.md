@@ -18,11 +18,37 @@ A participant must remain implementable from this document alone, without readin
 
 This contract defines the minimum IPC surface required by
 `m1-simulated-vertical-slice-and-baseline-validation.md` RF-005 and by
-`m0-data-plane-and-storage-contracts.md`'s "HTTPS data-plane v1 contract": handshake/version
-compatibility, per-request authorization decisions, durable chunk-acceptance coordination, and
-Artifact-verification-result coordination. It does not define a general-purpose RPC framework,
-and it does not define every message a future non-M1 Worker responsibility (for example,
-compression) may eventually require.
+`m0-data-plane-and-storage-contracts.md`'s "HTTPS data-plane v1 contract":
+
+- handshake / version compatibility;
+- per-request authorization for `chunk_upload`;
+- durable verified-chunk acceptance coordination;
+- resume-discovery durable-state retrieval, including pagination within the frame limit;
+- `seal_manifest` first durable commit (`Incomplete -> PendingVerification`);
+- full-Artifact verification-result coordination and the authoritative
+  `PendingVerification -> Verified | Failed` transition.
+
+It does not define a general-purpose RPC framework, and it does not define every message a
+future non-M1 Worker responsibility (for example, compression) may eventually require.
+
+## Protocol version
+
+The current wire `protocol_version` for this contract is **`"2"`**.
+
+`protocol_version "1"` was the pre-#39 baseline. It defined only handshake/`ProtocolError`
+and a single `AuthorizationQuery`/`AuthorizationDecision` pair that was insufficient to
+implement the complete `m0-data-plane-and-storage-contracts.md` "HTTPS data-plane v1
+contract": it carried no resume-discovery retrieval path, no `seal_manifest` first-commit
+message, and no way for Worker to learn the durable `chunk_size`/`digest_algorithm` it must
+enforce. `protocol_version "1"` is superseded and incomplete; the complete M1 Agent -> Worker
+HTTPS -> `bamepd` control path requires `protocol_version "2"`.
+
+`bamepd` MAY accept more than one `protocol_version` for a bounded compatibility window
+(below), but M1 requires only `"2"`: no `bamepd` build is required to keep accepting `"1"`,
+and a `"1"`-only Worker connecting to a `"2"` `bamepd` (or the reverse) is rejected at
+handshake like any other incompatible version. This is a contract-catalog revision, not an
+architectural change — ADR-0018 explicitly leaves "the concrete IPC message catalog" to this
+Specification — so no ADR changes.
 
 ## Transport, framing, and versioning
 
@@ -42,15 +68,20 @@ compression) may eventually require.
   `byte_length_of_json_payload` is the exact UTF-8 byte length of `utf8_json_payload`, which is
   a single UTF-8-encoded JSON object.
 - Maximum frame size is **1 MiB**. Only metadata/control fields cross this boundary; bulk
-  chunk bytes never do (`m0-data-plane-and-storage-contracts.md` "HTTPS data-plane v1
-  contract" — Worker stages/verifies bytes locally and reports only digests/sizes/outcomes
-  over UDS). A frame declaring a length above the maximum is a protocol violation: the receiver
-  closes the connection without attempting to read the oversized payload.
+  chunk bytes never do, and neither do reconstructed full-Artifact bytes
+  (`m0-data-plane-and-storage-contracts.md` "HTTPS data-plane v1 contract" — Worker
+  stages/verifies bytes locally and reports only digests/sizes/outcomes over UDS). A frame
+  declaring a length above the maximum is a protocol violation: the receiver closes the
+  connection without attempting to read the oversized payload.
+- The one response whose payload can grow with Artifact size — the resume-discovery
+  held-chunk set — is **paginated** so every individual frame stays within the 1 MiB limit
+  (see "Resume-manifest pagination"). The 1 MiB limit is never raised to fit a resume
+  payload.
 - Every message is a JSON object carrying at least:
 
   ```text
   {
-    "protocol_version": "1",
+    "protocol_version": "2",
     "message_id": "<uuid v4>",
     "type": "<MessageType>",
     ...type-specific fields...
@@ -58,15 +89,17 @@ compression) may eventually require.
   ```
 
   A response additionally carries `"in_reply_to": "<message_id of the request>"`.
-- `protocol_version` is `"1"` for this contract version. An incompatible version is rejected
+- `protocol_version` is `"2"` for this contract version. An incompatible version is rejected
   explicitly at handshake (below), never best-effort interpreted.
-- Unknown top-level `type`: rejected with `ProtocolError` (below). Unknown fields inside an
-  otherwise valid known message type are ignored, for forward-compatible minor additions —
-  identical in spirit to `m0-agent-protocol-contract.md`'s wire-compatibility rule, so that
-  adding one optional field does not require a synchronized Worker/`bamepd` release merely due
-  to serialization rigidity, per ADR-0003.
+- Unknown top-level `type` (after a compatible handshake): rejected with `ProtocolError`
+  (below). Unknown fields inside an otherwise valid known message type are ignored, for
+  forward-compatible minor additions — identical in spirit to `m0-agent-protocol-contract.md`'s
+  wire-compatibility rule, so that adding one optional field does not require a synchronized
+  Worker/`bamepd` release merely due to serialization rigidity, per ADR-0003.
 - Absent optional fields are omitted, never sent as `null`, matching the convention already
-  used by `m0-agent-protocol-contract.md`.
+  used by `m0-agent-protocol-contract.md`. Where the HTTPS contract requires a JSON `null`
+  (for example `expected_chunk_count` before sealing), the IPC message omits the field and
+  the Worker renders `null` in the HTTP response.
 
 ## Handshake
 
@@ -79,16 +112,21 @@ bamepd -> Worker: ServerHello{server_protocol_version, compatible: bool}
                    | HandshakeRejected{reason}
 ```
 
+- `worker_protocol_version` and `server_protocol_version` are `"2"` for this contract version.
 - `worker_instance_id` is a UUID v4 the Worker generates fresh at process start, identifying
   one Worker process lifetime; it changes across every Worker restart and lets `bamepd`
   recognize a new connection generation.
 - `compatible` is `true` only when `bamepd` supports `worker_protocol_version`. `bamepd` MAY
   support more than one version for a bounded compatibility window; this contract does not
-  define that window.
+  define that window, and M1 requires only `"2"`.
 - `HandshakeRejected{reason}` uses one closed generic value (`"incompatible_version"`); no
-  other message is valid on that connection afterward, and `bamepd` closes it.
+  other message is valid on that connection afterward, and `bamepd` closes it. A `"1"` Worker
+  and a `"2"`-only `bamepd` (or the reverse) reach exactly this outcome — a `"1"` peer never
+  silently interprets a `"2"` message type, because the version mismatch is caught first.
 - Every message sent before a successful handshake, other than `WorkerHello` itself, is a
   protocol violation (`ProtocolError`, below).
+- There is no per-message feature negotiation: a compatible handshake establishes the full
+  `protocol_version "2"` catalog for that connection generation.
 
 ## Connection generations and correlation
 
@@ -99,139 +137,447 @@ response that arrives after reconnect for a request sent on a prior generation �
 without being applied to any state; this is "stale response" handling under "Failure
 semantics" below.
 
+Transient operation handles (below) are also generation-scoped: a handle minted on one
+generation is invalid on every later one.
+
+## Operations, HTTP mapping, and transcript inputs
+
+Each of the three `m0-data-plane-and-storage-contracts.md` "HTTPS data-plane v1 contract"
+operations maps to one **authorizing request** plus zero or more generation-scoped
+**follow-up** messages:
+
+| HTTP operation | authorizing request | follow-up(s) |
+| --- | --- | --- |
+| `PUT .../chunks/{chunk_index}` (chunk upload) | `AuthorizationQuery` | `ChunkAcceptanceRequest` |
+| `GET .../chunks` (resume discovery) | `ResumeDiscoveryQuery` | `ResumeDiscoveryContinue` (per page) |
+| `POST .../seal` (seal manifest) | `ManifestSealRequest` | `ArtifactVerificationReport` |
+
+The `operation` value bound into the canonical proof transcript
+(`m0-data-plane-and-storage-contracts.md` "Per-request proof": `1 = chunk_upload`,
+`2 = resume_discovery`, `3 = seal_manifest`) is **implied by the authorizing request's
+`type`**, not carried as a separate wire field — `AuthorizationQuery` is always
+`chunk_upload`, `ResumeDiscoveryQuery` is always `resume_discovery`, `ManifestSealRequest` is
+always `seal_manifest`.
+
+`bamepd` reconstructs the exact 137-byte proof transcript
+(`m0-data-plane-and-storage-contracts.md` "Per-request proof" — the transcript layout is
+unchanged) from these input sources:
+
+| Transcript field | Source when `bamepd` reconstructs |
+| --- | --- |
+| `capability_id` | `SHA-256` of the exact UTF-8 `token` bytes the Worker forwarded |
+| `operation` | the authorizing request message `type` (table above) |
+| `transfer_id` | the `transfer_id` the Worker forwarded from the HTTP route |
+| `artifact_id` | the `artifact_id` **bound to `token`** in the capability `bamepd` itself issued — never a wire value |
+| `direction` | the `direction` **bound to `token`** in the capability `bamepd` itself issued — never a wire value |
+| `chunk_index` | `AuthorizationQuery` only: the `chunk_index` the Worker forwarded from the HTTP route; absent (`chunk_index_present = 0`) for the other two |
+| `proof_id`, `issued_at` | the wire values from the Worker (originally the `X-Bamep-Transfer-Proof` carrier) |
+
+Worker never sends `artifact_id` or `direction` on this boundary and never needs them: they
+are not present in the HTTP route or common headers, and the `token` is opaque to Worker
+(`m0-data-plane-and-storage-contracts.md` "Capability opacity"). The Agent still signs
+`artifact_id` and `direction` into its transcript exactly as before; because `bamepd`
+reconstructs those two fields from the capability binding rather than from anything the
+request could assert, a proof that signed a different `artifact_id`/`direction` than the
+`token` is bound to simply fails signature verification and is denied with the generic
+non-enumerable denial — cross-Artifact / cross-direction substitution stays fail-closed, and
+proof binding is not weakened.
+
 ## Minimum messages
 
-Every request/response pair below correlates via `in_reply_to`. Field names are illustrative;
-implementations must use these exact wire names.
+Every request/response pair below correlates via `in_reply_to`. Implementations must use these
+exact wire `type` names and field names.
 
-### 1. Authorization query / decision
+### 1. Chunk-upload authorization (`AuthorizationQuery` / `AuthorizationDecision`)
+
+The pre-body authorization for `PUT .../chunks/{chunk_index}`.
 
 ```text
 Worker -> bamepd: AuthorizationQuery{
-    token,                     // opaque capability, forwarded exactly as received
-    operation,                 // "chunk_upload" | "resume_discovery" | "seal_manifest"
-    transfer_id,
-    artifact_id,
-    direction,
-    chunk_index?,              // present only for chunk_upload
-    proof_id,
-    issued_at,
-    signature
+    token,          // opaque capability, forwarded exactly as received
+    transfer_id,    // from the HTTP route
+    chunk_index,    // from the HTTP route (non-negative integer)
+    proof_id,       // from the X-Bamep-Transfer-Proof carrier
+    issued_at,      // from the X-Bamep-Transfer-Proof carrier
+    signature       // from the X-Bamep-Transfer-Proof carrier
 }
 bamepd -> Worker: AuthorizationDecision{
     decision: "approved" | "denied",
-    expected_chunk_digest?     // present only when decision=approved, operation=chunk_upload,
-                                // and chunk_index is already durable; the already-recorded
-                                // expected digest for that chunk_index
+    // all of the following are present only when decision = "approved":
+    digest_algorithm,          // e.g. "sha256" — the Transfer manifest's fixed algorithm
+    chunk_size,                // positive integer bytes — the Transfer manifest's fixed chunk size
+    acceptance_handle,         // transient, generation-scoped; see "Transient operation handles"
+    expected_chunk_digest?     // additionally present only when chunk_index is already durable:
+                               // the already-recorded expected digest for that chunk_index,
+                               // canonical base64url-no-pad
 }
 ```
 
-`bamepd` reconstructs the exact canonical proof transcript from `token` and the request fields
-above per `m0-data-plane-and-storage-contracts.md` "Per-request proof", and performs the
-complete authoritative check: signature validity, capability validity/expiry/scope, replay,
-and current durable authorization. Worker MAY perform a local mechanical pre-check (for
-example, rejecting an obviously malformed signature encoding before spending a round trip) as
-a performance optimization, but such a local check is never sufficient authorization by
-itself and never substitutes for this query, per ADR-0018 — every operation requiring current
-durable authorization obtains an authoritative decision from `bamepd` first. `decision: denied`
-carries no further reason field; the non-enumerable-denial requirement from
-`m0-data-plane-and-storage-contracts.md` applies identically across this boundary, so Worker
-cannot leak a more specific HTTP response than the generic `401` even if it wanted to.
+`bamepd` performs the complete authoritative check for `operation = chunk_upload`: signature
+validity over the reconstructed transcript, capability validity/expiry/scope, proof freshness,
+replay, and current durable authorization (owning Attempt still `InProgress`, credential
+`CredentialActive`, Artifact/manifest state permits this chunk). Worker MAY perform a local
+mechanical pre-check (for example, rejecting an obviously malformed signature encoding before
+spending a round trip), but such a local check is never sufficient authorization by itself and
+never substitutes for this query, per ADR-0018.
 
-### 2. Verified-chunk durable acceptance
+On `approved`, `digest_algorithm` and `chunk_size` are the authoritative durable manifest
+facts the Worker MUST use — to enforce the `413 CHUNK_TOO_LARGE` body bound before reading
+the body, and to compute the chunk digest with the correct algorithm — never inferred from a
+Worker constant. On `denied`, `AuthorizationDecision` carries `decision` only: no
+`digest_algorithm`, `chunk_size`, `acceptance_handle`, or `expected_chunk_digest`, so it
+leaks nothing beyond the generic non-enumerable denial. The Worker maps `denied` to the
+fixed `401` body and, for a declared-vs-`expected_chunk_digest` mismatch, to
+`409 CHUNK_IDENTITY_CONFLICT` before reading the body
+(`m0-data-plane-and-storage-contracts.md` "Durable chunk acceptance ordering").
+
+### 2. Verified-chunk durable acceptance (`ChunkAcceptanceRequest` / `ChunkAcceptanceDecision`)
+
+Sent only after Worker has itself received the body and verified the bytes hash to `digest`
+with the `digest_algorithm` from the `AuthorizationDecision`
+(`m0-data-plane-and-storage-contracts.md` "Durable chunk acceptance ordering" step 6).
 
 ```text
 Worker -> bamepd: ChunkAcceptanceRequest{
-    transfer_id, artifact_id, chunk_index, digest, size
+    acceptance_handle,   // exactly the value from the approving AuthorizationDecision
+    transfer_id,
+    chunk_index,
+    digest,              // canonical base64url-no-pad; the Worker-verified actual chunk digest
+    size                 // exact count of raw verified chunk bytes (see below)
 }
 bamepd -> Worker: ChunkAcceptanceDecision{
     outcome: "committed" | "already_committed" | "rejected",
-    reason?    // present only when outcome=rejected
+    reason?              // present only when outcome = "rejected"; closed vocabulary below
 }
 ```
 
-Sent only after Worker has itself verified the received bytes hash to `digest`
-(`m0-data-plane-and-storage-contracts.md` "Durable chunk acceptance ordering"). `bamepd`
-durably commits the chunk identity (first-writer for a new `chunk_index`) or recognizes an
-identical already-committed identity and returns `already_committed`; either outcome is a
-Worker-visible success. `rejected` covers a durable state conflict — for example, the Transfer
-became terminal, or a *different* digest already exists for that `chunk_index` — and Worker
-maps this deterministically to the HTTP `409` shapes in `m0-data-plane-and-storage-contracts.md`.
+`acceptance_handle` binds this durable-commit request to the specific just-authorized
+`chunk_upload`: `bamepd` rejects a `ChunkAcceptanceRequest` whose handle it did not mint on
+the current generation, or whose `transfer_id`/`chunk_index` do not match the handle's
+authorized operation. `bamepd` still independently re-validates current durable state at
+commit time (Transfer/Artifact/Attempt eligibility, manifest compatibility, no conflicting
+existing identity) — the handle does not replace that check.
 
-### 3. Artifact verification result
+`size` is the exact number of raw verified chunk bytes the Worker received and hashed. It has
+already been bounded by the `AuthorizationDecision`'s `chunk_size` (plus any bounded Worker
+margin) before the body was accepted; `digest` is over exactly those `size` bytes. The Worker
+MUST NOT use a client-declared `Content-Length` that disagrees with the bytes actually
+received as `size`. `bamepd` durably records/revalidates `size` against current manifest
+constraints as part of the commit.
+
+Outcomes:
+
+- `committed` — `bamepd` durably committed the chunk identity `(transfer_id, chunk_index,
+  digest)` as first-writer for a new `chunk_index`. HTTP `201 { "chunk_index": N, "status":
+  "accepted" }`.
+- `already_committed` — `bamepd` recognized an identical already-durable
+  `(transfer_id, chunk_index, digest)` and did not re-commit. HTTP `200 { "chunk_index": N,
+  "status": "already_held" }`. Only `bamepd` durable authority establishes this; a
+  Worker-local staged file never does.
+- `rejected` with `reason`, a closed vocabulary the Worker maps deterministically to one HTTP
+  `409` shape, with no Worker inference from `bamepd` internals:
+
+  | `reason` | HTTP response |
+  | --- | --- |
+  | `chunk_identity_conflict` | `409 { "error": { "code": "CHUNK_IDENTITY_CONFLICT" } }` — a *different* digest is already durable for that `chunk_index` (for example a race that committed another digest after this request was authorized) |
+  | `transfer_not_continuable` | `409 { "error": { "code": "TRANSFER_NOT_CONTINUABLE" } }` — the owning Transfer/Artifact/Attempt is already terminal, or the manifest is already sealed and `chunk_index` was never part of the sealed set |
+
+  `DIGEST_MISMATCH` and `CHUNK_TOO_LARGE` are never `ChunkAcceptanceDecision` outcomes: the
+  Worker detects both locally (mismatch after hashing the body; oversize from `chunk_size`
+  before the body) and never reaches this message.
+
+### 3. Resume-discovery authorization and first page (`ResumeDiscoveryQuery` / `ResumeDiscoveryPage`)
+
+The authorizing request for `GET .../chunks`. It authorizes `operation = resume_discovery`
+and returns the first page of durable resume state in one round trip.
+
+```text
+Worker -> bamepd: ResumeDiscoveryQuery{
+    token,          // opaque capability, forwarded exactly as received
+    transfer_id,    // from the HTTP route
+    proof_id,       // from the X-Bamep-Transfer-Proof carrier
+    issued_at,      // from the X-Bamep-Transfer-Proof carrier
+    signature       // from the X-Bamep-Transfer-Proof carrier
+}
+bamepd -> Worker: ResumeDiscoveryPage{
+    decision: "approved" | "denied",
+    // all of the following are present only when decision = "approved":
+    transfer_id,
+    sealed: bool,
+    digest_algorithm,          // e.g. "sha256"
+    chunk_size,                // positive integer bytes
+    expected_chunk_count?,     // present only when sealed; omitted before sealing
+                               //   (Worker renders JSON null in the HTTP response)
+    held_chunks: [ { chunk_index, digest }, ... ],   // this page's slice, ascending chunk_index
+    resume_cursor?             // present iff more held-chunk pages remain
+}
+```
+
+`bamepd` performs the complete authoritative check for `operation = resume_discovery`
+(identical discipline to `AuthorizationQuery`). On `denied`, `ResumeDiscoveryPage` carries
+`decision` only.
+
+`held_chunks` reflects **only** chunk identities `bamepd` durably holds and has individually
+verified — never Worker-local staged-but-uncommitted bytes — so it stays correct after HTTP
+connection loss, Worker restart, authorization renewal, Agent reconnect, or `bamepd` restart
+(`m0-data-plane-and-storage-contracts.md` "Resume discovery"). Each page's `held_chunks` is
+ordered by ascending `chunk_index` and the page set contains no omitted or duplicated durable
+chunk identity for chunks durable at authorization time; a chunk accepted *after* that instant
+MAY be absent, which is safe because re-submitting an already-held chunk is idempotent
+(`200 already_held`).
+
+### 4. Resume-discovery pagination (`ResumeDiscoveryContinue` / `ResumeDiscoveryPage`)
+
+```text
+Worker -> bamepd: ResumeDiscoveryContinue{
+    resume_cursor   // exactly the value from the previous ResumeDiscoveryPage
+}
+bamepd -> Worker: ResumeDiscoveryPage{
+    decision: "approved" | "denied",
+    held_chunks?: [ { chunk_index, digest }, ... ],   // next slice, ascending
+    resume_cursor?                                     // present iff still more pages remain
+}
+```
+
+Continuation pages carry `held_chunks` and `resume_cursor` only; the manifest-level fields
+(`sealed`, `digest_algorithm`, `chunk_size`, `expected_chunk_count`) appear on the first page
+and the Worker reuses them. `bamepd` serves every page of one resume query from a consistent
+durable snapshot taken at authorization time. A `resume_cursor` `bamepd` does not recognize on
+the current generation (stale, wrong generation, already consumed) returns
+`ResumeDiscoveryPage{ decision: "denied" }`; the Worker then fails the HTTP request closed
+(below) and discards any partial `held_chunks` it had aggregated.
+
+See "Resume-manifest pagination" for the frame-limit reasoning and cursor semantics.
+
+### 5. Seal-manifest first durable commit (`ManifestSealRequest` / `ManifestSealDecision`)
+
+The authorizing request for `POST .../seal`. It authorizes `operation = seal_manifest` and,
+on success, performs the first durable commit (`Incomplete -> PendingVerification`) as one
+transaction (`m0-data-plane-and-storage-contracts.md` "Durable chunk acceptance ordering").
+
+```text
+Worker -> bamepd: ManifestSealRequest{
+    token,             // opaque capability, forwarded exactly as received
+    transfer_id,       // from the HTTP route
+    proof_id,          // from the X-Bamep-Transfer-Proof carrier
+    issued_at,         // from the X-Bamep-Transfer-Proof carrier
+    signature,         // from the X-Bamep-Transfer-Proof carrier
+    chunk_count,       // Agent-declared, from the HTTP request body (non-negative integer)
+    artifact_digest    // Agent-declared, from the HTTP request body (canonical base64url-no-pad)
+}
+bamepd -> Worker: ManifestSealDecision{
+    outcome: "sealed" | "already_pending_verification" | "rejected" | "denied",
+    reason?,                    // present only when outcome = "rejected"; closed vocabulary below
+    // the following are present only when outcome ∈ {"sealed", "already_pending_verification"}:
+    verification_handle,        // transient, generation-scoped; see "Transient operation handles"
+    digest_algorithm,          // e.g. "sha256"
+    chunk_size,                // positive integer bytes
+    chunk_count,               // the authoritative durable sealed chunk_count
+    expected_artifact_digest   // the authoritative durable sealed full-Artifact digest,
+                               //   canonical base64url-no-pad
+}
+```
+
+Outcomes:
+
+- `sealed` — first valid seal: `bamepd` verified every chunk index `0..chunk_count-1` is
+  durably held and individually verified, sealed the manifest with
+  `(chunk_count, artifact_digest)`, and committed `Incomplete -> PendingVerification` in one
+  transaction. The Worker proceeds to full-Artifact verification.
+- `already_pending_verification` — idempotent retry: the manifest is already sealed with an
+  identical `(transfer_id, chunk_count, artifact_digest)` and the Artifact is already
+  `PendingVerification`. No second seal transaction. The Worker re-drives full-Artifact
+  verification (this is how the Agent safely retries after a Worker crash between sealing and
+  verification completing).
+- `rejected` with `reason`, a closed vocabulary the Worker maps deterministically:
+
+  | `reason` | HTTP response |
+  | --- | --- |
+  | `incomplete_manifest` | `409 { "error": { "code": "INCOMPLETE_MANIFEST" } }` — `bamepd` does not durably hold every chunk index `0..chunk_count-1` individually verified |
+  | `manifest_already_sealed` | `409 { "error": { "code": "MANIFEST_ALREADY_SEALED" } }` — the manifest is already sealed with a *different* `chunk_count` or `artifact_digest` |
+
+- `denied` — the authorization check failed; the message carries `outcome` only and nothing
+  else. HTTP `401`, generic non-enumerable. An owning Transfer/Artifact/Attempt that is
+  already terminal is an authorization denial here (`denied`), not a `409`, matching
+  `m0-data-plane-and-storage-contracts.md`, which lists no `TRANSFER_NOT_CONTINUABLE` shape
+  for `seal_manifest`.
+
+On `sealed`/`already_pending_verification`, `expected_artifact_digest` and `chunk_count` are
+the **authoritative durable sealed values**. The Worker MUST verify against these, never
+against the values it sent in the HTTP body — which matters especially for an idempotent
+retry, where the durable sealed values are authoritative and the request body is only an
+idempotency assertion.
+
+### 6. Full-Artifact verification result (`ArtifactVerificationReport` / `ArtifactVerificationAck`)
+
+Sent once, after `bamepd` has already durably committed `Incomplete -> PendingVerification`
+(outcome `sealed` or `already_pending_verification` above) and the Worker has reconstructed
+the full Artifact byte stream and computed its digest
+(`m0-data-plane-and-storage-contracts.md` "Full-Artifact byte reconstruction").
 
 ```text
 Worker -> bamepd: ArtifactVerificationReport{
-    transfer_id, artifact_id, computed_artifact_digest, matches_expected: bool
+    verification_handle,        // exactly the value from the ManifestSealDecision
+    computed_artifact_digest    // canonical base64url-no-pad; the digest the Worker computed
+                                //   over the reconstructed full-Artifact byte stream
 }
 bamepd -> Worker: ArtifactVerificationAck{
-    outcome: "committed"
+    outcome: "committed",
+    artifact_status: "Verified" | "Failed"
 }
 ```
 
-Sent once, after `bamepd` has already durably committed `Incomplete -> PendingVerification`
-for the `seal_manifest` operation (`m0-data-plane-and-storage-contracts.md` "Durable chunk
-acceptance ordering"). `bamepd` commits the resulting `PendingVerification -> Verified |
-Failed` transition and, once committed, is responsible for the owning Agent Protocol
-`ActionResult` on the separate WSS control connection
-(`m1-simulated-vertical-slice-and-baseline-validation.md` RF-005) — this message never itself
-produces an Agent Protocol effect, preserving that the Agent remains the sole Agent Protocol
-participant and Worker never emits `ActionResult` directly.
+`verification_handle` binds this report to the specific just-committed
+`Incomplete -> PendingVerification`. The Worker reports only the **mechanical fact** it
+observed — the digest it computed. `bamepd` **independently** compares
+`computed_artifact_digest` against its own durable `expected_artifact_digest` and commits
+`PendingVerification -> Verified` on a match or `PendingVerification -> Failed` on a mismatch.
+The Worker carries no verdict field and cannot establish `Verified` by assertion — only
+`bamepd`'s own comparison against its durable expected digest decides.
+`ArtifactVerificationAck` returns the authoritative committed `artifact_status`, which the
+Worker renders in the HTTP
+seal response `{ "transfer_id", "artifact_id", "sealed": true, "artifact_status": "Verified" |
+"Failed" }`. `Failed` is an HTTP `200` (a completed operation that produced a `Failed`
+Artifact), not a `409` (`m0-data-plane-and-storage-contracts.md` "HTTPS data-plane v1
+contract" operation 3).
 
-### 4. Generic protocol error
+Once `bamepd` commits, it is responsible for the owning Agent Protocol `ActionResult` on the
+separate WSS control connection (`m1-simulated-vertical-slice-and-baseline-validation.md`
+RF-005) — this message never itself produces an Agent Protocol effect, preserving that the
+Agent remains the sole Agent Protocol participant and Worker never emits `ActionResult`
+directly.
+
+If the Worker cannot complete verification within the HTTP request — it cannot access the
+accepted chunk bytes it staged (for example after a restart that lost staging), or UDS is
+lost before the `Ack` — it does not send a fabricated `Ack`: the HTTP request fails closed
+with the generic `401`-shaped response, the durable Artifact remains `PendingVerification`,
+and a later idempotent seal retry re-drives verification.
+
+### 7. Generic protocol error (`ProtocolError`)
 
 ```text
 { "type": "ProtocolError", "code": string, "message"?: string, "in_reply_to"?: string }
 ```
 
-Used for a malformed frame/message, an unknown `type`, a pre-handshake violation, or an
-oversized-frame violation observed before the connection is closed. `code` is a stable
-non-empty diagnostic string; `message`, when present, must not expose secrets (see "Security
-and logging" below). Whether the connection is closed after sending `ProtocolError` is
-implementation policy for this contract, unless a future safety requirement states otherwise —
-mirroring `m0-agent-protocol-contract.md`'s equivalent rule for its own `ProtocolError`.
+Used for a malformed frame/message, an unknown `type` (after a compatible handshake), a
+pre-handshake violation, or an oversized-frame violation observed before the connection is
+closed. `code` is a stable non-empty diagnostic string; `message`, when present, must not
+expose secrets (see "Security and logging"). Whether the connection is closed after sending
+`ProtocolError` is implementation policy for this contract, unless a future safety requirement
+states otherwise — mirroring `m0-agent-protocol-contract.md`'s equivalent rule for its own
+`ProtocolError`.
+
+## Transient operation handles
+
+`acceptance_handle`, `resume_cursor`, and `verification_handle` share one definition:
+
+- opaque to the Worker; the Worker echoes the exact value back and never parses it;
+- minted by `bamepd` in the response to an authorizing request, on one connection generation;
+- bound to exactly one authorized data-plane operation instance (one `transfer_id`, one
+  authorized `proof_id`, and — for `acceptance_handle` — one `chunk_index`);
+- valid only on the generation that minted it; discarded on disconnect and never honoured on
+  a later generation;
+- consumed by its follow-up message(s): `acceptance_handle` and `verification_handle` are
+  single-use; `resume_cursor` advances one page per `ResumeDiscoveryContinue` and each value
+  is accepted once;
+- **never a durable business identity.** A handle is not persisted, is not an idempotency key,
+  and never authorizes anything on its own — it correlates a follow-up message to an
+  operation `bamepd` already authorized this generation, and `bamepd` still independently
+  validates current durable state on every durable commit.
+
+A retried logical operation (fresh `proof_id`) obtains a fresh authorizing decision and fresh
+handles; it never reuses handles from a prior attempt or generation.
+
+## Resume-manifest pagination
+
+`ResumeDiscoveryPage.held_chunks` is the only response payload that grows with Artifact size.
+Each entry is `{ "chunk_index": <integer>, "digest": "<43-char base64url>" }` ≈ 60–70 UTF-8
+bytes. A realistic M1 Volume/Image capture (a disk image of tens to hundreds of GiB at, for
+example, the 4 MiB experimental chunk size from
+`docs/reference/transfer-resumability-spike.md`) produces tens of thousands to hundreds of
+thousands of held-chunk entries — well over the 1 MiB frame limit for a single frame. The M1
+contract does not bound one Transfer's resume payload below 1 MiB, so this response is
+paginated rather than raising the universal frame limit.
+
+- `bamepd` chooses a bounded page size such that every `ResumeDiscoveryPage` frame — including
+  its non-`held_chunks` fields on the first page — stays safely within 1 MiB.
+- Pages are strictly ordered by ascending `chunk_index`. Semantically the cursor represents
+  "the highest `chunk_index` already returned"; `bamepd` MAY encode it opaquely, but the next
+  page always begins at the next higher held `chunk_index` with no gap and no repeat.
+- `resume_cursor` is present on a `ResumeDiscoveryPage` iff at least one more held chunk
+  remains; its absence means the aggregate is complete.
+- Every page is correlated to the current connection generation like any other response.
+- The Worker aggregates pages in order into the single HTTP `200` response body. If any page
+  cannot be obtained — disconnect, stale generation, `bamepd` returns
+  `ResumeDiscoveryPage{ decision: "denied" }` for the cursor — the Worker abandons the
+  partial aggregate and returns the generic `401`-shaped fail-closed response. It never
+  returns a partial `held_chunks` list as if it were complete.
+
+If a future M1 decision bounds one Transfer's held-chunk count such that the whole set
+provably fits one frame, this pagination degenerates to a single page (`resume_cursor` never
+present) with no contract change.
 
 ## Authority
 
 Every message above preserves ADR-0018's authority split: Worker only reports observed
-mechanical facts (bytes verified, digest computed) or requests a decision; `bamepd` is the
-only participant that decides authorization, durable chunk acceptance, and Artifact lifecycle
-transitions. No message in this catalog lets Worker submit a general database mutation,
-arbitrary query, or independent business decision. Worker holds no PostgreSQL repository
-Adapter and this contract gives it no path to one.
+mechanical facts (bytes verified, digest computed, size received) or requests a decision;
+`bamepd` is the only participant that decides authorization, durable chunk acceptance,
+manifest sealing, and Artifact lifecycle transitions. The transient handles do not give the
+Worker authority — `bamepd` independently re-validates current durable state on every commit,
+and a handle only ties a follow-up message to an operation `bamepd` already authorized this
+generation. No message in this catalog lets Worker submit a general database mutation,
+arbitrary durable-state query, or independent business decision: `ResumeDiscoveryQuery` is not
+a generic PostgreSQL read — it is one authorization-bound retrieval of one authorized
+Transfer's durable resume state. Worker holds no PostgreSQL repository Adapter and this
+contract gives it no path to one.
 
 ## Failure semantics
 
 - **UDS unavailable (no connection):** fail-closed. Worker must not authorize new work from
-  stale local assumptions, must not fabricate a `ChunkAcceptanceDecision`/
+  stale local assumptions, must not fabricate any `AuthorizationDecision`,
+  `ChunkAcceptanceDecision`, `ResumeDiscoveryPage`, `ManifestSealDecision`, or
   `ArtifactVerificationAck` outcome locally, and must not independently advance any Domain
-  state. Every HTTP request that would otherwise require an `AuthorizationQuery` instead
-  receives the same generic `401` denial defined by
-  `m0-data-plane-and-storage-contracts.md`, identical in shape to an ordinary authorization
-  denial — a distinguishable "try again later" response is deliberately not defined, since it
-  would leak Worker/`bamepd` operational state to an unauthenticated observer without helping a
-  legitimate Agent, whose retry/reconnection behavior is already governed by the Job lifecycle
-  contract rather than by HTTP error text.
-- **Disconnect with a request in flight:** the outstanding request is treated as failed/
-  uncertain, never as success. Worker must not report HTTP success for an operation whose
-  `AuthorizationDecision`, `ChunkAcceptanceDecision`, or `ArtifactVerificationAck` it never
-  received. Worker reconnects and, if the operation is retried, sends a fresh request (fresh
-  `message_id`); durable idempotency is governed by the identities in "Idempotency identities"
-  below, never by UDS `message_id`.
-- **Duplicate request after reconnect:** for `ChunkAcceptanceRequest`, `bamepd` recognizes an
-  already-committed identical `(transfer_id, chunk_index, digest)` and returns
-  `already_committed` rather than erroring or double-committing. The equivalent applies to a
-  repeated `seal_manifest` flow per `m0-data-plane-and-storage-contracts.md`.
-- **Stale response/unknown correlation:** a response whose `in_reply_to` does not match an
-  outstanding request on the current connection generation is discarded and never applied to
-  any state or surfaced to an HTTP client, per "Connection generations and correlation" above.
+  state. Every HTTP request that would otherwise require an authorizing request instead
+  receives the same generic `401` denial defined by `m0-data-plane-and-storage-contracts.md`,
+  identical in shape to an ordinary authorization denial — a distinguishable "try again later"
+  response is deliberately not defined, since it would leak Worker/`bamepd` operational state
+  to an unauthenticated observer without helping a legitimate Agent, whose
+  retry/reconnection behavior is already governed by the Job lifecycle contract rather than
+  by HTTP error text.
+- **Disconnect with a request in flight:** the outstanding request is treated as
+  failed/uncertain, never as success. Worker must not report HTTP success for an operation
+  whose authorizing decision, `ChunkAcceptanceDecision`, `ResumeDiscoveryPage`,
+  `ManifestSealDecision`, or `ArtifactVerificationAck` it never received. Worker reconnects
+  and, if the operation is retried, sends a fresh authorizing request (fresh `message_id`,
+  fresh `proof_id`); durable idempotency is governed by the identities in "Idempotency
+  identities", never by UDS `message_id` or by a transient handle.
+- **Disconnect during resume pagination:** the HTTP `GET .../chunks` fails closed with the
+  generic `401`-shaped response; any partial `held_chunks` aggregate is discarded. A fresh
+  request with a fresh proof restarts pagination from the first page.
+- **Disconnect after `ManifestSealDecision{sealed}` but before `ArtifactVerificationAck`:**
+  the Artifact durably remains `PendingVerification` — never falsely `Verified`, never lost
+  back to `Incomplete`. The HTTP `POST .../seal` fails closed; an idempotent seal retry
+  (`already_pending_verification`) re-drives verification.
+- **Duplicate authorizing request after reconnect:**
+  - `ChunkAcceptanceRequest` — `bamepd` recognizes an already-committed identical
+    `(transfer_id, chunk_index, digest)` and returns `already_committed`, never
+    double-committing.
+  - `ManifestSealRequest` — `bamepd` recognizes an identical already-sealed
+    `(transfer_id, chunk_count, artifact_digest)` and returns
+    `already_pending_verification`, never double-sealing.
+  - `ResumeDiscoveryQuery` — idempotent by nature (read-only); a fresh proof simply
+    re-authorizes and re-reads current durable state.
+- **Stale response / unknown correlation:** a response whose `in_reply_to` does not match an
+  outstanding request on the current connection generation, or a follow-up carrying a handle
+  or cursor from a prior generation, is discarded and never applied to any state or surfaced
+  to an HTTP client, per "Connection generations and correlation".
 - **Incompatible protocol version:** rejected explicitly at handshake (`HandshakeRejected`);
   no further message is processed on that connection. Worker retries reconnect per its own
   backoff policy, which is implementation-time.
-- **Malformed frame/message:** the receiver sends `ProtocolError` where the frame was at least
-  parseable enough to identify a correlation target, and otherwise simply closes the
-  connection; the peer reconnects and re-handshakes. Given this boundary is fully internal and
-  host-local, this Specification does not require the more elaborate degraded-operation
+- **Malformed frame/message:** the receiver sends `ProtocolError` where the frame was at
+  least parseable enough to identify a correlation target, and otherwise simply closes the
+  connection; the peer reconnects and re-handshakes. Given this boundary is fully internal
+  and host-local, this Specification does not require the more elaborate degraded-operation
   behavior Agent Protocol defines for its externally-facing connection.
 - Whether Worker stays alive and keeps reconnecting, or self-terminates and relies on
   `bamepd` supervision (ADR-0018) to respawn it, after prolonged UDS loss remains
@@ -246,24 +592,38 @@ identities:
 | Identity | Scope | Idempotency meaning |
 | --- | --- | --- |
 | UDS `message_id` | one message transmission on one connection generation | none; fresh per send, never a durable idempotency key |
-| UDS connection generation (`worker_instance_id` + handshake) | one Worker process lifetime/connection | scopes which outstanding requests/responses are still valid for correlation |
+| UDS connection generation (`worker_instance_id` + handshake) | one Worker process lifetime/connection | scopes which outstanding requests/responses and transient handles are still valid |
+| `acceptance_handle` / `resume_cursor` / `verification_handle` | one authorized operation instance on one connection generation | correlates a follow-up message to an already-authorized operation; **never** a durable identity, never persisted, discarded on disconnect |
 | `transfer_id` | durable logical Transfer | correlates every message about one Transfer; not itself sufficient for chunk-level idempotency |
-| `artifact_id` | durable logical Artifact | correlates Artifact-verification messages |
+| `artifact_id` | durable logical Artifact | correlation identity `bamepd` resolves from the Transfer / capability binding; not carried on this boundary |
 | capability identity (`SHA-256(token)`) | one issued capability instance | identifies which capability a proof is bound to; changes on renewal, is not a business idempotency key |
 | `proof_id` | one HTTP request attempt | single-use anti-replay only; a retried operation mints a fresh `proof_id`, per `m0-data-plane-and-storage-contracts.md` "Idempotent retry is not proof reuse" |
 | `(transfer_id, chunk_index, digest)` | one durable chunk identity | **the** idempotency key for `ChunkAcceptanceRequest`/durable chunk acceptance; a repeated request with this identical triple is always safe |
-| `(transfer_id, chunk_count, artifact_digest)` | one sealed manifest | the idempotency key for a repeated `seal_manifest` request once already sealed with identical declared values |
+| `(transfer_id, chunk_count, artifact_digest)` | one sealed manifest | **the** idempotency key for a repeated `ManifestSealRequest` once already sealed with identical declared values |
 
 Collapsing any of these — for example, treating a fresh `proof_id` as proof that a chunk must
-be new, or treating UDS `message_id` as a durable acceptance key — would either falsely reject
-a legitimate idempotent retry or falsely admit a replay; neither is acceptable.
+be new, treating UDS `message_id` as a durable acceptance key, or treating a transient handle
+as a durable idempotency key — would either falsely reject a legitimate idempotent retry or
+falsely admit a replay; neither is acceptable.
 
 ## Compatibility and unknown fields
 
-- Adding an optional field to any message in this catalog is a forward-compatible minor
-  change: the unaware peer ignores it.
-- A materially new message *type* or a new required field is a `protocol_version` change,
-  handled explicitly at handshake rather than silently negotiated per-message.
+- Adding an optional field to a message in this catalog, where the unaware peer can safely
+  ignore it, is a forward-compatible minor change within `protocol_version "2"`.
+- A materially new message *type*, a new required field, or a change to which participant
+  authoritatively derives a value is a `protocol_version` change, handled explicitly at
+  handshake rather than silently negotiated per-message. The `"1" -> "2"` revision in this
+  document is exactly such a change: new message types (`ResumeDiscoveryQuery`,
+  `ResumeDiscoveryContinue`, `ManifestSealRequest`), new required response fields
+  (`digest_algorithm`/`chunk_size`/`acceptance_handle` on an approved `AuthorizationDecision`,
+  `artifact_status` on `ArtifactVerificationAck`), removed request fields
+  (`operation`/`artifact_id`/`direction` from `AuthorizationQuery`), and a changed
+  `matches_expected` semantic (`bamepd` now compares digests authoritatively).
+- The optional-field allowance must not be used to overload `AuthorizationQuery`/
+  `AuthorizationDecision` (or any authorizing request) with unrelated durable-mutation or
+  generic-query semantics merely to avoid a version bump: authorization stays authorization,
+  durable seal stays an explicit `ManifestSealRequest`, and resume-state retrieval stays an
+  explicit authorization-bound `ResumeDiscoveryQuery`.
 - Worker ships with and is released alongside `bamepd` (ADR-0018), but this contract remains
   independently specified so a participant does not need synchronized Rust releases merely to
   add an optional field, and so a future non-Rust participant remains implementable from this
@@ -275,15 +635,26 @@ a legitimate idempotent retry or falsely admit a replay; neither is acceptable.
   private proof key (which never leaves the Agent and never crosses this boundary at all), and
   the Server TLS private key (which never crosses this boundary either, per ADR-0018) MUST be
   redacted from logs and debug output wherever this contract's messages are logged.
-- `proof_public_key` and its thumbprint are not themselves secret and may appear in
-  diagnostics.
-- `AuthorizationDecision{decision: "denied"}` carries no reason field precisely so that no
+- Transient handles (`acceptance_handle`, `resume_cursor`, `verification_handle`) are not
+  long-lived secrets, but carry no diagnostic value and SHOULD be redacted or abbreviated in
+  logs.
+- Chunk digests, the full-Artifact digest, and chunk sizes are integrity identities, not
+  secrets, and may appear in diagnostics. `proof_public_key` and its thumbprint are not
+  secret and may appear in diagnostics. Raw chunk bytes and reconstructed Artifact bytes
+  never cross this boundary and are never logged.
+- A `denied` outcome on any authorizing request (`AuthorizationDecision`,
+  `ResumeDiscoveryPage`, `ManifestSealDecision`) carries no reason field precisely so that no
   log/diagnostic derived from this contract can casually leak a more specific internal
   authorization reason (unknown transfer, wrong Endpoint, terminal Attempt, revoked
   credential, replay, wrong proof key, or another internal cause) into a Worker-side
-  observable surface. Precise internal diagnostics may still exist inside `bamepd` according
-  to its own observability policy (`m0-persistence-observability-and-domain-events.md`); this
-  contract does not carry them to Worker.
+  observable surface. The `rejected` reasons that *do* exist
+  (`chunk_identity_conflict`, `transfer_not_continuable`, `incomplete_manifest`,
+  `manifest_already_sealed`) are post-authorization semantic conflicts that
+  `m0-data-plane-and-storage-contracts.md` already exposes as distinct HTTP `409` codes, not
+  authorization-enumeration reasons. Precise internal authorization diagnostics may still
+  exist inside `bamepd` per its own observability policy
+  (`m0-persistence-observability-and-domain-events.md`); this contract does not carry them to
+  Worker.
 
 ## Out of scope
 
@@ -292,6 +663,8 @@ a legitimate idempotent retry or falsely admit a replay; neither is acceptable.
 - the concrete host-local mechanism by which Worker obtains Server TLS key material (ADR-0018
   requires it not cross this IPC protocol, but the concrete provisioning mechanism is
   implementation-time);
+- the concrete opaque encoding of transient handles (`bamepd` implementation choice, subject
+  only to the properties in "Transient operation handles");
 - process supervision/respawn mechanics (ADR-0018 topology, not this wire contract);
 - PostgreSQL schema and query mechanics;
 - the HTTPS data-plane request/response contract itself (owned by
@@ -301,20 +674,39 @@ a legitimate idempotent retry or falsely admit a replay; neither is acceptable.
 
 At minimum:
 
-- handshake success/incompatible-version rejection, including the pre-handshake protocol
-  violation for any other message type;
+- handshake success and incompatible-version rejection, including a `"1"` peer against a
+  `"2"`-only peer, and the pre-handshake protocol violation for any other message type;
 - frame length-prefix parsing, including the oversized-frame rejection boundary;
-- unknown `type` rejection and unknown-field forward compatibility;
+- unknown `type` rejection (after a compatible handshake) and unknown-field forward
+  compatibility;
 - `AuthorizationQuery`/`AuthorizationDecision` for approved and denied cases, including that
-  `denied` never carries a reason;
-- `ChunkAcceptanceRequest` for new-identity commit, idempotent already-committed replay, and
-  rejected/conflicting identity;
-- `ArtifactVerificationReport`/`ArtifactVerificationAck` committing the correct
-  `PendingVerification -> Verified | Failed` transition;
-- UDS disconnect with a request in flight never producing a fabricated success;
-- stale response/unknown correlation discarded without effect;
-- reconnect after Worker restart completing a fresh handshake and connection generation;
-- fail-closed HTTP behavior (generic `401`) while UDS is unavailable.
+  `approved` carries `digest_algorithm`/`chunk_size`/`acceptance_handle` and `denied` carries
+  none of them and no reason;
+- proof-transcript reconstruction using `artifact_id`/`direction` from the capability binding,
+  including that a proof signed over a different `artifact_id`/`direction` fails closed;
+- `ChunkAcceptanceRequest` for new-identity commit, idempotent `already_committed` replay,
+  and each `rejected` reason mapping to its HTTP `409` code; a `ChunkAcceptanceRequest`
+  carrying a foreign/stale `acceptance_handle` rejected;
+- `ResumeDiscoveryQuery`/`ResumeDiscoveryPage` returning only durable held chunks, never
+  Worker-local staged bytes; approved vs denied; `expected_chunk_count` omitted before
+  sealing and present after;
+- resume pagination: multi-page aggregation, ascending order with no gap/repeat, every frame
+  within 1 MiB, stale-cursor denial, and disconnect-during-pagination failing the HTTP
+  request closed with no partial list;
+- `ManifestSealRequest`/`ManifestSealDecision` for first `sealed`, idempotent
+  `already_pending_verification`, `incomplete_manifest`, `manifest_already_sealed`, and
+  `denied` for a terminal owning Attempt; authoritative `expected_artifact_digest`/
+  `chunk_count` returned on success;
+- `ArtifactVerificationReport`/`ArtifactVerificationAck`: `bamepd` compares
+  `computed_artifact_digest` to its own durable expected value and returns the authoritative
+  `artifact_status`; a report cannot drive `Verified` by assertion;
+- UDS disconnect with a request in flight never producing a fabricated success, for every
+  authorizing request and follow-up;
+- disconnect after the seal first-commit leaving the Artifact durably `PendingVerification`;
+- stale response / stale handle / stale cursor discarded without effect;
+- reconnect after Worker restart completing a fresh handshake and connection generation, and
+  every prior-generation handle/cursor rejected;
+- fail-closed HTTP behavior (generic `401`) while UDS is unavailable, for every operation.
 
 Contract tests exercise the real framing/message shapes; Simulator-level scenarios exercising
 this boundary must not bypass it through in-process shortcuts, consistent with
@@ -327,9 +719,11 @@ requirement applied to this analogous internal boundary.
 - ADR-0003 — Worker/Agent language and contract-independence requirement.
 - ADR-0008 — data-plane transport/chunking/resumability rationale.
 - ADR-0018 — isolated Worker data-plane process boundary; UDS direction and durable-authority
-  split this contract implements.
+  split this contract implements, and which explicitly leaves the concrete IPC message
+  catalog (including its versioning) to this Specification.
 - `m0-data-plane-and-storage-contracts.md` — HTTPS data-plane v1 contract, proof
-  canonicalization, and durable chunk-acceptance ordering this IPC contract serves.
+  canonicalization, full-Artifact byte reconstruction, and durable chunk-acceptance ordering
+  this IPC contract serves.
 - `m0-agent-protocol-contract.md` — the separate Agent Protocol boundary `bamepd` alone
   remains responsible for; Worker never emits Agent Protocol messages.
 - `m0-persistence-observability-and-domain-events.md` — durable state/audit authority
@@ -338,3 +732,5 @@ requirement applied to this analogous internal boundary.
   this contract's messages ultimately serve.
 - `docs/reference/worker-data-plane-composition-spike.md` — empirical evidence for the Worker
   process/listener/IPC composition this contract's framing choices build on.
+- `docs/reference/transfer-resumability-spike.md` — empirical evidence for chunked
+  reconstruction and the held-chunk-set scale that motivates resume pagination.
