@@ -8,15 +8,19 @@
 //! (ADR-0003's contract-independence constraint) — this crate does not
 //! redefine it, and must never be treated as authoritative over it.
 //!
-//! Scope: this crate implements the handshake/protocol-error message slice
-//! `WorkerHello`/`ServerHello`/`HandshakeRejected`/`ProtocolError` (Issue
-//! #37) plus `AuthorizationQuery`/`AuthorizationDecision` (Issue #38), plus
-//! the common envelope, framing, and codec machinery. The remaining business
-//! message catalog (`ChunkAcceptanceRequest`/`ChunkAcceptanceDecision`,
-//! `ArtifactVerificationReport`/`ArtifactVerificationAck`) is deliberately
-//! not represented here yet — #39 does not yet implement their business
-//! behavior, and this crate does not add unused wire machinery ahead of the
-//! Work Package that needs it.
+//! Scope: this crate implements the **complete** Worker Protocol v1 message
+//! catalog (`m1-worker-data-plane-control-contract.md` "Minimum messages"):
+//! the handshake/error slice `WorkerHello`/`ServerHello`/`HandshakeRejected`/
+//! `ProtocolError`, chunk-upload authorization `AuthorizationQuery`/
+//! `AuthorizationDecision`, verified-chunk durable acceptance
+//! `ChunkAcceptanceRequest`/`ChunkAcceptanceDecision`, resume discovery and
+//! pagination `ResumeDiscoveryQuery`/`ResumeDiscoveryPage`/
+//! `ResumeDiscoveryContinue`, seal first durable commit `ManifestSealRequest`/
+//! `ManifestSealDecision`, and full-Artifact verification
+//! `ArtifactVerificationReport`/`ArtifactVerificationAck` — plus the common
+//! envelope, framing, and codec machinery. #39 completes the partial #37/#38
+//! rendering to this catalog without a `protocol_version` increment
+//! (`m1-worker-data-plane-control-contract.md` "Freeze point for v1").
 //!
 //! This crate carries no Domain, Server, PostgreSQL, HTTP framework, or
 //! storage dependency: only `bamep-worker-protocol` itself, `serde`,
@@ -37,9 +41,18 @@ pub use framing::{
     SendError, MAX_FRAME_PAYLOAD_BYTES,
 };
 pub use messages::{
-    AuthorizationDecisionBody, AuthorizationDecisionMessage, AuthorizationDecisionOutcome,
-    AuthorizationOperation, AuthorizationQueryBody, AuthorizationQueryMessage,
-    HandshakeRejectedBody, HandshakeRejectedMessage, HandshakeRejectionReason, ProtocolErrorBody,
-    ProtocolErrorMessage, ServerHelloBody, ServerHelloMessage, WireTransferDirection,
-    WorkerHelloBody, WorkerHelloMessage, WorkerProtocolMessage,
+    ArtifactVerificationAckBody, ArtifactVerificationAckMessage, ArtifactVerificationAckOutcome,
+    ArtifactVerificationReportBody, ArtifactVerificationReportMessage, AuthorizationDecisionBody,
+    AuthorizationDecisionMessage, AuthorizationDecisionOutcome, AuthorizationQueryBody,
+    AuthorizationQueryMessage, ChunkAcceptanceDecisionBody, ChunkAcceptanceDecisionMessage,
+    ChunkAcceptanceOutcome, ChunkAcceptanceRejectionReason, ChunkAcceptanceRequestBody,
+    ChunkAcceptanceRequestMessage, HandshakeRejectedBody, HandshakeRejectedMessage,
+    HandshakeRejectionReason, HeldChunk, ManifestSealDecisionBody, ManifestSealDecisionMessage,
+    ManifestSealOutcome, ManifestSealRejectionReason, ManifestSealRequestBody,
+    ManifestSealRequestMessage, ProtocolErrorBody, ProtocolErrorMessage,
+    ResumeDiscoveryContinueBody, ResumeDiscoveryContinueMessage, ResumeDiscoveryDecision,
+    ResumeDiscoveryPageBody, ResumeDiscoveryPageMessage, ResumeDiscoveryQueryBody,
+    ResumeDiscoveryQueryMessage, SealedManifestFacts, ServerHelloBody, ServerHelloMessage,
+    WireArtifactStatus, WireDigestAlgorithm, WorkerHelloBody, WorkerHelloMessage,
+    WorkerProtocolMessage,
 };

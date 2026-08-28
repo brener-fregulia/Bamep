@@ -53,8 +53,8 @@ use bamep_server::runtime::resource_arbiter::{
 };
 use bamep_server::runtime::worker_authority::WorkerAuthorityRegistry;
 use bamep_worker_protocol::{
-    receive, send, AuthorizationDecisionOutcome, AuthorizationOperation, AuthorizationQueryMessage,
-    ServerHelloMessage, WireTransferDirection, WorkerHelloMessage, WorkerProtocolMessage,
+    receive, send, AuthorizationDecisionOutcome, AuthorizationQueryMessage, ServerHelloMessage,
+    WorkerHelloMessage, WorkerProtocolMessage,
 };
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
@@ -370,11 +370,11 @@ async fn agent_issued_capability_is_approved_by_a_real_worker_uds_query() {
     let proof_id = bamep_domain::ProofId::generate();
     let issued_at_millis = Utc::now().timestamp_millis() as u64;
     let transcript_fields = bamep_domain::ProofTranscriptFields {
-        operation: bamep_domain::AuthorizationOperation::ResumeDiscovery,
+        operation: bamep_domain::AuthorizationOperation::ChunkUpload,
         transfer_id: fixture.transfer_id,
         artifact_id: fixture.artifact_id,
         direction: TransferDirection::AgentToServer,
-        chunk_index: None,
+        chunk_index: Some(0),
         proof_id,
         issued_at_millis,
     };
@@ -382,13 +382,13 @@ async fn agent_issued_capability_is_approved_by_a_real_worker_uds_query() {
     let signature = signing_key.sign(&transcript);
     let signature = bamep_domain::ProofSignature::from_bytes(signature.to_bytes());
 
+    // `artifact_id`/`direction` are signed into the 137-byte transcript but
+    // never carried on the v1 wire message — `bamepd` reconstructs them from
+    // the capability binding it granted on the Agent WSS side.
     let query = AuthorizationQueryMessage::new(
         token,
-        AuthorizationOperation::ResumeDiscovery,
         fixture.transfer_id.0,
-        fixture.artifact_id.0,
-        WireTransferDirection::AgentToServer,
-        None,
+        0,
         proof_id.to_wire_value(),
         issued_at_millis,
         signature.to_wire_value(),

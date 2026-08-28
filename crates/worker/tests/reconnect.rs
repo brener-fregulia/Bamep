@@ -16,9 +16,8 @@ use std::time::Duration;
 
 use bamep_worker::ipc::{authorization_channel, run_client_loop, AuthorityTracker, QueryError};
 use bamep_worker_protocol::{
-    receive, send, AuthorizationDecisionMessage, AuthorizationOperation, AuthorizationQueryMessage,
-    HandshakeRejectedMessage, ProtocolVersion, ServerHelloMessage, WireTransferDirection,
-    WorkerProtocolMessage,
+    receive, send, AuthorizationDecisionMessage, AuthorizationQueryMessage,
+    HandshakeRejectedMessage, ProtocolVersion, ServerHelloMessage, WorkerProtocolMessage,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::time::timeout;
@@ -333,11 +332,8 @@ async fn a_malformed_handshake_rejected_never_becomes_available() {
 fn sample_authorization_query() -> AuthorizationQueryMessage {
     AuthorizationQueryMessage::new(
         "opaque-token",
-        AuthorizationOperation::ResumeDiscovery,
         Uuid::new_v4(),
-        Uuid::new_v4(),
-        WireTransferDirection::AgentToServer,
-        None,
+        0,
         "proof-id-value",
         1_700_000_000_000,
         "signature-value",

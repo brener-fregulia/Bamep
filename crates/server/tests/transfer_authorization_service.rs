@@ -622,8 +622,6 @@ fn signed_query_input(
         token: token.to_string(),
         operation: bamep_domain::AuthorizationOperation::ResumeDiscovery,
         transfer_id: transfer_id.0,
-        artifact_id: artifact_id.0,
-        direction: TransferDirection::AgentToServer,
         chunk_index: None,
         proof_id: proof_id.to_wire_value(),
         issued_at_millis,
@@ -883,8 +881,6 @@ fn signed_query_for(
         token: token.to_string(),
         operation,
         transfer_id: transfer_id.0,
-        artifact_id: artifact_id.0,
-        direction: TransferDirection::AgentToServer,
         chunk_index,
         proof_id: proof_id.to_wire_value(),
         issued_at_millis,
@@ -911,6 +907,24 @@ async fn decide_for(
         bamep_domain::ProofId::generate(),
     );
     services.authorization.decide(input).await.unwrap()
+}
+
+/// Asserts `outcome` is `Approved` and carries exactly `expected` as its
+/// `expected_chunk_digest`, ignoring the authoritative
+/// `digest_algorithm`/`chunk_size` manifest facts every approved decision
+/// also carries (`m1-worker-data-plane-control-contract.md` "Chunk-upload
+/// authorization").
+fn assert_approved_with_expected_digest(
+    outcome: WorkerAuthorizationOutcome,
+    expected: Option<String>,
+) {
+    match outcome {
+        WorkerAuthorizationOutcome::Approved {
+            expected_chunk_digest,
+            ..
+        } => assert_eq!(expected_chunk_digest, expected),
+        other => panic!("expected Approved, got {other:?}"),
+    }
 }
 
 /// §27/§10/§11 — the Artifact-state x operation matrix, derived from
@@ -1146,51 +1160,45 @@ async fn expected_chunk_digest_behavior() {
         .unwrap();
 
     // A. known chunk index -> approved with the exact canonical digest.
-    assert_eq!(
+    assert_approved_with_expected_digest(
         decide_for(
             &services,
             &token,
             &signing_key,
             &fixture,
             Op::ChunkUpload,
-            Some(3)
+            Some(3),
         )
         .await,
-        WorkerAuthorizationOutcome::Approved {
-            expected_chunk_digest: Some(digest_wire(&known_digest)),
-        }
+        Some(digest_wire(&known_digest)),
     );
 
     // B. unknown/new index (unsealed, continuation allowed) -> approved, digest omitted.
-    assert_eq!(
+    assert_approved_with_expected_digest(
         decide_for(
             &services,
             &token,
             &signing_key,
             &fixture,
             Op::ChunkUpload,
-            Some(9)
+            Some(9),
         )
         .await,
-        WorkerAuthorizationOutcome::Approved {
-            expected_chunk_digest: None,
-        }
+        None,
     );
 
     // C. non-chunk operation -> digest omitted.
-    assert_eq!(
+    assert_approved_with_expected_digest(
         decide_for(
             &services,
             &token,
             &signing_key,
             &fixture,
             Op::ResumeDiscovery,
-            None
+            None,
         )
         .await,
-        WorkerAuthorizationOutcome::Approved {
-            expected_chunk_digest: None,
-        }
+        None,
     );
 
     // D. incompatible Artifact state -> denied.

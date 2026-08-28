@@ -23,6 +23,15 @@ const KNOWN_MESSAGE_TYPES: &[&str] = &[
     "HandshakeRejected",
     "AuthorizationQuery",
     "AuthorizationDecision",
+    "ChunkAcceptanceRequest",
+    "ChunkAcceptanceDecision",
+    "ResumeDiscoveryQuery",
+    "ResumeDiscoveryPage",
+    "ResumeDiscoveryContinue",
+    "ManifestSealRequest",
+    "ManifestSealDecision",
+    "ArtifactVerificationReport",
+    "ArtifactVerificationAck",
     "ProtocolError",
 ];
 
@@ -148,41 +157,34 @@ mod tests {
     /// `DecodeError::UnknownType`.
     #[test]
     fn every_real_message_variant_round_trips_without_being_classified_unknown() {
-        use crate::messages::{
-            AuthorizationDecisionMessage, AuthorizationOperation, AuthorizationQueryMessage,
-            HandshakeRejectedMessage, ServerHelloMessage, WireTransferDirection,
-        };
-
-        let variants = [
-            WorkerProtocolMessage::WorkerHello(WorkerHelloMessage::new(Uuid::new_v4())),
-            WorkerProtocolMessage::ServerHello(ServerHelloMessage::new(Uuid::new_v4())),
-            WorkerProtocolMessage::HandshakeRejected(
-                HandshakeRejectedMessage::incompatible_version(Uuid::new_v4()),
-            ),
-            WorkerProtocolMessage::AuthorizationQuery(AuthorizationQueryMessage::new(
-                "t",
-                AuthorizationOperation::ChunkUpload,
-                Uuid::new_v4(),
-                Uuid::new_v4(),
-                WireTransferDirection::AgentToServer,
-                Some(0),
-                "p",
-                1,
-                "s",
-            )),
-            WorkerProtocolMessage::AuthorizationDecision(AuthorizationDecisionMessage::approved(
-                Uuid::new_v4(),
-                None,
-            )),
-            WorkerProtocolMessage::ProtocolError(ProtocolErrorMessage::new("some_code")),
-        ];
-        for variant in variants {
+        for variant in crate::messages::tests_support::one_of_each_variant() {
             let encoded = encode(&variant).expect("encode");
             match decode(&encoded) {
                 Ok(_) => {}
                 Err(err) => panic!("real variant misclassified: {err}"),
             }
         }
+    }
+
+    /// Every wire `type` string in [`KNOWN_MESSAGE_TYPES`] must actually be
+    /// produced by some real [`WorkerProtocolMessage`] variant, and every
+    /// real variant's `type` must be listed — so the list cannot drift out
+    /// of sync with the enum in either direction.
+    #[test]
+    fn known_message_types_exactly_matches_the_real_variant_set() {
+        let mut produced: Vec<String> = crate::messages::tests_support::one_of_each_variant()
+            .iter()
+            .map(|m| {
+                serde_json::to_value(m).expect("encode")["type"]
+                    .as_str()
+                    .expect("type string")
+                    .to_string()
+            })
+            .collect();
+        produced.sort();
+        let mut known: Vec<String> = KNOWN_MESSAGE_TYPES.iter().map(|s| s.to_string()).collect();
+        known.sort();
+        assert_eq!(produced, known);
     }
 
     #[test]

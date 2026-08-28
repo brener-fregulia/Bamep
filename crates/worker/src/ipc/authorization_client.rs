@@ -105,21 +105,10 @@ pub type AuthorizationPublisher = Publisher;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamep_worker_protocol::{AuthorizationOperation, WireTransferDirection};
     use uuid::Uuid;
 
     fn sample_query() -> AuthorizationQueryMessage {
-        AuthorizationQueryMessage::new(
-            "token",
-            AuthorizationOperation::ResumeDiscovery,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            WireTransferDirection::AgentToServer,
-            None,
-            "proof-id",
-            1,
-            "signature",
-        )
+        AuthorizationQueryMessage::new("token", Uuid::new_v4(), 0, "proof-id", 1, "signature")
     }
 
     #[tokio::test]

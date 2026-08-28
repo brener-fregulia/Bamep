@@ -43,8 +43,8 @@ use bamep_server::runtime::resource_arbiter::{
 };
 use bamep_server::runtime::worker_authority::WorkerAuthorityRegistry;
 use bamep_worker_protocol::{
-    receive, send, AuthorizationDecisionOutcome, AuthorizationOperation, AuthorizationQueryMessage,
-    ServerHelloMessage, WireTransferDirection, WorkerHelloMessage, WorkerProtocolMessage,
+    receive, send, AuthorizationDecisionOutcome, AuthorizationQueryMessage, ServerHelloMessage,
+    WorkerHelloMessage, WorkerProtocolMessage,
 };
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
@@ -220,6 +220,10 @@ async fn issue_capability(
     token
 }
 
+/// A real, byte-identical `chunk_upload` `AuthorizationQuery` for
+/// `chunk_index 0`. `artifact_id`/`direction` are signed into the 137-byte
+/// transcript (that layout is unchanged) but never carried on the v1 wire
+/// message — `bamepd` reconstructs them from the capability binding.
 fn signed_authorization_query(
     signing_key: &SigningKey,
     token: &str,
@@ -229,11 +233,11 @@ fn signed_authorization_query(
     let proof_id = bamep_domain::ProofId::generate();
     let issued_at_millis = Utc::now().timestamp_millis() as u64;
     let fields = bamep_domain::ProofTranscriptFields {
-        operation: bamep_domain::AuthorizationOperation::ResumeDiscovery,
+        operation: bamep_domain::AuthorizationOperation::ChunkUpload,
         transfer_id: fixture.transfer_id,
         artifact_id: fixture.artifact_id,
         direction: TransferDirection::AgentToServer,
-        chunk_index: None,
+        chunk_index: Some(0),
         proof_id,
         issued_at_millis,
     };
@@ -243,11 +247,8 @@ fn signed_authorization_query(
 
     AuthorizationQueryMessage::new(
         token,
-        AuthorizationOperation::ResumeDiscovery,
         fixture.transfer_id.0,
-        fixture.artifact_id.0,
-        WireTransferDirection::AgentToServer,
-        None,
+        0,
         proof_id.to_wire_value(),
         issued_at_millis,
         signature.to_wire_value(),

@@ -136,7 +136,7 @@ mod imp {
     use bamep_worker_protocol::{
         receive, send, AuthorizationDecisionMessage, AuthorizationQueryMessage, DecodeError,
         HandshakeRejectedMessage, ProtocolErrorMessage, ReceiveError, ServerHelloMessage,
-        WorkerProtocolMessage,
+        WireDigestAlgorithm, WorkerProtocolMessage,
     };
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::watch;
@@ -537,33 +537,25 @@ mod imp {
         }
     }
 
-    /// Converts a wire `AuthorizationOperation`/`WireTransferDirection` into
-    /// their Domain equivalents. Both are already closed, exhaustively
-    /// matched enums, so this conversion is total — never a parse failure.
-    fn to_domain_operation(
-        operation: bamep_worker_protocol::AuthorizationOperation,
-    ) -> bamep_domain::AuthorizationOperation {
-        match operation {
-            bamep_worker_protocol::AuthorizationOperation::ChunkUpload => {
-                bamep_domain::AuthorizationOperation::ChunkUpload
-            }
-            bamep_worker_protocol::AuthorizationOperation::ResumeDiscovery => {
-                bamep_domain::AuthorizationOperation::ResumeDiscovery
-            }
-            bamep_worker_protocol::AuthorizationOperation::SealManifest => {
-                bamep_domain::AuthorizationOperation::SealManifest
-            }
+    fn to_wire_digest_algorithm(algorithm: bamep_domain::DigestAlgorithm) -> WireDigestAlgorithm {
+        match algorithm {
+            bamep_domain::DigestAlgorithm::Sha256 => WireDigestAlgorithm::Sha256,
         }
     }
 
-    fn to_domain_direction(
-        direction: bamep_worker_protocol::WireTransferDirection,
-    ) -> bamep_domain::TransferDirection {
-        match direction {
-            bamep_worker_protocol::WireTransferDirection::AgentToServer => {
-                bamep_domain::TransferDirection::AgentToServer
-            }
-        }
+    /// Mints one transient, generation-scoped `acceptance_handle`
+    /// (`m1-worker-data-plane-control-contract.md` "Transient operation
+    /// handles"): opaque to the Worker, minted by `bamepd` in the response to
+    /// an authorizing request.
+    ///
+    /// v4 UUIDs draw 122 bits from the OS CSPRNG (`getrandom`), so a fresh
+    /// value is collision-safe as an opaque token. The generation-scoped
+    /// single-use *store* that binds this handle to one `(transfer_id,
+    /// chunk_index, proof_id)` and rejects a foreign/stale one on the
+    /// matching `ChunkAcceptanceRequest` is added by #39 Phase B; no
+    /// `ChunkAcceptanceRequest` handler consumes it yet.
+    fn mint_acceptance_handle() -> String {
+        format!("acc_{}", Uuid::new_v4().simple())
     }
 
     /// Converts one received `AuthorizationQuery` into the Application-layer
@@ -575,13 +567,15 @@ mod imp {
         transfer_authorization: &TransferAuthorizationService,
         query: &AuthorizationQueryMessage,
     ) -> AuthorizationDecisionMessage {
+        // An `AuthorizationQuery` always implies `operation = chunk_upload`
+        // and always carries a `chunk_index` (the message type is the
+        // operation — `m1-worker-data-plane-control-contract.md` "Operations,
+        // HTTP mapping, and transcript inputs").
         let input = WorkerAuthorizationQueryInput {
             token: query.body.token.clone(),
-            operation: to_domain_operation(query.body.operation),
+            operation: bamep_domain::AuthorizationOperation::ChunkUpload,
             transfer_id: query.body.transfer_id,
-            artifact_id: query.body.artifact_id,
-            direction: to_domain_direction(query.body.direction),
-            chunk_index: query.body.chunk_index,
+            chunk_index: Some(query.body.chunk_index),
             proof_id: query.body.proof_id.clone(),
             issued_at_millis: query.body.issued_at,
             signature: query.body.signature.clone(),
@@ -589,8 +583,16 @@ mod imp {
         let request_id = query.envelope.message_id;
         match transfer_authorization.decide(input).await {
             Ok(WorkerAuthorizationOutcome::Approved {
+                digest_algorithm,
+                chunk_size,
                 expected_chunk_digest,
-            }) => AuthorizationDecisionMessage::approved(request_id, expected_chunk_digest),
+            }) => AuthorizationDecisionMessage::approved(
+                request_id,
+                to_wire_digest_algorithm(digest_algorithm),
+                chunk_size,
+                mint_acceptance_handle(),
+                expected_chunk_digest,
+            ),
             Ok(WorkerAuthorizationOutcome::Denied) => {
                 AuthorizationDecisionMessage::denied(request_id)
             }

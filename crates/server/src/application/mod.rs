@@ -18,15 +18,15 @@ use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_domain::{
     build_proof_transcript, capability_is_current, capability_matches_request,
     evaluate_final_destructive_dispatch, evaluate_transfer_dispatch, proof_is_fresh, transitions,
-    verify_proof_signature, ActionEvidence, ActionEvidenceOutcome, ActionId, Actor, ArtifactId,
-    Attempt, AttemptState, AuditRecord, AuthorizationOperation, BootContext, BootNonce,
-    CancelAckEvidence, CancellationRequestOutcome, CapabilityBinding, CapabilityId,
-    CapabilityToken, DestructiveIntent, DigestAlgorithm, EmptyWorkflow, EndpointId,
-    FinalDispatchInputs, FinalDispatchOutcome, FinalDispatchRejection, IdentityState,
-    InvalidIdentityTransition, InventoryRevision, InventorySnapshot, Job, JobId, JobStepId,
-    ProofId, ProofPublicKey, ProofSignature, ProofTranscriptFields, RequestedOperation, Transfer,
-    TransferDirection, TransferDispatchInputs, TransferDispatchRejection, TransferId,
-    TrustedBootstrapState, DEFAULT_CAPABILITY_TTL_MILLIS, DEFAULT_CREDENTIAL_TTL,
+    verify_proof_signature, ActionEvidence, ActionEvidenceOutcome, ActionId, Actor, Attempt,
+    AttemptState, AuditRecord, AuthorizationOperation, BootContext, BootNonce, CancelAckEvidence,
+    CancellationRequestOutcome, CapabilityBinding, CapabilityId, CapabilityToken,
+    DestructiveIntent, DigestAlgorithm, EmptyWorkflow, EndpointId, FinalDispatchInputs,
+    FinalDispatchOutcome, FinalDispatchRejection, IdentityState, InvalidIdentityTransition,
+    InventoryRevision, InventorySnapshot, Job, JobId, JobStepId, ProofId, ProofPublicKey,
+    ProofSignature, ProofTranscriptFields, RequestedOperation, Transfer, TransferDirection,
+    TransferDispatchInputs, TransferDispatchRejection, TransferId, TrustedBootstrapState,
+    DEFAULT_CAPABILITY_TTL_MILLIS, DEFAULT_CREDENTIAL_TTL,
 };
 use bamep_trusted_bootstrap::{AcceptedSiteKeys, BootstrapAssertion, ServerCertFingerprint};
 use chrono::{DateTime, Duration, Utc};
@@ -2320,18 +2320,24 @@ pub enum TransferAuthorizationOutcome {
     ProtocolViolation,
 }
 
-/// The exact fields Worker forwards from one `AuthorizationQuery`
-/// (`m1-worker-data-plane-control-contract.md` "Authorization query /
-/// decision"), already converted from wire types into this layer's working
-/// representation by the UDS Adapter — this struct itself carries no
+/// The exact fields Worker forwards from one authorizing request
+/// (`m1-worker-data-plane-control-contract.md` "Operations, HTTP mapping, and
+/// transcript inputs"), already converted from wire types into this layer's
+/// working representation by the UDS Adapter — this struct itself carries no
 /// `bamep-worker-protocol` dependency.
+///
+/// Under Worker Protocol v1 no authorizing request carries `artifact_id` or
+/// `direction`: `bamepd` reconstructs both from the capability binding it
+/// controls, never from the wire. `operation` is implied by the authorizing
+/// request's message type (`AuthorizationQuery` -> `chunk_upload`,
+/// `ResumeDiscoveryQuery` -> `resume_discovery`, `ManifestSealRequest` ->
+/// `seal_manifest`) and set here by the Adapter, never read off a wire field.
+/// `chunk_index` is `Some` only for `chunk_upload`.
 #[derive(Debug, Clone)]
 pub struct WorkerAuthorizationQueryInput {
     pub token: String,
     pub operation: AuthorizationOperation,
     pub transfer_id: uuid::Uuid,
-    pub artifact_id: uuid::Uuid,
-    pub direction: TransferDirection,
     pub chunk_index: Option<u64>,
     pub proof_id: String,
     pub issued_at_millis: u64,
@@ -2339,17 +2345,19 @@ pub struct WorkerAuthorizationQueryInput {
 }
 
 /// Outcome of [`TransferAuthorizationService::decide`]
-/// (`m1-worker-data-plane-control-contract.md` "Authorization query /
-/// decision"). `Denied` never carries a reason, mirroring
+/// (`m1-worker-data-plane-control-contract.md` "Chunk-upload authorization").
+/// `Denied` never carries a reason, mirroring
 /// [`TransferAuthorizationOutcome::Denied`] — Worker must never be able to
-/// observe why. `expected_chunk_digest` is never populated by this Work
-/// Package (durable chunk-identity lookup is #39's
-/// `ChunkAcceptanceRequest`/`ChunkAcceptanceDecision` scope); the field
-/// exists so a future #39 change extends this outcome rather than
-/// introducing a second one.
+/// observe why. `Approved` carries the authoritative durable manifest facts
+/// (`digest_algorithm`, `chunk_size`) the Worker MUST use to bound and hash
+/// the body, plus `expected_chunk_digest` when `chunk_index` is already
+/// durable. The transient generation-scoped `acceptance_handle` is minted by
+/// the UDS Adapter, which owns the connection-generation context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerAuthorizationOutcome {
     Approved {
+        digest_algorithm: DigestAlgorithm,
+        chunk_size: u32,
         expected_chunk_digest: Option<String>,
     },
     Denied,
@@ -2541,15 +2549,23 @@ impl TransferAuthorizationService {
 
         let now = self.clock.now();
 
-        // 2. capability current / expiry / epoch and operation scope binding
+        // 2. capability current / expiry / epoch and operation scope binding.
+        // `artifact_id` and `direction` are reconstructed from the capability
+        // binding `bamepd` controls, never from the wire
+        // (`m1-worker-data-plane-control-contract.md` "Operations, HTTP
+        // mapping, and transcript inputs"). `transfer_id` and `chunk_index`
+        // are the wire/route values, so `capability_matches_request` still
+        // meaningfully rejects a `token` presented for a different Transfer,
+        // and still enforces the operation/`chunk_index` presence rule.
         if capability_is_current(&binding, now, self.capabilities.epoch()).is_err() {
             return Ok(WorkerAuthorizationOutcome::Denied);
         }
+        let operation = input.operation;
         let requested = RequestedOperation {
-            operation: input.operation,
+            operation,
             transfer_id: TransferId(input.transfer_id),
-            artifact_id: ArtifactId(input.artifact_id),
-            direction: input.direction,
+            artifact_id: binding.artifact_id,
+            direction: binding.direction,
             chunk_index: input.chunk_index,
         };
         if capability_matches_request(&binding, &requested).is_err() {
@@ -2569,14 +2585,20 @@ impl TransferAuthorizationService {
             return Ok(WorkerAuthorizationOutcome::Denied);
         }
 
-        // 5. signature over the independently reconstructed canonical transcript
+        // 5. signature over the independently reconstructed canonical
+        // transcript. `artifact_id`/`direction` come from the capability
+        // binding: a proof the Agent signed over a different
+        // `artifact_id`/`direction` than `token` is bound to simply fails
+        // verification here and is denied with the generic non-enumerable
+        // denial (`m1-worker-data-plane-control-contract.md` "Operations,
+        // HTTP mapping, and transcript inputs").
         let transcript = build_proof_transcript(
             &capability_id,
             &ProofTranscriptFields {
-                operation: input.operation,
+                operation,
                 transfer_id: requested.transfer_id,
-                artifact_id: requested.artifact_id,
-                direction: input.direction,
+                artifact_id: binding.artifact_id,
+                direction: binding.direction,
                 chunk_index: input.chunk_index,
                 proof_id,
                 issued_at_millis: input.issued_at_millis,
@@ -2625,17 +2647,18 @@ impl TransferAuthorizationService {
         // §10–§11). A `chunk_index` beyond the manifest's 32-bit index space
         // can never have a durable expected identity — fail closed rather
         // than treat it as a fresh continuation.
-        let chunk_index_u32 = match input.chunk_index {
+        let expected_chunk = match input.chunk_index {
             Some(index) => match u32::try_from(index) {
-                Ok(index) => Some(bamep_domain::ChunkIndex(index)),
+                Ok(index) => state
+                    .manifest
+                    .expected_chunk(bamep_domain::ChunkIndex(index))
+                    .cloned(),
                 Err(_) => return Ok(WorkerAuthorizationOutcome::Denied),
             },
             None => None,
         };
-        let expected_chunk =
-            chunk_index_u32.and_then(|index| state.manifest.expected_chunk(index).cloned());
         if bamep_domain::data_plane_operation_is_current(
-            input.operation,
+            operation,
             state.artifact.state,
             state.manifest.sealed,
             expected_chunk.is_some(),
@@ -2666,22 +2689,18 @@ impl TransferAuthorizationService {
             return Ok(WorkerAuthorizationOutcome::Denied);
         }
 
-        // 8. approved. For an approved `chunk_upload` whose `chunk_index`
-        // already carries a durable expected identity, carry that recorded
-        // expected digest so the Worker can enforce the manifest identity
-        // (`m1-worker-data-plane-control-contract.md` "Authorization query /
-        // decision"). #38 only *carries* the expected digest; the Worker's
-        // comparison against the Agent-declared digest and the resulting
-        // HTTP `409` is #39 (correction §14).
-        let expected_chunk_digest = match input.operation {
-            AuthorizationOperation::ChunkUpload => {
-                expected_chunk.map(|chunk| chunk.digest.to_wire_value())
-            }
-            AuthorizationOperation::ResumeDiscovery | AuthorizationOperation::SealManifest => None,
-        };
-
+        // 8. approved. Carry the authoritative durable manifest facts
+        // (`digest_algorithm`, `chunk_size`) the Worker MUST use to enforce
+        // the `413 CHUNK_TOO_LARGE` bound and compute the chunk digest, and —
+        // when `chunk_index` already carries a durable expected identity —
+        // that recorded expected digest so the Worker can enforce the
+        // manifest identity before reading the body
+        // (`m1-worker-data-plane-control-contract.md` "Chunk-upload
+        // authorization").
         Ok(WorkerAuthorizationOutcome::Approved {
-            expected_chunk_digest,
+            digest_algorithm: state.manifest.digest_algorithm,
+            chunk_size: state.manifest.chunk_size.get(),
+            expected_chunk_digest: expected_chunk.map(|chunk| chunk.digest.to_wire_value()),
         })
     }
 }
