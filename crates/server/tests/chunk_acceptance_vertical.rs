@@ -182,6 +182,71 @@ async fn a_verified_chunk_is_durably_committed_end_to_end_over_a_real_uds_socket
 }
 
 #[tokio::test]
+async fn a_same_digest_different_size_follow_up_fails_closed_over_a_real_uds_socket() {
+    // Issue #39 Phase C1 item 3: an identical-digest follow-up reporting a
+    // size that contradicts the durable expected identity has no enumerable
+    // `rejected` reason. `bamepd` sends no `ChunkAcceptanceDecision`, rewrites
+    // nothing durable, and the single-use handle still stays consumed.
+    let db = TestDatabase::setup().await;
+    let fixture = dispatched_transfer_fixture(&db.pool, "c1-accept-size-contradiction").await;
+    let authorization = build_authorization_service(db.pool.clone());
+    let signing_key = SigningKey::from_bytes(&rand::random());
+    let token = issue_capability(&authorization, &fixture, &signing_key).await;
+
+    let socket = TempSocketPath::fresh();
+    let plane = WorkerControlPlane::bind(&socket.0).expect("bind");
+    let registry = Arc::new(WorkerAuthorityRegistry::new());
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let run_task = tokio::spawn(plane.run(
+        Arc::clone(&registry),
+        Arc::clone(&authorization),
+        build_chunk_acceptance_service(db.pool.clone()),
+        shutdown_rx,
+    ));
+
+    let mut stream = handshake(&socket.0).await;
+    let digest = digest_wire(0xC3);
+
+    // Durably commit chunk 0 at the full chunk size.
+    let (handle1, _) = authorize_chunk(&mut stream, &signing_key, &token, &fixture, 0).await;
+    let first = send_acceptance(&mut stream, &handle1, &fixture, 0, &digest, CHUNK_SIZE).await;
+    assert_eq!(first, Some((ChunkAcceptanceOutcome::Committed, None)));
+
+    // Same digest, contradicting size -> no response at all.
+    let (handle2, expected) = authorize_chunk(&mut stream, &signing_key, &token, &fixture, 0).await;
+    assert_eq!(expected.as_deref(), Some(digest.as_str()));
+    let second = send_acceptance(&mut stream, &handle2, &fixture, 0, &digest, CHUNK_SIZE - 1).await;
+    assert_eq!(
+        second, None,
+        "no ChunkAcceptanceDecision on a fail-closed follow-up"
+    );
+
+    // Durable digest / size / held state is exactly the first-writer's.
+    let transfers = PostgresTransferRepository::new(db.pool.clone());
+    let (context, held) = transfers
+        .find_transfer_context(fixture.transfer_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        held.iter().copied().collect::<Vec<_>>(),
+        vec![ChunkIndex(0)]
+    );
+    let expected_chunk = context.manifest.expected_chunk(ChunkIndex(0)).unwrap();
+    assert_eq!(expected_chunk.size, CHUNK_SIZE);
+    assert_eq!(expected_chunk.digest.to_wire_value(), digest);
+
+    // The single-use handle is consumed regardless of the fail-closed outcome
+    // (item 8); another logical retry needs a fresh proof and handle.
+    let store = registry.current_operations().expect("current store");
+    assert!(store.acceptance_binding(&handle2).is_none());
+
+    drop(stream);
+    run_task.abort();
+    db.teardown().await;
+}
+
+#[tokio::test]
 async fn a_lost_decision_is_recovered_idempotently_by_a_fresh_proof_and_handle() {
     // Issue #39 Phase C1 item 20.
     let db = TestDatabase::setup().await;
@@ -336,20 +401,23 @@ async fn new_then_identical_then_conflicting_and_size_bounds() {
             .unwrap(),
         ChunkAcceptanceCommit::AlreadyCommitted
     );
-    // same index, different digest -> conflict, never overwritten
+    // same index, different digest -> conflict, never overwritten. This is
+    // the *only* condition that yields the closed `chunk_identity_conflict`
+    // public reason.
     assert_eq!(
         svc.commit_chunk_acceptance(fixture.transfer_id, 0, digest_wire(0x22), 4096)
             .await
             .unwrap(),
         ChunkAcceptanceCommit::RejectedConflict
     );
-    // same digest but a size contradicting the durable record -> fail closed
-    // (Conflict in the durable model), never a silent size rewrite.
+    // same digest but a size contradicting the durable record -> fail closed,
+    // never a silent size rewrite. No *different* digest exists, so this must
+    // not surface `chunk_identity_conflict` (Issue #39 Phase C1 item 3).
     assert_eq!(
         svc.commit_chunk_acceptance(fixture.transfer_id, 0, d.clone(), 4095)
             .await
             .unwrap(),
-        ChunkAcceptanceCommit::RejectedConflict
+        ChunkAcceptanceCommit::FailClosed
     );
     // size outside the manifest bound -> fail closed (not an enumerable reason)
     assert_eq!(

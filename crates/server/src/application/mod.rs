@@ -2435,11 +2435,14 @@ impl ChunkAcceptanceService {
     /// no response at all).
     ///
     /// A `chunk_index` beyond the manifest's 32-bit index space, a
-    /// non-canonical `digest`, or a `size` outside `1..=chunk_size` is a
-    /// contract-violating follow-up: it fails closed as
+    /// non-canonical `digest`, a `size` outside `1..=chunk_size`, or a `size`
+    /// that contradicts the size already durable for an identical-digest
+    /// `chunk_index` is a contract-violating follow-up: it fails closed as
     /// [`ChunkAcceptanceCommit::FailClosed`] and is never mapped to one of
-    /// the two enumerable `rejected` reasons (Issue #39 Phase C1 items 11,
-    /// 14, 15).
+    /// the two enumerable `rejected` reasons (Issue #39 Phase C1 items 3, 11,
+    /// 14, 15). `RejectedConflict` (`chunk_identity_conflict`) is produced
+    /// only when a *different* digest is already durable for the
+    /// `chunk_index`.
     pub async fn commit_chunk_acceptance(
         &self,
         transfer_id: TransferId,
@@ -2491,13 +2494,46 @@ impl ChunkAcceptanceService {
                     return ChunkAcceptanceDecided::FailClosed;
                 };
 
+                // Distinguish the public C1 outcome using the already-locked
+                // authoritative expected identity (Issue #39 Phase C1 item 4).
+                // The Domain's generic `(index, size, digest)` immutability
+                // rule rejects "size *or* digest differs" as one `Conflict`,
+                // but the Specification's closed public reason
+                // `chunk_identity_conflict` means *specifically* "a different
+                // digest is already durable for this `chunk_index`" (m1
+                // "Verified-chunk durable acceptance"; the durable idempotency
+                // identity is `(transfer_id, chunk_index, digest)`, with `size`
+                // separately revalidated above). A same-digest / different-size
+                // follow-up is internally contradictory to the durable expected
+                // identity and has no enumerable `rejected` reason, so it fails
+                // closed rather than borrowing `chunk_identity_conflict` (items
+                // 2, 3). The comparison runs inside the locked transaction over
+                // `facts` — no pre-transaction lookup, first-writer
+                // serialization unchanged (item 5).
+                if let Some(existing) = facts.manifest.expected_chunk(index) {
+                    if existing.digest != digest {
+                        return ChunkAcceptanceDecided::RejectConflict;
+                    }
+                    if existing.size != size {
+                        return ChunkAcceptanceDecided::FailClosed;
+                    }
+                    // Exact durable identity — fall through to the normal
+                    // idempotent Domain path (`AlreadyRecorded`).
+                }
+
                 match facts
                     .manifest
                     .record_expected_chunk(index, size, digest.into_bytes())
                 {
                     Ok(outcome) => ChunkAcceptanceDecided::Commit(outcome),
                     Err(bamep_domain::ChunkRecordError::Conflict(_)) => {
-                        ChunkAcceptanceDecided::RejectConflict
+                        // Defense in depth (item 6): the positive
+                        // different-digest check above is the *only* path that
+                        // yields `RejectConflict`. Any residual Domain
+                        // `Conflict` here is not a proven digest conflict, so it
+                        // must not surface the closed public reason — fail
+                        // closed to keep `chunk_identity_conflict` truthful.
+                        ChunkAcceptanceDecided::FailClosed
                     }
                     Err(bamep_domain::ChunkRecordError::NotContinuable) => {
                         ChunkAcceptanceDecided::RejectNotContinuable

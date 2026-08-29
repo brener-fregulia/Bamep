@@ -1194,10 +1194,11 @@ pub enum AcceptChunkError {
 /// acceptance"; Issue #39 Phase C1). `FailClosed` is **not** a wire outcome —
 /// `bamepd` sends no `ChunkAcceptanceDecision` and the Worker fails the HTTP
 /// request closed. It covers a contract-violating follow-up (a `size` outside
-/// the manifest bound, a non-canonical `digest`) that the Specification's
-/// closed `rejected` vocabulary (`chunk_identity_conflict`,
+/// the manifest bound, a non-canonical `digest`, or a `size` contradicting the
+/// size already durable for an identical-digest `chunk_index`) that the
+/// Specification's closed `rejected` vocabulary (`chunk_identity_conflict`,
 /// `transfer_not_continuable`) deliberately does not describe, and that must
-/// never become an enumerable reason.
+/// never become an enumerable reason (Issue #39 Phase C1 item 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkAcceptanceCommit {
     Committed,
