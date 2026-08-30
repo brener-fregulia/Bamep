@@ -134,11 +134,13 @@ mod imp {
     use std::time::Duration;
 
     use bamep_worker_protocol::{
-        receive, send, AuthorizationDecisionMessage, AuthorizationQueryMessage,
-        ChunkAcceptanceDecisionMessage, ChunkAcceptanceRejectionReason,
-        ChunkAcceptanceRequestMessage, DecodeError, HandshakeRejectedMessage, HeldChunk,
-        ProtocolErrorMessage, ReceiveError, ResumeDiscoveryContinueMessage,
-        ResumeDiscoveryPageMessage, ResumeDiscoveryQueryMessage, ServerHelloMessage,
+        receive, send, ArtifactVerificationAckMessage, ArtifactVerificationReportMessage,
+        AuthorizationDecisionMessage, AuthorizationQueryMessage, ChunkAcceptanceDecisionMessage,
+        ChunkAcceptanceRejectionReason, ChunkAcceptanceRequestMessage, DecodeError,
+        HandshakeRejectedMessage, HeldChunk, ManifestSealDecisionMessage,
+        ManifestSealRejectionReason, ManifestSealRequestMessage, ProtocolErrorMessage,
+        ReceiveError, ResumeDiscoveryContinueMessage, ResumeDiscoveryPageMessage,
+        ResumeDiscoveryQueryMessage, SealedManifestFacts, ServerHelloMessage, WireArtifactStatus,
         WireDigestAlgorithm, WorkerProtocolMessage,
     };
     use tokio::net::{UnixListener, UnixStream};
@@ -147,13 +149,14 @@ mod imp {
     use uuid::Uuid;
 
     use crate::application::{
-        ChunkAcceptanceService, ResumeAuthorizationOutcome, TransferAuthorizationService,
-        WorkerAuthorizationOutcome, WorkerAuthorizationQueryInput,
+        ArtifactVerificationInput, ArtifactVerificationService, ChunkAcceptanceService,
+        ManifestSealInput, ManifestSealService, ResumeAuthorizationOutcome,
+        TransferAuthorizationService, WorkerAuthorizationOutcome, WorkerAuthorizationQueryInput,
     };
-    use crate::ports::ChunkAcceptanceCommit;
+    use crate::ports::{ArtifactVerificationCommit, ChunkAcceptanceCommit, ManifestSealCommit};
     use crate::runtime::transient_worker_operations::{
         AcceptanceBinding, HeldChunkEntry, ResumeCursorBinding, ResumeCursorState, ResumeSnapshot,
-        TransientWorkerOperationStore,
+        TransientWorkerOperationStore, VerificationBinding,
     };
 
     use super::*;
@@ -348,11 +351,14 @@ mod imp {
         /// composition root must treat that as a fatal, fail-closed
         /// condition rather than assuming the control plane is still
         /// healthy.
+        #[allow(clippy::too_many_arguments)]
         pub async fn run(
             self,
             registry: Arc<WorkerAuthorityRegistry>,
             transfer_authorization: Arc<TransferAuthorizationService>,
             chunk_acceptance: Arc<ChunkAcceptanceService>,
+            manifest_seal: Arc<ManifestSealService>,
+            artifact_verification: Arc<ArtifactVerificationService>,
             mut shutdown: watch::Receiver<bool>,
         ) -> Result<(), WorkerControlPlaneError> {
             let resume_page_size = self.resume_page_size;
@@ -368,12 +374,16 @@ mod imp {
                                 let registry = Arc::clone(&registry);
                                 let transfer_authorization = Arc::clone(&transfer_authorization);
                                 let chunk_acceptance = Arc::clone(&chunk_acceptance);
+                                let manifest_seal = Arc::clone(&manifest_seal);
+                                let artifact_verification = Arc::clone(&artifact_verification);
                                 let conn_shutdown = shutdown.clone();
                                 tasks.spawn(handle_connection(
                                     stream,
                                     registry,
                                     transfer_authorization,
                                     chunk_acceptance,
+                                    manifest_seal,
+                                    artifact_verification,
                                     resume_page_size,
                                     conn_shutdown,
                                 ));
@@ -498,6 +508,8 @@ mod imp {
         registry: Arc<WorkerAuthorityRegistry>,
         transfer_authorization: Arc<TransferAuthorizationService>,
         chunk_acceptance: Arc<ChunkAcceptanceService>,
+        manifest_seal: Arc<ManifestSealService>,
+        artifact_verification: Arc<ArtifactVerificationService>,
         resume_page_size: usize,
         mut shutdown: watch::Receiver<bool>,
     ) {
@@ -614,6 +626,60 @@ mod imp {
                                 .is_err()
                             {
                                 break;
+                            }
+                        }
+                        // A `ManifestSealRequest` whose durable seal fails
+                        // closed (structural violation, internal invariant
+                        // violation) or whose post-commit `verification_handle`
+                        // mint fails is discarded with no response — the
+                        // Worker fails the HTTP request closed and an
+                        // idempotent seal retry re-drives it (Issue #39 Phase
+                        // C2 items 8, 16, 21). Every other outcome produces a
+                        // `ManifestSealDecision`.
+                        Ok(WorkerProtocolMessage::ManifestSealRequest(request)) => {
+                            if let Some(decision) = handle_manifest_seal(
+                                &operations,
+                                &manifest_seal,
+                                &request,
+                            )
+                            .await
+                            {
+                                if send(
+                                    &mut stream,
+                                    &WorkerProtocolMessage::ManifestSealDecision(decision),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        // An `ArtifactVerificationReport` with an invalid/
+                        // stale/consumed/wrong-kind `verification_handle`, a
+                        // malformed reported digest, or a durable/binding
+                        // mismatch is discarded with no response — never
+                        // mapped to `Failed` (Issue #39 Phase C2 items 26, 27,
+                        // 32, 33). Only a committed
+                        // `Verified`/`Failed` transition produces an
+                        // `ArtifactVerificationAck`.
+                        Ok(WorkerProtocolMessage::ArtifactVerificationReport(report)) => {
+                            if let Some(ack) = handle_artifact_verification(
+                                &operations,
+                                &artifact_verification,
+                                &report,
+                            )
+                            .await
+                            {
+                                if send(
+                                    &mut stream,
+                                    &WorkerProtocolMessage::ArtifactVerificationAck(ack),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
                             }
                         }
                         Ok(_unexpected) => {
@@ -814,6 +880,183 @@ mod imp {
                 // (item 8).
                 eprintln!(
                     "bamepd: a ChunkAcceptanceRequest durable commit failed internally; no \
+                     response sent"
+                );
+                None
+            }
+        }
+    }
+
+    /// One received `ManifestSealRequest`. Returns `Some(decision)` for every
+    /// authoritative outcome (`sealed`, `already_pending_verification`,
+    /// `rejected`, `denied`); `None` means the request is discarded with no
+    /// response — a structural violation, an internal invariant violation
+    /// (Issue #39 Phase C2 items 8, 16), or a post-commit
+    /// `verification_handle` mint failure (item 21). The
+    /// `verification_handle` is minted **only after** the durable seal
+    /// transaction has returned a committed outcome (item 20); a mint failure
+    /// never emits a success decision with an unusable handle, and the
+    /// durable `PendingVerification` commit is **not** rolled back — a fresh
+    /// seal retry reaches `already_pending_verification` and mints a fresh
+    /// handle.
+    async fn handle_manifest_seal(
+        operations: &TransientWorkerOperationStore,
+        manifest_seal: &ManifestSealService,
+        request: &ManifestSealRequestMessage,
+    ) -> Option<ManifestSealDecisionMessage> {
+        let in_reply_to = request.envelope.message_id;
+
+        let commit = match manifest_seal
+            .commit_manifest_seal(ManifestSealInput {
+                token: request.body.token.clone(),
+                transfer_id: request.body.transfer_id,
+                proof_id: request.body.proof_id.clone(),
+                issued_at_millis: request.body.issued_at,
+                signature: request.body.signature.clone(),
+                chunk_count: request.body.chunk_count,
+                artifact_digest: request.body.artifact_digest.clone(),
+            })
+            .await
+        {
+            Ok(commit) => commit,
+            Err(_) => {
+                // Internal persistence failure: nothing was durably
+                // committed. No response — a fresh retry recovers.
+                eprintln!(
+                    "bamepd: a ManifestSealRequest durable commit failed internally; no response \
+                     sent"
+                );
+                return None;
+            }
+        };
+
+        let (outcome_is_sealed, facts) = match commit {
+            ManifestSealCommit::Sealed(facts) => (true, facts),
+            ManifestSealCommit::AlreadyPending(facts) => (false, facts),
+            ManifestSealCommit::RejectedIncomplete => {
+                return Some(ManifestSealDecisionMessage::rejected(
+                    in_reply_to,
+                    ManifestSealRejectionReason::IncompleteManifest,
+                ));
+            }
+            ManifestSealCommit::RejectedAlreadySealed => {
+                return Some(ManifestSealDecisionMessage::rejected(
+                    in_reply_to,
+                    ManifestSealRejectionReason::ManifestAlreadySealed,
+                ));
+            }
+            ManifestSealCommit::Denied => {
+                return Some(ManifestSealDecisionMessage::denied(in_reply_to));
+            }
+            ManifestSealCommit::FailClosed => {
+                eprintln!(
+                    "bamepd: discarded a contract-violating or internally inconsistent \
+                     ManifestSealRequest (no response)"
+                );
+                return None;
+            }
+        };
+
+        // The durable `Incomplete -> PendingVerification` commit already
+        // exists; only now mint the generation-scoped `verification_handle`
+        // bound to the authoritative durable sealed identity (item 20). A mint
+        // failure (store saturated, opaque-id collision, superseded
+        // generation) must not yield a success decision carrying an unusable
+        // handle — no response, fail closed, the Saturated/IdCollision/
+        // StaleGeneration cause never surfaced (item 21).
+        let verification_handle = match operations.mint_verification(VerificationBinding {
+            transfer_id: bamep_domain::TransferId(request.body.transfer_id),
+            artifact_id: facts.artifact_id,
+            chunk_count: facts.chunk_count,
+            expected_artifact_digest: facts.expected_artifact_digest.clone(),
+        }) {
+            Ok(handle) => handle,
+            Err(_) => {
+                eprintln!(
+                    "bamepd: a ManifestSealRequest committed durably but the verification_handle \
+                     mint failed closed; no response sent (a fresh seal retry recovers)"
+                );
+                return None;
+            }
+        };
+
+        let sealed_facts = SealedManifestFacts {
+            verification_handle,
+            artifact_id: facts.artifact_id.0,
+            digest_algorithm: to_wire_digest_algorithm(facts.digest_algorithm),
+            chunk_size: facts.chunk_size,
+            chunk_count: facts.chunk_count,
+            expected_artifact_digest: facts.expected_artifact_digest,
+        };
+        Some(if outcome_is_sealed {
+            ManifestSealDecisionMessage::sealed(in_reply_to, sealed_facts)
+        } else {
+            ManifestSealDecisionMessage::already_pending_verification(in_reply_to, sealed_facts)
+        })
+    }
+
+    /// One received `ArtifactVerificationReport`. Returns `Some(ack)` only
+    /// when the durable `PendingVerification -> Verified | Failed` transition
+    /// actually committed (both statuses are `committed` acks the Worker maps
+    /// to HTTP `200`); `None` means the request is discarded with no
+    /// response — an invalid/stale/consumed/wrong-kind `verification_handle`
+    /// (item 32), a malformed reported digest, a durable/binding mismatch, or
+    /// an internal persistence failure (items 26, 27, 33, 50). The consumed
+    /// handle stays consumed regardless (item 26); a later logical retry
+    /// starts from a fresh seal.
+    async fn handle_artifact_verification(
+        operations: &TransientWorkerOperationStore,
+        artifact_verification: &ArtifactVerificationService,
+        report: &ArtifactVerificationReportMessage,
+    ) -> Option<ArtifactVerificationAckMessage> {
+        let in_reply_to = report.envelope.message_id;
+
+        // Consuming the `verification_handle` is the generation-scoped
+        // linearization point. Unknown / stale-generation / already-consumed /
+        // wrong-kind all fail closed with no response and no durable mutation
+        // (item 32). The binding it returns is the authoritative correlation
+        // target — the wire carries no Transfer/Artifact fields.
+        let binding = match operations.consume_verification(&report.body.verification_handle) {
+            Ok(binding) => binding,
+            Err(_) => {
+                eprintln!(
+                    "bamepd: discarded an ArtifactVerificationReport presenting an invalid or \
+                     stale verification_handle (no response, no durable mutation)"
+                );
+                return None;
+            }
+        };
+
+        match artifact_verification
+            .commit_artifact_verification(ArtifactVerificationInput {
+                transfer_id: binding.transfer_id.0,
+                artifact_id: binding.artifact_id.0,
+                chunk_count: binding.chunk_count,
+                computed_artifact_digest: report.body.computed_artifact_digest.clone(),
+            })
+            .await
+        {
+            Ok(ArtifactVerificationCommit::Committed { verified }) => {
+                let status = if verified {
+                    WireArtifactStatus::Verified
+                } else {
+                    WireArtifactStatus::Failed
+                };
+                Some(ArtifactVerificationAckMessage::committed(
+                    in_reply_to,
+                    status,
+                ))
+            }
+            Ok(ArtifactVerificationCommit::FailClosed) => {
+                eprintln!(
+                    "bamepd: discarded an ArtifactVerificationReport that could not be committed \
+                     (malformed digest, or durable/binding mismatch); no response, no mutation"
+                );
+                None
+            }
+            Err(_) => {
+                eprintln!(
+                    "bamepd: an ArtifactVerificationReport durable commit failed internally; no \
                      response sent"
                 );
                 None
@@ -1311,11 +1554,14 @@ mod imp {
             self
         }
 
+        #[allow(clippy::too_many_arguments)]
         pub async fn run(
             self,
             _registry: Arc<WorkerAuthorityRegistry>,
             _transfer_authorization: Arc<crate::application::TransferAuthorizationService>,
             _chunk_acceptance: Arc<crate::application::ChunkAcceptanceService>,
+            _manifest_seal: Arc<crate::application::ManifestSealService>,
+            _artifact_verification: Arc<crate::application::ArtifactVerificationService>,
             _shutdown: watch::Receiver<bool>,
         ) -> Result<(), WorkerControlPlaneError> {
             Ok(())

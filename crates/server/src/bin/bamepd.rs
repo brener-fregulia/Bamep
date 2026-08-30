@@ -27,7 +27,10 @@ use bamep_server::adapters::postgres::{
 };
 use bamep_server::adapters::worker_control_plane::WorkerControlPlane;
 use bamep_server::adapters::worker_runtime_ownership::{RuntimeOwnershipLock, TrustedRuntimeDir};
-use bamep_server::application::{ChunkAcceptanceService, TransferAuthorizationService};
+use bamep_server::application::{
+    ArtifactVerificationService, ChunkAcceptanceService, ManifestSealService,
+    TransferAuthorizationService,
+};
 use bamep_server::runtime::bamepd_config::BamepdConfig;
 use bamep_server::runtime::capability_store::CapabilityStore;
 use bamep_server::runtime::replay_cache::ReplayCache;
@@ -99,12 +102,29 @@ async fn run(config: BamepdConfig) {
     let transfer_authorization = Arc::new(TransferAuthorizationService::new(
         authorization_repo,
         Arc::clone(&capability_store),
-        replay_cache,
+        Arc::clone(&replay_cache),
         config.data_plane_base_url.clone(),
     ));
     // Issue #39 Phase C1: `ChunkAcceptanceRequest` durable coordination.
     // `resume_discovery` reuses `transfer_authorization` directly.
     let chunk_acceptance = Arc::new(ChunkAcceptanceService::new(Arc::new(
+        PostgresTransferRepository::new(pool.clone()),
+    )));
+    // Issue #39 Phase C2: `ManifestSealRequest` is its own authorizing
+    // request — it reuses the same capability store / replay cache as
+    // `transfer_authorization` so a capability issued through the Agent WSS
+    // path is exactly what the seal path later validates. Its current
+    // durable authorization read shares one transaction with the seal
+    // mutation (no authorization -> mutation TOCTOU).
+    let manifest_seal = Arc::new(ManifestSealService::new(
+        Arc::new(PostgresTransferRepository::new(pool.clone())),
+        Arc::clone(&capability_store),
+        Arc::clone(&replay_cache),
+    ));
+    // Issue #39 Phase C2: `ArtifactVerificationReport` — the transient
+    // `verification_handle` is consumed by the control plane; this service
+    // reloads durable state and compares digests independently.
+    let artifact_verification = Arc::new(ArtifactVerificationService::new(Arc::new(
         PostgresTransferRepository::new(pool),
     )));
 
@@ -147,6 +167,8 @@ async fn run(config: BamepdConfig) {
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         Arc::clone(&chunk_acceptance),
+        Arc::clone(&manifest_seal),
+        Arc::clone(&artifact_verification),
         shutdown_rx,
     ));
 

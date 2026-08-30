@@ -20,15 +20,15 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use bamep_domain::presented_credential::{CredentialKind, CredentialLookupId};
 use bamep_domain::{
-    ActionEvidenceApplied, ActionId, Artifact, ArtifactTransitionError, Attempt, AttemptId,
-    AuditRecord, BootContext, BootContextResolveError, CancelAckApplied, CancellationRequestError,
-    ChunkAcceptError, ChunkIndex, ChunkRecordError, ChunkRecordOutcome, DestructiveIntent,
-    DestructiveIntentError, EndpointAggregate, EndpointId, FinalDispatchDenial,
-    FinalDispatchOutcome, FinalDispatchRejection, InvalidIdentityTransition, InventoryRevision,
-    InventoryRevisionId, InventorySnapshot, Job, JobAdmissionError, JobAdmissionOutcome, JobId,
-    JobStep, JobStepEligibilityError, JobStepId, ReconciliationApplied, RedeemOutcome, SealError,
-    SealOutcome, TargetFingerprint, Transfer, TransferBindingError, TransferContext, TransferId,
-    TransitionOutcome, TrustedBootstrapOutcome,
+    ActionEvidenceApplied, ActionId, Artifact, ArtifactId, ArtifactTransitionError, Attempt,
+    AttemptId, AuditRecord, BootContext, BootContextResolveError, CancelAckApplied,
+    CancellationRequestError, ChunkAcceptError, ChunkIndex, ChunkRecordError, ChunkRecordOutcome,
+    DestructiveIntent, DestructiveIntentError, Digest, DigestAlgorithm, EndpointAggregate,
+    EndpointId, FinalDispatchDenial, FinalDispatchOutcome, FinalDispatchRejection,
+    InvalidIdentityTransition, InventoryRevision, InventoryRevisionId, InventorySnapshot, Job,
+    JobAdmissionError, JobAdmissionOutcome, JobId, JobStep, JobStepEligibilityError, JobStepId,
+    ReconciliationApplied, RedeemOutcome, SealError, SealOutcome, TargetFingerprint, Transfer,
+    TransferBindingError, TransferContext, TransferId, TransitionOutcome, TrustedBootstrapOutcome,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -1241,6 +1241,145 @@ pub enum CommitChunkAcceptanceError {
     Repository(#[from] RepositoryError),
 }
 
+// ---------------------------------------------------------------------
+// Atomic manifest seal (Issue #39 Phase C2)
+// (`m1-worker-data-plane-control-contract.md` "Seal-manifest first durable
+// commit"; `m0-data-plane-and-storage-contracts.md` "Durable chunk
+// acceptance ordering")
+// ---------------------------------------------------------------------
+
+/// The authoritative durable sealed-manifest facts a committed
+/// (`sealed` / `already_pending_verification`) seal decision carries back to
+/// the Worker (`m1-worker-data-plane-control-contract.md` "Seal-manifest
+/// first durable commit": "the **authoritative durable sealed values**").
+/// Every field is sourced from the locked durable snapshot the seal
+/// transaction produced or confirmed — never echoed from the Agent's request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedManifestDurableFacts {
+    pub artifact_id: ArtifactId,
+    pub digest_algorithm: DigestAlgorithm,
+    pub chunk_size: u32,
+    pub chunk_count: u64,
+    /// Canonical base64url-no-pad.
+    pub expected_artifact_digest: String,
+}
+
+/// What the Application decided one `ManifestSealRequest` should durably do,
+/// over the freshly locked [`AuthorizationDurableState`] (Transfer, Artifact,
+/// owning Attempt, Endpoint credential, manifest, held chunks — all in the
+/// same transaction the seal commits in). The Adapter turns this into the
+/// atomic persistence and the [`ManifestSealCommit`] it reports; it never
+/// makes this decision itself (ADR-0018).
+pub enum ManifestSealDecided {
+    /// First valid seal: atomically persist the sealed manifest facts
+    /// (`chunk_count`, `artifact_digest`, `sealed = true`) **and**
+    /// `Artifact Incomplete -> PendingVerification` in one transaction. Both
+    /// `bamep_domain::ChunkManifest::seal` and
+    /// `bamep_domain::begin_verification` have already succeeded against the
+    /// locked snapshot inside the closure — the Adapter only persists.
+    Seal {
+        chunk_count: u32,
+        artifact_digest: Digest,
+    },
+    /// Idempotent crash-recovery retry: durable state is already
+    /// `manifest sealed` + `Artifact PendingVerification` with the identical
+    /// `(transfer_id, chunk_count, artifact_digest)`. No second seal
+    /// transition, no Artifact transition.
+    AlreadyPending,
+    /// `bamepd` does not durably hold every chunk `0..chunk_count-1`
+    /// individually verified (or the recorded identity set is
+    /// incomplete/non-contiguous) — `rejected { incomplete_manifest }`. No
+    /// durable seal; Artifact stays `Incomplete`.
+    RejectIncomplete,
+    /// The manifest is already sealed with a *different*
+    /// `chunk_count`/`artifact_digest` — `rejected { manifest_already_sealed }`.
+    /// The original sealed tuple is never rewritten.
+    RejectAlreadySealed,
+    /// The authorization check failed (wrong Endpoint/Artifact/Attempt, an
+    /// Attempt that is not `InProgress`, a revoked credential, or a terminal
+    /// Artifact) — generic non-enumerable `denied`, leaking no terminal-state
+    /// detail (`m1-worker-data-plane-control-contract.md`: a terminal owning
+    /// Transfer/Artifact/Attempt is a `denied`, never a `409`).
+    Denied,
+    /// Not a legal seal at all — a non-canonical `artifact_digest`, or an
+    /// internally contradictory durable state (`sealed` manifest with an
+    /// `Incomplete` Artifact, or vice versa). No `ManifestSealDecision` is
+    /// sent; `bamepd` logs the invariant violation and the Worker fails the
+    /// HTTP request closed. Never mapped to an enumerable `rejected` reason
+    /// (Issue #39 Phase C2).
+    FailClosed,
+}
+
+pub type CommitManifestSealDecision =
+    Box<dyn FnOnce(&AuthorizationDurableState) -> ManifestSealDecided + Send>;
+
+/// The durable outcome of one `ManifestSealRequest`
+/// (`m1-worker-data-plane-control-contract.md` "Seal-manifest first durable
+/// commit"; Issue #39 Phase C2). `FailClosed` is **not** a wire outcome — see
+/// [`ManifestSealDecided::FailClosed`].
+pub enum ManifestSealCommit {
+    Sealed(SealedManifestDurableFacts),
+    AlreadyPending(SealedManifestDurableFacts),
+    RejectedIncomplete,
+    RejectedAlreadySealed,
+    Denied,
+    FailClosed,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CommitManifestSealError {
+    #[error("transfer {0:?} not found")]
+    TransferNotFound(TransferId),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
+// ---------------------------------------------------------------------
+// Atomic full-Artifact verification commit (Issue #39 Phase C2)
+// ---------------------------------------------------------------------
+
+/// What the Application decided one `ArtifactVerificationReport` should
+/// durably do, over the freshly locked [`TransferLockedFacts`]. The digest
+/// comparison itself (`bamep_domain::complete_verification`) has already run
+/// inside the closure against `bamepd`'s **own durable** expected digest —
+/// never the value the transient `verification_handle` carried
+/// (`m1-worker-data-plane-control-contract.md` "Full-Artifact verification
+/// result": "`bamepd` **independently** compares").
+pub enum ArtifactVerificationDecided {
+    /// Persist `PendingVerification -> Verified | Failed` (carried on the
+    /// `Artifact`).
+    Commit(Artifact),
+    /// The report cannot be committed — the Artifact is not
+    /// `PendingVerification`, the manifest is not sealed, or the consumed
+    /// `verification_handle`'s bound identity does not exactly match current
+    /// durable state. No `ArtifactVerificationAck`, no mutation; a fresh seal
+    /// retry re-drives verification.
+    FailClosed,
+}
+
+pub type CommitArtifactVerificationDecision =
+    Box<dyn FnOnce(&TransferLockedFacts) -> ArtifactVerificationDecided + Send>;
+
+/// The durable outcome of one `ArtifactVerificationReport`
+/// (`m1-worker-data-plane-control-contract.md` "Full-Artifact verification
+/// result"; Issue #39 Phase C2). Both `Verified` and `Failed` are
+/// **successful** verification commits; only `FailClosed` produces no `Ack`.
+pub enum ArtifactVerificationCommit {
+    /// `true` -> `Verified`, `false` -> `Failed`.
+    Committed {
+        verified: bool,
+    },
+    FailClosed,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CommitArtifactVerificationError {
+    #[error("transfer {0:?} not found")]
+    TransferNotFound(TransferId),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SealManifestError {
     #[error("transfer {0:?} not found")]
@@ -1349,6 +1488,43 @@ pub trait TransferRepository: Send + Sync {
         index: ChunkIndex,
         decide: CommitChunkAcceptanceDecision,
     ) -> Result<ChunkAcceptanceCommit, CommitChunkAcceptanceError>;
+
+    /// Locks the `Transfer`, its owning `Attempt`, its `Endpoint`/credential,
+    /// and its Artifact/manifest/held-chunk facts **together in one
+    /// transaction**, assembles the [`AuthorizationDurableState`] snapshot,
+    /// invokes `decide` with it, and — only for
+    /// [`ManifestSealDecided::Seal`] — atomically persists the sealed manifest
+    /// facts *and* `Artifact Incomplete -> PendingVerification` before
+    /// committing once (Issue #39 Phase C2;
+    /// `m1-worker-data-plane-control-contract.md` "Seal-manifest first durable
+    /// commit"; `m0-data-plane-and-storage-contracts.md` "Durable chunk
+    /// acceptance ordering"). The current durable authorization facts are read
+    /// in the *same* transaction as the seal so no authorization -> mutation
+    /// TOCTOU exists. [`ManifestSealDecided::AlreadyPending`] and every
+    /// rejection persist nothing.
+    async fn commit_manifest_seal(
+        &self,
+        transfer_id: TransferId,
+        decide: CommitManifestSealDecision,
+    ) -> Result<ManifestSealCommit, CommitManifestSealError>;
+
+    /// Locks exactly the `Transfer` identified by `transfer_id` and its
+    /// Artifact/manifest/held-chunk facts, invokes `decide` with the freshly
+    /// locked [`TransferLockedFacts`] (so it can revalidate the consumed
+    /// `verification_handle`'s bound sealed identity against current durable
+    /// state and compare the Worker-computed digest against the durable
+    /// expected digest), and — only for
+    /// [`ArtifactVerificationDecided::Commit`] — atomically persists
+    /// `PendingVerification -> Verified | Failed` in the same transaction
+    /// (Issue #39 Phase C2; `m1-worker-data-plane-control-contract.md`
+    /// "Full-Artifact verification result"). Distinct from the lower-level
+    /// #36 [`Self::complete_artifact_verification`] primitive, which cannot
+    /// express the fail-closed binding-revalidation branch.
+    async fn commit_artifact_verification(
+        &self,
+        transfer_id: TransferId,
+        decide: CommitArtifactVerificationDecision,
+    ) -> Result<ArtifactVerificationCommit, CommitArtifactVerificationError>;
 
     /// Locks exactly the `Transfer` identified by `transfer_id`, invokes
     /// `decide` with its freshly locked [`TransferLockedFacts`], and — only

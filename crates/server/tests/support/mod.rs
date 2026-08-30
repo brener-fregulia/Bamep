@@ -96,6 +96,74 @@ pub fn build_chunk_acceptance_service(
     ))
 }
 
+/// A standalone `ManifestSealService` with its own (unshared) capability
+/// store / replay cache — sufficient for `WorkerControlPlane::run` call sites
+/// that never actually send a `ManifestSealRequest`. Issue #39 Phase C2
+/// verticals that DO exercise seal use
+/// [`build_worker_control_services`] so the seal path shares the exact
+/// capability store the Agent-side `issue_capability` minted into.
+pub fn build_manifest_seal_service(
+    pool: PgPool,
+) -> Arc<bamep_server::application::ManifestSealService> {
+    Arc::new(bamep_server::application::ManifestSealService::new(
+        Arc::new(PostgresTransferRepository::new(pool)),
+        Arc::new(CapabilityStore::new()),
+        Arc::new(ReplayCache::new()),
+    ))
+}
+
+pub fn build_artifact_verification_service(
+    pool: PgPool,
+) -> Arc<bamep_server::application::ArtifactVerificationService> {
+    Arc::new(bamep_server::application::ArtifactVerificationService::new(
+        Arc::new(PostgresTransferRepository::new(pool)),
+    ))
+}
+
+/// Every service `WorkerControlPlane::run` requires, all sharing **one**
+/// [`CapabilityStore`] / [`ReplayCache`] so a capability issued through
+/// `authorization.issue` (the Agent WSS path) is exactly what
+/// `manifest_seal` (an authorizing request in its own right) later validates
+/// (Issue #39 Phase C2).
+pub struct WorkerControlServices {
+    pub authorization: Arc<bamep_server::application::TransferAuthorizationService>,
+    pub chunk_acceptance: Arc<bamep_server::application::ChunkAcceptanceService>,
+    pub manifest_seal: Arc<bamep_server::application::ManifestSealService>,
+    pub artifact_verification: Arc<bamep_server::application::ArtifactVerificationService>,
+}
+
+pub fn build_worker_control_services(pool: PgPool) -> WorkerControlServices {
+    let capability_store = Arc::new(CapabilityStore::new());
+    let replay_cache = Arc::new(ReplayCache::new());
+    WorkerControlServices {
+        authorization: Arc::new(
+            bamep_server::application::TransferAuthorizationService::new(
+                Arc::new(
+                    bamep_server::adapters::postgres::PostgresTransferAuthorizationRepository::new(
+                        pool.clone(),
+                    ),
+                ),
+                Arc::clone(&capability_store),
+                Arc::clone(&replay_cache),
+                DATA_PLANE_BASE_URL,
+            ),
+        ),
+        chunk_acceptance: Arc::new(bamep_server::application::ChunkAcceptanceService::new(
+            Arc::new(PostgresTransferRepository::new(pool.clone())),
+        )),
+        manifest_seal: Arc::new(bamep_server::application::ManifestSealService::new(
+            Arc::new(PostgresTransferRepository::new(pool.clone())),
+            Arc::clone(&capability_store),
+            Arc::clone(&replay_cache),
+        )),
+        artifact_verification: Arc::new(
+            bamep_server::application::ArtifactVerificationService::new(Arc::new(
+                PostgresTransferRepository::new(pool),
+            )),
+        ),
+    }
+}
+
 /// Issues a real sender-constrained capability for `fixture` bound to
 /// `signing_key`'s public key.
 pub async fn issue_capability(

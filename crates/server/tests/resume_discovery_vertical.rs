@@ -34,7 +34,8 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use support::{
-    build_authorization_service, build_chunk_acceptance_service, dispatched_transfer_fixture,
+    build_artifact_verification_service, build_authorization_service,
+    build_chunk_acceptance_service, build_manifest_seal_service, dispatched_transfer_fixture,
     handshake, issue_capability, sign_proof, DispatchedTransfer, TempSocketPath, TestDatabase,
     IPC_TEST_TIMEOUT as TEST_TIMEOUT,
 };
@@ -155,6 +156,8 @@ impl Harness {
             Arc::clone(&registry),
             authorization,
             build_chunk_acceptance_service(db.pool.clone()),
+            build_manifest_seal_service(db.pool.clone()),
+            build_artifact_verification_service(db.pool.clone()),
             shutdown_rx,
         ));
         Self {

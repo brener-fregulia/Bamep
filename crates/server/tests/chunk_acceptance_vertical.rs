@@ -36,7 +36,8 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use support::{
-    build_authorization_service, build_chunk_acceptance_service, dispatched_transfer_fixture,
+    build_artifact_verification_service, build_authorization_service,
+    build_chunk_acceptance_service, build_manifest_seal_service, dispatched_transfer_fixture,
     handshake, issue_capability, sign_proof, DispatchedTransfer, TempSocketPath, TestDatabase,
     IPC_TEST_TIMEOUT as TEST_TIMEOUT,
 };
@@ -147,6 +148,8 @@ async fn a_verified_chunk_is_durably_committed_end_to_end_over_a_real_uds_socket
         Arc::clone(&registry),
         Arc::clone(&authorization),
         build_chunk_acceptance_service(db.pool.clone()),
+        build_manifest_seal_service(db.pool.clone()),
+        build_artifact_verification_service(db.pool.clone()),
         shutdown_rx,
     ));
 
@@ -201,6 +204,8 @@ async fn a_same_digest_different_size_follow_up_fails_closed_over_a_real_uds_soc
         Arc::clone(&registry),
         Arc::clone(&authorization),
         build_chunk_acceptance_service(db.pool.clone()),
+        build_manifest_seal_service(db.pool.clone()),
+        build_artifact_verification_service(db.pool.clone()),
         shutdown_rx,
     ));
 
@@ -263,6 +268,8 @@ async fn a_lost_decision_is_recovered_idempotently_by_a_fresh_proof_and_handle()
         Arc::clone(&registry),
         Arc::clone(&authorization),
         build_chunk_acceptance_service(db.pool.clone()),
+        build_manifest_seal_service(db.pool.clone()),
+        build_artifact_verification_service(db.pool.clone()),
         shutdown_rx,
     ));
 
@@ -323,6 +330,8 @@ async fn a_foreign_acceptance_handle_is_discarded_with_no_response() {
         Arc::clone(&registry),
         Arc::clone(&authorization),
         build_chunk_acceptance_service(db.pool.clone()),
+        build_manifest_seal_service(db.pool.clone()),
+        build_artifact_verification_service(db.pool.clone()),
         shutdown_rx,
     ));
 

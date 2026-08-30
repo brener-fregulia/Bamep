@@ -32,7 +32,8 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use support::{
-    build_authorization_service, build_chunk_acceptance_service, dispatched_transfer_fixture,
+    build_artifact_verification_service, build_authorization_service,
+    build_chunk_acceptance_service, build_manifest_seal_service, dispatched_transfer_fixture,
     handshake, issue_capability, sign_proof, DispatchedTransfer, TempSocketPath, TestDatabase,
     IPC_TEST_TIMEOUT as TEST_TIMEOUT,
 };
@@ -78,6 +79,8 @@ async fn a_real_signed_query_over_a_real_uds_socket_is_approved() {
         Arc::clone(&registry),
         Arc::clone(&authorization),
         build_chunk_acceptance_service(db.pool.clone()),
+        build_manifest_seal_service(db.pool.clone()),
+        build_artifact_verification_service(db.pool.clone()),
         shutdown_rx,
     ));
 
@@ -152,6 +155,8 @@ async fn a_query_signed_by_the_wrong_key_over_a_real_uds_socket_is_denied() {
         Arc::clone(&registry),
         Arc::clone(&authorization),
         build_chunk_acceptance_service(db.pool.clone()),
+        build_manifest_seal_service(db.pool.clone()),
+        build_artifact_verification_service(db.pool.clone()),
         shutdown_rx,
     ));
 
@@ -214,6 +219,8 @@ async fn a_new_connection_after_a_prior_ones_mid_query_disconnect_still_works() 
         registry,
         Arc::clone(&authorization),
         build_chunk_acceptance_service(db.pool.clone()),
+        build_manifest_seal_service(db.pool.clone()),
+        build_artifact_verification_service(db.pool.clone()),
         shutdown_rx,
     ));
 
@@ -284,6 +291,8 @@ async fn an_acceptance_handle_loses_all_authority_when_its_generation_ends() {
         Arc::clone(&registry),
         Arc::clone(&authorization),
         build_chunk_acceptance_service(db.pool.clone()),
+        build_manifest_seal_service(db.pool.clone()),
+        build_artifact_verification_service(db.pool.clone()),
         shutdown_rx,
     ));
 
@@ -361,6 +370,8 @@ async fn a_saturated_transient_store_denies_an_otherwise_authorized_query() {
         Arc::clone(&registry),
         Arc::clone(&authorization),
         build_chunk_acceptance_service(db.pool.clone()),
+        build_manifest_seal_service(db.pool.clone()),
+        build_artifact_verification_service(db.pool.clone()),
         shutdown_rx,
     ));
 

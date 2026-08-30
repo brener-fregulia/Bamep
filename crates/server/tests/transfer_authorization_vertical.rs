@@ -349,6 +349,8 @@ async fn agent_issued_capability_is_approved_by_a_real_worker_uds_query() {
         registry,
         Arc::clone(&transfer_authorization),
         chunk_acceptance,
+        support::build_manifest_seal_service(db.pool.clone()),
+        support::build_artifact_verification_service(db.pool.clone()),
         shutdown_rx,
     ));
 

@@ -125,6 +125,24 @@ impl TransferRepository for UnreachableTransferRepository {
     ) -> Result<bamep_domain::SealOutcome, bamep_server::ports::SealManifestError> {
         unreachable!()
     }
+    async fn commit_manifest_seal(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::CommitManifestSealDecision,
+    ) -> Result<bamep_server::ports::ManifestSealCommit, bamep_server::ports::CommitManifestSealError>
+    {
+        unreachable!()
+    }
+    async fn commit_artifact_verification(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::CommitArtifactVerificationDecision,
+    ) -> Result<
+        bamep_server::ports::ArtifactVerificationCommit,
+        bamep_server::ports::CommitArtifactVerificationError,
+    > {
+        unreachable!()
+    }
     async fn begin_artifact_verification(
         &self,
         _: bamep_domain::TransferId,
@@ -159,6 +177,26 @@ fn fake_chunk_acceptance_service() -> Arc<ChunkAcceptanceService> {
     Arc::new(ChunkAcceptanceService::new(Arc::new(
         UnreachableTransferRepository,
     )))
+}
+
+/// No #37-scope test sends a `ManifestSealRequest` or
+/// `ArtifactVerificationReport`, so these seal/verification services
+/// `WorkerControlPlane::run` now requires are never actually invoked. Real
+/// C2 behavior is covered by `manifest_seal_vertical.rs` /
+/// `artifact_verification_vertical.rs`.
+fn fake_manifest_seal_service() -> Arc<bamep_server::application::ManifestSealService> {
+    Arc::new(bamep_server::application::ManifestSealService::new(
+        Arc::new(UnreachableTransferRepository),
+        Arc::new(CapabilityStore::new()),
+        Arc::new(ReplayCache::new()),
+    ))
+}
+
+fn fake_artifact_verification_service(
+) -> Arc<bamep_server::application::ArtifactVerificationService> {
+    Arc::new(bamep_server::application::ArtifactVerificationService::new(
+        Arc::new(UnreachableTransferRepository),
+    ))
 }
 
 struct TempSocketPath(PathBuf);
@@ -237,6 +275,8 @@ async fn successful_handshake_makes_authority_available() {
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 
@@ -267,6 +307,8 @@ async fn disconnect_invalidates_authority_immediately() {
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 
@@ -292,6 +334,8 @@ async fn reconnect_after_disconnect_completes_a_fresh_handshake_with_a_new_gener
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 
@@ -317,6 +361,8 @@ async fn a_message_before_worker_hello_is_a_pre_handshake_violation() {
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 
@@ -367,6 +413,8 @@ async fn an_unknown_top_level_message_type_receives_a_protocol_error_and_never_r
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 
@@ -418,6 +466,8 @@ async fn incompatible_protocol_version_is_rejected_and_never_registers_a_generat
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 
@@ -460,6 +510,8 @@ async fn worker_hello_with_wrong_envelope_protocol_version_never_registers_a_gen
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 
@@ -497,6 +549,8 @@ async fn worker_hello_with_non_v4_message_id_never_registers_a_generation() {
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 
@@ -535,6 +589,8 @@ async fn worker_hello_with_non_v4_worker_instance_id_never_registers_a_generatio
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 
@@ -569,6 +625,8 @@ async fn an_overlapping_second_handshake_supersedes_the_first_and_its_later_disc
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 
@@ -621,6 +679,8 @@ async fn controlled_shutdown_removes_the_socket_file() {
         registry,
         transfer_authorization,
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 
@@ -667,6 +727,8 @@ async fn a_still_live_socket_is_never_unlinked_or_replaced() {
         registry,
         transfer_authorization,
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 
@@ -802,6 +864,8 @@ async fn controlled_shutdown_does_not_remove_a_pathname_replaced_after_bind() {
         registry,
         transfer_authorization,
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
     shutdown_tx.send(true).expect("send shutdown");
@@ -826,6 +890,8 @@ async fn controlled_shutdown_disconnects_an_active_connection_before_returning()
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 
@@ -880,6 +946,8 @@ async fn repeated_connect_disconnect_cycles_keep_the_listener_promptly_responsiv
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx,
     ));
 

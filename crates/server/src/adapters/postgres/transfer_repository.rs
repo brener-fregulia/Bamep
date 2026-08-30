@@ -37,13 +37,17 @@ use bamep_domain::{
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
-use super::shared::to_backend_err;
+use super::authorization_repository::load_attempt_for_update;
+use super::shared::{load_by_id_for_update, to_backend_err};
 use crate::ports::{
     AcceptChunkDecision, AcceptChunkError, AcceptChunkOutcome, ArtifactTransitionDecision,
-    ArtifactTransitionRepoError, BindAttemptDecision, BindAttemptError, ChunkAcceptanceCommit,
-    ChunkAcceptanceDecided, CommitChunkAcceptanceDecision, CommitChunkAcceptanceError,
-    CreateTransferError, RecordChunkDecision, RecordChunkError, RepositoryError,
-    SealManifestDecision, SealManifestError, TransferLockedFacts, TransferRepository,
+    ArtifactTransitionRepoError, ArtifactVerificationCommit, ArtifactVerificationDecided,
+    AuthorizationDurableState, BindAttemptDecision, BindAttemptError, ChunkAcceptanceCommit,
+    ChunkAcceptanceDecided, CommitArtifactVerificationDecision, CommitArtifactVerificationError,
+    CommitChunkAcceptanceDecision, CommitChunkAcceptanceError, CommitManifestSealDecision,
+    CommitManifestSealError, CreateTransferError, ManifestSealCommit, ManifestSealDecided,
+    RecordChunkDecision, RecordChunkError, RepositoryError, SealManifestDecision,
+    SealManifestError, SealedManifestDurableFacts, TransferLockedFacts, TransferRepository,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
@@ -615,6 +619,167 @@ impl TransferRepository for PostgresTransferRepository {
                     tx.commit().await.map_err(to_backend_err)?;
                     Ok(ChunkAcceptanceCommit::Committed)
                 }
+            }
+        }
+    }
+
+    async fn commit_manifest_seal(
+        &self,
+        transfer_id: TransferId,
+        decide: CommitManifestSealDecision,
+    ) -> Result<ManifestSealCommit, CommitManifestSealError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        // Lock the Transfer/Artifact/manifest/held-chunk facts, the owning
+        // Attempt, and the Endpoint/credential row all `FOR UPDATE` in this
+        // one transaction — the same consistent locked snapshot Issue #38's
+        // `load_authorization_state` composes, but kept *open* so the seal
+        // mutation commits against exactly the state the authorization
+        // decision was made over (Issue #39 Phase C2: no authorization ->
+        // mutation TOCTOU). The `transfers` row lock is the serialization
+        // anchor, exactly as for `commit_chunk_acceptance`.
+        let Some(facts) = load_locked_facts(&mut tx, transfer_id).await? else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(CommitManifestSealError::TransferNotFound(transfer_id));
+        };
+        let attempt = match facts.transfer.attempt_id {
+            Some(attempt_id) => load_attempt_for_update(&mut tx, attempt_id).await?,
+            None => None,
+        };
+        let Some(endpoint) = load_by_id_for_update(&mut tx, facts.transfer.endpoint_id).await?
+        else {
+            return Err(CommitManifestSealError::Repository(
+                RepositoryError::Backend(format!(
+                    "transfer {transfer_id:?} durably references missing endpoint {:?}",
+                    facts.transfer.endpoint_id
+                )),
+            ));
+        };
+
+        let artifact_id = facts.artifact.id;
+        let digest_algorithm = facts.manifest.digest_algorithm;
+        let chunk_size = facts.manifest.chunk_size.get();
+
+        let snapshot = AuthorizationDurableState {
+            transfer: facts.transfer,
+            artifact: facts.artifact,
+            manifest: facts.manifest,
+            held_chunk_indices: facts.held_chunk_indices,
+            attempt,
+            endpoint,
+        };
+
+        let sealed_facts = |digest_wire: String, chunk_count: u64| SealedManifestDurableFacts {
+            artifact_id,
+            digest_algorithm,
+            chunk_size,
+            chunk_count,
+            expected_artifact_digest: digest_wire,
+        };
+
+        match decide(&snapshot) {
+            ManifestSealDecided::Denied => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(ManifestSealCommit::Denied)
+            }
+            ManifestSealDecided::FailClosed => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(ManifestSealCommit::FailClosed)
+            }
+            ManifestSealDecided::RejectIncomplete => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(ManifestSealCommit::RejectedIncomplete)
+            }
+            ManifestSealDecided::RejectAlreadySealed => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(ManifestSealCommit::RejectedAlreadySealed)
+            }
+            ManifestSealDecided::AlreadyPending => {
+                // No mutation — the durable sealed tuple is authoritative
+                // (`m1-worker-data-plane-control-contract.md`: the durable
+                // sealed values, not the request body, are authoritative on
+                // an idempotent retry).
+                let chunk_count = snapshot.manifest.chunk_count.ok_or_else(|| {
+                    RepositoryError::Backend(
+                        "already-PendingVerification artifact has an unsealed durable manifest"
+                            .into(),
+                    )
+                })?;
+                let artifact_digest =
+                    snapshot.manifest.artifact_digest.as_ref().ok_or_else(|| {
+                        RepositoryError::Backend(
+                            "already-sealed durable manifest is missing its artifact_digest".into(),
+                        )
+                    })?;
+                let out = sealed_facts(artifact_digest.to_wire_value(), u64::from(chunk_count));
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(ManifestSealCommit::AlreadyPending(out))
+            }
+            ManifestSealDecided::Seal {
+                chunk_count,
+                artifact_digest,
+            } => {
+                // First valid seal: the sealed manifest facts and
+                // `Incomplete -> PendingVerification` commit atomically, in
+                // this one transaction — never a sealed manifest with an
+                // Incomplete Artifact observable in between (Issue #39 Phase
+                // C2).
+                sqlx::query(
+                    "UPDATE chunk_manifests SET sealed = TRUE, chunk_count = $1, \
+                     artifact_digest = $2 WHERE artifact_id = $3",
+                )
+                .bind(chunk_count as i32)
+                .bind(artifact_digest.as_bytes())
+                .bind(artifact_id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(to_backend_err)?;
+
+                sqlx::query("UPDATE artifacts SET state = $1 WHERE id = $2")
+                    .bind(PgArtifactState::PendingVerification)
+                    .bind(artifact_id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+
+                tx.commit().await.map_err(to_backend_err)?;
+                Ok(ManifestSealCommit::Sealed(sealed_facts(
+                    artifact_digest.to_wire_value(),
+                    u64::from(chunk_count),
+                )))
+            }
+        }
+    }
+
+    async fn commit_artifact_verification(
+        &self,
+        transfer_id: TransferId,
+        decide: CommitArtifactVerificationDecision,
+    ) -> Result<ArtifactVerificationCommit, CommitArtifactVerificationError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+        let Some(facts) = load_locked_facts(&mut tx, transfer_id).await? else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(CommitArtifactVerificationError::TransferNotFound(
+                transfer_id,
+            ));
+        };
+
+        match decide(&facts) {
+            ArtifactVerificationDecided::FailClosed => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(ArtifactVerificationCommit::FailClosed)
+            }
+            ArtifactVerificationDecided::Commit(updated) => {
+                sqlx::query("UPDATE artifacts SET state = $1 WHERE id = $2")
+                    .bind(PgArtifactState::from(updated.state))
+                    .bind(updated.id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+                tx.commit().await.map_err(to_backend_err)?;
+                Ok(ArtifactVerificationCommit::Committed {
+                    verified: updated.state == ArtifactState::Verified,
+                })
             }
         }
     }

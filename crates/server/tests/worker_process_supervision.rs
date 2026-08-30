@@ -130,6 +130,24 @@ impl TransferRepository for UnreachableTransferRepository {
     ) -> Result<bamep_domain::SealOutcome, bamep_server::ports::SealManifestError> {
         unreachable!()
     }
+    async fn commit_manifest_seal(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::CommitManifestSealDecision,
+    ) -> Result<bamep_server::ports::ManifestSealCommit, bamep_server::ports::CommitManifestSealError>
+    {
+        unreachable!()
+    }
+    async fn commit_artifact_verification(
+        &self,
+        _: bamep_domain::TransferId,
+        _: bamep_server::ports::CommitArtifactVerificationDecision,
+    ) -> Result<
+        bamep_server::ports::ArtifactVerificationCommit,
+        bamep_server::ports::CommitArtifactVerificationError,
+    > {
+        unreachable!()
+    }
     async fn begin_artifact_verification(
         &self,
         _: bamep_domain::TransferId,
@@ -164,6 +182,21 @@ fn fake_chunk_acceptance_service() -> Arc<ChunkAcceptanceService> {
     Arc::new(ChunkAcceptanceService::new(Arc::new(
         UnreachableTransferRepository,
     )))
+}
+
+fn fake_manifest_seal_service() -> Arc<bamep_server::application::ManifestSealService> {
+    Arc::new(bamep_server::application::ManifestSealService::new(
+        Arc::new(UnreachableTransferRepository),
+        Arc::new(CapabilityStore::new()),
+        Arc::new(ReplayCache::new()),
+    ))
+}
+
+fn fake_artifact_verification_service(
+) -> Arc<bamep_server::application::ArtifactVerificationService> {
+    Arc::new(bamep_server::application::ArtifactVerificationService::new(
+        Arc::new(UnreachableTransferRepository),
+    ))
 }
 
 struct TestEnv {
@@ -294,6 +327,8 @@ async fn supervisor_manages_a_genuinely_separate_worker_process_through_handshak
         Arc::clone(&registry),
         Arc::clone(&transfer_authorization),
         fake_chunk_acceptance_service(),
+        fake_manifest_seal_service(),
+        fake_artifact_verification_service(),
         shutdown_rx.clone(),
     ));
 

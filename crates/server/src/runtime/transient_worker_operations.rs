@@ -601,29 +601,30 @@ impl TransientWorkerOperationStore {
     }
 
     /// Consumes the verification binding for `handle` iff it is a
-    /// verification handle minted on the current generation whose bound
-    /// `transfer_id`/`artifact_id` match the presented values — the same
-    /// single-use / preserve-on-mismatch discipline as
-    /// [`consume_acceptance`](Self::consume_acceptance). A wrong
-    /// Transfer/Artifact can never be substituted for the sealed identity
-    /// this handle authorizes.
+    /// verification handle minted on the current generation — atomically,
+    /// single-use, current-generation only, with the same wrong-kind
+    /// rejection and secret redaction as
+    /// [`consume_acceptance`](Self::consume_acceptance).
+    ///
+    /// Unlike `consume_acceptance`, this takes **only** the handle: the v1
+    /// `ArtifactVerificationReport` wire message carries no `transfer_id`/
+    /// `artifact_id` (`m1-worker-data-plane-control-contract.md` "Minimum
+    /// messages" #6 — only `verification_handle` + `computed_artifact_digest`),
+    /// so there is no presented Transfer/Artifact value to compare against and
+    /// no substitution field to reject. The returned [`VerificationBinding`]
+    /// *is* the authoritative correlation target; `bamepd` then independently
+    /// revalidates that bound sealed identity against current durable
+    /// PostgreSQL state before mutating anything (Issue #39 Phase C2).
     pub fn consume_verification(
         &self,
         handle: &str,
-        transfer_id: TransferId,
-        artifact_id: ArtifactId,
     ) -> Result<VerificationBinding, TransientOperationError> {
         self.with_bindings(|map| {
-            let matches = match map.get(handle) {
+            match map.get(handle) {
                 None => return Err(TransientOperationError::UnknownHandle),
-                Some(Binding::Verification(b)) => {
-                    b.transfer_id == transfer_id && b.artifact_id == artifact_id
-                }
+                Some(Binding::Verification(_)) => {}
                 Some(_) => return Err(TransientOperationError::WrongKind),
             };
-            if !matches {
-                return Err(TransientOperationError::BindingMismatch);
-            }
             match map.remove(handle) {
                 Some(Binding::Verification(b)) => Ok(b),
                 _ => unreachable!("verified under the same lock immediately above"),
@@ -922,7 +923,7 @@ mod tests {
             Err(TransientOperationError::WrongKind)
         );
         assert_eq!(
-            store.consume_verification(&handle, c.transfer_id, ArtifactId::new()),
+            store.consume_verification(&handle),
             Err(TransientOperationError::WrongKind)
         );
         assert!(store.resume_cursor_binding(&handle).is_some());
@@ -934,35 +935,31 @@ mod tests {
         let a = acceptance(0);
         let handle = store.mint_acceptance(a.clone()).unwrap();
         assert_eq!(
-            store.consume_verification(&handle, a.transfer_id, ArtifactId::new()),
+            store.consume_verification(&handle),
             Err(TransientOperationError::WrongKind)
         );
+        // the acceptance binding is preserved on a wrong-kind consume
+        assert!(store.acceptance_binding(&handle).is_some());
     }
 
     // -- verification consume -------------------------------------
 
     #[test]
-    fn verification_consume_is_single_use_and_binds_transfer_and_artifact() {
+    fn verification_consume_is_single_use_by_handle_alone() {
+        // The v1 `ArtifactVerificationReport` wire carries only the handle
+        // (Issue #39 Phase C2 item 25): consume is by handle alone, still
+        // atomic / single-use / current-generation, and the returned binding
+        // is the authoritative correlation target `bamepd` then revalidates
+        // against durable state.
         let (_r, store) = store();
         let v = verification();
         let handle = store.mint_verification(v.clone()).unwrap();
 
-        assert_eq!(
-            store.consume_verification(&handle, TransferId::new(), v.artifact_id),
-            Err(TransientOperationError::BindingMismatch)
-        );
-        assert_eq!(
-            store.consume_verification(&handle, v.transfer_id, ArtifactId::new()),
-            Err(TransientOperationError::BindingMismatch)
-        );
-        assert!(store.verification_binding(&handle).is_some());
-
-        let consumed = store
-            .consume_verification(&handle, v.transfer_id, v.artifact_id)
-            .unwrap();
+        let consumed = store.consume_verification(&handle).unwrap();
         assert_eq!(consumed, v);
+        // Single-use: a second consume of the same handle fails.
         assert_eq!(
-            store.consume_verification(&handle, v.transfer_id, v.artifact_id),
+            store.consume_verification(&handle),
             Err(TransientOperationError::UnknownHandle)
         );
     }
@@ -1147,7 +1144,7 @@ mod tests {
         registry.end_generation(generation);
 
         assert_eq!(
-            store.consume_verification(&handle, v.transfer_id, v.artifact_id),
+            store.consume_verification(&handle),
             Err(TransientOperationError::StaleGeneration)
         );
         assert_eq!(
@@ -1189,7 +1186,7 @@ mod tests {
             Err(TransientOperationError::StaleGeneration)
         );
         assert_eq!(
-            store.consume_verification(&ver, TransferId::new(), ArtifactId::new()),
+            store.consume_verification(&ver),
             Err(TransientOperationError::StaleGeneration)
         );
         assert_eq!(

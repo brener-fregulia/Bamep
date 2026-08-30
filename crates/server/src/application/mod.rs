@@ -37,16 +37,18 @@ use crate::ports::{
     AgentDispatchError, AgentDispatchPort, ApplyActionEvidenceDecision,
     ApplyActionEvidenceDecisionOutcome, ApplyActionEvidenceError, ApplyActionEvidenceResult,
     ApplyCancelAckDecision, ApplyCancelAckDecisionOutcome, ApplyCancelAckResult,
-    AuthorizationDurableState, AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError,
-    BootContextRepository, CancelAckCommit, CancellationRequestDecided, ChunkAcceptanceCommit,
-    ChunkAcceptanceDecided, CommitChunkAcceptanceError, CommitDestructiveDispatchError,
-    CommitTransferDispatchError, CreateWorkflowError, CredentialRedemptionRepository,
-    EndpointRepository, EndpointUpdateError, FinalDispatchCommit, FinalDispatchDecision,
-    FinalDispatchLockedFacts, InventoryRepository, JobRepository, RedemptionDecision,
-    RedemptionTarget, RepositoryError, RequestCancellationDecision, RequestCancellationError,
-    RequestCancellationLockedFacts, RequestCancellationResult, SatisfyStepPreconditionsDecision,
-    SatisfyStepPreconditionsError, TargetRevalidationPort, TransferAuthorizationRepository,
-    TransferDispatchDecision, TransferDispatchLockedFacts, TransferLockedFacts, TransferRepository,
+    ArtifactVerificationCommit, ArtifactVerificationDecided, AuthorizationDurableState,
+    AuthorizeDestructiveIntentDecision, AuthorizeDestructiveIntentError, BootContextRepository,
+    CancelAckCommit, CancellationRequestDecided, ChunkAcceptanceCommit, ChunkAcceptanceDecided,
+    CommitArtifactVerificationError, CommitChunkAcceptanceError, CommitDestructiveDispatchError,
+    CommitManifestSealError, CommitTransferDispatchError, CreateWorkflowError,
+    CredentialRedemptionRepository, EndpointRepository, EndpointUpdateError, FinalDispatchCommit,
+    FinalDispatchDecision, FinalDispatchLockedFacts, InventoryRepository, JobRepository,
+    ManifestSealCommit, ManifestSealDecided, RedemptionDecision, RedemptionTarget, RepositoryError,
+    RequestCancellationDecision, RequestCancellationError, RequestCancellationLockedFacts,
+    RequestCancellationResult, SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError,
+    TargetRevalidationPort, TransferAuthorizationRepository, TransferDispatchDecision,
+    TransferDispatchLockedFacts, TransferLockedFacts, TransferRepository,
 };
 use crate::runtime::capability_store::CapabilityStore;
 use crate::runtime::presence::PresenceRegistry;
@@ -2556,6 +2558,405 @@ impl ChunkAcceptanceService {
                 Ok(ChunkAcceptanceCommit::FailClosed)
             }
             Err(CommitChunkAcceptanceError::Repository(err)) => {
+                Err(ApplicationError::Repository(err))
+            }
+        }
+    }
+}
+
+/// Durable coordination of one `ManifestSealRequest`
+/// (`m1-worker-data-plane-control-contract.md` "Seal-manifest first durable
+/// commit"; `m0-data-plane-and-storage-contracts.md` "Durable chunk
+/// acceptance ordering"; Issue #39 Phase C2). Unlike `chunk_upload`, seal has
+/// **no** preceding `AuthorizationQuery`: this one message is its own
+/// authorizing request *and* the first durable commit
+/// (`Incomplete -> PendingVerification`).
+///
+/// The sender-constrained authorization discipline is exactly Issue #38's
+/// (capability opacity/binding, 137-byte proof transcript, signature,
+/// freshness, replay, Attempt ownership + `InProgress`, credential
+/// active/revocation, non-enumerable denial). Its process-local half
+/// (capability lookup/epoch, proof structural parse, freshness, signature,
+/// values derived from the capability binding) runs here; the **current
+/// durable** half that can race with the seal (exact Transfer/Artifact/
+/// Attempt/credential/manifest/held-chunk state), the replay check+insert,
+/// and the seal mutation all run inside the **one** PostgreSQL transaction
+/// [`TransferRepository::commit_manifest_seal`] owns — no authorization ->
+/// mutation TOCTOU (Issue #39 Phase C2).
+pub struct ManifestSealService {
+    repo: Arc<dyn TransferRepository>,
+    capabilities: Arc<CapabilityStore>,
+    replay: Arc<ReplayCache>,
+    clock: Arc<dyn Clock>,
+}
+
+/// The mechanical facts one received `ManifestSealRequest` carries.
+#[derive(Debug, Clone)]
+pub struct ManifestSealInput {
+    pub token: String,
+    pub transfer_id: uuid::Uuid,
+    pub proof_id: String,
+    pub issued_at_millis: u64,
+    pub signature: String,
+    pub chunk_count: u64,
+    pub artifact_digest: String,
+}
+
+impl ManifestSealService {
+    pub fn new(
+        repo: Arc<dyn TransferRepository>,
+        capabilities: Arc<CapabilityStore>,
+        replay: Arc<ReplayCache>,
+    ) -> Self {
+        Self {
+            repo,
+            capabilities,
+            replay,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Authorizes and, on success, atomically first-commits one seal. Returns
+    /// the [`ManifestSealCommit`] the Adapter maps to a `ManifestSealDecision`
+    /// (or, for `FailClosed`, to no response at all). The Adapter mints the
+    /// generation-scoped `verification_handle` only *after* this returns a
+    /// committed (`Sealed`/`AlreadyPending`) outcome.
+    pub async fn commit_manifest_seal(
+        &self,
+        input: ManifestSealInput,
+    ) -> Result<ManifestSealCommit, ApplicationError> {
+        let transfer_id = TransferId(input.transfer_id);
+
+        // -- process-local authorization (Issue #39 Phase C2 item 5): every
+        //    check here is static / capability-store-local and cannot race
+        //    with the durable seal, so it is legitimate before the mutation
+        //    transaction. --
+        let capability_id = CapabilityId::from_token_bytes(input.token.as_bytes());
+        let Some(binding) = self.capabilities.lookup(&capability_id) else {
+            return Ok(ManifestSealCommit::Denied);
+        };
+        let now = self.clock.now();
+        if capability_is_current(&binding, now, self.capabilities.epoch()).is_err() {
+            return Ok(ManifestSealCommit::Denied);
+        }
+        let requested = RequestedOperation {
+            operation: AuthorizationOperation::SealManifest,
+            transfer_id,
+            artifact_id: binding.artifact_id,
+            direction: binding.direction,
+            chunk_index: None,
+        };
+        if capability_matches_request(&binding, &requested).is_err() {
+            return Ok(ManifestSealCommit::Denied);
+        }
+        let Ok(proof_id) = ProofId::parse_wire_value(&input.proof_id) else {
+            return Ok(ManifestSealCommit::Denied);
+        };
+        let Ok(signature) = ProofSignature::parse_wire_value(&input.signature) else {
+            return Ok(ManifestSealCommit::Denied);
+        };
+        if proof_is_fresh(input.issued_at_millis, now).is_err() {
+            return Ok(ManifestSealCommit::Denied);
+        }
+        let transcript = build_proof_transcript(
+            &capability_id,
+            &ProofTranscriptFields {
+                operation: AuthorizationOperation::SealManifest,
+                transfer_id,
+                artifact_id: binding.artifact_id,
+                direction: binding.direction,
+                chunk_index: None,
+                proof_id,
+                issued_at_millis: input.issued_at_millis,
+            },
+        );
+        if !verify_proof_signature(&binding.proof_public_key, &transcript, &signature) {
+            return Ok(ManifestSealCommit::Denied);
+        }
+
+        // `chunk_count` outside the Domain's 32-bit representation has no
+        // approved public business reason — fail closed, no transaction, no
+        // proof consumed (item 8).
+        let Ok(chunk_count) = u32::try_from(input.chunk_count) else {
+            return Ok(ManifestSealCommit::FailClosed);
+        };
+
+        let replay = Arc::clone(&self.replay);
+        let artifact_digest_wire = input.artifact_digest.clone();
+        let replay_valid_until = DateTime::from_timestamp_millis(
+            bamep_domain::proof_replay_valid_until_millis(input.issued_at_millis)
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+        )
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+
+        let decide: crate::ports::CommitManifestSealDecision =
+            Box::new(move |state: &AuthorizationDurableState| {
+                // -- current durable authorization, in the SAME transaction as
+                //    the seal (item 5). Mirrors Issue #38 `authorize_request`
+                //    step 6. --
+                if state.transfer.endpoint_id != binding.endpoint_id
+                    || state.transfer.artifact_id != binding.artifact_id
+                    || state.transfer.direction != binding.direction
+                {
+                    return ManifestSealDecided::Denied;
+                }
+                let Some(attempt) = state.attempt.as_ref() else {
+                    return ManifestSealDecided::Denied;
+                };
+                if attempt.id != binding.attempt_id || attempt.state != AttemptState::InProgress {
+                    return ManifestSealDecided::Denied;
+                }
+                if state.endpoint.credential.dimension(now) != CredentialDimension::CredentialActive
+                {
+                    return ManifestSealDecided::Denied;
+                }
+
+                // Seal-specific current-operation eligibility (item 17, 18): a
+                // `Verified`/`Failed` Artifact is a generic `denied`, never
+                // `manifest_already_sealed`; `Incomplete` and
+                // `PendingVerification` both stay seal-eligible here (the
+                // finer same-identity-only rule for `PendingVerification` is
+                // enforced by the Domain `seal` outcome below).
+                if bamep_domain::data_plane_operation_is_current(
+                    AuthorizationOperation::SealManifest,
+                    state.artifact.state,
+                    state.manifest.sealed,
+                    false,
+                )
+                .is_err()
+                {
+                    return ManifestSealDecided::Denied;
+                }
+
+                // Canonical digest parse against the durable manifest
+                // algorithm (item 8) — before the replay check, so a
+                // structurally invalid follow-up consumes no proof state.
+                let Ok(digest) = bamep_domain::Digest::parse_wire_value(
+                    state.manifest.digest_algorithm,
+                    &artifact_digest_wire,
+                ) else {
+                    return ManifestSealDecided::FailClosed;
+                };
+
+                // Replay check+insert only now that the request would
+                // otherwise pass authorization (item 7 / Issue #38 invariant:
+                // a request that fails authorization must not consume proof
+                // replay state). If the later commit fails, the entry is NOT
+                // rolled back — a retry uses a fresh `proof_id`.
+                if replay
+                    .check_and_insert(proof_id, now, replay_valid_until)
+                    .is_err()
+                {
+                    return ManifestSealDecided::Denied;
+                }
+
+                // -- Domain composition (item 11). --
+                match state.artifact.state {
+                    bamep_domain::ArtifactState::Incomplete => {
+                        if state.manifest.sealed {
+                            // Sealed manifest + Incomplete Artifact — an
+                            // inconsistent state C2's atomic path never
+                            // produces (item 16). Fail closed; never
+                            // `already_pending_verification`.
+                            return ManifestSealDecided::FailClosed;
+                        }
+                        match state
+                            .manifest
+                            .seal(chunk_count, digest.clone().into_bytes())
+                        {
+                            Ok(bamep_domain::SealOutcome::Sealed(sealed)) => {
+                                // The declared chunk set is complete and
+                                // contiguous; now require every index
+                                // `0..chunk_count-1` to be durably held/
+                                // verified (item 37) — an expected identity
+                                // merely existing is not enough.
+                                match bamep_domain::begin_verification(
+                                    &state.artifact,
+                                    &sealed,
+                                    &state.held_chunk_indices,
+                                ) {
+                                    Ok(_pending) => ManifestSealDecided::Seal {
+                                        chunk_count,
+                                        artifact_digest: digest,
+                                    },
+                                    Err(
+                                        bamep_domain::ArtifactTransitionError::IncompleteChunks,
+                                    ) => ManifestSealDecided::RejectIncomplete,
+                                    // NotIncomplete / ManifestNotSealed /
+                                    // ManifestMismatch are all impossible for
+                                    // a freshly sealed candidate over this
+                                    // exact `Incomplete` Artifact.
+                                    Err(_) => ManifestSealDecided::FailClosed,
+                                }
+                            }
+                            // A not-yet-sealed manifest whose recorded
+                            // identity set is short or non-contiguous is
+                            // exactly `incomplete_manifest` (item 12); no
+                            // durable seal, Artifact stays `Incomplete`.
+                            Err(bamep_domain::SealError::IncompleteChunkSet)
+                            | Err(bamep_domain::SealError::NonContiguousIndices) => {
+                                ManifestSealDecided::RejectIncomplete
+                            }
+                            // `AlreadySealed`/`ConflictingReseal` require
+                            // `self.sealed`, impossible on this branch;
+                            // `InvalidDigestLength` is impossible after the
+                            // canonical parse above.
+                            Ok(_) | Err(_) => ManifestSealDecided::FailClosed,
+                        }
+                    }
+                    bamep_domain::ArtifactState::PendingVerification => {
+                        if !state.manifest.sealed {
+                            // `PendingVerification` requires a sealed manifest
+                            // — inconsistent (item 16).
+                            return ManifestSealDecided::FailClosed;
+                        }
+                        match state.manifest.seal(chunk_count, digest.into_bytes()) {
+                            // Identical `(chunk_count, artifact_digest)` — the
+                            // idempotent crash-recovery retry (item 14).
+                            Ok(bamep_domain::SealOutcome::AlreadySealed) => {
+                                ManifestSealDecided::AlreadyPending
+                            }
+                            // Different `(chunk_count, artifact_digest)` —
+                            // `manifest_already_sealed`, original tuple never
+                            // rewritten (item 13).
+                            Err(bamep_domain::SealError::ConflictingReseal) => {
+                                ManifestSealDecided::RejectAlreadySealed
+                            }
+                            // `Sealed` is impossible (already sealed); every
+                            // other error is impossible after a canonical
+                            // digest over an already-sealed manifest.
+                            Ok(_) | Err(_) => ManifestSealDecided::FailClosed,
+                        }
+                    }
+                    // Terminal — already `Denied` by the eligibility check
+                    // above; defensive.
+                    bamep_domain::ArtifactState::Verified | bamep_domain::ArtifactState::Failed => {
+                        ManifestSealDecided::Denied
+                    }
+                }
+            });
+
+        match self.repo.commit_manifest_seal(transfer_id, decide).await {
+            Ok(commit) => Ok(commit),
+            Err(CommitManifestSealError::TransferNotFound(_)) => {
+                // An authorized token for a Transfer that no longer resolves
+                // is the generic non-enumerable denial (route addressing an
+                // unknown resource is never enumerable —
+                // `m0-data-plane-and-storage-contracts.md`).
+                Ok(ManifestSealCommit::Denied)
+            }
+            Err(CommitManifestSealError::Repository(err)) => Err(ApplicationError::Repository(err)),
+        }
+    }
+}
+
+/// Durable coordination of one `ArtifactVerificationReport`
+/// (`m1-worker-data-plane-control-contract.md` "Full-Artifact verification
+/// result"; Issue #39 Phase C2). The transient `verification_handle` has
+/// already been consumed (single-use, current-generation) by the UDS Adapter
+/// before this is called, so this service performs **no** authorization of
+/// its own. It independently reloads the durable sealed Artifact under lock,
+/// revalidates that the consumed handle's bound identity still matches it
+/// exactly, and compares the Worker-*reported* `computed_artifact_digest`
+/// against `bamepd`'s **own durable** `expected_artifact_digest` — never the
+/// value the handle carried — before committing
+/// `PendingVerification -> Verified | Failed` in one transaction. No bytes
+/// cross UDS; `bamepd` never computes the full-Artifact digest.
+pub struct ArtifactVerificationService {
+    repo: Arc<dyn TransferRepository>,
+}
+
+/// The consumed `verification_handle`'s bound sealed identity plus the
+/// Worker's reported mechanical digest — the inputs to one verification
+/// commit.
+#[derive(Debug, Clone)]
+pub struct ArtifactVerificationInput {
+    pub transfer_id: uuid::Uuid,
+    pub artifact_id: uuid::Uuid,
+    pub chunk_count: u64,
+    pub computed_artifact_digest: String,
+}
+
+impl ArtifactVerificationService {
+    pub fn new(repo: Arc<dyn TransferRepository>) -> Self {
+        Self { repo }
+    }
+
+    /// Independently commits `PendingVerification -> Verified | Failed`.
+    /// Returns [`ArtifactVerificationCommit::Committed`] for either terminal
+    /// status (both are successful verification commits the Worker maps to
+    /// HTTP `200`), or [`ArtifactVerificationCommit::FailClosed`] — no `Ack`,
+    /// no mutation — for a malformed reported digest, a durable/binding
+    /// mismatch, or a non-`PendingVerification` Artifact.
+    pub async fn commit_artifact_verification(
+        &self,
+        input: ArtifactVerificationInput,
+    ) -> Result<ArtifactVerificationCommit, ApplicationError> {
+        let transfer_id = TransferId(input.transfer_id);
+        let bound_artifact_id = bamep_domain::ArtifactId(input.artifact_id);
+        let bound_chunk_count = input.chunk_count;
+        let computed_wire = input.computed_artifact_digest.clone();
+
+        let decide: crate::ports::CommitArtifactVerificationDecision =
+            Box::new(move |facts: &TransferLockedFacts| {
+                // The durable Artifact this Transfer owns must be exactly the
+                // one the consumed handle was bound to, currently
+                // `PendingVerification`, with a sealed manifest whose
+                // `chunk_count` matches the handle (item 29, 33). Any
+                // mismatch is an internal invariant violation — fail closed,
+                // never repair, never retarget, never trust the transient
+                // binding over PostgreSQL.
+                if facts.artifact.id != bound_artifact_id
+                    || facts.transfer.artifact_id != bound_artifact_id
+                    || facts.artifact.state != bamep_domain::ArtifactState::PendingVerification
+                    || !facts.manifest.sealed
+                    || facts.manifest.chunk_count.map(u64::from) != Some(bound_chunk_count)
+                {
+                    return ArtifactVerificationDecided::FailClosed;
+                }
+
+                // `bamepd`'s OWN durable expected digest — not the transient
+                // binding's copy (item 28).
+                let Some(expected) = facts.manifest.artifact_digest.as_ref() else {
+                    return ArtifactVerificationDecided::FailClosed;
+                };
+
+                // Parse the Worker-reported digest strictly (item 27). A
+                // malformed digest is NOT a completed `Failed` verification —
+                // it is fail-closed, no `Ack`, Artifact stays
+                // `PendingVerification`.
+                let Ok(computed) = bamep_domain::Digest::parse_wire_value(
+                    facts.manifest.digest_algorithm,
+                    &computed_wire,
+                ) else {
+                    return ArtifactVerificationDecided::FailClosed;
+                };
+
+                // `bamepd` independently compares (item 28, 30). A mismatch is
+                // an authoritative completed verification result (`Failed`),
+                // never a rejection or protocol error.
+                let digest_matches = computed.as_bytes() == expected.as_bytes();
+                match bamep_domain::complete_verification(&facts.artifact, digest_matches) {
+                    Ok(updated) => ArtifactVerificationDecided::Commit(updated),
+                    Err(_) => ArtifactVerificationDecided::FailClosed,
+                }
+            });
+
+        match self
+            .repo
+            .commit_artifact_verification(transfer_id, decide)
+            .await
+        {
+            Ok(commit) => Ok(commit),
+            Err(CommitArtifactVerificationError::TransferNotFound(_)) => {
+                Ok(ArtifactVerificationCommit::FailClosed)
+            }
+            Err(CommitArtifactVerificationError::Repository(err)) => {
                 Err(ApplicationError::Repository(err))
             }
         }
