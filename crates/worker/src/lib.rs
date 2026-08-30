@@ -12,20 +12,24 @@
 //! identity, maintaining a fail-closed view of whether authoritative
 //! `bamepd` control is currently available
 //! (`docs/specifications/m1-worker-data-plane-control-contract.md`), and —
-//! since Issue #39 Phase D1 — a local chunk **byte-storage** mechanism
-//! (`storage`): staging an authorized chunk body, hashing it incrementally
-//! with SHA-256, and finalizing it into a restart-stable file. That layer
-//! still owns no durable or business authority; a finalized file never
-//! means `bamepd` accepted the chunk (ADR-0018 "PostgreSQL and storage":
-//! storage I/O is execution, durable acceptance is `bamepd`'s).
+//! since Issue #39 Phase D1/D2 — the `storage` module: a local chunk
+//! **byte-storage** mechanism (staging an authorized chunk body, hashing it
+//! incrementally with SHA-256, finalizing it into a restart-stable file) and
+//! **full-Artifact reconstruction** (reopening a sealed Artifact's finalized
+//! chunks in order and independently recomputing its full SHA-256). That
+//! layer still owns no durable or business authority: a finalized file never
+//! means `bamepd` accepted the chunk, and reconstruction reports only a
+//! mechanically computed digest — it decides no `Verified`/`Failed` verdict
+//! (ADR-0018 "PostgreSQL and storage": storage I/O is execution, durable
+//! acceptance/verification is `bamepd`'s).
 //!
 //! Issue #37 implemented the handshake/connection-generation/fail-closed-
-//! authority slice; Phase D1 adds `storage` only. Still out of scope here:
+//! authority slice; Phase D1/D2 add `storage` only. Still out of scope here:
 //! the business message catalog (`AuthorizationQuery`,
-//! `ChunkAcceptanceRequest`, `ArtifactVerificationReport`, and their
-//! responses), full-Artifact reconstruction across chunks, and the
-//! Worker-owned HTTPS/TLS data-plane listener and routes — see
-//! `bamep-worker-protocol` and this crate's `tls`/`storage` module docs.
+//! `ChunkAcceptanceRequest`, `ManifestSealRequest`,
+//! `ArtifactVerificationReport`, and their responses) and the Worker-owned
+//! HTTPS/TLS data-plane listener and routes — see `bamep-worker-protocol`
+//! and this crate's `tls`/`storage` module docs.
 
 pub mod config;
 pub mod ipc;

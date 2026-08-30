@@ -1,8 +1,14 @@
-//! Worker-local chunk byte storage (Issue #39 Phase D1): the narrow
-//! filesystem mechanism that stages one authorized chunk body, hashes it
-//! incrementally with SHA-256, and finalizes it into a restart-stable file
-//! that the later HTTPS data-plane handler (Phase E) and full-Artifact
-//! reconstruction (Phase D2) will consume.
+//! Worker-local chunk byte storage and full-Artifact reconstruction (Issue
+//! #39 Phase D1 + D2).
+//!
+//! Phase D1 ([`FilesystemChunkStore`]) is the narrow filesystem mechanism
+//! that stages one authorized chunk body, hashes it incrementally with
+//! SHA-256, and finalizes it into a restart-stable file. Phase D2
+//! ([`FullArtifactHasher`]) reopens those finalized files for one sealed
+//! Artifact, in strict `0..chunk_count` order, and independently recomputes
+//! the full-Artifact SHA-256 over their raw concatenation — a fresh reread,
+//! reusing none of D1's per-chunk hashes and deciding no `Verified`/`Failed`
+//! verdict.
 //!
 //! This layer owns **bytes only**. It owns no Transfer/Artifact business
 //! state, no durable authority, and performs no `bamepd` coordination
@@ -16,11 +22,11 @@
 //! Artifact state"). See [`FinalizedChunk`] for the authority caveats an
 //! orphan final file carries.
 //!
-//! Deliberately **not** in Phase D1: the HTTPS listener, TLS serving, route
-//! parsing, HTTP header handling, any UDS business message
+//! Deliberately **not** in Phase D1/D2: the HTTPS listener, TLS serving,
+//! route parsing, HTTP header handling, and any UDS business message flow
 //! (`AuthorizationQuery`, `ChunkAcceptanceRequest`, `ResumeDiscoveryQuery`,
-//! `ManifestSealRequest`, `ArtifactVerificationReport`), and full-Artifact
-//! concatenation/digest across chunks.
+//! `ManifestSealRequest`, `ArtifactVerificationReport`). Phase E composes
+//! D1 + D2 + the Worker Protocol into the HTTPS surface.
 //!
 //! # Blocking-I/O model
 //!
@@ -162,6 +168,14 @@ mod fs_store;
 
 #[cfg(unix)]
 pub use fs_store::{ChunkStore, FilesystemChunkStore, StagingChunk, StoredChunkReader};
+
+#[cfg(unix)]
+mod full_artifact;
+
+#[cfg(unix)]
+pub use full_artifact::{
+    FullArtifactDigest, FullArtifactError, FullArtifactHasher, FullArtifactRequest,
+};
 
 #[cfg(not(unix))]
 mod fs_store {
