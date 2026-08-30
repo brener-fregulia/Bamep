@@ -30,7 +30,26 @@ sha2 = "0.10"
 # convention `bamep-trusted-bootstrap` already uses and the digest text
 # `m0-data-plane-and-storage-contracts.md` fixes.
 base64 = "0.22"
+# Issue #39 Phase E2A — the Worker-owned HTTPS `/api/data/v1/` data-plane
+# listener (ADR-0018; the same Axum 0.8 stack ADR-0017 already accepts for
+# `bamepd`'s Administrative surface, chosen here to avoid a second unrelated
+# Rust HTTP stack). `axum` for exact routing/response building; `axum-server`
+# for the smallest rustls TLS-serving + graceful-shutdown integration
+# (`tls-rustls-no-provider`: no bundled crypto backend — the Worker feeds its
+# own `ring`-built `rustls::ServerConfig`).
+axum = { version = "0.8", default-features = false, features = ["json", "tokio"] }
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+# Fixed JSON success/error response bodies for the data-plane contract.
+serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "test-util"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+# Minimal real-HTTPS test client (Phase E2A integration tests): a raw
+# hyper-1 http1 connection over `tokio-rustls`, trusting the exact test leaf.
+# All already resolved via `axum`/`axum-server`; declared here only so tests
+# may name them.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

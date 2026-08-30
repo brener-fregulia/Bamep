@@ -35,10 +35,16 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 bamep-simulator = { path = "../simulator" }
-# Cross-crate interop proof only (Issue #39 Phase E1): drives the real
-# `bamep_worker::ipc` control client against the real `WorkerControlPlane`.
-# Dev-only, one-directional — `bamep-worker` never depends on `bamep-server`.
+# Cross-crate interop proofs only (Issue #39 Phases E1/E2A): drives the real
+# `bamep_worker` control client + HTTPS data-plane runtime against the real
+# `WorkerControlPlane` and real PostgreSQL. Dev-only, one-directional —
+# `bamep-worker` never depends on `bamep-server`.
 bamep-worker = { path = "../worker" }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 rand = "0.8"
+# Minimal real-HTTPS test client for the E2A data-plane vertical (all already
+# resolved via `bamep-worker`'s `axum`/`axum-server` dependencies).
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"

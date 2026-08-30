@@ -13,6 +13,7 @@
 //! A small config struct plus environment parsing is sufficient here; no CLI
 //! framework is introduced for a handful of configuration values.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -36,6 +37,14 @@ pub const ENV_STORAGE_ROOT: &str = "BAMEP_WORKER_STORAGE_ROOT";
 /// this exact name into the spawned Worker child environment. A duration, not
 /// business state.
 pub const ENV_CONTROL_REQUEST_TIMEOUT_MS: &str = "BAMEP_WORKER_CONTROL_REQUEST_TIMEOUT_MS";
+/// Local TCP socket address the Worker binds its HTTPS `/api/data/v1/`
+/// data-plane listener to (Issue #39 Phase E2A). `bamepd` derives this from
+/// the same configuration that produces `data_plane_base_url` and validates
+/// that the port matches before forwarding it here, so normal composition
+/// cannot advertise one port while the Worker listens on another
+/// (`m0-agent-protocol-contract.md` "Endpoint discovery for the data-plane
+/// listener"). A bind address, not business state.
+pub const ENV_DATA_PLANE_BIND_ADDR: &str = "BAMEP_WORKER_DATA_PLANE_BIND_ADDR";
 
 const DEFAULT_RECONNECT_DELAY_MS: u64 = 500;
 
@@ -102,6 +111,10 @@ pub struct WorkerConfig {
     /// `m1-worker-data-plane-control-contract.md` "Failure semantics"). Not a
     /// reconnect backoff — a per-request answer deadline.
     pub control_request_timeout: Duration,
+    /// Local address the HTTPS `/api/data/v1/` data-plane listener binds to
+    /// (Issue #39 Phase E2A). Its port is forwarded by `bamepd` already
+    /// reconciled against `data_plane_base_url`.
+    pub data_plane_bind_addr: SocketAddr,
 }
 
 impl WorkerConfig {
@@ -131,6 +144,7 @@ impl WorkerConfig {
             MIN_CONTROL_REQUEST_TIMEOUT_MS,
             MAX_CONTROL_REQUEST_TIMEOUT_MS,
         )?;
+        let data_plane_bind_addr = required_socket_addr(&get, ENV_DATA_PLANE_BIND_ADDR)?;
 
         Ok(Self {
             uds_path,
@@ -139,8 +153,25 @@ impl WorkerConfig {
             storage_root,
             reconnect_delay,
             control_request_timeout,
+            data_plane_bind_addr,
         })
     }
+}
+
+/// Parses a required `IP:port` socket address. `bamepd` has already validated
+/// the port against `data_plane_base_url`; the Worker only needs a bindable
+/// local address (`0.0.0.0`/`::`/a specific interface, and — in tests — an
+/// ephemeral `:0`).
+fn required_socket_addr(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+) -> Result<SocketAddr, ConfigError> {
+    let raw = get(name).ok_or(ConfigError::MissingEnv(name))?;
+    raw.parse::<SocketAddr>()
+        .map_err(|_| ConfigError::InvalidEnv {
+            name,
+            reason: format!("must be an IP:port socket address, got {raw:?}"),
+        })
 }
 
 /// Parses an optional millisecond duration from `name`, applying `default_ms`
@@ -225,6 +256,7 @@ mod tests {
             (ENV_TLS_CERT_PATH, "/etc/bamep/tls/cert.pem"),
             (ENV_TLS_KEY_PATH, "/etc/bamep/tls/key.pem"),
             (ENV_STORAGE_ROOT, "/var/lib/bamep/worker-chunks"),
+            (ENV_DATA_PLANE_BIND_ADDR, "127.0.0.1:8443"),
         ]
     }
 
@@ -251,6 +283,49 @@ mod tests {
             config.control_request_timeout,
             Duration::from_millis(DEFAULT_CONTROL_REQUEST_TIMEOUT_MS)
         );
+        assert_eq!(
+            config.data_plane_bind_addr,
+            "127.0.0.1:8443".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_data_plane_bind_addr_is_rejected() {
+        let values: Vec<_> = base()
+            .into_iter()
+            .filter(|(name, _)| *name != ENV_DATA_PLANE_BIND_ADDR)
+            .collect();
+        let err = WorkerConfig::from_lookup(lookup(&values)).unwrap_err();
+        assert_eq!(err, ConfigError::MissingEnv(ENV_DATA_PLANE_BIND_ADDR));
+    }
+
+    #[test]
+    fn a_non_socket_addr_data_plane_bind_addr_is_rejected() {
+        for bad in [
+            "not-an-addr",
+            "127.0.0.1",
+            "https://x:1",
+            "0.0.0.0:",
+            ":8443",
+        ] {
+            let err = from_base_with(&[(ENV_DATA_PLANE_BIND_ADDR, bad)]).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidEnv { name, .. } if name == ENV_DATA_PLANE_BIND_ADDR),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ephemeral_and_wildcard_bind_addr_are_accepted() {
+        for good in ["127.0.0.1:0", "0.0.0.0:8443", "[::1]:9000", "[::]:0"] {
+            let config = from_base_with(&[(ENV_DATA_PLANE_BIND_ADDR, good)])
+                .unwrap_or_else(|e| panic!("{good:?} must parse: {e:?}"));
+            assert_eq!(
+                config.data_plane_bind_addr,
+                good.parse::<SocketAddr>().unwrap()
+            );
+        }
     }
 
     #[test]

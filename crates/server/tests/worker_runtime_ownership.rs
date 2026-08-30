@@ -156,6 +156,10 @@ fn spawn_bamepd(binary: &Path, env: &TestEnv) -> std::process::Child {
         )
         .env("BAMEP_WORKER_TLS_CERT_PATH", &env.cert_path)
         .env("BAMEP_WORKER_TLS_KEY_PATH", &env.key_path)
+        // Issue #39 Phase E2A: bamepd validates this against the
+        // BAMEP_DATA_PLANE_BASE_URL port and forwards it to the Worker
+        // child (the placeholder Worker executable never binds it).
+        .env("BAMEP_WORKER_DATA_PLANE_BIND_ADDR", "127.0.0.1:8443")
         // Issue #39 Phase D1: `bamepd` requires this to be present so it can
         // forward it to the Worker child. This test's Worker executable is a
         // harmless placeholder, so the path is only carried, never used.

@@ -31,7 +31,8 @@ use bamep_server::ports::{
     AuthorizationDurableState, RepositoryError, TransferAuthorizationRepository, TransferRepository,
 };
 use bamep_server::runtime::bamepd_config::{
-    ENV_RECONNECT_DELAY_MS, ENV_STORAGE_ROOT, ENV_TLS_CERT_PATH, ENV_TLS_KEY_PATH, ENV_UDS_PATH,
+    ENV_DATA_PLANE_BIND_ADDR, ENV_RECONNECT_DELAY_MS, ENV_STORAGE_ROOT, ENV_TLS_CERT_PATH,
+    ENV_TLS_KEY_PATH, ENV_UDS_PATH,
 };
 use bamep_server::runtime::capability_store::CapabilityStore;
 use bamep_server::runtime::replay_cache::ReplayCache;
@@ -354,6 +355,13 @@ async fn supervisor_manages_a_genuinely_separate_worker_process_through_handshak
         (
             ENV_STORAGE_ROOT.to_string(),
             env.storage_root.display().to_string(),
+        ),
+        // Issue #39 Phase E2A: the spawned Worker now binds an HTTPS
+        // data-plane listener. An ephemeral loopback port keeps this
+        // supervision test free of a fixed-port dependency.
+        (
+            ENV_DATA_PLANE_BIND_ADDR.to_string(),
+            "127.0.0.1:0".to_string(),
         ),
     ];
     let supervisor = WorkerSupervisor::new(SupervisorConfig {

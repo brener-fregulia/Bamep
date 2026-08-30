@@ -18,6 +18,7 @@
 //! constants if either ever changes. All are filesystem locations / timing —
 //! never Transfer IDs, capabilities, or proof material (ADR-0018).
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -37,6 +38,13 @@ pub const ENV_STORAGE_ROOT: &str = "BAMEP_WORKER_STORAGE_ROOT";
 /// Bounds how long one Worker Protocol control request waits for `bamepd`
 /// (Issue #39 Phase E1); `bamepd` only carries it through to the child.
 pub const ENV_CONTROL_REQUEST_TIMEOUT_MS: &str = "BAMEP_WORKER_CONTROL_REQUEST_TIMEOUT_MS";
+/// Must stay identical to `bamep_worker::config::ENV_DATA_PLANE_BIND_ADDR`.
+/// The local `IP:port` the Worker binds its HTTPS `/api/data/v1/` listener
+/// to (Issue #39 Phase E2A). `bamepd` validates that its port equals the
+/// port of `data_plane_base_url` before forwarding it — normal composition
+/// cannot advertise one port and bind another (`m0-agent-protocol-contract.md`
+/// "Endpoint discovery for the data-plane listener").
+pub const ENV_DATA_PLANE_BIND_ADDR: &str = "BAMEP_WORKER_DATA_PLANE_BIND_ADDR";
 pub const ENV_WORKER_EXECUTABLE: &str = "BAMEPD_WORKER_EXECUTABLE";
 pub const ENV_WORKER_RESTART_DELAY_MS: &str = "BAMEPD_WORKER_RESTART_DELAY_MS";
 /// PostgreSQL connection string (ADR-0013). Required starting with Issue
@@ -108,6 +116,10 @@ pub struct BamepdConfig {
     /// forwarded verbatim to the spawned Worker child (Issue #39 Phase E1).
     /// `bamepd` neither reads nor enforces it — the Worker does.
     pub worker_control_request_timeout: Duration,
+    /// Local `IP:port` the Worker binds its HTTPS data-plane listener to
+    /// (Issue #39 Phase E2A), forwarded to the Worker child. Validated so its
+    /// port equals `data_plane_base_url`'s port.
+    pub worker_data_plane_bind_addr: SocketAddr,
 }
 
 impl BamepdConfig {
@@ -144,6 +156,11 @@ impl BamepdConfig {
             MIN_CONTROL_REQUEST_TIMEOUT_MS,
             MAX_CONTROL_REQUEST_TIMEOUT_MS,
         )?;
+        let worker_data_plane_bind_addr = required_bind_addr_matching_origin(
+            &get,
+            ENV_DATA_PLANE_BIND_ADDR,
+            &data_plane_base_url,
+        )?;
 
         Ok(Self {
             uds_path,
@@ -156,14 +173,16 @@ impl BamepdConfig {
             data_plane_base_url,
             worker_storage_root,
             worker_control_request_timeout,
+            worker_data_plane_bind_addr,
         })
     }
 
     /// The exact environment `bamepd` forwards to the spawned Worker child
-    /// — UDS path, TLS identity paths, reconnect/timeout timing, and the
-    /// chunk storage root only, never business state (Issue #37 "Worker
-    /// process config"; Issue #39 Phase D1 adds the storage root, Phase E1
-    /// the control-request timeout — a filesystem location and a duration).
+    /// — UDS path, TLS identity paths, reconnect/timeout timing, the chunk
+    /// storage root, and the HTTPS bind address only, never business state
+    /// (Issue #37 "Worker process config"; Phase D1 adds the storage root,
+    /// Phase E1 the control-request timeout, Phase E2A the data-plane bind
+    /// address — filesystem locations, durations, and a socket address).
     pub fn worker_env(&self) -> Vec<(String, String)> {
         vec![
             (
@@ -189,6 +208,10 @@ impl BamepdConfig {
             (
                 ENV_CONTROL_REQUEST_TIMEOUT_MS.to_string(),
                 self.worker_control_request_timeout.as_millis().to_string(),
+            ),
+            (
+                ENV_DATA_PLANE_BIND_ADDR.to_string(),
+                self.worker_data_plane_bind_addr.to_string(),
             ),
         ]
     }
@@ -263,6 +286,47 @@ fn required_https_origin(
     Ok(value)
 }
 
+/// Parses a required `IP:port` bind address for the Worker HTTPS listener
+/// and rejects it unless its port equals the port of `data_plane_base_url`
+/// (an explicit `https://` origin with no port means `443`). This is the
+/// narrowest mechanism that makes it impossible for normal composition to
+/// advertise `data_plane_base_url` on one port while the Worker binds another
+/// (`m0-agent-protocol-contract.md` "Endpoint discovery for the data-plane
+/// listener"). `bamepd` does not bind this address itself — it only forwards
+/// it to the Worker child.
+fn required_bind_addr_matching_origin(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    data_plane_base_url: &str,
+) -> Result<SocketAddr, BamepdConfigError> {
+    let raw = required_string(get, name)?;
+    let bind_addr = raw
+        .parse::<SocketAddr>()
+        .map_err(|_| BamepdConfigError::InvalidEnv {
+            name,
+            reason: format!("must be an IP:port socket address, got {raw:?}"),
+        })?;
+
+    let origin_port = url::Url::parse(data_plane_base_url)
+        .ok()
+        .and_then(|url| url.port_or_known_default())
+        .ok_or(BamepdConfigError::InvalidEnv {
+            name,
+            reason: "cannot determine the port of BAMEP_DATA_PLANE_BASE_URL".to_string(),
+        })?;
+
+    if bind_addr.port() != origin_port {
+        return Err(BamepdConfigError::InvalidEnv {
+            name,
+            reason: format!(
+                "port {} must equal the BAMEP_DATA_PLANE_BASE_URL port {origin_port}",
+                bind_addr.port()
+            ),
+        });
+    }
+    Ok(bind_addr)
+}
+
 fn optional_millis(
     get: &impl Fn(&str) -> Option<String>,
     name: &'static str,
@@ -310,6 +374,7 @@ mod tests {
             (ENV_DATABASE_URL, "postgres://bamep@localhost/bamep"),
             (ENV_DATA_PLANE_BASE_URL, "https://server.example:8443"),
             (ENV_STORAGE_ROOT, "/var/lib/bamep/worker-chunks"),
+            (ENV_DATA_PLANE_BIND_ADDR, "0.0.0.0:8443"),
         ]
     }
 
@@ -335,6 +400,61 @@ mod tests {
             config.worker_control_request_timeout,
             Duration::from_millis(DEFAULT_CONTROL_REQUEST_TIMEOUT_MS)
         );
+        assert_eq!(
+            config.worker_data_plane_bind_addr,
+            "0.0.0.0:8443".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn the_data_plane_bind_addr_port_must_match_the_advertised_origin_port() {
+        // Origin with an explicit port.
+        let mut values = base_values();
+        values.retain(|(name, _)| *name != ENV_DATA_PLANE_BIND_ADDR);
+        values.push((ENV_DATA_PLANE_BIND_ADDR, "127.0.0.1:9999"));
+        let err = BamepdConfig::from_lookup(lookup(&values)).unwrap_err();
+        assert!(
+            matches!(err, BamepdConfigError::InvalidEnv { name, .. } if name == ENV_DATA_PLANE_BIND_ADDR)
+        );
+
+        // Origin with no explicit port defaults to 443.
+        let mut values = base_values();
+        values.retain(|(name, _)| {
+            *name != ENV_DATA_PLANE_BASE_URL && *name != ENV_DATA_PLANE_BIND_ADDR
+        });
+        values.push((ENV_DATA_PLANE_BASE_URL, "https://server.example"));
+        values.push((ENV_DATA_PLANE_BIND_ADDR, "0.0.0.0:443"));
+        let config = BamepdConfig::from_lookup(lookup(&values)).expect("port 443 matches https");
+        assert_eq!(config.worker_data_plane_bind_addr.port(), 443);
+
+        let mut values = base_values();
+        values.retain(|(name, _)| {
+            *name != ENV_DATA_PLANE_BASE_URL && *name != ENV_DATA_PLANE_BIND_ADDR
+        });
+        values.push((ENV_DATA_PLANE_BASE_URL, "https://server.example"));
+        values.push((ENV_DATA_PLANE_BIND_ADDR, "0.0.0.0:8443"));
+        let err = BamepdConfig::from_lookup(lookup(&values)).unwrap_err();
+        assert!(
+            matches!(err, BamepdConfigError::InvalidEnv { name, .. } if name == ENV_DATA_PLANE_BIND_ADDR)
+        );
+    }
+
+    #[test]
+    fn a_missing_or_malformed_data_plane_bind_addr_is_rejected() {
+        let mut values = base_values();
+        values.retain(|(name, _)| *name != ENV_DATA_PLANE_BIND_ADDR);
+        assert_eq!(
+            BamepdConfig::from_lookup(lookup(&values)).unwrap_err(),
+            BamepdConfigError::MissingEnv(ENV_DATA_PLANE_BIND_ADDR)
+        );
+
+        let mut values = base_values();
+        values.retain(|(name, _)| *name != ENV_DATA_PLANE_BIND_ADDR);
+        values.push((ENV_DATA_PLANE_BIND_ADDR, "server.example:8443"));
+        assert!(matches!(
+            BamepdConfig::from_lookup(lookup(&values)).unwrap_err(),
+            BamepdConfigError::InvalidEnv { name, .. } if name == ENV_DATA_PLANE_BIND_ADDR
+        ));
     }
 
     #[test]
@@ -403,6 +523,18 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         map.insert(ENV_DATA_PLANE_BASE_URL.to_string(), raw.to_string());
+        // Keep the bind-addr port consistent with a *well-formed* origin so
+        // these tests isolate the origin-shape validation; an adversarial
+        // origin fails on the origin check first, before the bind check.
+        if let Some(port) = url::Url::parse(raw)
+            .ok()
+            .and_then(|url| url.port_or_known_default())
+        {
+            map.insert(
+                ENV_DATA_PLANE_BIND_ADDR.to_string(),
+                format!("0.0.0.0:{port}"),
+            );
+        }
         BamepdConfig::from_lookup(move |key: &str| map.get(key).cloned())
     }
 
@@ -485,6 +617,10 @@ mod tests {
         assert_eq!(
             get(ENV_CONTROL_REQUEST_TIMEOUT_MS),
             Some(DEFAULT_CONTROL_REQUEST_TIMEOUT_MS.to_string())
+        );
+        assert_eq!(
+            get(ENV_DATA_PLANE_BIND_ADDR),
+            Some("0.0.0.0:8443".to_string())
         );
     }
 

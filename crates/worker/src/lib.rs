@@ -20,6 +20,13 @@
 //!   timeout, and every operation reporting only what `bamepd` decided (never
 //!   a fabricated decision, never a local `Verified`/`Failed` verdict, never a
 //!   replayed proof/handle across a reconnect).
+//! - **`data_plane`** — since Phase E2A: the Worker-owned HTTPS
+//!   `/api/data/v1/` listener (Axum 0.8 + `axum-server`, serving the same
+//!   Server TLS identity the Agent already trusts). It fully implements the
+//!   `GET .../chunks` resume-discovery operation by delegating to
+//!   `ipc::WorkerControlHandle::discover_resume`; it performs structural HTTP
+//!   parsing only and never verifies a capability, proof, or held-chunk
+//!   truth. Chunk `PUT` and seal `POST` are Phase E2B.
 //! - **`storage`** — since Phase D1/D2: a local chunk **byte-storage**
 //!   mechanism (staging an authorized chunk body, hashing it incrementally
 //!   with SHA-256, finalizing it into a restart-stable file) and
@@ -31,12 +38,13 @@
 //!   listener).
 //!
 //! Worker owns no durable/business authority (ADR-0018 "PostgreSQL and
-//! storage": storage I/O and control transport are execution; durable
-//! acceptance/sealing/verification are `bamepd`'s). Still out of scope here:
-//! the Worker-owned HTTPS/TLS data-plane listener and routes, and the
-//! orchestration that composes `ipc` + `storage` behind them (Phase E2).
+//! storage": storage I/O, control transport, and HTTP serving are execution;
+//! durable acceptance/sealing/verification are `bamepd`'s). Still out of
+//! scope here: chunk `PUT` transport, seal `POST`, and the orchestration
+//! that composes `data_plane` with `storage` (D1/D2) — Phase E2B.
 
 pub mod config;
+pub mod data_plane;
 pub mod ipc;
 pub mod storage;
 pub mod tls;
