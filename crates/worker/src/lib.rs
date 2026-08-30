@@ -9,17 +9,25 @@
 //! not own a PostgreSQL repository Adapter and does not independently
 //! mutate Bamep durable Domain/Application state"). Worker owns no Domain/
 //! Application authority here, only mechanism: loading its own TLS
-//! identity and maintaining a fail-closed view of whether authoritative
+//! identity, maintaining a fail-closed view of whether authoritative
 //! `bamepd` control is currently available
-//! (`docs/specifications/m1-worker-data-plane-control-contract.md`).
+//! (`docs/specifications/m1-worker-data-plane-control-contract.md`), and —
+//! since Issue #39 Phase D1 — a local chunk **byte-storage** mechanism
+//! (`storage`): staging an authorized chunk body, hashing it incrementally
+//! with SHA-256, and finalizing it into a restart-stable file. That layer
+//! still owns no durable or business authority; a finalized file never
+//! means `bamepd` accepted the chunk (ADR-0018 "PostgreSQL and storage":
+//! storage I/O is execution, durable acceptance is `bamepd`'s).
 //!
-//! Issue #37 implements only the handshake/connection-generation/fail-
-//! closed-authority slice. The business message catalog
-//! (`AuthorizationQuery`, `ChunkAcceptanceRequest`,
-//! `ArtifactVerificationReport`, and their responses) and the Worker-owned
-//! HTTPS data-plane listener are out of scope — see `bamep-worker-protocol`
-//! and this crate's `tls` module docs.
+//! Issue #37 implemented the handshake/connection-generation/fail-closed-
+//! authority slice; Phase D1 adds `storage` only. Still out of scope here:
+//! the business message catalog (`AuthorizationQuery`,
+//! `ChunkAcceptanceRequest`, `ArtifactVerificationReport`, and their
+//! responses), full-Artifact reconstruction across chunks, and the
+//! Worker-owned HTTPS/TLS data-plane listener and routes — see
+//! `bamep-worker-protocol` and this crate's `tls`/`storage` module docs.
 
 pub mod config;
 pub mod ipc;
+pub mod storage;
 pub mod tls;

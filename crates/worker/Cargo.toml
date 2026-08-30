@@ -21,6 +21,15 @@ rustls-pemfile = "2"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "1"
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+# Incremental SHA-256 over staged chunk bytes (Phase D1 chunk storage). Same
+# crate/version the rest of the workspace already hashes with
+# (`bamep-domain`, `bamep-trusted-bootstrap`, `bamep-simulator`); no `ring`
+# coupling for a pure byte hash.
+sha2 = "0.10"
+# Canonical RFC 4648 base64url-no-pad encoding of a chunk digest, matching the
+# convention `bamep-trusted-bootstrap` already uses and the digest text
+# `m0-data-plane-and-storage-contracts.md` fixes.
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }

@@ -181,10 +181,12 @@ version = "0.1.0"
 dependencies = [
  "bamep-trusted-bootstrap",
  "bamep-worker-protocol",
+ "base64",
  "rcgen",
  "rustix",
  "rustls",
  "rustls-pemfile",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
  "uuid",

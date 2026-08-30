@@ -156,6 +156,10 @@ fn spawn_bamepd(binary: &Path, env: &TestEnv) -> std::process::Child {
         )
         .env("BAMEP_WORKER_TLS_CERT_PATH", &env.cert_path)
         .env("BAMEP_WORKER_TLS_KEY_PATH", &env.key_path)
+        // Issue #39 Phase D1: `bamepd` requires this to be present so it can
+        // forward it to the Worker child. This test's Worker executable is a
+        // harmless placeholder, so the path is only carried, never used.
+        .env("BAMEP_WORKER_STORAGE_ROOT", env.dir.join("chunk-storage"))
         .env("BAMEPD_WORKER_RESTART_DELAY_MS", "500")
         .env("BAMEP_WORKER_RECONNECT_DELAY_MS", "500")
         .env("BAMEPD_DATABASE_URL", env.db_url())

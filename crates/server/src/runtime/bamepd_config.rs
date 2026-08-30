@@ -5,16 +5,18 @@
 //! `bamep_worker::config`.
 //!
 //! `BAMEP_WORKER_UDS_PATH`/`BAMEP_WORKER_TLS_CERT_PATH`/
-//! `BAMEP_WORKER_TLS_KEY_PATH`/`BAMEP_WORKER_RECONNECT_DELAY_MS` are the
-//! exact env var names `bamep_worker::config` reads on the Worker side —
-//! duplicated here as literal constants rather than pulling in a
-//! `bamep-server -> bamep-worker` crate dependency merely to share four
-//! strings, which would blur the intentionally one-directional isolation
-//! boundary (Issue #37 "Worker executable discovery"). [`BamepdConfig::worker_env`]
-//! forwards them verbatim into the spawned Worker child's environment, so
-//! both processes always agree on the same UDS path without a second name
-//! to keep in sync. Keep these four literals identical to
-//! `crates/worker/src/config.rs`'s `ENV_*` constants if either ever changes.
+//! `BAMEP_WORKER_TLS_KEY_PATH`/`BAMEP_WORKER_RECONNECT_DELAY_MS`/
+//! `BAMEP_WORKER_STORAGE_ROOT` are the exact env var names
+//! `bamep_worker::config` reads on the Worker side — duplicated here as
+//! literal constants rather than pulling in a `bamep-server -> bamep-worker`
+//! crate dependency merely to share a handful of strings, which would blur
+//! the intentionally one-directional isolation boundary (Issue #37 "Worker
+//! executable discovery"). [`BamepdConfig::worker_env`] forwards them
+//! verbatim into the spawned Worker child's environment, so both processes
+//! always agree on the same paths without a second name to keep in sync.
+//! Keep these literals identical to `crates/worker/src/config.rs`'s `ENV_*`
+//! constants if either ever changes. All are filesystem locations / timing —
+//! never Transfer IDs, capabilities, or proof material (ADR-0018).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -27,6 +29,10 @@ pub const ENV_TLS_CERT_PATH: &str = "BAMEP_WORKER_TLS_CERT_PATH";
 pub const ENV_TLS_KEY_PATH: &str = "BAMEP_WORKER_TLS_KEY_PATH";
 /// Must stay identical to `bamep_worker::config::ENV_RECONNECT_DELAY_MS`.
 pub const ENV_RECONNECT_DELAY_MS: &str = "BAMEP_WORKER_RECONNECT_DELAY_MS";
+/// Must stay identical to `bamep_worker::config::ENV_STORAGE_ROOT`. The
+/// absolute path to the Worker-owned local chunk storage tree (Issue #39
+/// Phase D1); `bamepd` only carries it through to the child.
+pub const ENV_STORAGE_ROOT: &str = "BAMEP_WORKER_STORAGE_ROOT";
 pub const ENV_WORKER_EXECUTABLE: &str = "BAMEPD_WORKER_EXECUTABLE";
 pub const ENV_WORKER_RESTART_DELAY_MS: &str = "BAMEPD_WORKER_RESTART_DELAY_MS";
 /// PostgreSQL connection string (ADR-0013). Required starting with Issue
@@ -82,6 +88,11 @@ pub struct BamepdConfig {
     pub worker_reconnect_delay: Duration,
     pub database_url: String,
     pub data_plane_base_url: String,
+    /// Absolute path to the Worker-owned local chunk storage tree, forwarded
+    /// verbatim to the spawned Worker child (Issue #39 Phase D1).
+    /// `bamepd` does not read or validate this tree itself; the Worker's
+    /// `crate::storage::FilesystemChunkStore::initialize` owns all checks.
+    pub worker_storage_root: PathBuf,
 }
 
 impl BamepdConfig {
@@ -100,6 +111,7 @@ impl BamepdConfig {
             optional_millis(&get, ENV_RECONNECT_DELAY_MS, DEFAULT_RECONNECT_DELAY_MS)?;
         let database_url = required_string(&get, ENV_DATABASE_URL)?;
         let data_plane_base_url = required_https_origin(&get, ENV_DATA_PLANE_BASE_URL)?;
+        let worker_storage_root = required_path(&get, ENV_STORAGE_ROOT)?;
 
         Ok(Self {
             uds_path,
@@ -110,12 +122,15 @@ impl BamepdConfig {
             worker_reconnect_delay,
             database_url,
             data_plane_base_url,
+            worker_storage_root,
         })
     }
 
     /// The exact environment `bamepd` forwards to the spawned Worker child
-    /// — UDS path and TLS identity paths/reconnect timing only, never
-    /// business state (Issue #37 "Worker process config").
+    /// — UDS path, TLS identity paths, reconnect timing, and the chunk
+    /// storage root only, never business state (Issue #37 "Worker process
+    /// config"; Issue #39 Phase D1 adds the storage root, a filesystem
+    /// location).
     pub fn worker_env(&self) -> Vec<(String, String)> {
         vec![
             (
@@ -133,6 +148,10 @@ impl BamepdConfig {
             (
                 ENV_RECONNECT_DELAY_MS.to_string(),
                 self.worker_reconnect_delay.as_millis().to_string(),
+            ),
+            (
+                ENV_STORAGE_ROOT.to_string(),
+                self.worker_storage_root.display().to_string(),
             ),
         ]
     }
@@ -253,6 +272,7 @@ mod tests {
             (ENV_TLS_KEY_PATH, "/etc/bamep/tls/key.pem"),
             (ENV_DATABASE_URL, "postgres://bamep@localhost/bamep"),
             (ENV_DATA_PLANE_BASE_URL, "https://server.example:8443"),
+            (ENV_STORAGE_ROOT, "/var/lib/bamep/worker-chunks"),
         ]
     }
 
@@ -270,6 +290,10 @@ mod tests {
         );
         assert_eq!(config.database_url, "postgres://bamep@localhost/bamep");
         assert_eq!(config.data_plane_base_url, "https://server.example:8443");
+        assert_eq!(
+            config.worker_storage_root,
+            PathBuf::from("/var/lib/bamep/worker-chunks")
+        );
     }
 
     #[test]
@@ -278,6 +302,14 @@ mod tests {
         values.retain(|(name, _)| *name != ENV_DATABASE_URL);
         let err = BamepdConfig::from_lookup(lookup(&values)).unwrap_err();
         assert_eq!(err, BamepdConfigError::MissingEnv(ENV_DATABASE_URL));
+    }
+
+    #[test]
+    fn missing_worker_storage_root_is_rejected() {
+        let mut values = base_values();
+        values.retain(|(name, _)| *name != ENV_STORAGE_ROOT);
+        let err = BamepdConfig::from_lookup(lookup(&values)).unwrap_err();
+        assert_eq!(err, BamepdConfigError::MissingEnv(ENV_STORAGE_ROOT));
     }
 
     #[test]
@@ -387,6 +419,10 @@ mod tests {
             Some("/etc/bamep/tls/key.pem".to_string())
         );
         assert_eq!(get(ENV_RECONNECT_DELAY_MS), Some("142".to_string()));
+        assert_eq!(
+            get(ENV_STORAGE_ROOT),
+            Some("/var/lib/bamep/worker-chunks".to_string())
+        );
     }
 
     fn with_delay(name: &'static str, raw: &str) -> Result<BamepdConfig, BamepdConfigError> {

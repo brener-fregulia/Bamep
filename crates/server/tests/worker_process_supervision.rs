@@ -31,7 +31,7 @@ use bamep_server::ports::{
     AuthorizationDurableState, RepositoryError, TransferAuthorizationRepository, TransferRepository,
 };
 use bamep_server::runtime::bamepd_config::{
-    ENV_RECONNECT_DELAY_MS, ENV_TLS_CERT_PATH, ENV_TLS_KEY_PATH, ENV_UDS_PATH,
+    ENV_RECONNECT_DELAY_MS, ENV_STORAGE_ROOT, ENV_TLS_CERT_PATH, ENV_TLS_KEY_PATH, ENV_UDS_PATH,
 };
 use bamep_server::runtime::capability_store::CapabilityStore;
 use bamep_server::runtime::replay_cache::ReplayCache;
@@ -204,6 +204,10 @@ struct TestEnv {
     socket_path: PathBuf,
     cert_path: PathBuf,
     key_path: PathBuf,
+    /// Worker-local chunk storage root (Issue #39 Phase D1). Not
+    /// pre-created; the spawned Worker's `FilesystemChunkStore::initialize`
+    /// creates it `0700` under the already-trusted `dir`.
+    storage_root: PathBuf,
 }
 
 impl TestEnv {
@@ -240,6 +244,7 @@ impl TestEnv {
             socket_path: dir.join("worker.sock"),
             cert_path,
             key_path,
+            storage_root: dir.join("chunk-storage"),
             dir,
         }
     }
@@ -346,6 +351,10 @@ async fn supervisor_manages_a_genuinely_separate_worker_process_through_handshak
             env.key_path.display().to_string(),
         ),
         (ENV_RECONNECT_DELAY_MS.to_string(), "100".to_string()),
+        (
+            ENV_STORAGE_ROOT.to_string(),
+            env.storage_root.display().to_string(),
+        ),
     ];
     let supervisor = WorkerSupervisor::new(SupervisorConfig {
         worker_executable,
