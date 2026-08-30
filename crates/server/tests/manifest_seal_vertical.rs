@@ -212,12 +212,19 @@ async fn first_valid_seal_atomically_reaches_pending_verification_over_a_real_ud
     let artifact_digest = digest_wire(0x99);
 
     let mut stream = handshake(&env.socket.0).await;
-    let body = send_seal(&mut stream, env.seal_request(2, &artifact_digest))
+    let request = env.seal_request(2, &artifact_digest);
+    let seal_proof_id = request.body.proof_id.clone();
+    let body = send_seal(&mut stream, request)
         .await
         .expect("a valid seal must produce a decision");
 
     assert_eq!(body.outcome, ManifestSealOutcome::Sealed);
     assert!(body.reason.is_none());
+    // The wire ManifestSealDecision exposes no proof_id anywhere (Correction
+    // B item 16) — it is internal operation-instance correlation metadata.
+    let wire = serde_json::to_string(&body).unwrap();
+    assert!(!wire.contains("proof_id"));
+    assert!(!wire.contains(&seal_proof_id));
     // Authoritative durable success facts, not echoed request values.
     assert_eq!(body.artifact_id, Some(env.fixture.artifact_id.0));
     assert_eq!(body.digest_algorithm, Some(WireDigestAlgorithm::Sha256));
@@ -241,6 +248,11 @@ async fn first_valid_seal_atomically_reaches_pending_verification_over_a_real_ud
     assert_eq!(binding.artifact_id, env.fixture.artifact_id);
     assert_eq!(binding.chunk_count, 2);
     assert_eq!(binding.expected_artifact_digest, artifact_digest);
+    // The binding retains the exact authorizing ManifestSealRequest proof_id
+    // (Correction B items 7, 16) and never renders it in Debug.
+    assert_eq!(binding.proof_id, seal_proof_id);
+    assert!(!format!("{binding:?}").contains(&seal_proof_id));
+    assert!(format!("{binding:?}").contains("REDACTED"));
 
     // Durable state: manifest sealed with exactly this tuple, Artifact
     // PendingVerification — both committed atomically.

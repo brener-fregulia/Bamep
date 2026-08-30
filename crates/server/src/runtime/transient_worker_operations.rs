@@ -149,20 +149,42 @@ impl fmt::Debug for AcceptanceBinding {
     }
 }
 
-/// Binds one `verification_handle` to the exact sealed Artifact identity
-/// `bamepd` committed (`sealed` or `already_pending_verification`) on this
-/// generation (`m1-worker-data-plane-control-contract.md` "Seal-manifest
-/// first durable commit"). Phase C's `ManifestSealRequest` handler mints this
-/// with the authoritative durable values it already holds after the seal
-/// transaction; Phase B never derives them and defines no durable seal
-/// lookup. `chunk_count`/`expected_artifact_digest` are integrity identities,
-/// not secrets.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Binds one `verification_handle` to the exact authorized data-plane
+/// operation instance `bamepd` committed (`sealed` or
+/// `already_pending_verification`) on this generation
+/// (`m1-worker-data-plane-control-contract.md` "Transient operation handles":
+/// "bound to exactly one authorized data-plane operation instance (one
+/// `transfer_id`, one authorized `proof_id`, ...)"). Phase C's
+/// `ManifestSealRequest` handler mints this with the authoritative durable
+/// values it already holds after the seal transaction; Phase B never derives
+/// them and defines no durable seal lookup.
+///
+/// `chunk_count`/`expected_artifact_digest` are integrity identities, not
+/// secrets, and are the exact durable sealed identity `bamepd` re-checks the
+/// consumed binding against before it mutates anything. `proof_id` is the
+/// authorized `ManifestSealRequest` proof instance — internal operation-
+/// instance correlation metadata only: never echoed to the Worker (the
+/// `ArtifactVerificationReport` wire carries none), never logged, never
+/// re-authorized on the follow-up, not a durable identity.
+#[derive(Clone, PartialEq, Eq)]
 pub struct VerificationBinding {
     pub transfer_id: TransferId,
     pub artifact_id: ArtifactId,
     pub chunk_count: u64,
     pub expected_artifact_digest: String,
+    pub proof_id: String,
+}
+
+impl fmt::Debug for VerificationBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VerificationBinding")
+            .field("transfer_id", &self.transfer_id)
+            .field("artifact_id", &self.artifact_id)
+            .field("chunk_count", &self.chunk_count)
+            .field("expected_artifact_digest", &self.expected_artifact_digest)
+            .field("proof_id", &REDACTED)
+            .finish()
+    }
 }
 
 /// A deliberately small typed continuation boundary for one paginated
@@ -170,10 +192,31 @@ pub struct VerificationBinding {
 /// "Resume-manifest pagination"). Phase C populates [`ResumeCursorState`]
 /// from its own consistent durable snapshot; Phase B never queries
 /// PostgreSQL and defines no generic database-cursor semantics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `proof_id` is the authorizing `ResumeDiscoveryQuery` proof instance
+/// (`m1-worker-data-plane-control-contract.md` "Transient operation handles":
+/// each cursor is "bound to exactly one authorized data-plane operation
+/// instance (one `transfer_id`, one authorized `proof_id`, ...)"). Every
+/// successor cursor minted by [`TransientWorkerOperationStore::advance_resume_cursor`]
+/// preserves exactly that same authorizing `proof_id` — continuation pages
+/// require no fresh proof and the `ResumeDiscoveryContinue` wire carries none.
+/// Internal correlation metadata only: never echoed to the Worker, never
+/// logged, never re-authorized.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResumeCursorBinding {
     pub transfer_id: TransferId,
+    pub proof_id: String,
     pub state: ResumeCursorState,
+}
+
+impl fmt::Debug for ResumeCursorBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResumeCursorBinding")
+            .field("transfer_id", &self.transfer_id)
+            .field("proof_id", &REDACTED)
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 /// The bounded continuation state one `resume_cursor` carries. Kept minimal
@@ -687,15 +730,20 @@ impl TransientWorkerOperationStore {
         // removed under the single `bindings` lock, so a collision leaves the
         // current cursor completely intact with no gap and no duplicate.
         self.with_bindings(|map| {
-            match map.get(cursor) {
+            // The authorizing `proof_id` is copied verbatim onto every
+            // successor cursor — a continuation page reuses the exact
+            // already-authorized resume operation instance and never presents
+            // a fresh proof (Issue #39 Phase C2 Correction B item 8).
+            let authorizing_proof_id = match map.get(cursor) {
                 None => return Err(TransientOperationError::UnknownHandle),
                 Some(Binding::ResumeCursor(b)) => {
                     if b.transfer_id != transfer_id {
                         return Err(TransientOperationError::BindingMismatch);
                     }
+                    b.proof_id.clone()
                 }
                 Some(_) => return Err(TransientOperationError::WrongKind),
-            }
+            };
 
             let successor = match next {
                 None => None,
@@ -714,7 +762,11 @@ impl TransientWorkerOperationStore {
                     };
                     Some((
                         id,
-                        Binding::ResumeCursor(ResumeCursorBinding { transfer_id, state }),
+                        Binding::ResumeCursor(ResumeCursorBinding {
+                            transfer_id,
+                            proof_id: authorizing_proof_id,
+                            state,
+                        }),
                     ))
                 }
             };
@@ -772,12 +824,14 @@ mod tests {
             artifact_id: ArtifactId::new(),
             chunk_count: 3,
             expected_artifact_digest: "ead".to_string(),
+            proof_id: "seal-proof-id-secret".to_string(),
         }
     }
 
     fn cursor(next_chunk_index: u64) -> ResumeCursorBinding {
         ResumeCursorBinding {
             transfer_id: TransferId::new(),
+            proof_id: "resume-proof-id-secret".to_string(),
             state: ResumeCursorState {
                 snapshot_id: Uuid::new_v4(),
                 next_chunk_index,
@@ -957,11 +1011,45 @@ mod tests {
 
         let consumed = store.consume_verification(&handle).unwrap();
         assert_eq!(consumed, v);
+        // The authorizing `proof_id` is retained internally (Correction B
+        // item 7) — it round-trips through mint/consume unchanged.
+        assert_eq!(consumed.proof_id, "seal-proof-id-secret");
         // Single-use: a second consume of the same handle fails.
         assert_eq!(
             store.consume_verification(&handle),
             Err(TransientOperationError::UnknownHandle)
         );
+    }
+
+    #[test]
+    fn verification_binding_debug_redacts_proof_id_but_keeps_correlation_fields() {
+        // Correction B item 10: adding `proof_id` must not make derived Debug
+        // leak it — same discipline as `AcceptanceBinding`.
+        let v = VerificationBinding {
+            proof_id: "top-secret-seal-proof".to_string(),
+            ..verification()
+        };
+        let rendered = format!("{v:?}");
+        assert!(!rendered.contains("top-secret-seal-proof"));
+        assert!(rendered.contains("proof_id"));
+        assert!(rendered.contains("REDACTED"));
+        // Non-secret correlation fields stay visible.
+        assert!(rendered.contains("chunk_count"));
+        assert!(rendered.contains("expected_artifact_digest"));
+    }
+
+    #[test]
+    fn resume_cursor_binding_debug_redacts_proof_id_but_keeps_correlation_fields() {
+        let c = ResumeCursorBinding {
+            proof_id: "top-secret-resume-proof".to_string(),
+            ..cursor(7)
+        };
+        let rendered = format!("{c:?}");
+        assert!(!rendered.contains("top-secret-resume-proof"));
+        assert!(rendered.contains("proof_id"));
+        assert!(rendered.contains("REDACTED"));
+        assert!(rendered.contains("state"));
+        assert!(rendered.contains("next_chunk_index"));
     }
 
     // -- resume cursor advance -----------------------------------
@@ -988,10 +1076,12 @@ mod tests {
             Err(TransientOperationError::UnknownHandle)
         );
         // the new cursor carries the advanced state
-        assert_eq!(
-            store.resume_cursor_binding(&second).unwrap().state,
-            next_state
-        );
+        let successor_binding = store.resume_cursor_binding(&second).unwrap();
+        assert_eq!(successor_binding.state, next_state);
+        // ...and preserves the exact authorizing `proof_id` — a continuation
+        // page reuses the already-authorized resume operation, no fresh proof
+        // (Correction B item 8).
+        assert_eq!(successor_binding.proof_id, c.proof_id);
 
         // final page: advance with `None` removes it and mints nothing
         assert_eq!(

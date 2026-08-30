@@ -969,6 +969,13 @@ mod imp {
             artifact_id: facts.artifact_id,
             chunk_count: facts.chunk_count,
             expected_artifact_digest: facts.expected_artifact_digest.clone(),
+            // The exact authorized `ManifestSealRequest` proof instance whose
+            // durable result caused this handle to be minted — internal
+            // operation-instance correlation metadata only, never echoed to
+            // the Worker (`ManifestSealDecision` carries no `proof_id`), never
+            // logged, never re-authorized on the follow-up (Issue #39 Phase C2
+            // Correction B items 7, 12).
+            proof_id: request.body.proof_id.clone(),
         }) {
             Ok(handle) => handle,
             Err(_) => {
@@ -1032,6 +1039,13 @@ mod imp {
                 transfer_id: binding.transfer_id.0,
                 artifact_id: binding.artifact_id.0,
                 chunk_count: binding.chunk_count,
+                // The consumed binding's full sealed identity is revalidated
+                // against durable PostgreSQL state, including this last field
+                // (Issue #39 Phase C2 Correction A). `binding.proof_id` is
+                // internal correlation metadata only and is deliberately not
+                // forwarded — the verification commit re-runs no proof
+                // authorization.
+                bound_expected_artifact_digest: binding.expected_artifact_digest.clone(),
                 computed_artifact_digest: report.body.computed_artifact_digest.clone(),
             })
             .await
@@ -1161,6 +1175,13 @@ mod imp {
         };
         let cursor = match operations.mint_resume_cursor(ResumeCursorBinding {
             transfer_id,
+            // The authorizing `ResumeDiscoveryQuery` proof instance — success
+            // above implies the authorization service already accepted it
+            // structurally and cryptographically, so the Adapter re-parses
+            // nothing. Every successor cursor preserves this exact value;
+            // `ResumeDiscoveryContinue` carries no proof (Issue #39 Phase C2
+            // Correction B items 8, 13).
+            proof_id: query.body.proof_id.clone(),
             state: ResumeCursorState {
                 snapshot_id,
                 next_chunk_index,

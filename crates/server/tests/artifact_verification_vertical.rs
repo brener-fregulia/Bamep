@@ -29,6 +29,7 @@ use bamep_domain::{ArtifactState, Digest, DigestAlgorithm, TransferId};
 use bamep_server::adapters::postgres::PostgresTransferRepository;
 use bamep_server::adapters::worker_control_plane::WorkerControlPlane;
 use bamep_server::ports::TransferRepository;
+use bamep_server::runtime::transient_worker_operations::VerificationBinding;
 use bamep_server::runtime::worker_authority::WorkerAuthorityRegistry;
 use bamep_worker_protocol::{
     receive, send, ArtifactVerificationAckOutcome, ArtifactVerificationReportMessage,
@@ -58,9 +59,9 @@ struct Env {
     signing_key: SigningKey,
     token: String,
     // Held for the test's lifetime so the shared capability store / replay
-    // cache and the connection-generation registry outlive the running plane.
+    // cache outlive the running plane.
     _services: WorkerControlServices,
-    _registry: Arc<WorkerAuthorityRegistry>,
+    registry: Arc<WorkerAuthorityRegistry>,
     socket: TempSocketPath,
     run_task: tokio::task::JoinHandle<
         Result<(), bamep_server::adapters::worker_control_plane::WorkerControlPlaneError>,
@@ -107,7 +108,7 @@ impl Env {
             signing_key,
             token,
             _services: services,
-            _registry: registry,
+            registry,
             socket,
             run_task,
             _shutdown_tx: shutdown_tx,
@@ -239,6 +240,67 @@ async fn a_mismatching_computed_digest_commits_failed_over_a_real_uds() {
     assert_eq!(
         artifact_state(&env.db.pool, env.fixture.transfer_id).await,
         ArtifactState::Failed
+    );
+
+    drop(stream);
+    env.finish().await;
+}
+
+#[tokio::test]
+async fn a_verification_handle_whose_bound_expected_digest_differs_from_durable_never_mutates() {
+    // Issue #39 Phase C2 Correction A items 1, 2, 5: the consumed transient
+    // binding must match the EXACT durable sealed identity — including
+    // `expected_artifact_digest`. A current-generation binding whose bound
+    // digest `X != D` fails closed even when the Worker's mechanically
+    // computed digest `== D`, because correlation integrity of the binding
+    // itself is not established. Then recovery via a fresh seal proof works.
+    let env = Env::start("c2-verify-digest-binding-mismatch").await;
+    let mut stream = handshake(&env.socket.0).await;
+    // A real seal commits the Artifact to PendingVerification with durable
+    // expected digest D (= env.expected_digest); we ignore its correct handle.
+    let _correct_handle = env.seal(&mut stream, true).await;
+
+    // Inject a current-generation VerificationBinding whose sealed identity is
+    // exact EXCEPT expected_artifact_digest (X = digest_wire(0xAA) != D).
+    let operations = env
+        .registry
+        .current_operations()
+        .expect("current generation store");
+    let mismatched_handle = operations
+        .mint_verification(VerificationBinding {
+            transfer_id: env.fixture.transfer_id,
+            artifact_id: env.fixture.artifact_id,
+            chunk_count: 1,
+            expected_artifact_digest: digest_wire(0xAA),
+            proof_id: "injected-correlation-only".to_string(),
+        })
+        .expect("mint the mismatched binding");
+    assert_ne!(digest_wire(0xAA), env.expected_digest);
+
+    // Report the *correct* durable digest D. No Ack — the binding did not
+    // match the exact durable sealed identity.
+    let no_ack = send_report(&mut stream, &mismatched_handle, &env.expected_digest).await;
+    assert!(
+        no_ack.is_none(),
+        "a binding whose expected digest differs from durable must fail closed"
+    );
+    assert_eq!(
+        artifact_state(&env.db.pool, env.fixture.transfer_id).await,
+        ArtifactState::PendingVerification,
+        "no durable mutation"
+    );
+
+    // Recovery: fresh seal proof -> already_pending_verification -> a fresh
+    // correct handle -> verification completes normally.
+    let recovered_handle = env.seal(&mut stream, false).await;
+    assert_ne!(recovered_handle, mismatched_handle);
+    let status = send_report(&mut stream, &recovered_handle, &env.expected_digest)
+        .await
+        .expect("the re-driven verification commits");
+    assert_eq!(status, WireArtifactStatus::Verified);
+    assert_eq!(
+        artifact_state(&env.db.pool, env.fixture.transfer_id).await,
+        ArtifactState::Verified
     );
 
     drop(stream);

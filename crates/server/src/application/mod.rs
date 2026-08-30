@@ -2871,14 +2871,24 @@ pub struct ArtifactVerificationService {
     repo: Arc<dyn TransferRepository>,
 }
 
-/// The consumed `verification_handle`'s bound sealed identity plus the
-/// Worker's reported mechanical digest — the inputs to one verification
-/// commit.
+/// The consumed `verification_handle`'s **complete** bound sealed identity
+/// (`transfer_id`, `artifact_id`, `chunk_count`,
+/// `bound_expected_artifact_digest` — the canonical base64url-no-pad value the
+/// binding was minted with) plus the Worker's reported mechanical digest — the
+/// inputs to one verification commit. The Adapter fills these from the
+/// consumed [`crate::runtime::transient_worker_operations::VerificationBinding`]
+/// as plain values; Application takes no worker-protocol dependency and never
+/// sees the opaque handle string (Issue #39 Phase C2 Correction A item 4).
 #[derive(Debug, Clone)]
 pub struct ArtifactVerificationInput {
     pub transfer_id: uuid::Uuid,
     pub artifact_id: uuid::Uuid,
     pub chunk_count: u64,
+    /// The `expected_artifact_digest` the consumed binding carried — canonical
+    /// base64url-no-pad. Revalidated against the durable sealed manifest as
+    /// part of the exact-sealed-identity check; it is **not** the comparison
+    /// authority (item 3).
+    pub bound_expected_artifact_digest: String,
     pub computed_artifact_digest: String,
 }
 
@@ -2900,6 +2910,7 @@ impl ArtifactVerificationService {
         let transfer_id = TransferId(input.transfer_id);
         let bound_artifact_id = bamep_domain::ArtifactId(input.artifact_id);
         let bound_chunk_count = input.chunk_count;
+        let bound_expected_digest_wire = input.bound_expected_artifact_digest.clone();
         let computed_wire = input.computed_artifact_digest.clone();
 
         let decide: crate::ports::CommitArtifactVerificationDecision =
@@ -2920,11 +2931,23 @@ impl ArtifactVerificationService {
                     return ArtifactVerificationDecided::FailClosed;
                 }
 
-                // `bamepd`'s OWN durable expected digest — not the transient
-                // binding's copy (item 28).
+                // `bamepd`'s OWN durable expected digest — the final
+                // comparison authority (item 3, 28), never the transient
+                // binding's copy.
                 let Some(expected) = facts.manifest.artifact_digest.as_ref() else {
                     return ArtifactVerificationDecided::FailClosed;
                 };
+
+                // Complete the exact-sealed-identity check: the consumed
+                // binding's `expected_artifact_digest` must equal the durable
+                // sealed digest's canonical wire value (Correction A items 1,
+                // 2). This closes the last unvalidated field of the transient
+                // binding — a `verification_handle` minted against a different
+                // sealed identity never drives a durable transition. The
+                // durable digest below remains the business authority.
+                if expected.to_wire_value() != bound_expected_digest_wire {
+                    return ArtifactVerificationDecided::FailClosed;
+                }
 
                 // Parse the Worker-reported digest strictly (item 27). A
                 // malformed digest is NOT a completed `Failed` verification —

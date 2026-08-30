@@ -66,6 +66,21 @@ async fn resume_query(
     token: &str,
     fixture: &DispatchedTransfer,
 ) -> ResumeDiscoveryPageBody {
+    resume_query_with_proof(stream, signing_key, token, fixture)
+        .await
+        .0
+}
+
+/// Like [`resume_query`] but also returns the exact wire `proof_id` the
+/// `ResumeDiscoveryQuery` signed, so a test can assert the resume-cursor
+/// chain retains that authorizing proof instance (Issue #39 Phase C2
+/// Correction B item 15).
+async fn resume_query_with_proof(
+    stream: &mut tokio::net::UnixStream,
+    signing_key: &SigningKey,
+    token: &str,
+    fixture: &DispatchedTransfer,
+) -> (ResumeDiscoveryPageBody, String) {
     let (proof_id, issued_at, signature) = sign_proof(
         signing_key,
         token,
@@ -73,6 +88,7 @@ async fn resume_query(
         bamep_domain::AuthorizationOperation::ResumeDiscovery,
         None,
     );
+    let proof_id_wire = proof_id.clone();
     let q = ResumeDiscoveryQueryMessage::new(
         token,
         fixture.transfer_id.0,
@@ -86,7 +102,7 @@ async fn resume_query(
         .unwrap();
     let page = expect_page(stream).await;
     assert_eq!(page.in_reply_to, sent);
-    page
+    (page, proof_id_wire)
 }
 
 async fn resume_continue(
@@ -222,17 +238,45 @@ async fn pagination_is_strictly_ascending_with_no_gap_or_repeat_and_first_page_o
     }
 
     let mut stream = handshake(&h.socket_path).await;
-    let mut page = resume_query(&mut stream, &h.signing_key, &h.token, &h.fixture).await;
+    let (mut page, query_proof_id) =
+        resume_query_with_proof(&mut stream, &h.signing_key, &h.token, &h.fixture).await;
 
     // First page: metadata present, first slice.
     assert!(page.transfer_id.is_some() && page.sealed.is_some() && page.chunk_size.is_some());
     let mut seen: Vec<u64> = indices(&page);
     assert_eq!(seen, vec![0, 1]);
 
+    // The initial resume cursor binds the exact authorizing ResumeDiscoveryQuery
+    // proof_id — internal correlation metadata, never on the wire (Correction B
+    // items 8, 15).
+    let store = h.registry.current_operations().expect("store");
+    let first_cursor = page.resume_cursor.clone().expect("more pages remain");
+    assert_eq!(
+        store
+            .resume_cursor_binding(&first_cursor)
+            .expect("live cursor binding")
+            .proof_id,
+        query_proof_id
+    );
+
     let mut pages = 1;
+    let mut continuations = 0;
     while let Some(cursor) = page.resume_cursor.clone() {
         page = resume_continue(&mut stream, &cursor).await;
         pages += 1;
+        continuations += 1;
+        // Every successor cursor preserves exactly that same authorizing
+        // proof_id — a continuation page requires no fresh proof.
+        if let Some(next_cursor) = page.resume_cursor.clone() {
+            assert_eq!(
+                store
+                    .resume_cursor_binding(&next_cursor)
+                    .expect("live successor cursor binding")
+                    .proof_id,
+                query_proof_id,
+                "successor cursor {continuations} lost the authorizing proof_id"
+            );
+        }
         // Continuation pages carry NO manifest-level field.
         assert!(page.transfer_id.is_none());
         assert!(page.sealed.is_none());
@@ -248,8 +292,11 @@ async fn pagination_is_strictly_ascending_with_no_gap_or_repeat_and_first_page_o
         "ascending, no gap, no repeat"
     );
 
+    assert!(
+        continuations >= 2,
+        "the test must exercise at least one successor cursor"
+    );
     // The snapshot is released once pagination completes.
-    let store = h.registry.current_operations().expect("store");
     assert_eq!(store.live_resume_snapshot_count(), 0);
 
     drop(stream);
