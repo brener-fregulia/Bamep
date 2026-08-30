@@ -1,5 +1,6 @@
 //! The `/api/data/v1/` router, common request parsing, fixed response
-//! shapes, and the Phase E2A resume-discovery handler.
+//! shapes, and the operation handlers: resume discovery (Phase E2A), chunk
+//! upload, and seal + verification (Phase E2B).
 
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -11,6 +12,23 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::ipc::{ResumeAggregate, ResumeDiscovery, ResumeDiscoveryInput, WorkerControlHandle};
+use crate::storage::FilesystemChunkStore;
+
+#[cfg(unix)]
+use super::upload;
+#[cfg(unix)]
+use crate::ipc::{
+    ArtifactVerification, AuthorizeChunkInput, ChunkAcceptance, ChunkAuthorization, ManifestSeal,
+    ManifestSealInput,
+};
+#[cfg(unix)]
+use crate::storage::{FullArtifactError, FullArtifactHasher, FullArtifactRequest};
+#[cfg(unix)]
+use axum::body::Body;
+#[cfg(unix)]
+use axum::routing::{post, put};
+#[cfg(unix)]
+use bamep_worker_protocol::{ChunkAcceptanceRejectionReason, ManifestSealRejectionReason};
 
 /// `X-Bamep-Capability: <token>` (`m0-data-plane-and-storage-contracts.md`
 /// "Common request elements").
@@ -21,28 +39,62 @@ const HEADER_TRANSFER_PROOF: &str = "x-bamep-transfer-proof";
 const PROOF_ID_LEN: usize = 22;
 /// `signature` is 86 base64url-no-pad characters (a 64-byte Ed25519 signature).
 const SIGNATURE_LEN: usize = 86;
+/// `X-Bamep-Chunk-Digest: <digest>` — the Agent-declared SHA-256 over the
+/// exact `chunk_upload` request-body bytes, canonical base64url-no-pad.
+#[cfg(unix)]
+const HEADER_CHUNK_DIGEST: &str = "x-bamep-chunk-digest";
+/// A base64url-no-pad SHA-256 digest is exactly 43 ASCII characters.
+#[cfg(unix)]
+const SHA256_DIGEST_B64_LEN: usize = 43;
+/// Upper bound on the tiny `POST .../seal` JSON body (`{ "chunk_count",
+/// "artifact_digest" }`). Anything larger is malformed, not a real seal.
+#[cfg(unix)]
+const SEAL_BODY_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct DataPlaneState {
     control: WorkerControlHandle,
+    /// Phase D1 storage: `chunk_upload` stages into it, `seal` reconstructs
+    /// the full Artifact from it. Unused on non-Unix (the real store is
+    /// Unix-only; the data plane there is a compile-only stub).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    chunk_store: FilesystemChunkStore,
 }
 
-/// Builds the exact `/api/data/v1/` router. Only the resume-discovery route
-/// is registered in Phase E2A; every other path is a deterministic API
-/// failure (never HTML, never a redirect).
-pub fn router(control: WorkerControlHandle) -> Router {
-    Router::new()
-        .route(
-            "/api/data/v1/transfers/{transfer_id}/chunks",
-            get(resume_discovery),
-        )
-        // A recognised path with an unsupported method -> 405 (JSON).
+/// Builds the exact `/api/data/v1/` router. Every path outside the three
+/// defined route shapes is a deterministic JSON API failure — never HTML,
+/// never a 3xx redirect (Axum 0.8 performs no trailing-slash normalisation).
+pub fn router(control: WorkerControlHandle, chunk_store: FilesystemChunkStore) -> Router {
+    let state = DataPlaneState {
+        control,
+        chunk_store,
+    };
+
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut router = Router::new().route(
+        "/api/data/v1/transfers/{transfer_id}/chunks",
+        get(resume_discovery),
+    );
+
+    // Chunk `PUT` and seal `POST` compose the Unix-only D1/D2 storage
+    // mechanism; the non-Unix build serves only resume discovery.
+    #[cfg(unix)]
+    {
+        router = router
+            .route(
+                "/api/data/v1/transfers/{transfer_id}/chunks/{chunk_index}",
+                put(chunk_upload),
+            )
+            .route(
+                "/api/data/v1/transfers/{transfer_id}/seal",
+                post(seal_manifest),
+            );
+    }
+
+    router
         .method_not_allowed_fallback(method_not_allowed)
-        // Any other path -> 404 UNKNOWN_ROUTE (JSON). Axum 0.8 performs no
-        // trailing-slash normalisation, so `.../chunks/` lands here — never a
-        // 3xx redirect.
         .fallback(unknown_route)
-        .with_state(DataPlaneState { control })
+        .with_state(state)
 }
 
 // =====================================================================
@@ -75,14 +127,10 @@ async fn resume_discovery(
     match state.control.discover_resume(input).await {
         Ok(ResumeDiscovery::Approved(aggregate)) => render_resume(transfer_id, aggregate),
         Ok(ResumeDiscovery::Denied) => authorization_denied(),
-        Err(control_error) => {
+        Err(error) => {
             // The contract maps every control-transport failure to the same
-            // generic denial (non-enumerable). A safe internal line — no
-            // secrets, no request material — aids operability.
-            eprintln!(
-                "bamep-worker: data-plane resume_discovery failed closed: control error class = {}",
-                control_error_class(&control_error)
-            );
+            // generic denial (non-enumerable).
+            log_control_failure("resume_discovery", &error);
             authorization_denied()
         }
     }
@@ -147,6 +195,280 @@ fn control_error_class(error: &crate::ipc::ControlError) -> &'static str {
         E::CorrelationViolation => "correlation_violation",
         E::ProtocolError { .. } => "protocol_error",
         E::ResumePageUnavailable => "resume_page_unavailable",
+    }
+}
+
+/// A safe internal diagnostic line for a fail-closed control failure — no
+/// secrets, no capability/proof/request material, just the error class.
+fn log_control_failure(operation: &str, error: &crate::ipc::ControlError) {
+    eprintln!(
+        "bamep-worker: data-plane {operation} failed closed: control error class = {}",
+        control_error_class(error)
+    );
+}
+
+// =====================================================================
+// Chunk upload — PUT /api/data/v1/transfers/{transfer_id}/chunks/{chunk_index}
+// =====================================================================
+
+/// Composition (`m0-data-plane-and-storage-contracts.md` "Durable chunk
+/// acceptance ordering"): structural parse -> E1 `authorize_chunk` -> pre-body
+/// rejections -> stream the body into D1 staging bounded by the authoritative
+/// `chunk_size` -> mechanical SHA-256 -> validate the declared/expected digest
+/// identity -> D1 restart-stable no-replace finalize -> E1 `commit_chunk` ->
+/// only then the HTTP response. No `ChunkAcceptanceRequest` is sent before D1
+/// finalization; no success is returned before `bamepd`'s durable commit.
+#[cfg(unix)]
+async fn chunk_upload(
+    State(state): State<DataPlaneState>,
+    Path((transfer_id_raw, chunk_index_raw)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    // ---- structural parse only (never authorization) ----
+    let Some(transfer_id) = parse_canonical_uuid(&transfer_id_raw) else {
+        return malformed_request();
+    };
+    let Some(chunk_index) = parse_canonical_chunk_index(&chunk_index_raw) else {
+        return malformed_request();
+    };
+    let Ok(proof) = parse_common(&headers) else {
+        return malformed_request();
+    };
+    let declared_digest = match header_str(&headers, HEADER_CHUNK_DIGEST) {
+        Ok(value) if is_canonical_base64url_no_pad(value, SHA256_DIGEST_B64_LEN) => {
+            value.to_string()
+        }
+        _ => return malformed_request(),
+    };
+    if !content_type_is_octet_stream(&headers) {
+        return malformed_request();
+    }
+
+    // ---- E1 authorize BEFORE reading any body ----
+    let input = AuthorizeChunkInput {
+        token: proof.token,
+        transfer_id,
+        chunk_index,
+        proof_id: proof.proof_id,
+        issued_at: proof.issued_at,
+        signature: proof.signature,
+    };
+    let approved = match state.control.authorize_chunk(input).await {
+        Ok(ChunkAuthorization::Approved(approved)) => approved,
+        Ok(ChunkAuthorization::Denied) => return authorization_denied(),
+        Err(error) => {
+            log_control_failure("chunk_upload authorize", &error);
+            return authorization_denied();
+        }
+    };
+
+    // Exhaustive: a future digest algorithm must not silently hash as SHA-256.
+    match approved.digest_algorithm {
+        bamep_worker_protocol::WireDigestAlgorithm::Sha256 => {}
+    }
+
+    // ---- pre-body rejections (step 3) ----
+    if let Some(expected) = &approved.expected_chunk_digest {
+        if *expected != declared_digest {
+            return chunk_identity_conflict();
+        }
+    }
+    if let Some(announced_len) = declared_content_length(&headers) {
+        if announced_len > u64::from(approved.chunk_size) {
+            return chunk_too_large();
+        }
+    }
+
+    // ---- stream into D1, hash, validate, finalize (steps 4-5) ----
+    let staged = upload::stage_chunk_body(
+        state.chunk_store.clone(),
+        upload::StageRequest {
+            transfer_id,
+            chunk_index,
+            chunk_size: approved.chunk_size,
+            declared_digest,
+        },
+        body,
+    )
+    .await;
+    let (verified_digest, verified_size) = match staged {
+        upload::StageOutcome::Finalized { size, digest } => (digest, size),
+        // A zero-byte body cannot represent a `1..=chunk_size` chunk.
+        upload::StageOutcome::EmptyBody => return malformed_request(),
+        upload::StageOutcome::TooLarge => return chunk_too_large(),
+        upload::StageOutcome::DigestMismatch => return digest_mismatch(),
+        // Restart-stable local residue whose bytes differ from this upload —
+        // a source-mutation transfer failure, fail closed (not an enumerable
+        // `409`, which are `bamepd`-authoritative outcomes).
+        upload::StageOutcome::LocalIdentityConflict | upload::StageOutcome::StorageUnavailable => {
+            return authorization_denied();
+        }
+    };
+
+    // ---- durable acceptance, then the HTTP response (steps 6-8) ----
+    match state
+        .control
+        .commit_chunk(approved.acceptance_ticket, verified_digest, verified_size)
+        .await
+    {
+        Ok(ChunkAcceptance::Committed) => chunk_accepted(chunk_index),
+        Ok(ChunkAcceptance::AlreadyCommitted) => chunk_already_held(chunk_index),
+        Ok(ChunkAcceptance::Rejected(ChunkAcceptanceRejectionReason::ChunkIdentityConflict)) => {
+            chunk_identity_conflict()
+        }
+        Ok(ChunkAcceptance::Rejected(ChunkAcceptanceRejectionReason::TransferNotContinuable)) => {
+            transfer_not_continuable()
+        }
+        Err(error) => {
+            log_control_failure("chunk_upload commit", &error);
+            authorization_denied()
+        }
+    }
+}
+
+// =====================================================================
+// Seal + verify — POST /api/data/v1/transfers/{transfer_id}/seal
+// =====================================================================
+
+/// Composition: structural parse -> E1 `seal_manifest` (the first durable
+/// `Incomplete -> PendingVerification` commit) -> D2 independent full-Artifact
+/// reconstruction over the **authoritative** sealed `chunk_count`/`chunk_size`
+/// (never the request body, never local file counts, never the expected
+/// digest) -> E1 `report_artifact_verification`. `bamepd`'s authoritative
+/// `Verified`/`Failed` — from its own comparison against the durable expected
+/// digest — is the `200` response. Any failure after the first commit leaves
+/// the Artifact `PendingVerification`; the request fails closed with the
+/// generic `401` and a later idempotent seal retry re-drives verification.
+#[cfg(unix)]
+async fn seal_manifest(
+    State(state): State<DataPlaneState>,
+    Path(transfer_id_raw): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let Some(transfer_id) = parse_canonical_uuid(&transfer_id_raw) else {
+        return malformed_request();
+    };
+    let Ok(proof) = parse_common(&headers) else {
+        return malformed_request();
+    };
+    let Some((chunk_count, artifact_digest)) = read_seal_body(body).await else {
+        return malformed_request();
+    };
+
+    let input = ManifestSealInput {
+        token: proof.token,
+        transfer_id,
+        proof_id: proof.proof_id,
+        issued_at: proof.issued_at,
+        signature: proof.signature,
+        chunk_count,
+        artifact_digest,
+    };
+    let success = match state.control.seal_manifest(input).await {
+        Ok(ManifestSeal::Sealed(success))
+        | Ok(ManifestSeal::AlreadyPendingVerification(success)) => success,
+        Ok(ManifestSeal::Rejected(ManifestSealRejectionReason::IncompleteManifest)) => {
+            return incomplete_manifest();
+        }
+        Ok(ManifestSeal::Rejected(ManifestSealRejectionReason::ManifestAlreadySealed)) => {
+            return manifest_already_sealed();
+        }
+        Ok(ManifestSeal::Denied) => return authorization_denied(),
+        Err(error) => {
+            log_control_failure("seal_manifest seal", &error);
+            return authorization_denied();
+        }
+    };
+
+    // Exhaustive digest-algorithm guard (never fall through to SHA-256).
+    match success.digest_algorithm {
+        bamep_worker_protocol::WireDigestAlgorithm::Sha256 => {}
+    }
+
+    let request = FullArtifactRequest {
+        transfer_id,
+        chunk_count: success.chunk_count,
+        chunk_size: success.chunk_size,
+    };
+    let computed = match FullArtifactHasher::for_store(&state.chunk_store)
+        .compute_blocking(request)
+        .await
+    {
+        Ok(full) => full.digest.to_base64url_no_pad(),
+        Err(error) => {
+            eprintln!(
+                "bamep-worker: data-plane seal_manifest verification reread failed closed: {}",
+                full_artifact_error_class(&error)
+            );
+            return authorization_denied();
+        }
+    };
+
+    match state
+        .control
+        .report_artifact_verification(success.verification_ticket, computed)
+        .await
+    {
+        Ok(status) => seal_result(transfer_id, success.artifact_id, status),
+        Err(error) => {
+            log_control_failure("seal_manifest verification report", &error);
+            authorization_denied()
+        }
+    }
+}
+
+/// Reads and structurally validates the exact `POST .../seal` body:
+/// `{ "chunk_count": <non-negative integer>, "artifact_digest": <canonical
+/// base64url-no-pad SHA-256> }` and nothing else. Any deviation -> `None` ->
+/// `400 MALFORMED_REQUEST`. The values themselves stay authoritative to
+/// `bamepd` (the Worker verifies against the sealed values it returns).
+#[cfg(unix)]
+async fn read_seal_body(body: Body) -> Option<(u64, String)> {
+    let bytes = axum::body::to_bytes(body, SEAL_BODY_LIMIT).await.ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let object = value.as_object()?;
+    if object.len() != 2 {
+        return None;
+    }
+    let chunk_count = object.get("chunk_count")?.as_u64()?;
+    let artifact_digest = object.get("artifact_digest")?.as_str()?;
+    if !is_canonical_base64url_no_pad(artifact_digest, SHA256_DIGEST_B64_LEN) {
+        return None;
+    }
+    Some((chunk_count, artifact_digest.to_string()))
+}
+
+#[cfg(unix)]
+fn seal_result(transfer_id: Uuid, artifact_id: Uuid, status: ArtifactVerification) -> Response {
+    let artifact_status = match status {
+        ArtifactVerification::Verified => "Verified",
+        ArtifactVerification::Failed => "Failed",
+    };
+    json_response(
+        StatusCode::OK,
+        json!({
+            "transfer_id": transfer_id.to_string(),
+            "artifact_id": artifact_id.to_string(),
+            "sealed": true,
+            "artifact_status": artifact_status,
+        }),
+    )
+}
+
+#[cfg(unix)]
+fn full_artifact_error_class(error: &FullArtifactError) -> &'static str {
+    use FullArtifactError as E;
+    match error {
+        E::RequiredChunkMissing { .. } => "required_chunk_missing",
+        E::RequiredChunkUnreadable { .. } => "required_chunk_unreadable",
+        E::ChunkReadFailed { .. } => "chunk_read_failed",
+        E::ChunkExceedsChunkSize { .. } => "chunk_exceeds_chunk_size",
+        E::NonFinalChunkTooShort { .. } => "non_final_chunk_too_short",
+        E::FinalChunkEmpty { .. } => "final_chunk_empty",
+        E::TotalSizeOverflow { .. } => "total_size_overflow",
+        E::BlockingTaskFailed => "blocking_task_failed",
     }
 }
 
@@ -237,8 +559,50 @@ fn parse_canonical_uuid(raw: &str) -> Option<Uuid> {
     (parsed.hyphenated().to_string() == raw).then_some(parsed)
 }
 
+/// A `chunk_index` path segment in its one canonical form: ASCII digits only,
+/// no sign, no `+`, no whitespace, no underscore, no leading zero (except
+/// `"0"`), and within `u64` range. Anything else is "not a well-formed
+/// non-negative integer" -> `MALFORMED_REQUEST`.
+#[cfg(unix)]
+fn parse_canonical_chunk_index(raw: &str) -> Option<u64> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let parsed: u64 = raw.parse().ok()?;
+    (parsed.to_string() == raw).then_some(parsed)
+}
+
+/// `Content-Type` must be `application/octet-stream` (a trailing `;`-parameter
+/// is tolerated; the media type match is case-insensitive per RFC 9110).
+#[cfg(unix)]
+fn content_type_is_octet_stream(headers: &HeaderMap) -> bool {
+    let Ok(value) = header_str(headers, header::CONTENT_TYPE.as_str()) else {
+        return false;
+    };
+    value
+        .split(';')
+        .next()
+        .map(|media_type| {
+            media_type
+                .trim()
+                .eq_ignore_ascii_case("application/octet-stream")
+        })
+        .unwrap_or(false)
+}
+
+/// The declared body length, if a well-formed `Content-Length` is present.
+/// Used only for an early `413` before the body is read; its absence (chunked
+/// transfer) just defers the check to D1's streaming size bound.
+#[cfg(unix)]
+fn declared_content_length(headers: &HeaderMap) -> Option<u64> {
+    header_str(headers, header::CONTENT_LENGTH.as_str())
+        .ok()?
+        .parse()
+        .ok()
+}
+
 // =====================================================================
-// Fixed response shapes (reused by Phase E2B)
+// Fixed response shapes (shared by all operations)
 // =====================================================================
 
 fn json_response(status: StatusCode, body: Value) -> Response {
@@ -273,6 +637,60 @@ async fn unknown_route() -> Response {
 
 async fn method_not_allowed() -> Response {
     error_response(StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED")
+}
+
+// ---- Phase E2B success + semantic-conflict shapes ----
+// Exact status codes read from `m0-data-plane-and-storage-contracts.md`
+// "Operations" (a `409` for every semantic conflict except an oversized
+// body, which is `413`).
+
+/// `201 Created` — `{ "chunk_index": N, "status": "accepted" }`.
+#[cfg(unix)]
+fn chunk_accepted(chunk_index: u64) -> Response {
+    json_response(
+        StatusCode::CREATED,
+        json!({ "chunk_index": chunk_index, "status": "accepted" }),
+    )
+}
+
+/// `200 OK` — `{ "chunk_index": N, "status": "already_held" }` for an
+/// identical already-durable chunk resubmitted idempotently.
+#[cfg(unix)]
+fn chunk_already_held(chunk_index: u64) -> Response {
+    json_response(
+        StatusCode::OK,
+        json!({ "chunk_index": chunk_index, "status": "already_held" }),
+    )
+}
+
+#[cfg(unix)]
+fn chunk_too_large() -> Response {
+    error_response(StatusCode::PAYLOAD_TOO_LARGE, "CHUNK_TOO_LARGE")
+}
+
+#[cfg(unix)]
+fn digest_mismatch() -> Response {
+    error_response(StatusCode::CONFLICT, "DIGEST_MISMATCH")
+}
+
+#[cfg(unix)]
+fn chunk_identity_conflict() -> Response {
+    error_response(StatusCode::CONFLICT, "CHUNK_IDENTITY_CONFLICT")
+}
+
+#[cfg(unix)]
+fn transfer_not_continuable() -> Response {
+    error_response(StatusCode::CONFLICT, "TRANSFER_NOT_CONTINUABLE")
+}
+
+#[cfg(unix)]
+fn incomplete_manifest() -> Response {
+    error_response(StatusCode::CONFLICT, "INCOMPLETE_MANIFEST")
+}
+
+#[cfg(unix)]
+fn manifest_already_sealed() -> Response {
+    error_response(StatusCode::CONFLICT, "MANIFEST_ALREADY_SEALED")
 }
 
 #[cfg(test)]
@@ -431,5 +849,145 @@ mod tests {
         let (status, _, body) = read_response(method_not_allowed().await).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(body, json!({ "error": { "code": "METHOD_NOT_ALLOWED" } }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chunk_index_parsing_is_canonical_decimal_only() {
+        assert_eq!(parse_canonical_chunk_index("0"), Some(0));
+        assert_eq!(parse_canonical_chunk_index("7"), Some(7));
+        assert_eq!(
+            parse_canonical_chunk_index("4294967296"),
+            Some(4_294_967_296)
+        );
+
+        for bad in [
+            "01", "007", "-1", "+1", " 1", "1 ", "1_0", "0x1", "", "1.0", "1e3",
+        ] {
+            assert_eq!(
+                parse_canonical_chunk_index(bad),
+                None,
+                "must reject {bad:?}"
+            );
+        }
+        // Overflows u64.
+        assert_eq!(parse_canonical_chunk_index("18446744073709551616"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_type_must_be_octet_stream() {
+        assert!(content_type_is_octet_stream(&headers(&[(
+            "content-type",
+            "application/octet-stream"
+        )])));
+        assert!(content_type_is_octet_stream(&headers(&[(
+            "content-type",
+            "Application/Octet-Stream"
+        )])));
+        assert!(content_type_is_octet_stream(&headers(&[(
+            "content-type",
+            "application/octet-stream; charset=binary"
+        )])));
+        assert!(!content_type_is_octet_stream(&headers(&[(
+            "content-type",
+            "application/json"
+        )])));
+        assert!(!content_type_is_octet_stream(&headers(&[])));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn e2b_success_and_conflict_bodies_match_the_contract_exactly() {
+        let (status, cache, body) = read_response(chunk_accepted(3)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        assert_eq!(body, json!({ "chunk_index": 3, "status": "accepted" }));
+
+        let (status, _, body) = read_response(chunk_already_held(3)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "chunk_index": 3, "status": "already_held" }));
+
+        for (response, expected_status, code) in [
+            (
+                chunk_too_large(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "CHUNK_TOO_LARGE",
+            ),
+            (digest_mismatch(), StatusCode::CONFLICT, "DIGEST_MISMATCH"),
+            (
+                chunk_identity_conflict(),
+                StatusCode::CONFLICT,
+                "CHUNK_IDENTITY_CONFLICT",
+            ),
+            (
+                transfer_not_continuable(),
+                StatusCode::CONFLICT,
+                "TRANSFER_NOT_CONTINUABLE",
+            ),
+            (
+                incomplete_manifest(),
+                StatusCode::CONFLICT,
+                "INCOMPLETE_MANIFEST",
+            ),
+            (
+                manifest_already_sealed(),
+                StatusCode::CONFLICT,
+                "MANIFEST_ALREADY_SEALED",
+            ),
+        ] {
+            let (status, _, body) = read_response(response).await;
+            assert_eq!(status, expected_status, "{code}");
+            assert_eq!(body, json!({ "error": { "code": code } }), "{code}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn seal_result_renders_the_exact_success_shape() {
+        let transfer_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let (status, cache, body) = read_response(seal_result(
+            transfer_id,
+            artifact_id,
+            ArtifactVerification::Failed,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        assert_eq!(
+            body,
+            json!({
+                "transfer_id": transfer_id.to_string(),
+                "artifact_id": artifact_id.to_string(),
+                "sealed": true,
+                "artifact_status": "Failed",
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_seal_body_accepts_exactly_the_two_contract_fields() {
+        let digest = "A".repeat(43);
+        let ok = axum::body::Body::from(
+            json!({ "chunk_count": 5, "artifact_digest": digest }).to_string(),
+        );
+        assert_eq!(read_seal_body(ok).await, Some((5, digest.clone())));
+
+        for bad in [
+            "not json".to_string(),
+            json!({ "chunk_count": 5 }).to_string(),
+            json!({ "artifact_digest": digest }).to_string(),
+            json!({ "chunk_count": -1, "artifact_digest": digest }).to_string(),
+            json!({ "chunk_count": 5, "artifact_digest": "short" }).to_string(),
+            json!({ "chunk_count": 5, "artifact_digest": digest, "x": 1 }).to_string(),
+        ] {
+            assert_eq!(
+                read_seal_body(axum::body::Body::from(bad.clone())).await,
+                None,
+                "must reject {bad}"
+            );
+        }
     }
 }

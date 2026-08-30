@@ -15,8 +15,8 @@ Bamep currently has seven Rust crates:
 | `bamep-domain` | Pure Endpoint identity, boot-context, trusted-bootstrap, runtime-credential, and Job/JobStep workflow business logic |
 | `bamep-server` | Application services, Ports, PostgreSQL/transport Adapters, Agent session handling, and the `bamepd` Worker-supervision composition root |
 | `bamep-simulator` | Simulated Agent participant using real trusted-bootstrap and WSS/Agent Protocol boundaries |
-| `bamep-worker-protocol` | Rust wire model/codec/framing for the implemented Worker IPC v1 handshake slice |
-| `bamep-worker` | The isolated Worker process: UDS reconnecting client, fail-closed authority tracking, and Server TLS identity loading |
+| `bamep-worker-protocol` | Rust wire model/codec/framing for the implemented Worker Protocol v1 handshake + business-message catalog |
+| `bamep-worker` | The isolated Worker process: concurrent UDS control client, fail-closed authority tracking, Server TLS identity, local chunk storage + full-Artifact reconstruction, and the HTTPS `/api/data/v1/` data plane |
 
 Planned components remain outside Architecture until corresponding code exists.
 
@@ -36,15 +36,18 @@ The implemented structure preserves these rules:
 - `bamep-server` contains `application`, `ports`, and `adapters`; Application coordinates
   through Ports and Domain, while infrastructure-specific dependencies stay in Adapters.
 - PostgreSQL/SQLx and Agent transport/gateway implementations are Server Adapter concerns.
-- `bamep-worker-protocol` is a transport-independent Rust representation of the Worker IPC v1
-  handshake slice defined by `m1-worker-data-plane-control-contract.md`; it has no Domain,
-  Server, PostgreSQL, or HTTP-framework dependency, only `serde`/`serde_json`/`uuid`/
-  `thiserror` and `tokio`'s `io-util` feature (the generic `AsyncRead`/`AsyncWrite` framing
-  traits — no `net`/`rt`/`process`).
+- `bamep-worker-protocol` is a transport-independent Rust representation of the Worker
+  Protocol v1 handshake + business-message catalog defined by
+  `m1-worker-data-plane-control-contract.md`; it has no Domain, Server, PostgreSQL, or
+  HTTP-framework dependency, only `serde`/`serde_json`/`uuid`/`thiserror` and `tokio`'s
+  `io-util` feature (the generic `AsyncRead`/`AsyncWrite` framing traits — no
+  `net`/`rt`/`process`).
 - `bamep-worker` (both the `bamep_worker` library and its `bamep-worker` binary) depends on
-  `bamep-worker-protocol` and `bamep-trusted-bootstrap` only; it has no `bamep-domain`,
-  `bamep-server`, or SQLx/PostgreSQL dependency, and owns no PostgreSQL repository Adapter —
-  Worker holds no Domain/Application authority (ADR-0018).
+  `bamep-worker-protocol` and `bamep-trusted-bootstrap`, plus `axum`/`axum-server` (the same
+  Axum 0.8 stack ADR-0017 accepts, reused so there is no second Rust HTTP framework) and
+  `rustls`/`sha2`/`base64`/`rustix` for TLS serving, chunk hashing, and Unix-safe storage
+  primitives. It has no `bamep-domain`, `bamep-server`, or SQLx/PostgreSQL dependency, owns no
+  PostgreSQL repository Adapter, and holds no Domain/Application authority (ADR-0018).
 - `bamep-server` depends on `bamep-worker-protocol` (for the `bamepd`-side UDS handshake) but
   not on `bamep-worker` itself in production code, preserving one-directional isolation; the
   `bamepd` binary spawns the compiled `bamep-worker` executable as a separate OS process
@@ -378,11 +381,12 @@ no JobStep is transitioned, and the destructive-operation gate is never evaluate
 Binding an existing Transfer to an owning Attempt exactly once, and rejecting a conflicting
 rebind, is implemented and tested; #40 (below) is the first consumer that actually commits that
 owning Attempt. Agent Protocol transfer authorization (#38) is implemented — see
-"Sender-constrained transfer authorization" below. The Worker HTTPS chunk transport (#39) and
-the end-to-end Simulator RF-005 vertical (#19 — real WSS dispatch → authorization → Worker
-HTTPS → Artifact outcome → terminal action/workflow) remain unimplemented. The isolated Worker
-process/control boundary itself (#37) is implemented — see "Implemented isolated Worker runtime
-and control boundary" below.
+"Sender-constrained transfer authorization" below. The authenticated HTTPS chunk transport,
+storage, and Artifact verification through the Worker (#39) are implemented — see "Implemented
+Worker data-plane chunk transport" below. The end-to-end Simulator RF-005 vertical (#19 — real
+WSS dispatch → authorization → Worker HTTPS → Artifact outcome → terminal action/workflow)
+remains unimplemented. The isolated Worker process/control boundary itself (#37) is implemented
+— see "Implemented isolated Worker runtime and control boundary" below.
 
 ## Implemented non-destructive M1 transfer dispatch-commit path
 
@@ -427,17 +431,20 @@ Issue #37 materializes the process/runtime boundary ADR-0001/ADR-0003/ADR-0018 r
 the M1 Worker IPC handshake slice `m1-worker-data-plane-control-contract.md` defines. Issue #38
 adds sender-constrained transfer authorization on top of it — capability/proof cryptography,
 freshness, replay protection, and the `AuthorizationQuery`/`AuthorizationDecision` exchange over
-the same UDS boundary (see "Sender-constrained transfer authorization" below). Chunk HTTP
-routes, body transfer, storage I/O, and Artifact verification remain future Work Packages
-(#39/#19).
+the same UDS boundary (see "Sender-constrained transfer authorization" below). Issue #39 then
+adds the rest of the Worker Protocol v1 catalog, the Worker-local chunk storage and
+full-Artifact reconstruction mechanisms, and the Worker-owned HTTPS `/api/data/v1/` data plane
+that composes them — see "Implemented Worker data-plane chunk transport" below.
 
 **Process topology.** `bamepd` (a new `[[bin]]` target on the `bamep-server` package,
 `crates/server/src/bin/bamepd.rs`) is the minimal Server daemon composition root: it binds the
 Worker UDS listener, supervises the Worker OS process, forwards Worker configuration/TLS
-identity paths through the child process environment, and — since Issue #38 — connects to
-PostgreSQL and constructs the shared `TransferAuthorizationService` the Worker control plane
-needs to answer `AuthorizationQuery` with current durable state. It still owns nothing else — no
-Administrative API, Agent WSS listener, Web, scheduler workflows, or Worker HTTPS — so `bamepd`
+identity paths through the child process environment, and — since Issue #38, extended by #39 —
+connects to PostgreSQL and constructs the durable Application services the Worker control plane
+needs (`TransferAuthorizationService`, plus the `ChunkAcceptanceService`/`ManifestSealService`/
+`ArtifactVerificationService` for the rest of the v1 catalog). The Worker process — not
+`bamepd` — serves the external HTTPS `/api/data/v1/` data plane. `bamepd` still owns nothing
+else — no Administrative API, Agent WSS listener, Web, or scheduler workflows — so `bamepd`
 remains only a *partial* composition root; those existing/future responsibilities remain wired
 through their own Application/Adapter boundaries until their own composition-root work requires
 integration. `bamep-worker` (`crates/worker`, package `bamep-worker`) is a genuinely separate
@@ -448,9 +455,11 @@ in-process task.
 JSON framing, the common envelope (`protocol_version`/`message_id`/`type`, `in_reply_to` on
 responses), and the handshake/error message slice
 (`WorkerHello`/`ServerHello`/`HandshakeRejected`/`ProtocolError`) from
-`m1-worker-data-plane-control-contract.md`. The remaining business message catalog
-(`AuthorizationQuery`, `ChunkAcceptanceRequest`, `ArtifactVerificationReport`, and their
-responses) is not yet represented. `crate::framing` provides the length-prefix codec generic
+`m1-worker-data-plane-control-contract.md`. Since #39 the full v1 business catalog is also
+represented — the `AuthorizationQuery`/`ChunkAcceptanceRequest`/`ResumeDiscoveryQuery`(+
+`ResumeDiscoveryContinue`)/`ManifestSealRequest`/`ArtifactVerificationReport` request messages
+and their paired decisions/pages/acks, with shape validators — with `protocol_version` and the
+137-byte proof transcript unchanged. `crate::framing` provides the length-prefix codec generic
 over `tokio::io::AsyncRead`/`AsyncWrite`, reused by both the `bamepd`-side listener and the
 Worker client so the framing logic exists in exactly one place. `crate::codec::decode`
 distinguishes an unrecognized top-level `type` (`DecodeError::UnknownType`) from every other
@@ -485,18 +494,26 @@ in-process (never PostgreSQL-durable) Runtime Service, mirroring `presence`/`out
 that tracks the single current connection generation. A newer successful handshake always
 supersedes the previous one; a superseded generation's later disconnect is a no-op against the
 now-current generation. This registry is the narrow readiness/control-connection seam #39
-is expected to consume rather than inventing another notion of Worker authority. The accept
+consumes rather than inventing another notion of Worker authority. The accept
 loop drains completed connection-handler tasks during normal operation, not only at shutdown.
-Since #38, the per-connection handler is a genuine loop, not a single-shot receive: it answers
-`AuthorizationQuery` messages sequentially, in place, for the connection's entire lifetime,
-sending the corresponding `AuthorizationDecision` before reading the next frame. On `bamepd`
-shutdown, the control plane stops accepting new connections and removes the socket file.
+Since #38 the per-connection handler is a genuine loop, not a single-shot receive; since #39 it
+serves the full Worker Protocol v1 catalog sequentially in place — authorization, durable chunk
+acceptance, resume discovery pagination, the atomic manifest seal, and the independent Artifact
+verification commit — each request answered before the next frame is read, with generation-
+scoped transient handles linearised against connection supersession. On `bamepd` shutdown, the
+control plane stops accepting new connections and removes the socket file.
 
-**Worker-side reconnecting client.** `bamep_worker::ipc::client::run_client_loop` connects to
-the configured UDS as a client, performs the handshake, and then blocks until the connection
-ends (EOF, I/O error, or any post-handshake message, since none is valid business content in
-this Work Package), sleeping a configurable bounded delay before reconnecting — never
-busy-spinning. `bamep_worker::ipc::authority::AuthorityTracker` exposes the fail-closed
+**Worker-side reconnecting client.** `bamep_worker::ipc::control::worker_control` returns a
+cloneable `WorkerControlHandle` plus a `ControlDriver` that owns the whole connect →
+handshake → read/write/correlate → reconnect lifecycle in one task, sleeping a configurable
+bounded delay before reconnecting — never busy-spinning. Since #39 the driver runs the full
+Worker Protocol v1 control client: many concurrent outstanding requests correlated by
+`message_id`/`in_reply_to`, generation-scoped follow-up tickets (`acceptance_handle`/
+`verification_handle`/resume cursors) rejected locally after a reconnect, a bounded per-request
+timeout, and every operation reporting only what `bamepd` decided — never a fabricated decision,
+a local `Verified`/`Failed` verdict, or a replayed proof/handle across a reconnect. The
+superseded `ipc::client`/`ipc::authorization_client` single-outstanding-query modules are gone.
+`bamep_worker::ipc::authority::AuthorityTracker` exposes the fail-closed
 `AuthorityPhase` (`Disconnected`/`Connecting`/`Handshaking`/`Ready`) plus a per-process
 monotonic connection-generation counter over a `tokio::sync::watch` channel:
 `AuthoritySnapshot::is_available()` is `true` only for a current-generation successful
@@ -531,9 +548,9 @@ paths are forwarded through process configuration, never key material through UD
 proves the pair is rustls-usable (TLS 1.3, `ring` provider, no client-certificate
 authentication, mirroring `adapters::agent_transport::AgentTransportAcceptor`'s existing
 configuration shape) before considering itself ready. `bamep_worker::tls::identity::ServerTlsIdentity`
-implements a manual (never derived) `Debug` that redacts the private key. No production HTTPS
-data-plane listener is bound anywhere in this Work Package — that remains #39's
-responsibility; a temporary rustls `ServerConfig` is built only to validate loadability.
+implements a manual (never derived) `Debug` that redacts the private key. Since #39 that same
+`rustls::ServerConfig` is what the Worker's HTTPS data-plane listener actually serves (with
+`http/1.1` as the sole ALPN protocol) — see "Implemented Worker data-plane chunk transport".
 
 **Sender-constrained transfer authorization (Issue #38).**
 `bamep_domain::transfer_authorization` implements the M1 proof-key/capability/transcript
@@ -637,19 +654,16 @@ so `bamepd` is no longer PostgreSQL-free as the #37 architecture note originally
 wire crate depends on `bamep-domain`; both treat capability/proof material as opaque bytes to be
 forwarded, per ADR-0003/ADR-0018.
 
-`bamep_worker::ipc::authorization_client` extends the Worker UDS client with generation-scoped
-request/response routing: `run_client_loop` publishes a fresh `mpsc` sender for the pending-query
-channel over a `watch<Option<Sender>>` the instant a handshake succeeds, and clears it back to
-`None` the instant that connection ends. `AuthorizationClient::query` sends a query and awaits a
-paired `oneshot` reply; the same connection task that owns the socket for the rest of Issue #37's
-handshake/authority lifetime also owns sending each query and receiving its correlated
-`AuthorizationDecision` (`in_reply_to`-checked) — one outstanding query at a time, no detached
-tasks, no second reader/writer on the stream. A send failure, a non-matching reply, or the idle
-socket producing any frame at all (`bamepd` never pushes anything unsolicited) ends the
-connection and fails every awaiting caller closed (`QueryError::Disconnected`); no connection at
-all fails closed immediately (`QueryError::NotConnected`) — Worker can never fabricate an
-`AuthorizationDecision` locally. This mechanism is provisioned but not yet driven by production
-HTTP traffic — that remains #39's responsibility.
+Since #39 the Worker UDS client is `bamep_worker::ipc::control` (see "Worker-side reconnecting
+client" above): the `ControlDriver` publishes the live per-generation request channel over a
+`watch` the instant a handshake succeeds and clears it the instant the connection ends, and
+`WorkerControlHandle` exposes exactly the five authorizing/follow-up operation pairs the v1
+catalog defines — not a generic RPC surface. A disconnect with a request in flight, a
+correlation violation, a `bamepd` `ProtocolError`, a per-request timeout, or no connection at
+all all fail the caller closed with a typed `ControlError`; the Worker can never fabricate an
+`AuthorizationDecision`, `ChunkAcceptanceDecision`, `ResumeDiscoveryPage`,
+`ManifestSealDecision`, or `ArtifactVerificationAck` locally. This client is driven by real
+HTTPS data-plane traffic since #39 — see "Implemented Worker data-plane chunk transport".
 
 `bamep-simulator` carries the **Agent-side** half of this boundary, since M1's Agent
 participant is the Simulated Endpoint: `bamep_simulator::transfer_authorization` independently
@@ -662,6 +676,63 @@ attempt, and builds and signs its own copy of the exact 137-byte transcript
 interoperability evidence (`crates/simulator/tests/data_plane_proof_interop.rs`). This is the
 reusable Agent proof/authorization participant #19 will later compose into a real WSS+HTTPS
 transfer; #19 still owns that final composition.
+
+## Implemented Worker data-plane chunk transport (Issue #39)
+
+Issue #39 completes the M1 Worker data plane: the Worker process now terminates the external
+HTTPS `/api/data/v1/` transfer surface and executes it as pure mechanism, while every durable
+decision stays with `bamepd` (ADR-0018; `m0-data-plane-and-storage-contracts.md`;
+`m1-worker-data-plane-control-contract.md`).
+
+**Worker Protocol v1 catalog.** `bamep-worker-protocol` now carries every v1 business message
+(authorization, durable chunk acceptance, paginated resume discovery, atomic manifest seal,
+independent Artifact verification) alongside the #37 handshake slice, with per-message shape
+validators. `protocol_version` and the 137-byte proof transcript are unchanged.
+`bamep_worker::ipc::control` is the concurrent client over it (see "Worker-side reconnecting
+client"): one reconnecting connection, many correlated outstanding requests, generation-scoped
+`acceptance_handle`/`verification_handle`/resume-cursor tickets that a reconnect invalidates
+locally before anything is sent, and no local business verdict ever.
+
+**Worker-local chunk storage (`bamep_worker::storage`, Unix-only).** `FilesystemChunkStore`
+stages one authorized chunk body under an owner-only tree, hashes it incrementally with
+SHA-256, and finalizes it with `flush` → file `fsync` → `link(2)` no-replace placement →
+directory `fsync` into a deterministic restart-stable path; a byte-different chunk already at
+that path is refused, never overwritten, and recognised leftover staging files are cleared at
+startup. A finalized file means only "these exact bytes were staged and hashed here" — never
+that `bamepd` accepted or holds the chunk. `FullArtifactHasher` reopens a sealed Artifact's
+finalized chunks `0..chunk_count` in order and recomputes the full-Artifact SHA-256 over their
+raw concatenation with a fresh hasher — a true independent reread that reuses none of the
+per-chunk hashes and reaches no `Verified`/`Failed` verdict. The API is blocking and never
+buffers a whole chunk; the HTTP layer drives it from `spawn_blocking`.
+
+**Worker HTTPS data plane (`bamep_worker::data_plane`).** An Axum 0.8 + `axum-server` listener
+serves the Worker's existing `rustls::ServerConfig` (the same Server TLS identity the Agent
+already trusts; `http/1.1` ALPN; no second certificate, trust anchor, or client auth). It does
+**structural** HTTP parsing only — a structurally unrepresentable request is the contract's
+fixed `400 MALFORMED_REQUEST`; everything else, including a nonexistent `transfer_id`, goes to
+`bamepd` and every authorization or control-transport failure is the single fixed generic
+`401 AUTHORIZATION_DENIED`. No `5xx` on `/api/data/v1/`, no redirects. Three route shapes:
+`GET .../chunks` (resume discovery → `discover_resume`, one aggregated response, no cursor
+escapes); `PUT .../chunks/{n}` (authorize → stream the body into storage bounded by the
+authoritative `chunk_size` → mechanical SHA-256 → validate the declared/expected digest →
+no-replace finalize → `commit_chunk` → only then the `201 accepted` / `200 already_held`
+response); `POST .../seal` (`seal_manifest` first durable commit → independent full-Artifact
+reconstruction over the authoritative sealed `chunk_count`/`chunk_size` →
+`report_artifact_verification`, whose authoritative `Verified`/`Failed` is the `200` body —
+both verdicts are `200`). Bulk bytes never cross the UDS: only authorization inputs, the
+Worker-verified digest, the exact received size, and control results do. Any failure after the
+seal's first commit (a lost `Ack`, a reread failure, UDS loss) leaves the Artifact
+`PendingVerification` and fails the request closed; an idempotent seal retry re-drives
+verification.
+
+**`bamepd` durable authority (`bamep_server`).** The `bamepd`-side control plane answers the
+full catalog from current PostgreSQL state (see "`bamepd`-side UDS control plane"):
+`ChunkAcceptanceService` commits/confirms per-chunk expected identity; `ManifestSealService`
+seals `Incomplete → PendingVerification` and mints a `verification_handle` in one transaction;
+`ArtifactVerificationService` compares the Worker's reported digest against its own durable
+expected value — never trusting a Worker verdict — and commits `PendingVerification → Verified
+| Failed`. The `bamepd` binary constructs these services; the Worker process, not `bamepd`,
+binds the HTTPS listener.
 
 ## Maintenance rule
 

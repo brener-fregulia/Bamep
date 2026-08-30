@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use bamep_worker::data_plane::DataPlane;
 use bamep_worker::ipc::{worker_control, WorkerControlHandle};
+use bamep_worker::storage::FilesystemChunkStore;
 use bamep_worker::tls::{build_server_config, load_server_identity};
 use bamep_worker_protocol::{
     receive, send, HeldChunk, ResumeDiscoveryPageMessage, ServerHelloMessage, WireDigestAlgorithm,
@@ -141,6 +142,7 @@ impl FakeBamepd {
 struct Harness {
     _identity: TestIdentity,
     _socket_dir: TempDir,
+    _storage_dir: TempDir,
     server_addr: SocketAddr,
     leaf_der: Vec<u8>,
     control: WorkerControlHandle,
@@ -181,7 +183,16 @@ impl Harness {
         };
         let driver_task = tokio::spawn(driver.run(driver_shutdown));
 
-        let data_plane = DataPlane::new("127.0.0.1:0".parse().unwrap(), tls, control.clone());
+        let storage_dir = TempDir::fresh();
+        let chunk_store =
+            FilesystemChunkStore::initialize(&storage_dir.0).expect("initialize chunk store");
+
+        let data_plane = DataPlane::new(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            control.clone(),
+            chunk_store,
+        );
         let server_handle = data_plane.handle();
         let server_shutdown = {
             let mut rx = shutdown_rx;
@@ -198,6 +209,7 @@ impl Harness {
         Self {
             _identity: identity,
             _socket_dir: socket_dir,
+            _storage_dir: storage_dir,
             server_addr,
             leaf_der,
             control,

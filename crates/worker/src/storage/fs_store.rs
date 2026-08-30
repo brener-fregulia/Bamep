@@ -277,6 +277,18 @@ impl StagingChunk {
         self.written
     }
 
+    /// The SHA-256 over exactly the bytes staged so far, computed from a
+    /// clone of the running hash state — the staging file is left open and
+    /// unmodified. Phase E checks this against the declared/expected chunk
+    /// digest *before* [`finalize`](Self::finalize), so bytes that fail the
+    /// digest identity are never published as a restart-stable final
+    /// (`m0-data-plane-and-storage-contracts.md` "Durable chunk acceptance
+    /// ordering", step 5). This exposes the same value `finalize` computes
+    /// internally; it does not weaken the no-replace / restart guarantees.
+    pub fn digest(&self) -> Sha256Digest {
+        Sha256Digest::from_raw(self.hasher.clone().finalize().into())
+    }
+
     /// Appends `buf` to the staging file and folds it into the running
     /// SHA-256. Accepts arbitrary frame sizes; makes no assumption that one
     /// call equals one chunk. Fails closed and discards the staging file on

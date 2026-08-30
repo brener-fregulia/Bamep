@@ -36,9 +36,9 @@ fn main() {
 
     // Validate/prepare the local chunk storage root and clear recognized
     // leftover staging files before Worker continues (Issue #39 Phase D1).
-    // Fails closed: no usable storage root -> no Worker. Phase E2A does not
-    // yet inject this into the data-plane handler (resume discovery reads no
-    // storage), but Phase E2B will, so it stays initialized here.
+    // Fails closed: no usable storage root -> no Worker. Phase E2B injects
+    // this into the data-plane handler so `chunk_upload` stages into it and
+    // `seal` reconstructs the full Artifact from it.
     let chunk_store = bamep_worker::storage::FilesystemChunkStore::initialize(&config.storage_root)
         .unwrap_or_else(|err| {
             eprintln!("bamep-worker: chunk storage initialization failed: {err}");
@@ -66,10 +66,6 @@ fn main() {
         });
 
     runtime.block_on(async move {
-        // Held for the process lifetime; Phase E2B's chunk-PUT/seal-POST
-        // handlers are the first consumers of the storage mechanism.
-        let _chunk_store = chunk_store;
-
         let (control_handle, control_driver) = bamep_worker::ipc::worker_control(
             config.uds_path,
             config.reconnect_delay,
@@ -80,6 +76,7 @@ fn main() {
             config.data_plane_bind_addr,
             tls_server_config,
             control_handle,
+            chunk_store,
         );
 
         // One shutdown signal wired to both halves. `bamepd` supervision

@@ -102,7 +102,18 @@ async fn a_real_https_resume_get_returns_real_durable_held_chunks() {
         }
     }));
 
-    let data_plane = DataPlane::new("127.0.0.1:0".parse().unwrap(), tls, control.clone());
+    let storage_root =
+        std::env::temp_dir().join(format!("bamep-e2a-interop-store-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let chunk_store = bamep_worker::storage::FilesystemChunkStore::initialize(&storage_root)
+        .expect("initialize chunk store");
+
+    let data_plane = DataPlane::new(
+        "127.0.0.1:0".parse().unwrap(),
+        tls,
+        control.clone(),
+        chunk_store,
+    );
     let server_handle = data_plane.handle();
     let server_task = tokio::spawn(data_plane.run({
         let mut rx = shutdown_rx;
@@ -168,6 +179,7 @@ async fn a_real_https_resume_get_returns_real_durable_held_chunks() {
     server_task.abort();
     plane_task.abort();
     db.teardown().await;
+    let _ = std::fs::remove_dir_all(&storage_root);
 }
 
 fn digest_wire(byte: u8) -> String {

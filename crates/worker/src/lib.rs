@@ -1,10 +1,11 @@
-//! Bamep Worker process (Issue #37; Issue #39 Phases D1/D2/E1): the isolated,
-//! host-local OS process `bamepd` supervises per ADR-0001/ADR-0003/ADR-0018.
-//! This library crate holds the runtime pieces the `bamep-worker` binary
-//! (`src/main.rs`) composes: configuration loading, Server TLS identity
-//! loading, the local chunk byte-storage and full-Artifact reconstruction
-//! mechanisms (`storage`), and the concurrent, reconnecting Worker Protocol
-//! v1 control client (`ipc`).
+//! Bamep Worker process (Issue #37; Issue #39): the isolated, host-local OS
+//! process `bamepd` supervises per ADR-0001/ADR-0003/ADR-0018. This library
+//! crate holds the runtime pieces the `bamep-worker` binary (`src/main.rs`)
+//! composes: configuration loading, Server TLS identity loading, the local
+//! chunk byte-storage and full-Artifact reconstruction mechanisms
+//! (`storage`), the concurrent reconnecting Worker Protocol v1 control client
+//! (`ipc`), and the HTTPS `/api/data/v1/` data-plane listener that composes
+//! them (`data_plane`).
 //!
 //! This crate has no dependency on `bamep-domain`, `bamep-server`, or
 //! PostgreSQL/SQLx (ADR-0018 "Durable/business authority" — "Worker does
@@ -20,28 +21,25 @@
 //!   timeout, and every operation reporting only what `bamepd` decided (never
 //!   a fabricated decision, never a local `Verified`/`Failed` verdict, never a
 //!   replayed proof/handle across a reconnect).
-//! - **`data_plane`** — since Phase E2A: the Worker-owned HTTPS
-//!   `/api/data/v1/` listener (Axum 0.8 + `axum-server`, serving the same
-//!   Server TLS identity the Agent already trusts). It fully implements the
-//!   `GET .../chunks` resume-discovery operation by delegating to
-//!   `ipc::WorkerControlHandle::discover_resume`; it performs structural HTTP
-//!   parsing only and never verifies a capability, proof, or held-chunk
-//!   truth. Chunk `PUT` and seal `POST` are Phase E2B.
-//! - **`storage`** — since Phase D1/D2: a local chunk **byte-storage**
-//!   mechanism (staging an authorized chunk body, hashing it incrementally
-//!   with SHA-256, finalizing it into a restart-stable file) and
-//!   **full-Artifact reconstruction** (reopening a sealed Artifact's finalized
-//!   chunks in order and independently recomputing its full SHA-256). A
-//!   finalized file never means `bamepd` accepted the chunk, and
-//!   reconstruction reports only a mechanically computed digest.
-//! - **`tls`** — loading the Server TLS identity (not yet bound to a
-//!   listener).
+//! - **`data_plane`** — the Worker-owned HTTPS `/api/data/v1/` listener
+//!   (Axum 0.8 + `axum-server`, serving the same Server TLS identity the Agent
+//!   already trusts). It implements the full operation set — resume discovery
+//!   `GET`, chunk `PUT`, and seal `POST` — by composing `ipc` with `storage`;
+//!   it performs structural HTTP parsing only and never verifies a capability,
+//!   proof, or held-chunk truth, and never decides a `Verified`/`Failed`
+//!   verdict.
+//! - **`storage`** — a local chunk **byte-storage** mechanism (staging an
+//!   authorized chunk body, hashing it incrementally with SHA-256, finalizing
+//!   it into a restart-stable no-replace file) and **full-Artifact
+//!   reconstruction** (reopening a sealed Artifact's finalized chunks in order
+//!   and independently recomputing its full SHA-256). A finalized file never
+//!   means `bamepd` accepted the chunk, and reconstruction reports only a
+//!   mechanically computed digest.
+//! - **`tls`** — loading the Server TLS identity that `data_plane` serves.
 //!
 //! Worker owns no durable/business authority (ADR-0018 "PostgreSQL and
 //! storage": storage I/O, control transport, and HTTP serving are execution;
-//! durable acceptance/sealing/verification are `bamepd`'s). Still out of
-//! scope here: chunk `PUT` transport, seal `POST`, and the orchestration
-//! that composes `data_plane` with `storage` (D1/D2) — Phase E2B.
+//! durable acceptance/sealing/verification are `bamepd`'s).
 
 pub mod config;
 pub mod data_plane;

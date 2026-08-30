@@ -41,6 +41,13 @@ axum = { version = "0.8", default-features = false, features = ["json", "tokio"]
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 # Fixed JSON success/error response bodies for the data-plane contract.
 serde_json = "1"
+# Issue #39 Phase E2B — stream the `chunk_upload` request body frame-by-frame
+# into the blocking D1 staging mechanism without ever materializing a whole
+# chunk in memory (`m0-data-plane-and-storage-contracts.md` "Durable chunk
+# acceptance ordering"; D1's no-whole-chunk-in-memory guarantee). Only
+# `BodyExt::frame` is used; `http-body-util` is already a fully resolved
+# transitive dependency of `axum`, so this adds no new code to the build.
+http-body-util = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "test-util"] }
@@ -51,5 +58,8 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 # may name them.
 hyper = { version = "1", default-features = false, features = ["client", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
-http-body-util = "0.1"
+# A hand-rolled request/`Body` that errors mid-stream, for the `chunk_upload`
+# client-disconnect vertical (Phase E2B). Already resolved transitively via
+# `axum`; the ordinary-body helper uses the prod `http-body-util` dep above.
+http-body = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
