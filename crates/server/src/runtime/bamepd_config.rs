@@ -33,6 +33,10 @@ pub const ENV_RECONNECT_DELAY_MS: &str = "BAMEP_WORKER_RECONNECT_DELAY_MS";
 /// absolute path to the Worker-owned local chunk storage tree (Issue #39
 /// Phase D1); `bamepd` only carries it through to the child.
 pub const ENV_STORAGE_ROOT: &str = "BAMEP_WORKER_STORAGE_ROOT";
+/// Must stay identical to `bamep_worker::config::ENV_CONTROL_REQUEST_TIMEOUT_MS`.
+/// Bounds how long one Worker Protocol control request waits for `bamepd`
+/// (Issue #39 Phase E1); `bamepd` only carries it through to the child.
+pub const ENV_CONTROL_REQUEST_TIMEOUT_MS: &str = "BAMEP_WORKER_CONTROL_REQUEST_TIMEOUT_MS";
 pub const ENV_WORKER_EXECUTABLE: &str = "BAMEPD_WORKER_EXECUTABLE";
 pub const ENV_WORKER_RESTART_DELAY_MS: &str = "BAMEPD_WORKER_RESTART_DELAY_MS";
 /// PostgreSQL connection string (ADR-0013). Required starting with Issue
@@ -54,7 +58,7 @@ const DEFAULT_RECONNECT_DELAY_MS: u64 = 500;
 /// Both the Worker restart delay and the reconnect delay forwarded to
 /// Worker must be strictly positive: `0` would let a persistently failing
 /// Worker spawn (`WorkerSupervisor::run`) or a persistently unreachable
-/// `bamepd` (`bamep_worker::ipc::client::run_client_loop`) busy-loop
+/// `bamepd` (`bamep_worker::ipc::ControlDriver::run`) busy-loop
 /// (correction audit "Bounded non-zero timing config").
 ///
 /// `1`ms is not an operationally defensible floor (correction audit "Retry/
@@ -69,6 +73,13 @@ const MIN_DELAY_MS: u64 = 100;
 /// Conservative implementation-time upper bound around the existing
 /// `500ms` default, shared by both delays for consistency.
 const MAX_DELAY_MS: u64 = 30_000;
+
+/// Control-request timeout bounds (Issue #39 Phase E1). `bamepd` only
+/// carries this value through; the Worker enforces it. Kept identical to
+/// `bamep_worker::config`'s own floor/default/ceiling.
+const DEFAULT_CONTROL_REQUEST_TIMEOUT_MS: u64 = 5_000;
+const MIN_CONTROL_REQUEST_TIMEOUT_MS: u64 = 250;
+const MAX_CONTROL_REQUEST_TIMEOUT_MS: u64 = 60_000;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BamepdConfigError {
@@ -93,6 +104,10 @@ pub struct BamepdConfig {
     /// `bamepd` does not read or validate this tree itself; the Worker's
     /// `crate::storage::FilesystemChunkStore::initialize` owns all checks.
     pub worker_storage_root: PathBuf,
+    /// Bounded per-request answer deadline for the Worker's control client,
+    /// forwarded verbatim to the spawned Worker child (Issue #39 Phase E1).
+    /// `bamepd` neither reads nor enforces it — the Worker does.
+    pub worker_control_request_timeout: Duration,
 }
 
 impl BamepdConfig {
@@ -105,13 +120,30 @@ impl BamepdConfig {
         let worker_executable = required_path(&get, ENV_WORKER_EXECUTABLE)?;
         let tls_cert_path = required_path(&get, ENV_TLS_CERT_PATH)?;
         let tls_key_path = required_path(&get, ENV_TLS_KEY_PATH)?;
-        let worker_restart_delay =
-            optional_millis(&get, ENV_WORKER_RESTART_DELAY_MS, DEFAULT_RESTART_DELAY_MS)?;
-        let worker_reconnect_delay =
-            optional_millis(&get, ENV_RECONNECT_DELAY_MS, DEFAULT_RECONNECT_DELAY_MS)?;
+        let worker_restart_delay = optional_millis(
+            &get,
+            ENV_WORKER_RESTART_DELAY_MS,
+            DEFAULT_RESTART_DELAY_MS,
+            MIN_DELAY_MS,
+            MAX_DELAY_MS,
+        )?;
+        let worker_reconnect_delay = optional_millis(
+            &get,
+            ENV_RECONNECT_DELAY_MS,
+            DEFAULT_RECONNECT_DELAY_MS,
+            MIN_DELAY_MS,
+            MAX_DELAY_MS,
+        )?;
         let database_url = required_string(&get, ENV_DATABASE_URL)?;
         let data_plane_base_url = required_https_origin(&get, ENV_DATA_PLANE_BASE_URL)?;
         let worker_storage_root = required_path(&get, ENV_STORAGE_ROOT)?;
+        let worker_control_request_timeout = optional_millis(
+            &get,
+            ENV_CONTROL_REQUEST_TIMEOUT_MS,
+            DEFAULT_CONTROL_REQUEST_TIMEOUT_MS,
+            MIN_CONTROL_REQUEST_TIMEOUT_MS,
+            MAX_CONTROL_REQUEST_TIMEOUT_MS,
+        )?;
 
         Ok(Self {
             uds_path,
@@ -123,14 +155,15 @@ impl BamepdConfig {
             database_url,
             data_plane_base_url,
             worker_storage_root,
+            worker_control_request_timeout,
         })
     }
 
     /// The exact environment `bamepd` forwards to the spawned Worker child
-    /// — UDS path, TLS identity paths, reconnect timing, and the chunk
-    /// storage root only, never business state (Issue #37 "Worker process
-    /// config"; Issue #39 Phase D1 adds the storage root, a filesystem
-    /// location).
+    /// — UDS path, TLS identity paths, reconnect/timeout timing, and the
+    /// chunk storage root only, never business state (Issue #37 "Worker
+    /// process config"; Issue #39 Phase D1 adds the storage root, Phase E1
+    /// the control-request timeout — a filesystem location and a duration).
     pub fn worker_env(&self) -> Vec<(String, String)> {
         vec![
             (
@@ -152,6 +185,10 @@ impl BamepdConfig {
             (
                 ENV_STORAGE_ROOT.to_string(),
                 self.worker_storage_root.display().to_string(),
+            ),
+            (
+                ENV_CONTROL_REQUEST_TIMEOUT_MS.to_string(),
+                self.worker_control_request_timeout.as_millis().to_string(),
             ),
         ]
     }
@@ -230,6 +267,8 @@ fn optional_millis(
     get: &impl Fn(&str) -> Option<String>,
     name: &'static str,
     default_ms: u64,
+    min_ms: u64,
+    max_ms: u64,
 ) -> Result<Duration, BamepdConfigError> {
     match get(name) {
         Some(raw) => {
@@ -237,12 +276,10 @@ fn optional_millis(
                 name,
                 reason: "not a valid non-negative integer".to_string(),
             })?;
-            if !(MIN_DELAY_MS..=MAX_DELAY_MS).contains(&ms) {
+            if !(min_ms..=max_ms).contains(&ms) {
                 return Err(BamepdConfigError::InvalidEnv {
                     name,
-                    reason: format!(
-                        "must be between {MIN_DELAY_MS} and {MAX_DELAY_MS} milliseconds, got {ms}"
-                    ),
+                    reason: format!("must be between {min_ms} and {max_ms} milliseconds, got {ms}"),
                 });
             }
             Ok(Duration::from_millis(ms))
@@ -293,6 +330,28 @@ mod tests {
         assert_eq!(
             config.worker_storage_root,
             PathBuf::from("/var/lib/bamep/worker-chunks")
+        );
+        assert_eq!(
+            config.worker_control_request_timeout,
+            Duration::from_millis(DEFAULT_CONTROL_REQUEST_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn honors_and_bounds_the_worker_control_request_timeout() {
+        let config = with_delay(ENV_CONTROL_REQUEST_TIMEOUT_MS, "2000").expect("valid config");
+        assert_eq!(
+            config.worker_control_request_timeout,
+            Duration::from_millis(2000)
+        );
+
+        let err = with_delay(
+            ENV_CONTROL_REQUEST_TIMEOUT_MS,
+            &(MIN_CONTROL_REQUEST_TIMEOUT_MS - 1).to_string(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BamepdConfigError::InvalidEnv { name, .. } if name == ENV_CONTROL_REQUEST_TIMEOUT_MS)
         );
     }
 
@@ -422,6 +481,10 @@ mod tests {
         assert_eq!(
             get(ENV_STORAGE_ROOT),
             Some("/var/lib/bamep/worker-chunks".to_string())
+        );
+        assert_eq!(
+            get(ENV_CONTROL_REQUEST_TIMEOUT_MS),
+            Some(DEFAULT_CONTROL_REQUEST_TIMEOUT_MS.to_string())
         );
     }
 

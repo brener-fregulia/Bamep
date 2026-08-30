@@ -1,12 +1,13 @@
-//! `bamep-worker` binary entrypoint (Issue #37). Loads configuration and the
-//! Server TLS identity, then runs the reconnecting UDS control-plane client
-//! forever. `bamepd` owns this process's lifecycle — start, liveness,
-//! restart, and controlled termination
-//! (`bamep_server::runtime::worker_supervisor`) — so this binary itself
-//! implements no self-shutdown signal handling: ordinary process
-//! termination (SIGTERM/SIGKILL from the supervisor) is sufficient, since
-//! Worker holds no socket or other resource of its own that requires
-//! cleanup on exit (it is the UDS *client*, not the listener).
+//! `bamep-worker` binary entrypoint (Issue #37; Issue #39 Phases D1/D2/E1).
+//! Loads configuration, the Server TLS identity, and the local chunk storage
+//! root, then runs the concurrent Worker Protocol v1 control client forever.
+//! `bamepd` owns this process's lifecycle — start, liveness, restart, and
+//! controlled termination (`bamep_server::runtime::worker_supervisor`) — so
+//! this binary itself implements no self-shutdown signal handling: ordinary
+//! process termination (SIGTERM/SIGKILL from the supervisor) is sufficient.
+//! Phase E1 stands up the control client and retains its handle; Phase E2
+//! will compose that handle with D1 storage and D2 reconstruction behind the
+//! HTTPS data-plane routes.
 
 fn main() {
     let config = bamep_worker::config::WorkerConfig::from_env().unwrap_or_else(|err| {
@@ -45,8 +46,9 @@ fn main() {
 
     let worker_instance_id = uuid::Uuid::new_v4();
     eprintln!(
-        "bamep-worker: starting; worker_instance_id={worker_instance_id}; uds_path={}",
-        config.uds_path.display()
+        "bamep-worker: starting; worker_instance_id={worker_instance_id}; uds_path={}; control_request_timeout={}ms",
+        config.uds_path.display(),
+        config.control_request_timeout.as_millis(),
     );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -58,20 +60,24 @@ fn main() {
         });
 
     runtime.block_on(async move {
-        // Held for the process lifetime; Phase E's HTTPS request handler is
-        // the first consumer of the storage mechanism. D1 wires nothing to
-        // it beyond startup initialization.
+        // Held for the process lifetime; Phase E2's HTTPS request handlers are
+        // the first consumers of the storage mechanism and the control
+        // handle. E1 wires nothing to them beyond standing the control client
+        // up and keeping the reconnect/dispatch driver running.
         let _chunk_store = chunk_store;
 
-        let (tracker, _authority_rx) = bamep_worker::ipc::AuthorityTracker::new();
-        let (publisher, _authorization_client) = bamep_worker::ipc::authorization_channel();
-        let _: std::convert::Infallible = bamep_worker::ipc::run_client_loop(
+        let (control_handle, control_driver) = bamep_worker::ipc::worker_control(
             config.uds_path,
             config.reconnect_delay,
+            config.control_request_timeout,
             worker_instance_id,
-            tracker,
-            publisher,
-        )
-        .await;
+        );
+        let _control_handle = control_handle;
+
+        // `bamepd` supervision (SIGTERM/SIGKILL) terminates this process; the
+        // driver runs until then. `std::future::pending()` is the "no
+        // in-process shutdown" signal — the driver still fails closed and
+        // reconnects on every UDS loss.
+        control_driver.run(std::future::pending::<()>()).await;
     });
 }

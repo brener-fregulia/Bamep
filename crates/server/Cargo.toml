@@ -35,6 +35,10 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 bamep-simulator = { path = "../simulator" }
+# Cross-crate interop proof only (Issue #39 Phase E1): drives the real
+# `bamep_worker::ipc` control client against the real `WorkerControlPlane`.
+# Dev-only, one-directional — `bamep-worker` never depends on `bamep-server`.
+bamep-worker = { path = "../worker" }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 rand = "0.8"

@@ -119,6 +119,7 @@ dependencies = [
  "bamep-domain",
  "bamep-simulator",
  "bamep-trusted-bootstrap",
+ "bamep-worker",
  "bamep-worker-protocol",
  "chrono",
  "ed25519-dalek",

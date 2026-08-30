@@ -1,14 +1,17 @@
 //! Worker process configuration (Issue #37 "Worker process config"; Issue
-//! #39 Phase D1 adds the chunk storage root): the minimum values needed to
-//! reach the `bamepd` UDS, load the Server TLS identity, and locate the
-//! Worker-local chunk storage tree. Deliberately carries no business state —
-//! no Transfer IDs, capability tokens, proof keys, PostgreSQL URL, or other
-//! Domain state (Issue #37 "Worker process config": "Do not send business
-//! state through child startup args/environment"). The storage root is a
-//! filesystem *location*, mechanism configuration, not business state.
+//! #39 Phase D1 adds the chunk storage root, Phase E1 the control-request
+//! timeout): the minimum values needed to reach the `bamepd` UDS, load the
+//! Server TLS identity, locate the Worker-local chunk storage tree, and bound
+//! how long a Worker Protocol control request waits for `bamepd`.
+//! Deliberately carries no business state — no Transfer IDs, capability
+//! tokens, proof keys, PostgreSQL URL, or other Domain state (Issue #37
+//! "Worker process config": "Do not send business state through child
+//! startup args/environment"). The storage root is a filesystem *location*
+//! and the timeout is a *duration* — mechanism configuration, not business
+//! state.
 //!
 //! A small config struct plus environment parsing is sufficient here; no CLI
-//! framework is introduced for four configuration values.
+//! framework is introduced for a handful of configuration values.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -25,6 +28,14 @@ pub const ENV_RECONNECT_DELAY_MS: &str = "BAMEP_WORKER_RECONNECT_DELAY_MS";
 /// child environment (`bamep_server::runtime::bamepd_config`). This is a
 /// filesystem location only — never a Transfer ID, capability, or proof.
 pub const ENV_STORAGE_ROOT: &str = "BAMEP_WORKER_STORAGE_ROOT";
+/// Bounded time a single Worker Protocol control request
+/// (`AuthorizationQuery`, `ChunkAcceptanceRequest`, `ResumeDiscoveryQuery`/
+/// `ResumeDiscoveryContinue`, `ManifestSealRequest`,
+/// `ArtifactVerificationReport`) waits for `bamepd`'s reply on a live UDS
+/// connection before failing closed (Issue #39 Phase E1). `bamepd` forwards
+/// this exact name into the spawned Worker child environment. A duration, not
+/// business state.
+pub const ENV_CONTROL_REQUEST_TIMEOUT_MS: &str = "BAMEP_WORKER_CONTROL_REQUEST_TIMEOUT_MS";
 
 const DEFAULT_RECONNECT_DELAY_MS: u64 = 500;
 
@@ -44,6 +55,20 @@ const MIN_RECONNECT_DELAY_MS: u64 = 100;
 /// operation, low enough that a misconfigured value cannot silently make
 /// Worker take minutes to notice `bamepd` is back.
 const MAX_RECONNECT_DELAY_MS: u64 = 30_000;
+
+/// Default control-request timeout: `bamepd` answers a control request over a
+/// host-local UDS after (usually) a single PostgreSQL round trip, and its
+/// per-connection loop processes requests sequentially, so a pipelined burst
+/// can queue briefly behind DB work. `5_000`ms is comfortably above that
+/// worst case while still bounding a genuinely unresponsive `bamepd`.
+const DEFAULT_CONTROL_REQUEST_TIMEOUT_MS: u64 = 5_000;
+/// Floor: a UDS round trip plus trivial processing is well under `10`ms, but
+/// a contended `SELECT ... FOR UPDATE` can wait longer; `250`ms stops a
+/// misconfigured tiny value from failing every request spuriously.
+const MIN_CONTROL_REQUEST_TIMEOUT_MS: u64 = 250;
+/// Ceiling: past `60_000`ms a "stuck" `bamepd` is better treated as dead
+/// (the connection is recycled and the caller fails closed) than waited on.
+const MAX_CONTROL_REQUEST_TIMEOUT_MS: u64 = 60_000;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConfigError {
@@ -72,6 +97,11 @@ pub struct WorkerConfig {
     /// configurable so tests need not bake production timing into their
     /// assertions (Issue #37 "Restart policy"/"Worker reconnect").
     pub reconnect_delay: Duration,
+    /// Bounded time one Worker Protocol control request waits for `bamepd`'s
+    /// reply on a live connection before failing closed (Issue #39 Phase E1;
+    /// `m1-worker-data-plane-control-contract.md` "Failure semantics"). Not a
+    /// reconnect backoff — a per-request answer deadline.
+    pub control_request_timeout: Duration,
 }
 
 impl WorkerConfig {
@@ -87,24 +117,20 @@ impl WorkerConfig {
         let tls_cert_path = required_path(&get, ENV_TLS_CERT_PATH)?;
         let tls_key_path = required_path(&get, ENV_TLS_KEY_PATH)?;
         let storage_root = required_absolute_path(&get, ENV_STORAGE_ROOT)?;
-        let reconnect_delay = match get(ENV_RECONNECT_DELAY_MS) {
-            Some(raw) => {
-                let ms: u64 = raw.parse().map_err(|_| ConfigError::InvalidEnv {
-                    name: ENV_RECONNECT_DELAY_MS,
-                    reason: "not a valid non-negative integer".to_string(),
-                })?;
-                if !(MIN_RECONNECT_DELAY_MS..=MAX_RECONNECT_DELAY_MS).contains(&ms) {
-                    return Err(ConfigError::InvalidEnv {
-                        name: ENV_RECONNECT_DELAY_MS,
-                        reason: format!(
-                            "must be between {MIN_RECONNECT_DELAY_MS} and {MAX_RECONNECT_DELAY_MS} milliseconds, got {ms}"
-                        ),
-                    });
-                }
-                Duration::from_millis(ms)
-            }
-            None => Duration::from_millis(DEFAULT_RECONNECT_DELAY_MS),
-        };
+        let reconnect_delay = optional_bounded_millis(
+            &get,
+            ENV_RECONNECT_DELAY_MS,
+            DEFAULT_RECONNECT_DELAY_MS,
+            MIN_RECONNECT_DELAY_MS,
+            MAX_RECONNECT_DELAY_MS,
+        )?;
+        let control_request_timeout = optional_bounded_millis(
+            &get,
+            ENV_CONTROL_REQUEST_TIMEOUT_MS,
+            DEFAULT_CONTROL_REQUEST_TIMEOUT_MS,
+            MIN_CONTROL_REQUEST_TIMEOUT_MS,
+            MAX_CONTROL_REQUEST_TIMEOUT_MS,
+        )?;
 
         Ok(Self {
             uds_path,
@@ -112,8 +138,36 @@ impl WorkerConfig {
             tls_key_path,
             storage_root,
             reconnect_delay,
+            control_request_timeout,
         })
     }
+}
+
+/// Parses an optional millisecond duration from `name`, applying `default_ms`
+/// when unset and rejecting a value outside `[min_ms, max_ms]` or one that is
+/// not a non-negative integer. Shared by every bounded timing value so the
+/// floor/ceiling discipline is identical across them.
+fn optional_bounded_millis(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default_ms: u64,
+    min_ms: u64,
+    max_ms: u64,
+) -> Result<Duration, ConfigError> {
+    let Some(raw) = get(name) else {
+        return Ok(Duration::from_millis(default_ms));
+    };
+    let ms: u64 = raw.parse().map_err(|_| ConfigError::InvalidEnv {
+        name,
+        reason: "not a valid non-negative integer".to_string(),
+    })?;
+    if !(min_ms..=max_ms).contains(&ms) {
+        return Err(ConfigError::InvalidEnv {
+            name,
+            reason: format!("must be between {min_ms} and {max_ms} milliseconds, got {ms}"),
+        });
+    }
+    Ok(Duration::from_millis(ms))
 }
 
 fn required_path(
@@ -193,12 +247,55 @@ mod tests {
             config.reconnect_delay,
             Duration::from_millis(DEFAULT_RECONNECT_DELAY_MS)
         );
+        assert_eq!(
+            config.control_request_timeout,
+            Duration::from_millis(DEFAULT_CONTROL_REQUEST_TIMEOUT_MS)
+        );
     }
 
     #[test]
     fn honors_explicit_reconnect_delay() {
         let config = from_base_with(&[(ENV_RECONNECT_DELAY_MS, "150")]).expect("valid config");
         assert_eq!(config.reconnect_delay, Duration::from_millis(150));
+    }
+
+    #[test]
+    fn honors_explicit_control_request_timeout() {
+        let config =
+            from_base_with(&[(ENV_CONTROL_REQUEST_TIMEOUT_MS, "1500")]).expect("valid config");
+        assert_eq!(config.control_request_timeout, Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn control_request_timeout_below_minimum_is_rejected() {
+        let err = from_base_with(&[(
+            ENV_CONTROL_REQUEST_TIMEOUT_MS,
+            &(MIN_CONTROL_REQUEST_TIMEOUT_MS - 1).to_string(),
+        )])
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidEnv { name, .. } if name == ENV_CONTROL_REQUEST_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn control_request_timeout_above_maximum_is_rejected() {
+        let err = from_base_with(&[(
+            ENV_CONTROL_REQUEST_TIMEOUT_MS,
+            &(MAX_CONTROL_REQUEST_TIMEOUT_MS + 1).to_string(),
+        )])
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidEnv { name, .. } if name == ENV_CONTROL_REQUEST_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn malformed_control_request_timeout_is_rejected() {
+        let err = from_base_with(&[(ENV_CONTROL_REQUEST_TIMEOUT_MS, "soon")]).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidEnv { name, .. } if name == ENV_CONTROL_REQUEST_TIMEOUT_MS)
+        );
     }
 
     #[test]
