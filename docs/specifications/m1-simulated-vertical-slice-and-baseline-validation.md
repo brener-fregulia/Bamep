@@ -269,20 +269,33 @@ that bytes were sent:
 
 - `Succeeded` — sent only after `bamepd` has durably committed the owning Artifact to
   `Verified`: `{ "code": "TRANSFER_VERIFIED", "artifact_id": "<uuid>" }`;
-- `Failed` — sent once `bamepd` has durably committed a terminal `Failed` outcome for the
-  Transfer/Artifact/Attempt, using one of the following closed values:
-  - `{ "code": "ARTIFACT_VERIFICATION_FAILED", "artifact_id": "<uuid>" }` — Artifact reached
-    `PendingVerification -> Failed`;
+- `Failed` — one of the following closed values:
+  - `{ "code": "ARTIFACT_VERIFICATION_FAILED", "artifact_id": "<uuid>" }` — full-Artifact
+    verification failed (`PendingVerification -> Failed`);
   - `{ "code": "CHUNK_VERIFICATION_FAILED", "artifact_id": "<uuid>" }` — a required chunk
-    could not be reproduced/verified (`Incomplete -> Failed`);
+    could not be reproduced/verified;
   - `{ "code": "TRANSFER_ABANDONED", "artifact_id": "<uuid>" }` — capture was abandoned or
-    cancelled before completion (`Incomplete -> Failed`).
+    cancelled before completion.
+
+  Failure ordering differs by code. For `ARTIFACT_VERIFICATION_FAILED` the durable
+  `PendingVerification -> Failed` commit precedes the `ActionResult` — the seal/verification
+  path (`m1-worker-data-plane-control-contract.md`) already committed it, and the Agent
+  observes it as the seal HTTP response's `artifact_status`. For `CHUNK_VERIFICATION_FAILED`
+  and `TRANSFER_ABANDONED` no preceding operation commits the Artifact to `Failed`: the
+  Agent's terminal `ActionResult{Failed}` is itself the authoritative evidence `bamepd`
+  consumes to drive `Incomplete -> Failed`, atomically with the terminal workflow transition,
+  per `m0-data-plane-and-storage-contracts.md` "Artifact lifecycle" — which owns the
+  correlation validation, atomicity, retry/duplicate, and conflicting-evidence semantics for
+  that case.
 
 `Cancelled` remains part of the generic Agent Protocol vocabulary, composing with the Job
-lifecycle `Cancelling` contract; cancellation does not roll back chunks already durably
-accepted, and an Artifact that cannot reach `Verified` because of cancellation follows the
-existing `Incomplete -> Failed` rule above rather than a data-plane-specific cancellation
-state.
+lifecycle `Cancelling` contract (Issue #27, unchanged); cancellation does not roll back
+chunks already durably accepted. An Artifact still `Incomplete` when the owning Attempt's
+authoritative cancellation/abandonment outcome means it can no longer reach `Verified`
+follows the same `Incomplete -> Failed` rule — driven by `bamepd` and committed atomically
+with the existing cancellation terminal transition
+(`m0-data-plane-and-storage-contracts.md` "Artifact lifecycle") — not a data-plane-specific
+cancellation state.
 
 `ActionProgress` for this action uses `percent` and/or `bytes_processed`; when used,
 `bytes_processed` means cumulative bytes of chunks `bamepd` has durably accepted for this

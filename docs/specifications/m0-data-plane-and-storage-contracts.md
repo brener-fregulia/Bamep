@@ -699,6 +699,47 @@ exposed as partial success.
 If a future Selective workflow uses multiple independent Artifacts, those Artifacts may
 succeed/fail independently; workflow acceptance of partial success is a separate policy.
 
+### `Incomplete -> Failed` ownership and ordering (M1 Agent -> Server transfer)
+
+For the M1 Agent -> Server transfer, `Incomplete -> PendingVerification -> Verified | Failed`
+is driven durably by `bamepd` from the Worker seal/verification path
+(`m1-worker-data-plane-control-contract.md` "Seal-manifest first durable commit" and
+"Full-Artifact verification result"). Those commits precede the Agent's terminal
+`ActionResult`, which the Agent sends only after observing the committed `artifact_status` in
+the seal HTTP response (`m1-simulated-vertical-slice-and-baseline-validation.md` RF-005).
+
+`Incomplete -> Failed` has no such preceding operation: no HTTPS data-plane operation and no
+Worker control message performs it, and interruption/restart alone never does (a transfer
+merely interrupted keeps its Artifact `Incomplete`). For this transfer, `bamepd` drives
+`Incomplete -> Failed` when it consumes the owning action's authoritative terminal Agent
+Protocol evidence that the capture cannot complete: the Agent's `ActionResult{Failed}`
+carrying `CHUNK_VERIFICATION_FAILED` or `TRANSFER_ABANDONED`, or an authoritative `Cancelled`
+outcome for the owning Attempt while its Artifact is still `Incomplete`. `bamepd` first
+validates action/Transfer/Artifact correlation — the evidence's `artifact_id` must be the
+Artifact durably bound to that Transfer/Attempt; a mismatch fails closed and commits nothing.
+Only then does it commit, as **one atomic persistence transaction**:
+
+- `Incomplete -> Failed` for that Artifact;
+- the terminal Attempt/JobStep/Job workflow transition the same evidence produces
+  (`m0-job-lifecycle-and-scheduling.md` "Attempt lifecycle"; for a cancellation/abandonment
+  outcome, the existing Issue #27 cancellation terminal transition, unchanged);
+- the domain events and audit records those transitions already require
+  (`m0-persistence-observability-and-domain-events.md` "Atomic persistence" and "Required M1
+  normal-terminal Job/JobStep events"). This composition adds no event or audit record
+  beyond those, and no new event type.
+
+If that transaction cannot commit, no partial Artifact or workflow state is durable; the
+Agent's idempotent re-send of the same `ActionResult` recovers it. Matching duplicate
+terminal evidence is a no-op against the already-committed outcome, and conflicting later
+evidence never overwrites the first committed terminal Artifact/Attempt outcome
+(`m0-job-lifecycle-and-scheduling.md` "Duplicate and delayed evidence"). The terminal-Artifact
+immutability rules earlier in this section still hold: a conflicting `ActionResult`
+against an already-terminal Artifact fails closed — `Verified` is never rewritten to `Failed`
+to satisfy a later `ActionResult`, `Failed` is never rewritten to `Verified`,
+`CHUNK_VERIFICATION_FAILED` / `TRANSFER_ABANDONED` may drive `Incomplete -> Failed` only, and
+recorded chunk identities, manifest identity, `transfer_id`, and `artifact_id` are never
+rewritten.
+
 ## Destructive-use composition
 
 Artifact checks are additional safety gates.
