@@ -504,8 +504,12 @@ no variation and no `message`, to guarantee the required non-enumerable shape.
   returns, never the values in this request body; the response `artifact_id` also comes from
   that `ManifestSealDecision` (it is not on the route or in a header)
   (`m1-worker-data-plane-control-contract.md` "Seal-manifest first durable commit"). `bamepd`
-  separately sends the terminal `ActionResult` over the Agent Protocol WSS session once its
-  own commit exists — the HTTP response never substitutes for that message.
+  durably commits this authoritative `PendingVerification -> Verified | Failed` outcome before
+  the HTTP success response exposes it; the Agent, after observing that committed
+  `artifact_status`, sends the terminal `ActionResult` over its existing Agent Protocol WSS
+  session — `ActionResult` is Agent -> Server (`m0-agent-protocol-contract.md`) — and `bamepd`
+  consumes that inbound message through its normal Agent Protocol action-evidence path. The
+  HTTP response never substitutes for that `ActionResult`.
 - Generic authorization failure / Malformed: identical shapes to operation 1.
 - Semantic conflict: `409` `{ "error": { "code": "INCOMPLETE_MANIFEST" } }` when `bamepd` does
   not already durably hold every chunk index `0..chunk_count-1` individually verified; `409`

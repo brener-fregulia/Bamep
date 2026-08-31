@@ -463,11 +463,14 @@ seal response `{ "transfer_id", "artifact_id", "sealed": true, "artifact_status"
 Artifact), not a `409` (`m0-data-plane-and-storage-contracts.md` "HTTPS data-plane v1
 contract" operation 3).
 
-Once `bamepd` commits, it is responsible for the owning Agent Protocol `ActionResult` on the
-separate WSS control connection (`m1-simulated-vertical-slice-and-baseline-validation.md`
-RF-005) — this message never itself produces an Agent Protocol effect, preserving that the
-Agent remains the sole Agent Protocol participant and Worker never emits `ActionResult`
-directly.
+Once `bamepd` commits, the owning Agent Protocol `ActionResult` for the transfer action is
+still emitted by the Agent over its existing WSS control connection — `ActionResult` is
+Agent -> Server (`m0-agent-protocol-contract.md`) — after the Agent observes the committed
+`artifact_status` in the HTTP seal response
+(`m1-simulated-vertical-slice-and-baseline-validation.md` RF-005); `bamepd` then consumes that
+inbound message through its normal Agent Protocol action-evidence path. `ArtifactVerificationAck`
+itself never produces an Agent Protocol effect, preserving that the Agent remains the sole
+Agent Protocol participant and Worker never emits `ActionResult` directly.
 
 If the Worker cannot complete verification within the HTTP request — it cannot access the
 accepted chunk bytes it staged (for example after a restart that lost staging), or UDS is
