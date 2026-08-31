@@ -31,7 +31,9 @@ use crate::ports::{
     FinalDispatchLockedFacts, JobRepository, MarkUncertainDecision, RepositoryError,
     RequestCancellationDecision, RequestCancellationError, RequestCancellationLockedFacts,
     RequestCancellationResult, SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError,
-    TransferDispatchDecision, TransferDispatchLockedFacts,
+    TransferDispatchDecision, TransferDispatchLockedFacts, TransferTerminalEvidenceDecision,
+    TransferTerminalEvidenceDecisionOutcome, TransferTerminalEvidenceLockedFacts,
+    TransferTerminalEvidenceResult,
 };
 
 /// Adapter-local representation of the `job_state` PostgreSQL ENUM
@@ -631,11 +633,14 @@ impl JobRepository for PostgresJobRepository {
     /// #36 primitives). This strictly extends the existing `jobs ->
     /// job_steps -> attempts` order this file already uses everywhere else
     /// (see `commit_destructive_dispatch` above) by one additional leaf,
-    /// `transfers`; no other transaction in the repository ever locks
-    /// `transfers` together with `jobs`/`job_steps`/`attempts` in the
-    /// opposite order — `PostgresTransferRepository`'s own methods
-    /// (`load_locked_facts`) never lock `jobs`/`job_steps`/`attempts` at
-    /// all — so this ordering introduces no new deadlock cycle.
+    /// `transfers`. `PostgresTransferRepository`'s own methods
+    /// (`load_locked_facts` consumers) never lock `jobs`/`job_steps` at all.
+    /// [`Self::apply_transfer_terminal_evidence`] *does* lock
+    /// `transfers -> artifacts` before `attempts -> job_steps -> jobs` — the
+    /// opposite order for the `transfers`/`jobs` pair — but no cycle is
+    /// reachable: a JobStep is never being dispatched (this method) while its
+    /// Attempt is being evidenced (that method), the same linear-workflow
+    /// temporal disjointness `apply_action_evidence` already relies on.
     async fn commit_transfer_dispatch(
         &self,
         job_id: JobId,
@@ -935,6 +940,270 @@ impl JobRepository for PostgresJobRepository {
 
                 tx.commit().await.map_err(to_backend_err)?;
                 Ok(ApplyActionEvidenceResult::Applied(applied))
+            }
+        }
+    }
+
+    /// A plain, unlocked read. See the Port doc.
+    async fn action_has_bound_transfer(
+        &self,
+        action_id: ActionId,
+    ) -> Result<bool, RepositoryError> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM transfers t \
+                JOIN attempts a ON a.id = t.attempt_id \
+                WHERE a.action_id = $1 \
+             )",
+        )
+        .bind(action_id.0)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(to_backend_err)?;
+        Ok(exists)
+    }
+
+    /// See the Port doc for the full lock/decide/persist contract. Lock order
+    /// is `transfers -> artifacts -> attempts -> job_steps -> jobs`: the
+    /// `transfers`/`artifacts` prefix matches every `PostgresTransferRepository`
+    /// method (`load_locked_facts` consumers — `commit_chunk_acceptance`,
+    /// `commit_manifest_seal`, `commit_artifact_verification`), so a concurrent
+    /// chunk/seal/verification operation for the same Transfer serializes on
+    /// the `transfers` row rather than deadlocking; and the
+    /// `attempts -> job_steps -> jobs` suffix matches
+    /// [`Self::apply_action_evidence`]. `commit_transfer_dispatch` locks
+    /// `jobs -> job_steps -> attempts -> transfers` in the opposite order, but
+    /// a JobStep is never being dispatched while its Attempt is being
+    /// evidenced (linear workflow — the same temporal disjointness
+    /// `apply_action_evidence` already relies on), so no cycle is reachable.
+    async fn apply_transfer_terminal_evidence(
+        &self,
+        action_id: ActionId,
+        authenticated_endpoint_id: EndpointId,
+        decide: TransferTerminalEvidenceDecision,
+    ) -> Result<TransferTerminalEvidenceResult, ApplyActionEvidenceError> {
+        let mut tx = self.pool.begin().await.map_err(to_backend_err)?;
+
+        // Resolve action_id -> transfer_id from the immutable #40 binding
+        // (unlocked; only used to address the FOR UPDATE lock below).
+        let transfer_id: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT t.id FROM transfers t \
+             JOIN attempts a ON a.id = t.attempt_id \
+             WHERE a.action_id = $1",
+        )
+        .bind(action_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+        let Some(transfer_id) = transfer_id else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Ok(TransferTerminalEvidenceResult::NotTransferAction);
+        };
+
+        // 1. transfers -> artifacts (FOR UPDATE), no manifest/chunk load.
+        let Some((transfer, artifact)) =
+            super::transfer_repository::load_locked_transfer_and_artifact(
+                &mut tx,
+                bamep_domain::TransferId(transfer_id),
+            )
+            .await?
+        else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(ApplyActionEvidenceError::Repository(
+                RepositoryError::Backend(
+                    "transfer disappeared between resolution and lock".to_string(),
+                ),
+            ));
+        };
+        let Some(bound_attempt_id) = transfer.attempt_id else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Ok(TransferTerminalEvidenceResult::NotTransferAction);
+        };
+
+        // 2. attempts (FOR UPDATE).
+        let Some(attempt) =
+            super::authorization_repository::load_attempt_for_update(&mut tx, bound_attempt_id)
+                .await?
+        else {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(ApplyActionEvidenceError::Repository(
+                RepositoryError::Backend("transfer bound to a nonexistent attempt".to_string()),
+            ));
+        };
+        if attempt.action_id.0 != action_id.0 {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(ApplyActionEvidenceError::Repository(
+                RepositoryError::Backend(
+                    "transfer attempt does not own the resolved action".to_string(),
+                ),
+            ));
+        }
+
+        // 3. job_steps (FOR UPDATE).
+        let step_row = sqlx::query(
+            "SELECT id, job_id, step_order, state, \
+                    authorized_inventory_revision_id, authorized_target_fingerprint, failure_reason \
+             FROM job_steps WHERE id = $1 FOR UPDATE",
+        )
+        .bind(attempt.job_step_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(to_backend_err)?;
+        let Some(step_row) = step_row else {
+            return Err(ApplyActionEvidenceError::Repository(
+                RepositoryError::Backend(
+                    "attempt references a job_step that no longer exists".to_string(),
+                ),
+            ));
+        };
+        let job_step = row_to_job_step(&step_row)?;
+
+        // 4. jobs (FOR UPDATE) + ordered steps.
+        let job_row = sqlx::query("SELECT endpoint_id, state FROM jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_step.job_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(to_backend_err)?;
+        let Some(job_row) = job_row else {
+            return Err(ApplyActionEvidenceError::Repository(
+                RepositoryError::Backend(
+                    "job_step references a job that no longer exists".to_string(),
+                ),
+            ));
+        };
+        let job_endpoint_id: uuid::Uuid = job_row.try_get("endpoint_id").map_err(to_backend_err)?;
+        let job_state: PgJobState = job_row.try_get("state").map_err(to_backend_err)?;
+        let steps = fetch_job_steps(&mut tx, job_step.job_id, true)
+            .await
+            .map_err(ApplyActionEvidenceError::Repository)?;
+        let job = Job {
+            id: job_step.job_id,
+            endpoint_id: EndpointId(job_endpoint_id),
+            state: job_state.into(),
+            steps,
+        };
+
+        // Same generic non-enumeration as `apply_action_evidence`: unknown
+        // action and foreign-Endpoint action are indistinguishable.
+        if job.endpoint_id != authenticated_endpoint_id {
+            tx.rollback().await.map_err(to_backend_err)?;
+            return Err(ApplyActionEvidenceError::UnknownAction);
+        }
+
+        let facts = TransferTerminalEvidenceLockedFacts {
+            job,
+            job_step,
+            attempt,
+            transfer,
+            artifact,
+        };
+        let artifact_id = facts.artifact.id;
+
+        match decide(facts) {
+            TransferTerminalEvidenceDecisionOutcome::NoOp => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(TransferTerminalEvidenceResult::NoOp)
+            }
+            TransferTerminalEvidenceDecisionOutcome::Conflict => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(TransferTerminalEvidenceResult::Conflict)
+            }
+            TransferTerminalEvidenceDecisionOutcome::FailClosed => {
+                tx.rollback().await.map_err(to_backend_err)?;
+                Ok(TransferTerminalEvidenceResult::FailClosed)
+            }
+            TransferTerminalEvidenceDecisionOutcome::Applied {
+                commit,
+                artifact_failed,
+            } => {
+                if artifact_failed.is_some() {
+                    // CASE C: Artifact Incomplete -> Failed, in this same
+                    // transaction. The `artifacts` row is FOR UPDATE-locked
+                    // above, so the guarded UPDATE always affects exactly one
+                    // row here; a 0-row result means the durable state changed
+                    // under us despite the lock — fail closed, commit nothing.
+                    let failed = super::transfer_repository::persist_incomplete_artifact_failed(
+                        &mut tx,
+                        artifact_id,
+                    )
+                    .await?;
+                    if !failed {
+                        tx.rollback().await.map_err(to_backend_err)?;
+                        return Ok(TransferTerminalEvidenceResult::FailClosed);
+                    }
+                }
+
+                let applied = commit.outcome;
+
+                sqlx::query("UPDATE attempts SET state = $1 WHERE id = $2")
+                    .bind(PgAttemptState::from(applied.attempt.state))
+                    .bind(applied.attempt.id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+
+                sqlx::query("UPDATE job_steps SET state = $1, failure_reason = $2 WHERE id = $3")
+                    .bind(PgJobStepState::from(applied.job_step.state))
+                    .bind(
+                        applied
+                            .job_step
+                            .failure_reason
+                            .map(PgJobStepFailureReason::from),
+                    )
+                    .bind(applied.job_step.id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+
+                sqlx::query("UPDATE jobs SET state = $1 WHERE id = $2")
+                    .bind(PgJobState::from(applied.job.state))
+                    .bind(applied.job.id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+
+                for event in &applied.events {
+                    sqlx::query(
+                        "INSERT INTO domain_events \
+                         (event_id, event_type, event_version, endpoint_id, job_id, job_step_id, occurred_at, payload) \
+                         VALUES ($1, $2, 1, $3, $4, $5, $6, $7)",
+                    )
+                    .bind(event.event_id())
+                    .bind(PgDomainEventType::from(event))
+                    .bind(event.endpoint_id().0)
+                    .bind(event.job_id().map(|id| id.0))
+                    .bind(event.job_step_id().map(|id| id.0))
+                    .bind(event.occurred_at())
+                    .bind(event_payload(event))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+                }
+
+                if let Some(audit) = &commit.audit {
+                    sqlx::query(
+                        "INSERT INTO audit_records \
+                         (audit_id, endpoint_id, actor_kind, actor_label, occurred_at, detail, \
+                          job_id, job_step_id, attempt_id, action_id) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                    )
+                    .bind(audit.audit_id)
+                    .bind(audit.endpoint_id.0)
+                    .bind(PgAuditActorKind::from(&audit.actor))
+                    .bind(actor_label(&audit.actor))
+                    .bind(audit.occurred_at)
+                    .bind(&audit.detail)
+                    .bind(audit.job_id.map(|id| id.0))
+                    .bind(audit.job_step_id.map(|id| id.0))
+                    .bind(audit.attempt_id.map(|id| id.0))
+                    .bind(audit.action_id.map(|id| id.0))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(to_backend_err)?;
+                }
+
+                tx.commit().await.map_err(to_backend_err)?;
+                Ok(TransferTerminalEvidenceResult::Applied(applied))
             }
         }
     }

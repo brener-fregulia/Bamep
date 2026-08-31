@@ -371,6 +371,54 @@ pub trait JobRepository: Send + Sync {
         decide: ApplyActionEvidenceDecision,
     ) -> Result<ApplyActionEvidenceResult, ApplyActionEvidenceError>;
 
+    /// Read-only: whether a durable `Transfer` (Issue #36/#40) is bound to the
+    /// Attempt that owns `action_id`. This is the durable discriminator for
+    /// "is this action a `bamep.m1.data-plane-transfer`?" — `attempts` stores
+    /// no `action_type` (Issue #19 §9 "Action type / version resolution"), and
+    /// a bound `transfers.attempt_id` is set only by the non-destructive
+    /// transfer dispatch commitment (Issue #40) and never by any other path.
+    /// Never locks; a nonexistent/foreign `action_id` simply reports `false`.
+    async fn action_has_bound_transfer(&self, action_id: ActionId)
+        -> Result<bool, RepositoryError>;
+
+    /// Resolves `action_id` to its owning Attempt, its bound `Transfer`, and
+    /// that Transfer's `Artifact`, locks them **together with** the Attempt's
+    /// JobStep and Job in one transaction, verifies the owning Job targets
+    /// `authenticated_endpoint_id`, invokes `decide` with the freshly locked
+    /// [`TransferTerminalEvidenceLockedFacts`], and — only for
+    /// [`TransferTerminalEvidenceDecisionOutcome::Applied`] — atomically
+    /// persists, in the **same transaction** (Issue #19 checkpoint C2;
+    /// `m0-data-plane-and-storage-contracts.md` "Artifact lifecycle" —
+    /// `Incomplete -> Failed` ownership and ordering):
+    ///
+    /// - the Artifact `Incomplete -> Failed` transition, when the decision
+    ///   carries one (`CHUNK_VERIFICATION_FAILED` / `TRANSFER_ABANDONED`);
+    /// - the returned [`ActionEvidenceCommit`]'s Attempt/JobStep/Job state,
+    ///   required domain events, and (for a terminal outcome) required audit
+    ///   record — exactly as [`Self::apply_action_evidence`] persists them.
+    ///
+    /// Lock order is `transfers -> artifacts -> attempts -> job_steps ->
+    /// jobs`, matching `PostgresTransferRepository`'s
+    /// `transfers -> artifacts -> ... -> attempts` family so a concurrent
+    /// `commit_chunk_acceptance` / `commit_manifest_seal` /
+    /// `commit_artifact_verification` cannot deadlock with it, and consistent
+    /// with `commit_transfer_dispatch` by the same linear-workflow temporal
+    /// disjointness `apply_action_evidence` already relies on (a JobStep is
+    /// never being dispatched while its Attempt is being evidenced).
+    ///
+    /// An unknown `action_id`, or one whose owning Job targets a different
+    /// Endpoint, is [`ApplyActionEvidenceError::UnknownAction`] — same generic
+    /// non-enumeration as [`Self::apply_action_evidence`]. An `action_id` with
+    /// no bound `Transfer` returns
+    /// [`TransferTerminalEvidenceResult::NotTransferAction`] without invoking
+    /// `decide` (a caller that classified first should never observe this).
+    async fn apply_transfer_terminal_evidence(
+        &self,
+        action_id: ActionId,
+        authenticated_endpoint_id: EndpointId,
+        decide: TransferTerminalEvidenceDecision,
+    ) -> Result<TransferTerminalEvidenceResult, ApplyActionEvidenceError>;
+
     /// Read-only correlation check for `ActionProgress` (Issue #26
     /// "Correlate ActionProgress to the authenticated Endpoint"): resolves
     /// `action_id` to its owning Attempt -> JobStep -> Job and reports
@@ -786,7 +834,8 @@ pub enum ApplyActionEvidenceResult {
     Conflict,
 }
 
-/// Errors from [`JobRepository::apply_action_evidence`].
+/// Errors from [`JobRepository::apply_action_evidence`] and
+/// [`JobRepository::apply_transfer_terminal_evidence`].
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyActionEvidenceError {
     /// Unknown `action_id`, or a known `action_id` belonging to a Job that
@@ -796,6 +845,74 @@ pub enum ApplyActionEvidenceError {
     UnknownAction,
     #[error(transparent)]
     Repository(#[from] RepositoryError),
+}
+
+/// Durable facts read under lock immediately before one terminal
+/// `bamep.m1.data-plane-transfer` `ActionResult` decision (Issue #19
+/// checkpoint C2): the current Attempt, its JobStep, the owning Job (every
+/// ordered JobStep included), plus the bound `Transfer` and its `Artifact` —
+/// locked `transfers -> artifacts -> attempts -> job_steps -> jobs`.
+pub struct TransferTerminalEvidenceLockedFacts {
+    pub job: Job,
+    pub job_step: JobStep,
+    pub attempt: Attempt,
+    pub transfer: bamep_domain::Transfer,
+    pub artifact: bamep_domain::Artifact,
+}
+
+/// A pure decision over freshly locked [`TransferTerminalEvidenceLockedFacts`]
+/// for a terminal transfer `ActionResult`. Mirrors [`ApplyActionEvidenceDecision`]:
+/// the Adapter locks/reads, this closure decides (calling
+/// `bamep_domain::apply_action_evidence` for the generic Attempt/JobStep/Job
+/// math and, for CASE C, `bamep_domain::fail_incomplete` for the Artifact),
+/// and the Adapter persists the result atomically in one transaction.
+pub type TransferTerminalEvidenceDecision = Box<
+    dyn FnOnce(TransferTerminalEvidenceLockedFacts) -> TransferTerminalEvidenceDecisionOutcome
+        + Send,
+>;
+
+/// The outcomes a [`TransferTerminalEvidenceDecision`] may produce.
+#[allow(clippy::large_enum_variant)]
+pub enum TransferTerminalEvidenceDecisionOutcome {
+    Applied {
+        /// The generic Attempt/JobStep/Job commit, exactly as
+        /// [`ApplyActionEvidenceDecisionOutcome::Applied`] carries it.
+        commit: ActionEvidenceCommit,
+        /// `Some(Failed)` for CASE C (`CHUNK_VERIFICATION_FAILED` /
+        /// `TRANSFER_ABANDONED`) — the Adapter persists `Incomplete -> Failed`
+        /// for `commit.outcome`'s bound Artifact in the same transaction.
+        /// `None` for CASE A/B (`TRANSFER_VERIFIED` / `ARTIFACT_VERIFICATION_FAILED`),
+        /// where the seal/verification path already committed the terminal
+        /// Artifact state and this evidence must not re-transition it.
+        artifact_failed: Option<bamep_domain::Artifact>,
+    },
+    /// Matching duplicate terminal evidence — no mutation, no wire response
+    /// (`m0-job-lifecycle-and-scheduling.md` "Duplicate and delayed evidence").
+    NoOp,
+    /// Conflicting late terminal evidence — the first committed terminal
+    /// outcome wins; no mutation, no wire response.
+    Conflict,
+    /// Well-formed and correctly correlated, but the durable Artifact state
+    /// contradicts the claimed code (a false `TRANSFER_VERIFIED`, a
+    /// chunk-failure code against a non-`Incomplete` Artifact, ...), or the
+    /// evidence's `artifact_id` is not the bound Artifact. Commit nothing; the
+    /// caller maps this to a fail-closed `ProtocolError`.
+    FailClosed,
+}
+
+/// The result of [`JobRepository::apply_transfer_terminal_evidence`] after
+/// successful resolution/locking/correlation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum TransferTerminalEvidenceResult {
+    Applied(ActionEvidenceApplied),
+    NoOp,
+    Conflict,
+    FailClosed,
+    /// `action_id` resolved to no bound `Transfer` — a non-transfer action
+    /// reached this method (a caller that classified first never observes
+    /// this). The caller falls back to the RF-004 evidence path.
+    NotTransferAction,
 }
 
 /// Durable facts read under lock immediately before the final destructive-

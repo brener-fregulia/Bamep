@@ -43,8 +43,10 @@ use bamep_domain::{ActionEvidence, CancelAckEvidence, EndpointId};
 use bamep_trusted_bootstrap::ServerCertFingerprint;
 
 use crate::application::{
-    ActionEvidenceService, ApplicationError, BootstrapEvidenceService, CancellationService,
-    EnrollmentService, RedeemResult, TransferAuthorizationOutcome, TransferAuthorizationService,
+    parse_transfer_result_detail, ActionEvidenceService, ApplicationError,
+    BootstrapEvidenceService, CancellationService, EnrollmentService, RedeemResult,
+    TransferActionClassification, TransferAuthorizationOutcome, TransferAuthorizationService,
+    TransferTerminalEvidenceService, TransferTerminalOutcome,
 };
 use crate::ports::{
     ApplyActionEvidenceResult, ApplyReconciliationResult, CredentialRedemptionRepository,
@@ -187,6 +189,13 @@ pub struct AgentControlGateway<R: EndpointRepository, C: CredentialRedemptionRep
     bootstrap_evidence: Option<Arc<BootstrapEvidenceService<R>>>,
     inventory: Option<Arc<crate::application::InventoryService>>,
     action_evidence: Option<Arc<ActionEvidenceService>>,
+    /// Consumes terminal `bamep.m1.data-plane-transfer` `ActionResult`
+    /// evidence against durable Transfer/Artifact facts (Issue #19 checkpoint
+    /// C2). When configured, `handle_action_result` classifies the owning
+    /// action from durable Server facts and routes a transfer result here;
+    /// the RF-004 `bamep.m1.simulated-execution` path stays on
+    /// `action_evidence`, unchanged.
+    transfer_terminal_evidence: Option<Arc<TransferTerminalEvidenceService>>,
     /// Applies inbound `CancelAck` evidence (Issue #27 "CancelAck
     /// handling"). Deliberately never used for the operator/internal
     /// cancellation-request control path — that path
@@ -230,6 +239,7 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             bootstrap_evidence: None,
             inventory: None,
             action_evidence: None,
+            transfer_terminal_evidence: None,
             cancellation: None,
             reconciliation: None,
             transfer_authorization: None,
@@ -256,6 +266,14 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
 
     pub fn with_action_evidence_service(mut self, service: Arc<ActionEvidenceService>) -> Self {
         self.action_evidence = Some(service);
+        self
+    }
+
+    pub fn with_transfer_terminal_evidence_service(
+        mut self,
+        service: Arc<TransferTerminalEvidenceService>,
+    ) -> Self {
+        self.transfer_terminal_evidence = Some(service);
         self
     }
 
@@ -653,10 +671,19 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
     }
 
     /// Mirrors [`Self::handle_action_ack`] for `ActionResult`.
-    /// `outcome: Cancelled` is deliberately never routed to
-    /// [`ActionEvidenceService`] — Issue #26 handles only `Succeeded`/
-    /// `Failed` normal execution; `Cancelled` action-specific handling
-    /// belongs to Issue #27.
+    ///
+    /// `outcome: Cancelled` is deliberately never routed to either evidence
+    /// service — Issue #26/#19 C2 handle only `Succeeded`/`Failed`;
+    /// `Cancelled` action-specific handling belongs to Issue #27.
+    ///
+    /// The owning action is classified from **durable Server facts**, never
+    /// from `ActionResult.detail` (Issue #19 §8/§9): a
+    /// `bamep.m1.data-plane-transfer` result goes through
+    /// [`TransferTerminalEvidenceService`] (RF-005 closed detail vocabulary +
+    /// durable Artifact-truth gate + atomic CASE C `Incomplete -> Failed`);
+    /// the RF-004 `bamep.m1.simulated-execution` path stays exactly on
+    /// [`ActionEvidenceService`] with the unchanged
+    /// [`crate::application::m1_result_detail_matches`] check.
     async fn handle_action_result<W: MessageSink>(
         &self,
         write: &mut W,
@@ -667,17 +694,56 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
         if result.envelope.correlation_id != Some(result.body.action_id) {
             return self.send_protocol_error(write, Some(message_id)).await;
         }
+        if result.body.outcome == ActionResultOutcome::Cancelled {
+            return Ok(());
+        }
+
+        if let Some(transfer_terminal) = self.transfer_terminal_evidence.as_ref() {
+            match transfer_terminal
+                .classify(result.body.action_id, endpoint_id)
+                .await
+            {
+                Ok(TransferActionClassification::Unknown) => {
+                    // Non-enumeration: an unknown/foreign action is silently
+                    // dropped, exactly like `ActionEvidenceService`.
+                    return Ok(());
+                }
+                Ok(TransferActionClassification::DataPlaneTransfer) => {
+                    let parsed = match parse_transfer_result_detail(
+                        result.body.outcome,
+                        &result.body.detail,
+                    ) {
+                        Ok(parsed) => parsed,
+                        // Malformed/unknown/mismatched RF-005 detail: generic
+                        // ProtocolError, no durable terminal mutation.
+                        Err(_) => {
+                            return self.send_protocol_error(write, Some(message_id)).await;
+                        }
+                    };
+                    return match transfer_terminal
+                        .apply(result.body.action_id, endpoint_id, parsed)
+                        .await
+                    {
+                        Ok(TransferTerminalOutcome::Consumed) => Ok(()),
+                        Ok(TransferTerminalOutcome::FailClosed) => {
+                            self.send_protocol_error(write, Some(message_id)).await
+                        }
+                        Err(ApplicationError::UnknownAction) => Ok(()),
+                        Err(e) => Err(AgentGatewayError::Application(e)),
+                    };
+                }
+                Ok(TransferActionClassification::SimulatedExecution) => { /* RF-004 below */ }
+                Err(ApplicationError::UnknownAction) => return Ok(()),
+                Err(e) => return Err(AgentGatewayError::Application(e)),
+            }
+        }
+
+        // RF-004 `bamep.m1.simulated-execution` path — unchanged.
         let evidence = match result.body.outcome {
             ActionResultOutcome::Succeeded => ActionEvidence::ResultSucceeded,
             ActionResultOutcome::Failed => ActionEvidence::ResultFailed,
             ActionResultOutcome::Cancelled => return Ok(()),
         };
-        // Enforce the M1 concrete action's exact terminal `detail` shape
-        // before this evidence ever reaches a durable decision — malformed/
-        // incompatible detail must never cause a durable terminal transition
-        // (Issue #26 "Action wire contract enforcement"). `detail`'s schema
-        // is otherwise opaque to Agent Protocol; this check is intentionally
-        // Application-level, not codec-level.
         if !crate::application::m1_result_detail_matches(result.body.outcome, &result.body.detail) {
             return self.send_protocol_error(write, Some(message_id)).await;
         }

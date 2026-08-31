@@ -17,16 +17,16 @@ use bamep_domain::credential::{CredentialDimension, CredentialHash};
 use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_domain::{
     build_proof_transcript, capability_is_current, capability_matches_request,
-    evaluate_final_destructive_dispatch, evaluate_transfer_dispatch, proof_is_fresh, transitions,
-    verify_proof_signature, ActionEvidence, ActionEvidenceOutcome, ActionId, Actor, Attempt,
-    AttemptState, AuditRecord, AuthorizationOperation, BootContext, BootNonce, CancelAckEvidence,
-    CancellationRequestOutcome, CapabilityBinding, CapabilityId, CapabilityToken,
-    DestructiveIntent, DigestAlgorithm, EmptyWorkflow, EndpointId, FinalDispatchInputs,
-    FinalDispatchOutcome, FinalDispatchRejection, IdentityState, InvalidIdentityTransition,
-    InventoryRevision, InventorySnapshot, Job, JobId, JobStepId, ProofId, ProofPublicKey,
-    ProofSignature, ProofTranscriptFields, RequestedOperation, Transfer, TransferDirection,
-    TransferDispatchInputs, TransferDispatchRejection, TransferId, TrustedBootstrapState,
-    DEFAULT_CAPABILITY_TTL_MILLIS, DEFAULT_CREDENTIAL_TTL,
+    evaluate_final_destructive_dispatch, evaluate_transfer_dispatch, fail_incomplete,
+    proof_is_fresh, transitions, verify_proof_signature, ActionEvidence, ActionEvidenceOutcome,
+    ActionId, Actor, Artifact, ArtifactState, Attempt, AttemptState, AuditRecord,
+    AuthorizationOperation, BootContext, BootNonce, CancelAckEvidence, CancellationRequestOutcome,
+    CapabilityBinding, CapabilityId, CapabilityToken, DestructiveIntent, DigestAlgorithm,
+    EmptyWorkflow, EndpointId, FinalDispatchInputs, FinalDispatchOutcome, FinalDispatchRejection,
+    IdentityState, InvalidIdentityTransition, InventoryRevision, InventorySnapshot, Job, JobId,
+    JobStepId, ProofId, ProofPublicKey, ProofSignature, ProofTranscriptFields, RequestedOperation,
+    Transfer, TransferDirection, TransferDispatchInputs, TransferDispatchRejection, TransferId,
+    TrustedBootstrapState, DEFAULT_CAPABILITY_TTL_MILLIS, DEFAULT_CREDENTIAL_TTL,
 };
 use bamep_trusted_bootstrap::{AcceptedSiteKeys, BootstrapAssertion, ServerCertFingerprint};
 use chrono::{DateTime, Duration, Utc};
@@ -49,6 +49,7 @@ use crate::ports::{
     RequestCancellationResult, SatisfyStepPreconditionsDecision, SatisfyStepPreconditionsError,
     TargetRevalidationPort, TransferAuthorizationRepository, TransferDispatchDecision,
     TransferDispatchLockedFacts, TransferLockedFacts, TransferRepository,
+    TransferTerminalEvidenceDecisionOutcome, TransferTerminalEvidenceResult,
 };
 use crate::runtime::capability_store::CapabilityStore;
 use crate::runtime::presence::PresenceRegistry;
@@ -134,6 +135,98 @@ pub fn m1_result_detail_matches(
         bamep_agent_protocol::ActionResultOutcome::Cancelled => return false,
     };
     detail.get("code").and_then(|v| v.as_str()) == Some(expected_code)
+}
+
+/// The exact closed RF-005 `bamep.m1.data-plane-transfer` `ActionResult.detail`
+/// vocabulary (`m1-simulated-vertical-slice-and-baseline-validation.md` RF-005).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferResultCode {
+    /// `Succeeded` — the seal/verification path durably committed `Verified`.
+    TransferVerified,
+    /// `Failed` — `PendingVerification -> Failed` (seal path; committed before
+    /// this `ActionResult`).
+    ArtifactVerificationFailed,
+    /// `Failed` — a required chunk could not be reproduced/verified; this
+    /// `ActionResult` is itself the authoritative evidence that drives
+    /// `Incomplete -> Failed` (CASE C).
+    ChunkVerificationFailed,
+    /// `Failed` — capture abandoned/cancelled before completion; CASE C.
+    TransferAbandoned,
+}
+
+/// A parsed, shape-valid `bamep.m1.data-plane-transfer` `ActionResult.detail`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferResultDetail {
+    pub code: TransferResultCode,
+    pub artifact_id: Uuid,
+}
+
+/// Why a transfer `ActionResult.detail` is structurally invalid — every
+/// variant maps to the same generic `ProtocolError` at the wire boundary
+/// (`m0-agent-protocol-contract.md`; Issue #19 §10). Carried as a typed value
+/// only so tests can assert which structural rule was violated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TransferResultDetailError {
+    #[error("detail.code is missing or not a string")]
+    MissingCode,
+    #[error("detail.code is not a recognized bamep.m1.data-plane-transfer code")]
+    UnknownCode,
+    #[error("detail.code is not valid for this ActionResult.outcome")]
+    OutcomeCodeMismatch,
+    #[error("detail.artifact_id is missing or not a string")]
+    MissingArtifactId,
+    #[error("detail.artifact_id is not a canonical lowercase-hyphenated UUID")]
+    MalformedArtifactId,
+}
+
+/// Parses and shape-validates a `bamep.m1.data-plane-transfer` v1
+/// `ActionResult.detail` against the exact closed RF-005 vocabulary. `code`
+/// must match `outcome` and `artifact_id` must be a canonical UUID; extra keys
+/// are tolerated (forward compatibility, mirroring
+/// [`m1_result_detail_matches`] and `m0-agent-protocol-contract.md`'s
+/// wire-compat rule). `Cancelled` never reaches here — the gateway routes it
+/// to Issue #27 before this point.
+pub fn parse_transfer_result_detail(
+    outcome: bamep_agent_protocol::ActionResultOutcome,
+    detail: &serde_json::Map<String, serde_json::Value>,
+) -> Result<TransferResultDetail, TransferResultDetailError> {
+    use bamep_agent_protocol::ActionResultOutcome as O;
+    use TransferResultCode as C;
+    use TransferResultDetailError as E;
+
+    let code_str = detail
+        .get("code")
+        .and_then(|v| v.as_str())
+        .ok_or(E::MissingCode)?;
+    let code = match code_str {
+        "TRANSFER_VERIFIED" => C::TransferVerified,
+        "ARTIFACT_VERIFICATION_FAILED" => C::ArtifactVerificationFailed,
+        "CHUNK_VERIFICATION_FAILED" => C::ChunkVerificationFailed,
+        "TRANSFER_ABANDONED" => C::TransferAbandoned,
+        _ => return Err(E::UnknownCode),
+    };
+    let outcome_ok = matches!(
+        (outcome, code),
+        (O::Succeeded, C::TransferVerified)
+            | (
+                O::Failed,
+                C::ArtifactVerificationFailed | C::ChunkVerificationFailed | C::TransferAbandoned,
+            )
+    );
+    if !outcome_ok {
+        return Err(E::OutcomeCodeMismatch);
+    }
+
+    let artifact_id_str = detail
+        .get("artifact_id")
+        .and_then(|v| v.as_str())
+        .ok_or(E::MissingArtifactId)?;
+    let artifact_id = Uuid::parse_str(artifact_id_str).map_err(|_| E::MalformedArtifactId)?;
+    if artifact_id.hyphenated().to_string() != artifact_id_str {
+        return Err(E::MalformedArtifactId);
+    }
+
+    Ok(TransferResultDetail { code, artifact_id })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1206,6 +1299,263 @@ impl ActionEvidenceService {
             .repo
             .action_targets_endpoint(domain_action_id, authenticated_endpoint_id)
             .await?)
+    }
+}
+
+/// How the gateway must route one inbound `ActionResult` for `action_id`
+/// (Issue #19 §9 "Action type / version resolution"): resolved from durable
+/// Server facts, never from `ActionResult.detail`, which cannot select its own
+/// schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferActionClassification {
+    /// A durable `Transfer` (Issue #36/#40) is bound to this action's Attempt
+    /// — validate/consume through the RF-005 transfer path.
+    DataPlaneTransfer,
+    /// A known action for this Endpoint with no bound `Transfer` — the RF-004
+    /// `bamep.m1.simulated-execution` path.
+    SimulatedExecution,
+    /// Unknown `action_id`, or one whose owning Job targets a different
+    /// Endpoint — indistinguishable, mirroring
+    /// [`ActionEvidenceService`]'s non-enumeration.
+    Unknown,
+}
+
+/// The outcome the gateway maps to a wire response after
+/// [`TransferTerminalEvidenceService::apply`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferTerminalOutcome {
+    /// A durable terminal transition committed (or a matching duplicate /
+    /// conflicting-late no-op): the gateway sends no wire response, exactly
+    /// like the RF-004 evidence path.
+    Consumed,
+    /// Well-formed and correctly correlated, but the durable Artifact state
+    /// contradicts the claimed outcome, or the `artifact_id` is not the bound
+    /// Artifact: the gateway sends the generic `ProtocolError`.
+    FailClosed,
+}
+
+/// Consumes a terminal `bamep.m1.data-plane-transfer` `ActionResult` through
+/// the durable Server facts (Issue #19 checkpoint C2;
+/// `m1-simulated-vertical-slice-and-baseline-validation.md` RF-005;
+/// `m0-data-plane-and-storage-contracts.md` "Artifact lifecycle" —
+/// `Incomplete -> Failed` ownership and ordering).
+///
+/// - CASE A (`TRANSFER_VERIFIED`): commit workflow success **only** after
+///   independently confirming the durable bound Artifact is `Verified`.
+/// - CASE B (`ARTIFACT_VERIFICATION_FAILED`): confirm the durable bound
+///   Artifact is `Failed` (the seal path committed it), then apply the normal
+///   `ResultFailed` workflow transition — no further Artifact transition.
+/// - CASE C (`CHUNK_VERIFICATION_FAILED` / `TRANSFER_ABANDONED`): when the
+///   bound Artifact is `Incomplete`, drive `Incomplete -> Failed` **atomically
+///   with** the terminal Attempt/JobStep/Job transition in one transaction.
+///
+/// Reuses `bamep_domain::apply_action_evidence` for the generic
+/// Attempt/JobStep/Job math (no second lifecycle engine), and — like
+/// [`ActionEvidenceService`] — releases the Attempt's transient reservation
+/// exactly once on a terminal outcome.
+pub struct TransferTerminalEvidenceService {
+    repo: Arc<dyn JobRepository>,
+    reservations: Arc<AttemptReservationRegistry>,
+    arbiter: Arc<TechnicalResourceArbiter>,
+    clock: Arc<dyn Clock>,
+}
+
+impl TransferTerminalEvidenceService {
+    pub fn new(
+        repo: Arc<dyn JobRepository>,
+        reservations: Arc<AttemptReservationRegistry>,
+        arbiter: Arc<TechnicalResourceArbiter>,
+    ) -> Self {
+        Self::with_clock(repo, reservations, arbiter, Arc::new(SystemClock))
+    }
+
+    pub fn with_clock(
+        repo: Arc<dyn JobRepository>,
+        reservations: Arc<AttemptReservationRegistry>,
+        arbiter: Arc<TechnicalResourceArbiter>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            repo,
+            reservations,
+            arbiter,
+            clock,
+        }
+    }
+
+    /// Classifies how `action_id` (for the authenticated `endpoint_id`) must
+    /// be routed. A plain read; never locks or mutates.
+    pub async fn classify(
+        &self,
+        action_id: ProtocolId,
+        authenticated_endpoint_id: EndpointId,
+    ) -> Result<TransferActionClassification, ApplicationError> {
+        let domain_action_id = ActionId(action_id.as_uuid());
+        if !self
+            .repo
+            .action_targets_endpoint(domain_action_id, authenticated_endpoint_id)
+            .await?
+        {
+            return Ok(TransferActionClassification::Unknown);
+        }
+        if self
+            .repo
+            .action_has_bound_transfer(domain_action_id)
+            .await?
+        {
+            Ok(TransferActionClassification::DataPlaneTransfer)
+        } else {
+            Ok(TransferActionClassification::SimulatedExecution)
+        }
+    }
+
+    /// Consumes one shape-validated terminal transfer `ActionResult` for
+    /// `action_id`.
+    pub async fn apply(
+        &self,
+        action_id: ProtocolId,
+        authenticated_endpoint_id: EndpointId,
+        detail: TransferResultDetail,
+    ) -> Result<TransferTerminalOutcome, ApplicationError> {
+        let domain_action_id = ActionId(action_id.as_uuid());
+        let clock = Arc::clone(&self.clock);
+
+        let decide: crate::ports::TransferTerminalEvidenceDecision = Box::new(
+            move |facts: crate::ports::TransferTerminalEvidenceLockedFacts| {
+                decide_transfer_terminal_evidence(detail, facts, clock.now())
+            },
+        );
+
+        let result = self
+            .repo
+            .apply_transfer_terminal_evidence(domain_action_id, authenticated_endpoint_id, decide)
+            .await?;
+
+        match result {
+            TransferTerminalEvidenceResult::Applied(applied) => {
+                if applied.terminal {
+                    // Release the reservation exactly once — only the
+                    // successful remover releases through the arbiter, so
+                    // duplicate/concurrent terminal evidence never
+                    // double-releases (mirrors `ActionEvidenceService::apply`).
+                    if let Some(reservation) = self.reservations.take(applied.attempt.id) {
+                        self.arbiter.release(reservation);
+                    }
+                }
+                Ok(TransferTerminalOutcome::Consumed)
+            }
+            TransferTerminalEvidenceResult::NoOp | TransferTerminalEvidenceResult::Conflict => {
+                Ok(TransferTerminalOutcome::Consumed)
+            }
+            TransferTerminalEvidenceResult::FailClosed
+            | TransferTerminalEvidenceResult::NotTransferAction => {
+                Ok(TransferTerminalOutcome::FailClosed)
+            }
+        }
+    }
+}
+
+/// The pure CASE A/B/C decision over freshly locked durable facts. Never
+/// performs I/O; the Adapter persists whatever this returns atomically.
+fn decide_transfer_terminal_evidence(
+    detail: TransferResultDetail,
+    facts: crate::ports::TransferTerminalEvidenceLockedFacts,
+    now: DateTime<Utc>,
+) -> TransferTerminalEvidenceDecisionOutcome {
+    use TransferResultCode as C;
+    use TransferTerminalEvidenceDecisionOutcome as Out;
+
+    // Correlation: the claimed artifact_id must be exactly the Artifact
+    // durably bound to this Transfer/Attempt (`m0-data-plane-and-storage-contracts.md`
+    // "Artifact lifecycle" — a mismatch fails closed and commits nothing).
+    if detail.artifact_id != facts.artifact.id.0
+        || facts.transfer.artifact_id != facts.artifact.id
+        || facts.transfer.attempt_id != Some(facts.attempt.id)
+    {
+        return Out::FailClosed;
+    }
+
+    let evidence = match detail.code {
+        C::TransferVerified => ActionEvidence::ResultSucceeded,
+        C::ArtifactVerificationFailed | C::ChunkVerificationFailed | C::TransferAbandoned => {
+            ActionEvidence::ResultFailed
+        }
+    };
+
+    // Generic Attempt/JobStep/Job math (no second lifecycle engine). #27's
+    // "while Cancelling" composition is inherited here for free.
+    let applied = match bamep_domain::apply_action_evidence(
+        &facts.job,
+        &facts.job_step,
+        &facts.attempt,
+        evidence,
+        now,
+    ) {
+        ActionEvidenceOutcome::NoOp => return Out::NoOp,
+        ActionEvidenceOutcome::Conflict => return Out::Conflict,
+        ActionEvidenceOutcome::Applied(applied) => applied,
+    };
+
+    // A fresh terminal transition. Gate on durable Artifact truth per code
+    // (the Agent's claim alone is never sufficient — Issue #19 §5/§7).
+    let artifact_failed: Option<Artifact> = match detail.code {
+        C::TransferVerified => {
+            if facts.artifact.state != ArtifactState::Verified {
+                return Out::FailClosed;
+            }
+            None
+        }
+        C::ArtifactVerificationFailed => {
+            if facts.artifact.state != ArtifactState::Failed {
+                return Out::FailClosed;
+            }
+            None
+        }
+        C::ChunkVerificationFailed | C::TransferAbandoned => match facts.artifact.state {
+            ArtifactState::Incomplete => match fail_incomplete(&facts.artifact) {
+                Ok(failed) => Some(failed),
+                // `fail_incomplete` only rejects a non-`Incomplete` Artifact,
+                // already excluded above — unreachable, but fail closed.
+                Err(_) => return Out::FailClosed,
+            },
+            // `Verified` / `PendingVerification` / a `Failed` Artifact whose
+            // Attempt is somehow still non-terminal: the Specification does
+            // not close these combinations — fail closed (Issue #19 §7/§35).
+            _ => return Out::FailClosed,
+        },
+    };
+
+    let audit = applied.terminal.then(|| AuditRecord {
+        audit_id: Uuid::new_v4(),
+        endpoint_id: facts.job.endpoint_id,
+        actor: Actor::System,
+        occurred_at: now,
+        detail: format!(
+            "attempt {:?} action {:?} reached terminal state {:?} for job_step {:?} \
+             (bamep.m1.data-plane-transfer: {:?}{})",
+            applied.attempt.id,
+            applied.attempt.action_id,
+            applied.attempt.state,
+            applied.job_step.id,
+            detail.code,
+            if artifact_failed.is_some() {
+                ", artifact Incomplete -> Failed"
+            } else {
+                ""
+            },
+        ),
+        job_id: Some(facts.job.id),
+        job_step_id: Some(applied.job_step.id),
+        attempt_id: Some(applied.attempt.id),
+        action_id: Some(applied.attempt.action_id),
+    });
+
+    Out::Applied {
+        commit: ActionEvidenceCommit {
+            outcome: applied,
+            audit,
+        },
+        artifact_failed,
     }
 }
 
@@ -3755,6 +4105,25 @@ mod tests {
                 unimplemented!("DestructiveIntentService never correlates ActionProgress")
             }
 
+            async fn action_has_bound_transfer(
+                &self,
+                _action_id: bamep_domain::ActionId,
+            ) -> Result<bool, RepositoryError> {
+                unimplemented!("DestructiveIntentService never classifies transfer actions")
+            }
+
+            async fn apply_transfer_terminal_evidence(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+                _decide: crate::ports::TransferTerminalEvidenceDecision,
+            ) -> Result<
+                crate::ports::TransferTerminalEvidenceResult,
+                crate::ports::ApplyActionEvidenceError,
+            > {
+                unimplemented!("DestructiveIntentService never applies transfer terminal evidence")
+            }
+
             async fn request_cancellation(
                 &self,
                 _job_id: JobId,
@@ -4306,6 +4675,25 @@ mod tests {
                 _authenticated_endpoint_id: EndpointId,
             ) -> Result<bool, RepositoryError> {
                 unimplemented!("FinalDispatchService tests never correlate ActionProgress")
+            }
+
+            async fn action_has_bound_transfer(
+                &self,
+                _action_id: bamep_domain::ActionId,
+            ) -> Result<bool, RepositoryError> {
+                unimplemented!("FinalDispatchService tests never classify transfer actions")
+            }
+
+            async fn apply_transfer_terminal_evidence(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+                _decide: crate::ports::TransferTerminalEvidenceDecision,
+            ) -> Result<
+                crate::ports::TransferTerminalEvidenceResult,
+                crate::ports::ApplyActionEvidenceError,
+            > {
+                unimplemented!("FinalDispatchService tests never apply transfer terminal evidence")
             }
 
             async fn request_cancellation(
@@ -5037,6 +5425,25 @@ mod tests {
                 _authenticated_endpoint_id: EndpointId,
             ) -> Result<bool, RepositoryError> {
                 unimplemented!("TransferDispatchService never correlates ActionProgress")
+            }
+
+            async fn action_has_bound_transfer(
+                &self,
+                _action_id: bamep_domain::ActionId,
+            ) -> Result<bool, RepositoryError> {
+                unimplemented!("TransferDispatchService never classifies transfer actions")
+            }
+
+            async fn apply_transfer_terminal_evidence(
+                &self,
+                _action_id: bamep_domain::ActionId,
+                _authenticated_endpoint_id: EndpointId,
+                _decide: crate::ports::TransferTerminalEvidenceDecision,
+            ) -> Result<
+                crate::ports::TransferTerminalEvidenceResult,
+                crate::ports::ApplyActionEvidenceError,
+            > {
+                unimplemented!("TransferDispatchService never applies transfer terminal evidence")
             }
 
             async fn request_cancellation(

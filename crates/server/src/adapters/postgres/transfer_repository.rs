@@ -332,6 +332,100 @@ pub(crate) async fn persist_attempt_binding(
     Ok(())
 }
 
+/// Locks the `transfers` row for `transfer_id` and its correlated `artifacts`
+/// row (both `FOR UPDATE`) and returns just the reconstructed [`Transfer`] and
+/// [`Artifact`] — no manifest, no chunk-identity load. The lock prefix is
+/// identical to [`load_locked_facts`]'s (`transfers` then `artifacts`), so the
+/// same `transfers`-row serialization anchor and lock ordering hold; this
+/// primitive only skips the potentially large chunk-identity read the terminal
+/// -`ActionResult` path (Issue #19 checkpoint C2) never needs. `pub(crate)` so
+/// `super::job_repository`'s atomic terminal-evidence composition can lock/read
+/// these facts directly inside its own transaction (Issue #19 §12
+/// "Transaction design for CASE C").
+pub(crate) async fn load_locked_transfer_and_artifact(
+    tx: &mut Transaction<'_, Postgres>,
+    transfer_id: TransferId,
+) -> Result<Option<(Transfer, Artifact)>, RepositoryError> {
+    let Some(row) = sqlx::query(
+        r#"
+        SELECT id, endpoint_id, job_id, job_step_id, artifact_id, direction, digest_algorithm,
+               chunk_size, source_provenance, attempt_id
+        FROM transfers
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(transfer_id.0)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(to_backend_err)?
+    else {
+        return Ok(None);
+    };
+
+    let artifact_id: uuid::Uuid = row.try_get("artifact_id").map_err(to_backend_err)?;
+    let direction: PgTransferDirection = row.try_get("direction").map_err(to_backend_err)?;
+    let digest_algorithm: PgDigestAlgorithm =
+        row.try_get("digest_algorithm").map_err(to_backend_err)?;
+    let chunk_size: i32 = row.try_get("chunk_size").map_err(to_backend_err)?;
+    let source_provenance: String = row.try_get("source_provenance").map_err(to_backend_err)?;
+    let attempt_id: Option<uuid::Uuid> = row.try_get("attempt_id").map_err(to_backend_err)?;
+
+    let transfer = Transfer {
+        id: transfer_id,
+        endpoint_id: EndpointId(row.try_get("endpoint_id").map_err(to_backend_err)?),
+        job_id: JobId(row.try_get("job_id").map_err(to_backend_err)?),
+        job_step_id: JobStepId(row.try_get("job_step_id").map_err(to_backend_err)?),
+        artifact_id: ArtifactId(artifact_id),
+        direction: direction.into(),
+        digest_algorithm: digest_algorithm.into(),
+        chunk_size: bamep_domain::ChunkSize::new(chunk_size as u32).map_err(|_| {
+            RepositoryError::Backend("persisted transfer has a non-positive chunk_size".into())
+        })?,
+        source_provenance: SourceProvenance::new(source_provenance),
+        attempt_id: attempt_id.map(bamep_domain::AttemptId),
+    };
+
+    let artifact_row =
+        sqlx::query("SELECT state, capture_consistency FROM artifacts WHERE id = $1 FOR UPDATE")
+            .bind(artifact_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(to_backend_err)?;
+    let state: PgArtifactState = artifact_row.try_get("state").map_err(to_backend_err)?;
+    let capture_consistency: PgCaptureConsistency = artifact_row
+        .try_get("capture_consistency")
+        .map_err(to_backend_err)?;
+    let artifact = Artifact {
+        id: ArtifactId(artifact_id),
+        state: state.into(),
+        capture_consistency: capture_consistency.into(),
+    };
+
+    Ok(Some((transfer, artifact)))
+}
+
+/// Persists `Artifact Incomplete -> Failed` for `artifact_id` within the
+/// caller's already-open `tx`, returning `true` iff exactly one row moved from
+/// `Incomplete` to `Failed`. The `state = 'Incomplete'` guard makes this a
+/// no-op (returns `false`) against any already-non-`Incomplete` Artifact —
+/// terminal-Artifact immutability (`m0-data-plane-and-storage-contracts.md`
+/// "Artifact lifecycle"). The caller must have already locked the `artifacts`
+/// row (e.g. via [`load_locked_transfer_and_artifact`]) and decided the
+/// transition is legal (`bamep_domain::fail_incomplete`).
+pub(crate) async fn persist_incomplete_artifact_failed(
+    tx: &mut Transaction<'_, Postgres>,
+    artifact_id: ArtifactId,
+) -> Result<bool, RepositoryError> {
+    let result =
+        sqlx::query("UPDATE artifacts SET state = 'Failed' WHERE id = $1 AND state = 'Incomplete'")
+            .bind(artifact_id.0)
+            .execute(&mut **tx)
+            .await
+            .map_err(to_backend_err)?;
+    Ok(result.rows_affected() == 1)
+}
+
 #[async_trait]
 impl TransferRepository for PostgresTransferRepository {
     async fn create_transfer_context(

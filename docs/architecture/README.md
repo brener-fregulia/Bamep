@@ -383,10 +383,12 @@ rebind, is implemented and tested; #40 (below) is the first consumer that actual
 owning Attempt. Agent Protocol transfer authorization (#38) is implemented — see
 "Sender-constrained transfer authorization" below. The authenticated HTTPS chunk transport,
 storage, and Artifact verification through the Worker (#39) are implemented — see "Implemented
-Worker data-plane chunk transport" below. The end-to-end Simulator RF-005 vertical (#19 — real
-WSS dispatch → authorization → Worker HTTPS → Artifact outcome → terminal action/workflow)
-remains unimplemented. The isolated Worker process/control boundary itself (#37) is implemented
-— see "Implemented isolated Worker runtime and control boundary" below.
+Worker data-plane chunk transport" below. The Agent-side C1 transfer participant (#19) and the
+Server-side C2 terminal-`ActionResult` consumption (#19) are implemented — see "Implemented
+transfer terminal-result consumption" below; the end-to-end Simulator RF-005 vertical wiring
+those together over real WSS + Worker HTTPS in one run remains for checkpoint C3. The isolated
+Worker process/control boundary itself (#37) is implemented — see "Implemented isolated Worker
+runtime and control boundary" below.
 
 ## Implemented non-destructive M1 transfer dispatch-commit path
 
@@ -424,6 +426,59 @@ It sends `bamep.m1.data-plane-transfer` v1 with `parameters` reconstructed only 
 bound `Transfer` (`transfer_id`, `artifact_id`, `direction`, `digest_algorithm`, `chunk_size`) —
 never a caller-supplied replacement. The pre-existing `dispatch`/`bamep.m1.simulated-execution`
 path is unchanged.
+
+## Implemented transfer terminal-result consumption
+
+Issue #19 checkpoint C2 wires the Server side of the M1 transfer terminal `ActionResult`
+(`m1-simulated-vertical-slice-and-baseline-validation.md` RF-005;
+`m0-data-plane-and-storage-contracts.md` "Artifact lifecycle" — `Incomplete -> Failed`
+ownership and ordering).
+
+`AgentControlGateway::handle_action_result` now classifies the owning action from **durable
+Server facts**, never from `ActionResult.detail`: it asks the new
+`bamep_server::application::TransferTerminalEvidenceService::classify` whether a `Transfer`
+(Issue #40) is bound to the action's Attempt (the durable discriminator —
+`attempts` stores no `action_type`). A `bamep.m1.data-plane-transfer` result is validated
+against the closed RF-005 detail vocabulary (`parse_transfer_result_detail`) and consumed
+through `TransferTerminalEvidenceService::apply`; the RF-004 `bamep.m1.simulated-execution`
+path stays exactly on `ActionEvidenceService` with the unchanged `m1_result_detail_matches`
+check. A malformed transfer detail is answered with the existing generic `ProtocolError`.
+
+`TransferTerminalEvidenceService::apply` composes the pure Domain decision
+(`decide_transfer_terminal_evidence`, which reuses `bamep_domain::apply_action_evidence` for
+the generic Attempt/JobStep/Job math and `bamep_domain::fail_incomplete` for CASE C) with the
+new `JobRepository::apply_transfer_terminal_evidence` atomic boundary:
+
+- CASE A (`TRANSFER_VERIFIED`) commits Attempt/JobStep/Job success **only** when the durably
+  bound Artifact is independently confirmed `Verified` under lock; any other state fails
+  closed with no mutation.
+- CASE B (`ARTIFACT_VERIFICATION_FAILED`) requires the durably bound Artifact to already be
+  `Failed` (the #39 seal/verification path committed it) and performs the normal
+  `ResultFailed` workflow transition with no further Artifact transition.
+- CASE C (`CHUNK_VERIFICATION_FAILED` / `TRANSFER_ABANDONED`) drives
+  `Artifact Incomplete -> Failed` **in the same PostgreSQL transaction** as the terminal
+  Attempt/JobStep/Job transition and its already-required events/audit. A failed transaction
+  leaves neither side durably committed; an idempotent resend recovers it; a matching
+  duplicate is a `NoOp`; conflicting late evidence never overwrites the first committed
+  terminal outcome; a terminal Artifact is never rewritten (`Verified` never to `Failed`,
+  `Failed` never to `Verified`). Issue #27's "while `Cancelling` → Job `Cancelled`"
+  composition is inherited unchanged through `apply_action_evidence`.
+
+`PostgresJobRepository::apply_transfer_terminal_evidence` locks
+`transfers -> artifacts -> attempts -> job_steps -> jobs` — the `transfers -> artifacts`
+prefix matches `PostgresTransferRepository`'s chunk/seal/verification family (no deadlock with
+a concurrent `commit_chunk_acceptance` etc.), and the `attempts -> job_steps -> jobs` suffix
+matches `apply_action_evidence`; the opposite `transfers`/`jobs` order versus
+`commit_transfer_dispatch` is not a reachable cycle because a JobStep is never dispatched
+while its Attempt is being evidenced (linear workflow). `bamep_server::adapters::postgres::transfer_repository`
+gained the `pub(crate)` `load_locked_transfer_and_artifact` and
+`persist_incomplete_artifact_failed` primitives it composes.
+
+No wire contract changes (Agent Protocol catalog, `ActionResult` shape, closed RF-005 detail
+codes, Worker Protocol v1, the 137-byte proof transcript, and the HTTPS `/api/data/v1/`
+surface are all unchanged), no new Domain event, and the C1 Simulator participant is
+unchanged. The end-to-end Simulator RF-005 vertical (#19 — real WSS dispatch → authorization
+→ Worker HTTPS → `ActionResult` network round trip) remains for checkpoint C3.
 
 ## Implemented isolated Worker runtime and control boundary
 
