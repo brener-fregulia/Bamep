@@ -18,9 +18,38 @@ use std::sync::Arc;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 
 use bamep_trusted_bootstrap::ServerCertFingerprint;
+
+/// Builds a TLS 1.3-only `rustls` client configuration that authenticates the
+/// Server by the single exact leaf-certificate fingerprint `expected`
+/// ([`PinnedServerCertVerifier`]) and presents no client certificate — the
+/// identical trust model the WSS control plane already uses
+/// (`docs/specifications/m0-agent-protocol-contract.md` "Transport and
+/// handshake"). ADR-0018 and `m0-agent-protocol-contract.md` "Endpoint
+/// discovery for the data-plane listener" require the Worker-owned
+/// `data_plane_base_url` HTTPS origin to be verified against the *same* trusted
+/// leaf fingerprint with the *same* exact-pin comparison — never
+/// hostname/DNS/Web-PKI — so both [`crate::transport::connect_pinned_wss`] and
+/// the Agent-side data-plane HTTPS client
+/// ([`crate::data_plane::DataPlaneClient`]) build their client config here.
+///
+/// `alpn_protocols` is applied verbatim: empty for the WSS control plane,
+/// `[b"http/1.1".to_vec()]` for the Worker HTTP/1.1 data plane.
+pub fn pinned_tls13_client_config(
+    expected: ServerCertFingerprint,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<ClientConfig, RustlsError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier::new(expected)))
+        .with_no_client_auth();
+    config.alpn_protocols = alpn_protocols;
+    Ok(config)
+}
 
 /// Verifies the Server's presented leaf certificate against a single
 /// authenticated expected [`ServerCertFingerprint`]. `server_name`/SNI is

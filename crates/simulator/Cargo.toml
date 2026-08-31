@@ -11,11 +11,20 @@ path = "src/lib.rs"
 [dependencies]
 bamep-agent-protocol = { path = "../agent-protocol" }
 bamep-trusted-bootstrap = { path = "../trusted-bootstrap", features = ["fixture-signing"] }
-tokio = { version = "1", features = ["net"] }
+tokio = { version = "1", features = ["net", "rt", "io-util", "time"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# Issue #19 C1 — the Agent-side real HTTPS `/api/data/v1/` client for the M1
+# Agent -> Server data-plane transfer. Same minimal hyper-1 http1 + tokio-rustls
+# composition `bamep-worker`'s own HTTPS integration tests already use, so the
+# Simulator crosses the real Worker HTTPS boundary rather than an in-process
+# fake (`m0-simulator-contract-and-validation-strategy.md`). No second HTTP
+# stack, no `reqwest`, no OpenSSL.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
 thiserror = "1"
 serde_json = "1"
 # Independent Agent-side data-plane proof cryptography (Issue #38): the
@@ -33,5 +42,14 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 bamep-server = { path = "../server" }
 bamep-domain = { path = "../domain" }
+# Issue #19 C1 real-HTTPS integration tests: drive the Agent-side client against
+# a real `bamep_worker::data_plane::DataPlane` + real Worker control client,
+# backed by a fake `bamepd` UDS peer speaking the real `bamep-worker-protocol`
+# codec (`m0-simulator-contract-and-validation-strategy.md`; the missing Server
+# business authority belongs to later integration checkpoints). Dependency
+# direction is one-way — neither `bamep-worker` nor `bamep-worker-protocol`
+# depends on `bamep-simulator`, so there is no Cargo cycle.
+bamep-worker = { path = "../worker" }
+bamep-worker-protocol = { path = "../worker-protocol" }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
-tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "time", "sync"] }

@@ -9,13 +9,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rustls::pki_types::{InvalidDnsNameError, ServerName};
-use rustls::ClientConfig;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::verifier::PinnedServerCertVerifier;
+use crate::verifier::pinned_tls13_client_config;
 use bamep_trusted_bootstrap::ServerCertFingerprint;
 
 #[derive(Debug, thiserror::Error)]
@@ -48,15 +47,10 @@ pub async fn connect_pinned_wss(
     server_name: &str,
     expected_fingerprint: ServerCertFingerprint,
 ) -> Result<WebSocketStream<TlsStream<TcpStream>>, SimulatorTransportError> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(SimulatorTransportError::TlsConfig)?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier::new(
-            expected_fingerprint,
-        )))
-        .with_no_client_auth();
+    // The WSS control plane uses no ALPN; the identical exact-leaf-pin trust
+    // model is shared with the Worker data-plane HTTPS client via this helper.
+    let config = pinned_tls13_client_config(expected_fingerprint, Vec::new())
+        .map_err(SimulatorTransportError::TlsConfig)?;
 
     let connector = TlsConnector::from(Arc::new(config));
 
