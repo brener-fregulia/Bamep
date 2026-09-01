@@ -282,11 +282,15 @@ that bytes were sent:
   path (`m1-worker-data-plane-control-contract.md`) already committed it, and the Agent
   observes it as the seal HTTP response's `artifact_status`. For `CHUNK_VERIFICATION_FAILED`
   and `TRANSFER_ABANDONED` no preceding operation commits the Artifact to `Failed`: the
-  Agent's terminal `ActionResult{Failed}` is itself the authoritative evidence `bamepd`
-  consumes to drive `Incomplete -> Failed`, atomically with the terminal workflow transition,
-  per `m0-data-plane-and-storage-contracts.md` "Artifact lifecycle" — which owns the
-  correlation validation, atomicity, retry/duplicate, and conflicting-evidence semantics for
-  that case.
+  Agent's terminal `ActionResult{Failed}` is the authoritative evidence `bamepd` consumes to
+  drive `Incomplete -> Failed`, atomically with the terminal workflow transition — or, when
+  that terminal `ActionResult` was lost, an authoritative `#28` `StatusReport{Failed}`
+  reconciliation outcome for the owning Attempt while the Artifact is still `Incomplete`
+  drives the same atomic `Incomplete -> Failed`. `m0-data-plane-and-storage-contracts.md`
+  "Artifact lifecycle" owns the correlation validation, atomicity, retry/duplicate,
+  conflicting-evidence, and terminal-Artifact-immutability semantics for both channels,
+  including why the code-less `StatusReport{Failed}` is sufficient when the Artifact is
+  `Incomplete`.
 
 `Cancelled` remains part of the generic Agent Protocol vocabulary, composing with the Job
 lifecycle `Cancelling` contract (Issue #27, unchanged); cancellation does not roll back

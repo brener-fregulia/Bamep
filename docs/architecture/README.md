@@ -390,9 +390,10 @@ legitimate resume, real WSS disconnect/reconnect, corrupted-chunk rejection, sou
 reproducibility failure, invalid/replayed/wrong-binding authorization, Worker runtime
 restart, `bamepd`-restart transient-authorization invalidation + startup reconciliation,
 `Verified`/`Failed`-but-`ActionResult`-lost reconciliation, `capture_consistency`
-independence, source-vs-target identity independence, transfer cancellation, and a
-lock-order concurrency regression) are implemented — see "Implemented transfer
-terminal-result consumption", "Implemented transfer cancellation Artifact-failure
+independence, source-vs-target identity independence, transfer cancellation, a
+still-`Incomplete` Artifact reconciled by `StatusReport{Failed}`, and a lock-order
+concurrency regression) are implemented — see "Implemented transfer terminal-result
+consumption", "Implemented transfer cancellation / reconciliation Artifact-failure
 composition", and "Implemented integrated RF-005 transfer matrix" below. #19's integrated
 functional matrix is implemented; physical firmware/PXE/Secure-Boot/WinPE behaviour,
 20–24-Endpoint scale, physical-disk capture, and the production backup format are not in its
@@ -489,7 +490,7 @@ codes, Worker Protocol v1, the 137-byte proof transcript, and the HTTPS `/api/da
 surface are all unchanged), no new Domain event, and the C1 Simulator participant is
 unchanged.
 
-## Implemented transfer cancellation Artifact-failure composition
+## Implemented transfer cancellation / reconciliation Artifact-failure composition
 
 Issue #19 checkpoint C4 closes the one gap C2/C3 recorded: the
 `m0-data-plane-and-storage-contracts.md` "Artifact lifecycle" clause names an authoritative
@@ -510,13 +511,20 @@ every non-transfer `CancelAck` stays exactly on `CancellationService` (Issue #27
 unchanged). No new event, no new state, no new wire message.
 
 The same transfer-aware transaction also consumes an authoritative Issue #28
-`StatusReport{Cancelled}` after session-loss reconciliation. It reuses
-`bamep_domain::apply_status_report` for the unchanged workflow decision and atomically adds the
-Specification-owned `Artifact Incomplete -> Failed` transition when that decision terminates the
-owning transfer Attempt as `Cancelled`. Durable action-to-Transfer classification controls this
-routing; non-transfer Attempts and every other `StatusReport` state remain on the generic Issue
-#28 path. Terminal Artifacts and `PendingVerification` retain the lifecycle behavior described
-above.
+`StatusReport{Cancelled}` **or `StatusReport{Failed}`** after session-loss reconciliation —
+`TransferTerminalEvidenceService::apply_status_report_cancelled` /
+`apply_status_report_failed`. Both reuse `bamep_domain::apply_status_report` for the unchanged
+#28 workflow decision and atomically add the Specification-owned `Artifact Incomplete ->
+Failed` transition when that decision terminates the owning transfer Attempt (as `Cancelled`
+or `Failed`) while its bound Artifact is still `Incomplete` — the reconciliation equivalent of
+the `ActionResult{Failed}` `CHUNK_VERIFICATION_FAILED` / `TRANSFER_ABANDONED` path, per
+`m0-data-plane-and-storage-contracts.md` "`Incomplete -> Failed` ownership and ordering"
+(`StatusReport` carries no failure code; a still-`Incomplete` Artifact makes `Incomplete ->
+Failed` the only safe transition). Durable action-to-Transfer classification controls this
+routing; non-transfer Attempts and every other `StatusReport` state (`Running`, `Succeeded`,
+`Unknown`) remain on the generic Issue #28 path. Terminal Artifacts (`Verified`/`Failed`) are
+never rewritten and `PendingVerification` keeps its seal/verification-path outcome; the
+workflow still transitions per #28 in those cases.
 
 ## Implemented integrated RF-005 transfer matrix
 

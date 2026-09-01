@@ -864,12 +864,20 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
             return self.send_protocol_error(write, Some(message_id)).await;
         }
 
-        // Only the authoritative terminal Cancelled outcome has an
-        // additional transfer Artifact effect. Classify from durable Server
-        // facts, never from the StatusReport payload, and reuse C2/C4's
-        // transfer transaction. Every other status remains on #28's generic
-        // reconciliation path below.
-        if report.body.known_state == KnownActionState::Cancelled {
+        // An authoritative terminal Cancelled or Failed reconciliation
+        // outcome for a transfer-bound Attempt composes the atomic Artifact
+        // `Incomplete -> Failed` leg the data-plane Specification requires
+        // (`m0-data-plane-and-storage-contracts.md` "`Incomplete -> Failed`
+        // ownership and ordering"). Classify from durable Server facts, never
+        // from the StatusReport payload, and reuse the C2/C4 transfer
+        // transaction. Every other status, and every non-transfer action,
+        // stays on #28's generic reconciliation path below.
+        let transfer_reconciliation_evidence = match report.body.known_state {
+            KnownActionState::Cancelled => Some(bamep_domain::StatusReportEvidence::Cancelled),
+            KnownActionState::Failed => Some(bamep_domain::StatusReportEvidence::Failed),
+            _ => None,
+        };
+        if let Some(evidence) = transfer_reconciliation_evidence {
             if let Some(transfer_terminal) = self.transfer_terminal_evidence.as_ref() {
                 match transfer_terminal
                     .classify(report.body.action_id, endpoint_id)
@@ -877,16 +885,30 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                 {
                     Ok(TransferActionClassification::Unknown) => return Ok(()),
                     Ok(TransferActionClassification::DataPlaneTransfer) => {
-                        return match transfer_terminal
-                            .apply_status_report_cancelled(report.body.action_id, endpoint_id)
-                            .await
-                        {
+                        let applied = match evidence {
+                            bamep_domain::StatusReportEvidence::Cancelled => {
+                                transfer_terminal
+                                    .apply_status_report_cancelled(
+                                        report.body.action_id,
+                                        endpoint_id,
+                                    )
+                                    .await
+                            }
+                            // Only `Cancelled`/`Failed` reach here (see the
+                            // `match` on `known_state` above).
+                            _ => {
+                                transfer_terminal
+                                    .apply_status_report_failed(report.body.action_id, endpoint_id)
+                                    .await
+                            }
+                        };
+                        return match applied {
                             Ok(TransferStatusReportOutcome::Consumed) => Ok(()),
                             Ok(TransferStatusReportOutcome::NotTransferAction) => {
                                 self.apply_generic_status_report(
                                     report.body.action_id,
                                     endpoint_id,
-                                    bamep_domain::StatusReportEvidence::Cancelled,
+                                    evidence,
                                 )
                                 .await
                             }

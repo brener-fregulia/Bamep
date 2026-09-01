@@ -712,31 +712,60 @@ the seal HTTP response (`m1-simulated-vertical-slice-and-baseline-validation.md`
 Worker control message performs it, and interruption/restart alone never does (a transfer
 merely interrupted keeps its Artifact `Incomplete`). For this transfer, `bamepd` drives
 `Incomplete -> Failed` when it consumes the owning action's authoritative terminal Agent
-Protocol evidence that the capture cannot complete: the Agent's `ActionResult{Failed}`
-carrying `CHUNK_VERIFICATION_FAILED` or `TRANSFER_ABANDONED`, or an authoritative `Cancelled`
-outcome for the owning Attempt while its Artifact is still `Incomplete`. `bamepd` first
-validates action/Transfer/Artifact correlation — the evidence's `artifact_id` must be the
-Artifact durably bound to that Transfer/Attempt; a mismatch fails closed and commits nothing.
-Only then does it commit, as **one atomic persistence transaction**:
+Protocol evidence that the capture cannot complete, while its Artifact is still `Incomplete`:
+
+- the Agent's `ActionResult{Failed}` carrying `CHUNK_VERIFICATION_FAILED` or
+  `TRANSFER_ABANDONED`;
+- an authoritative terminal `Cancelled` outcome for the owning Attempt — the existing Issue
+  #27 `CancelAck{Cancelled}` path, or an authoritative `Cancelled` reconciliation outcome;
+- an authoritative terminal `Failed` outcome for the owning Attempt learned through
+  `m0-job-lifecycle-and-scheduling.md` `#28` reconciliation — `StatusReport{Failed}` applied
+  from `AwaitingReconciliation` — when the terminal `ActionResult{Failed}` was lost and the
+  reconnect reconciliation carries the outcome instead. This is the reconciliation equivalent
+  of the direct `ActionResult{Failed}` case above; the workflow decision remains unchanged
+  `#28` reconciliation.
+
+`bamepd` first validates action/Transfer/Artifact correlation — for a direct `ActionResult`
+the evidence's `artifact_id` must be the Artifact durably bound to that Transfer/Attempt; for
+a reconciliation outcome the resolved `action_id` must own the durable `Transfer` bound to
+that Attempt. A mismatch fails closed and commits nothing. Only then does it commit, as
+**one atomic persistence transaction**:
 
 - `Incomplete -> Failed` for that Artifact;
 - the terminal Attempt/JobStep/Job workflow transition the same evidence produces
-  (`m0-job-lifecycle-and-scheduling.md` "Attempt lifecycle"; for a cancellation/abandonment
-  outcome, the existing Issue #27 cancellation terminal transition, unchanged);
+  (`m0-job-lifecycle-and-scheduling.md` "Attempt lifecycle" — for a direct `ActionResult` the
+  matching terminal transition, for a cancellation outcome the existing Issue #27 cancellation
+  terminal transition, for a `#28` reconciliation `Failed`/`Cancelled` outcome the existing
+  reconciliation terminal transition, all unchanged);
 - the domain events and audit records those transitions already require
   (`m0-persistence-observability-and-domain-events.md` "Atomic persistence" and "Required M1
   normal-terminal Job/JobStep events"). This composition adds no event or audit record
   beyond those, and no new event type.
 
+A reconciliation `StatusReport` carries only `known_state` — never an RF-005 failure `code`
+or `artifact_id`. The durable Artifact state is the authoritative disambiguator, and it is
+sufficient here: an `Incomplete` Artifact has not entered the seal-verification path
+(`Incomplete -> PendingVerification` has not committed), so for a terminally-`Failed` or
+terminally-`Cancelled` owning Attempt the capture can no longer complete and `Incomplete ->
+Failed` is the only safe lifecycle transition, whatever failure `code` the lost `ActionResult`
+would have carried. `ARTIFACT_VERIFICATION_FAILED` cannot apply — it requires
+`PendingVerification`. If the bound Artifact is already `Verified` or `Failed`, the
+reconciliation outcome still transitions the workflow per `#28` but the terminal Artifact is
+never rewritten (`Verified` is never driven to `Failed` merely because reconciliation reports
+`Failed`). If the bound Artifact is `PendingVerification`, `PendingVerification -> Verified |
+Failed` remains owned by the Worker seal/verification path and reconciliation never drives it.
+
 If that transaction cannot commit, no partial Artifact or workflow state is durable; the
-Agent's idempotent re-send of the same `ActionResult` recovers it. Matching duplicate
-terminal evidence is a no-op against the already-committed outcome, and conflicting later
-evidence never overwrites the first committed terminal Artifact/Attempt outcome
+Agent's idempotent re-send of the same `ActionResult`, or a repeated reconciliation
+`StatusQuery`/`StatusReport` exchange, recovers it. Matching duplicate terminal evidence is a
+no-op against the already-committed outcome, and conflicting later evidence never overwrites
+the first committed terminal Artifact/Attempt outcome
 (`m0-job-lifecycle-and-scheduling.md` "Duplicate and delayed evidence"). The terminal-Artifact
-immutability rules earlier in this section still hold: a conflicting `ActionResult`
-against an already-terminal Artifact fails closed — `Verified` is never rewritten to `Failed`
-to satisfy a later `ActionResult`, `Failed` is never rewritten to `Verified`,
-`CHUNK_VERIFICATION_FAILED` / `TRANSFER_ABANDONED` may drive `Incomplete -> Failed` only, and
+immutability rules earlier in this section still hold: conflicting later terminal evidence — a
+direct `ActionResult` or a `#28` reconciliation outcome — against an already-terminal Artifact
+never rewrites it: `Verified` is never rewritten to `Failed` to satisfy later evidence,
+`Failed` is never rewritten to `Verified`, `CHUNK_VERIFICATION_FAILED` / `TRANSFER_ABANDONED`
+and a reconciliation `Failed`/`Cancelled` outcome may drive `Incomplete -> Failed` only, and
 recorded chunk identities, manifest identity, `transfer_id`, and `artifact_id` are never
 rewritten.
 

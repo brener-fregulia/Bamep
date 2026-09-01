@@ -194,6 +194,19 @@ async fn event_count(pool: &PgPool, job_id: uuid::Uuid, event_type: &str) -> i64
     .unwrap()
 }
 
+/// Count of the one terminal audit record a terminal transition writes
+/// (`... reached terminal state ...`).
+async fn terminal_audit_count(pool: &PgPool, job_id: uuid::Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_records \
+         WHERE job_id = $1 AND detail LIKE 'attempt %reached terminal state%'",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 // ---------------------------------------------------------------------
 // §26 — action-kind resolution from durable Server facts
 // ---------------------------------------------------------------------
@@ -806,6 +819,262 @@ async fn reconciled_transfer_cancellation_never_rewrites_non_incomplete_artifact
 
         db.teardown().await;
     }
+}
+
+// ---------------------------------------------------------------------
+// F2 — transfer-bound StatusReport{Failed} + Incomplete Artifact:
+// the reconciliation equivalent of the ActionResult{Failed} CASE C path
+// (`m0-data-plane-and-storage-contracts.md` "`Incomplete -> Failed`
+// ownership and ordering"). A lost terminal ActionResult carrying
+// CHUNK_VERIFICATION_FAILED / TRANSFER_ABANDONED is recovered on reconnect
+// through #28 StatusQuery/StatusReport, which carries no failure code — the
+// durable `Incomplete` Artifact state is the sufficient disambiguator.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn reconciled_transfer_failure_drives_incomplete_artifact_to_failed_atomically() {
+    let db = TestDatabase::setup().await;
+    let fixture = Fixture::create(&db.pool, "c2-reconcile-failed-atomic").await;
+    let svc = fixture.service(&db.pool);
+
+    assert_eq!(
+        artifact_state(&db.pool, fixture.base.transfer_id.0).await,
+        "Incomplete"
+    );
+
+    // The authoritative #28 input state after a lost terminal
+    // ActionResult{Failed} (CHUNK_VERIFICATION_FAILED / TRANSFER_ABANDONED —
+    // StatusReport cannot distinguish, and does not need to): the Job is still
+    // Running (not Cancelling) and the owning Attempt is AwaitingReconciliation.
+    sqlx::query("UPDATE attempts SET state = 'AwaitingReconciliation' WHERE id = $1")
+        .bind(fixture.attempt_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let outcome = svc
+        .apply_status_report_failed(fixture.base.action_id, fixture.base.endpoint_id)
+        .await
+        .unwrap();
+    assert_eq!(outcome, TransferStatusReportOutcome::Consumed);
+
+    assert_eq!(
+        artifact_state(&db.pool, fixture.base.transfer_id.0).await,
+        "Failed"
+    );
+    assert_eq!(attempt_state(&db.pool, fixture.attempt_id).await, "Failed");
+    let (step_state, failure_reason) = job_step_state(&db.pool, fixture.step_id).await;
+    assert_eq!(step_state, "Failed");
+    // The generic #28 reason — a StatusReport carries no more specific code.
+    assert_eq!(failure_reason.as_deref(), Some("ExecutionFailed"));
+    assert_eq!(job_state(&db.pool, fixture.job_id).await, "Failed");
+    assert_eq!(
+        event_count(&db.pool, fixture.job_id, "JobStepFailed").await,
+        1
+    );
+    assert_eq!(event_count(&db.pool, fixture.job_id, "JobFailed").await, 1);
+    assert_eq!(
+        event_count(&db.pool, fixture.job_id, "JobSucceeded").await,
+        0
+    );
+    assert_eq!(terminal_audit_count(&db.pool, fixture.job_id).await, 1);
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn reconciled_transfer_failure_never_rewrites_non_incomplete_artifacts() {
+    // Verified / Failed are terminal and are never rewritten; PendingVerification
+    // stays owned by the seal/verification path. The workflow still transitions
+    // to Failed per #28 in every case — identical to the pre-existing generic
+    // reconciliation behaviour, only routed through the transfer transaction.
+    for terminal_state in ["PendingVerification", "Verified", "Failed"] {
+        let db = TestDatabase::setup().await;
+        let fixture =
+            Fixture::create(&db.pool, &format!("c2-reconcile-failed-{terminal_state}")).await;
+
+        match terminal_state {
+            "PendingVerification" => fixture.drive_to_pending_verification(&db.pool).await,
+            "Verified" => fixture.drive_artifact_verified(&db.pool).await,
+            "Failed" => fixture.drive_artifact_verification_failed(&db.pool).await,
+            _ => unreachable!(),
+        }
+        sqlx::query("UPDATE attempts SET state = 'AwaitingReconciliation' WHERE id = $1")
+            .bind(fixture.attempt_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let outcome = fixture
+            .service(&db.pool)
+            .apply_status_report_failed(fixture.base.action_id, fixture.base.endpoint_id)
+            .await
+            .unwrap();
+        assert_eq!(outcome, TransferStatusReportOutcome::Consumed);
+        assert_eq!(
+            artifact_state(&db.pool, fixture.base.transfer_id.0).await,
+            terminal_state,
+            "{terminal_state}"
+        );
+        assert_eq!(
+            attempt_state(&db.pool, fixture.attempt_id).await,
+            "Failed",
+            "{terminal_state}"
+        );
+        assert_eq!(
+            job_state(&db.pool, fixture.job_id).await,
+            "Failed",
+            "{terminal_state}"
+        );
+        assert_eq!(
+            event_count(&db.pool, fixture.job_id, "JobFailed").await,
+            1,
+            "{terminal_state}"
+        );
+
+        db.teardown().await;
+    }
+}
+
+#[tokio::test]
+async fn reconciled_transfer_failure_rolls_back_artifact_and_workflow_together() {
+    let db = TestDatabase::setup().await;
+    let fixture = Fixture::create(&db.pool, "c2-reconcile-failed-rollback").await;
+    let svc = fixture.service(&db.pool);
+
+    sqlx::query("UPDATE attempts SET state = 'AwaitingReconciliation' WHERE id = $1")
+        .bind(fixture.attempt_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Abort the terminal-audit INSERT (the last write) after the Artifact and
+    // workflow mutations — PostgreSQL must roll the whole transaction back.
+    sqlx::query(
+        "CREATE FUNCTION reject_reconciled_failure_audit() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.detail LIKE 'attempt %reached terminal state%' THEN \
+         RAISE EXCEPTION 'forced reconciled failure audit failure'; END IF; \
+         RETURN NEW; END $$",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_reconciled_failure_audit BEFORE INSERT ON audit_records \
+         FOR EACH ROW EXECUTE FUNCTION reject_reconciled_failure_audit()",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let err = svc
+        .apply_status_report_failed(fixture.base.action_id, fixture.base.endpoint_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        bamep_server::application::ApplicationError::Repository(_)
+    ));
+
+    assert_eq!(
+        artifact_state(&db.pool, fixture.base.transfer_id.0).await,
+        "Incomplete"
+    );
+    assert_eq!(
+        attempt_state(&db.pool, fixture.attempt_id).await,
+        "AwaitingReconciliation"
+    );
+    assert_eq!(
+        job_step_state(&db.pool, fixture.step_id).await.0,
+        "Dispatching"
+    );
+    assert_eq!(job_state(&db.pool, fixture.job_id).await, "Running");
+    assert_eq!(event_count(&db.pool, fixture.job_id, "JobFailed").await, 0);
+    assert_eq!(terminal_audit_count(&db.pool, fixture.job_id).await, 0);
+
+    sqlx::query("DROP TRIGGER reject_reconciled_failure_audit ON audit_records")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let outcome = svc
+        .apply_status_report_failed(fixture.base.action_id, fixture.base.endpoint_id)
+        .await
+        .unwrap();
+    assert_eq!(outcome, TransferStatusReportOutcome::Consumed);
+    assert_eq!(
+        artifact_state(&db.pool, fixture.base.transfer_id.0).await,
+        "Failed"
+    );
+    assert_eq!(attempt_state(&db.pool, fixture.attempt_id).await, "Failed");
+    assert_eq!(job_state(&db.pool, fixture.job_id).await, "Failed");
+    assert_eq!(event_count(&db.pool, fixture.job_id, "JobFailed").await, 1);
+    assert_eq!(terminal_audit_count(&db.pool, fixture.job_id).await, 1);
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn reconciled_transfer_failure_duplicate_and_conflicting_evidence_never_overwrite() {
+    let db = TestDatabase::setup().await;
+    let fixture = Fixture::create(&db.pool, "c2-reconcile-failed-idempotent").await;
+    let svc = fixture.service(&db.pool);
+
+    sqlx::query("UPDATE attempts SET state = 'AwaitingReconciliation' WHERE id = $1")
+        .bind(fixture.attempt_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let first = svc
+        .apply_status_report_failed(fixture.base.action_id, fixture.base.endpoint_id)
+        .await
+        .unwrap();
+    assert_eq!(first, TransferStatusReportOutcome::Consumed);
+    assert_eq!(
+        artifact_state(&db.pool, fixture.base.transfer_id.0).await,
+        "Failed"
+    );
+
+    // A matching duplicate StatusReport{Failed}: no-op, nothing duplicated.
+    let dup = svc
+        .apply_status_report_failed(fixture.base.action_id, fixture.base.endpoint_id)
+        .await
+        .unwrap();
+    assert_eq!(dup, TransferStatusReportOutcome::Consumed);
+
+    // Conflicting late "success" evidence never rewrites the committed terminal
+    // Artifact or workflow outcome — the domain no-ops against the already
+    // terminal Attempt (mirrors
+    // `conflicting_transfer_verified_after_committed_case_c_failure_never_overwrites`).
+    let parsed = parse_transfer_result_detail(
+        ActionResultOutcome::Succeeded,
+        &detail("TRANSFER_VERIFIED", fixture.base.artifact_id.0),
+    )
+    .unwrap();
+    let conflicting = svc
+        .apply(fixture.base.action_id, fixture.base.endpoint_id, parsed)
+        .await
+        .unwrap();
+    assert_eq!(conflicting, TransferTerminalOutcome::Consumed); // ignored, not applied
+
+    assert_eq!(
+        artifact_state(&db.pool, fixture.base.transfer_id.0).await,
+        "Failed"
+    );
+    assert_eq!(attempt_state(&db.pool, fixture.attempt_id).await, "Failed");
+    assert_eq!(job_state(&db.pool, fixture.job_id).await, "Failed");
+    assert_eq!(event_count(&db.pool, fixture.job_id, "JobFailed").await, 1);
+    assert_eq!(
+        event_count(&db.pool, fixture.job_id, "JobStepFailed").await,
+        1
+    );
+    assert_eq!(
+        event_count(&db.pool, fixture.job_id, "JobSucceeded").await,
+        0
+    );
+    assert_eq!(terminal_audit_count(&db.pool, fixture.job_id).await, 1);
+
+    db.teardown().await;
 }
 
 // ---------------------------------------------------------------------

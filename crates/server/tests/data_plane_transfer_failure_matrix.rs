@@ -677,6 +677,113 @@ async fn status_report_unknown_never_proves_transfer_non_execution_or_success() 
 }
 
 // =====================================================================
+// F2 — CHUNK_VERIFICATION_FAILED with a *lost* terminal ActionResult is
+// recovered through #28 reconnect reconciliation: StatusReport{Failed} drives
+// the atomic `Artifact Incomplete -> Failed` + terminal workflow transition,
+// the reconciliation equivalent of the C2 CASE C ActionResult path.
+// =====================================================================
+
+#[tokio::test]
+async fn chunk_failure_with_a_lost_action_result_is_reconciled_by_status_report_failed() {
+    let db = TestDatabase::setup().await;
+    let v = Vertical::start(&db, "c4-chunk-failed-lost").await;
+    let (transfer_id, artifact_id) = v.transfer_and_artifact_ids().await;
+    let action_id = v.fixture.action_id;
+
+    let mut s1 = v.connect_agent().await;
+    v.dispatch_transfer(&s1).await;
+    let dispatch = s1.expect_dispatch().await;
+    let agent = v.agent();
+    let response = agent.accept(&dispatch);
+    let accepted = response.accepted.expect("accepted");
+    s1.send(AgentProtocolMessage::ActionAck(response.ack)).await;
+    let (k, g) = s1.obtain_grant(action_id, transfer_id).await;
+    let auth = AgentTransferAuthorization::new(
+        k,
+        g.body.token,
+        transfer_id,
+        artifact_id,
+        DataPlaneTransferDirection::AgentToServer,
+        g.body.data_plane_base_url,
+    );
+
+    // Chunk 0 uploads honestly (durably held); chunk 1 is transmitted corrupt,
+    // the Worker's independent hash rejects it, and C1 completes locally with a
+    // terminal Failed result.
+    let source = InMemoryTransferSource::pattern(SOURCE_LEN, 71);
+    let run = run_transfer_streaming_progress(
+        &agent,
+        &accepted,
+        &auth,
+        &source,
+        &TransferRunOptions {
+            corrupt_transmitted_bytes_of_chunk: Some(1),
+            ..Default::default()
+        },
+        &mut s1,
+        action_id,
+    )
+    .await;
+    assert_eq!(
+        run.outcome,
+        TransferRunOutcome::Completed(TransferActionResult::ChunkVerificationFailed {
+            artifact_id
+        })
+    );
+    assert_eq!(v.artifact_state().await, "Incomplete");
+    assert_eq!(v.held_chunk_indices().await, vec![0]);
+
+    // The terminal ActionResult is NEVER delivered — the session is lost first.
+    s1.drop_ungracefully().await;
+    assert_eq!(v.attempt_state().await, "AwaitingReconciliation");
+
+    // Reconnect: the Server issues StatusQuery, the Agent reports its
+    // authoritative local knowledge (Failed). StatusReport carries no failure
+    // code — the durable `Incomplete` Artifact makes `Incomplete -> Failed` the
+    // only safe transition.
+    let mut s2 = v.connect_agent().await;
+    let AgentProtocolMessage::StatusQuery(query) = s2.recv().await else {
+        panic!("expected StatusQuery");
+    };
+    assert_eq!(query.body.action_id, action_id);
+    s2.send(AgentProtocolMessage::StatusReport(
+        StatusReportMessage::new(action_id, bamep_agent_protocol::KnownActionState::Failed),
+    ))
+    .await;
+    poll_until(|| async { v.attempt_state().await == "Failed" }).await;
+
+    // A matching duplicate and conflicting late "success" both cross the same
+    // real WSS path — the first committed terminal outcome stays final.
+    s2.send(AgentProtocolMessage::StatusReport(
+        StatusReportMessage::new(action_id, bamep_agent_protocol::KnownActionState::Failed),
+    ))
+    .await;
+    s2.send(AgentProtocolMessage::StatusReport(
+        StatusReportMessage::new(action_id, bamep_agent_protocol::KnownActionState::Succeeded),
+    ))
+    .await;
+    s2.close_and_join().await;
+
+    assert_eq!(v.artifact_state().await, "Failed");
+    assert_eq!(v.attempt_state().await, "Failed");
+    assert_eq!(v.job_step_state().await, "Failed");
+    assert_eq!(
+        v.job_step_failure_reason().await.as_deref(),
+        Some("ExecutionFailed")
+    );
+    assert_eq!(v.job_state().await, "Failed");
+    // The one chunk that was durably held keeps its identity — never rewritten.
+    assert_eq!(v.held_chunk_indices().await, vec![0]);
+    assert_eq!(v.event_count("JobFailed").await, 1);
+    assert_eq!(v.event_count("JobStepFailed").await, 1);
+    assert_eq!(v.event_count("JobSucceeded").await, 0);
+    assert_eq!(v.terminal_audit_count().await, 1);
+
+    drop(v);
+    db.teardown().await;
+}
+
+// =====================================================================
 // §7 + §17 — corrupted transmission -> CHUNK_VERIFICATION_FAILED -> C2 CASE C
 // =====================================================================
 
