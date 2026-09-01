@@ -383,10 +383,13 @@ rebind, is implemented and tested; #40 (below) is the first consumer that actual
 owning Attempt. Agent Protocol transfer authorization (#38) is implemented — see
 "Sender-constrained transfer authorization" below. The authenticated HTTPS chunk transport,
 storage, and Artifact verification through the Worker (#39) are implemented — see "Implemented
-Worker data-plane chunk transport" below. The Agent-side C1 transfer participant (#19) and the
-Server-side C2 terminal-`ActionResult` consumption (#19) are implemented — see "Implemented
-transfer terminal-result consumption" below; the end-to-end Simulator RF-005 vertical wiring
-those together over real WSS + Worker HTTPS in one run remains for checkpoint C3. The isolated
+Worker data-plane chunk transport" below. The Agent-side C1 transfer participant (#19), the
+Server-side C2 terminal-`ActionResult` consumption (#19), and the C3 end-to-end RF-005
+happy-path vertical wiring them together over real WSS + Worker HTTPS + Worker UDS +
+PostgreSQL in one run are implemented — see "Implemented transfer terminal-result
+consumption" and "Implemented integrated RF-005 transfer vertical" below. The failure/resume
+matrix (interruption, corruption, source mutation, authorization denial, Worker/Server
+restart, cancellation race, reconnect) remains for checkpoint C4. The isolated
 Worker process/control boundary itself (#37) is implemented — see "Implemented isolated Worker
 runtime and control boundary" below.
 
@@ -477,8 +480,58 @@ gained the `pub(crate)` `load_locked_transfer_and_artifact` and
 No wire contract changes (Agent Protocol catalog, `ActionResult` shape, closed RF-005 detail
 codes, Worker Protocol v1, the 137-byte proof transcript, and the HTTPS `/api/data/v1/`
 surface are all unchanged), no new Domain event, and the C1 Simulator participant is
-unchanged. The end-to-end Simulator RF-005 vertical (#19 — real WSS dispatch → authorization
-→ Worker HTTPS → `ActionResult` network round trip) remains for checkpoint C3.
+unchanged.
+
+One recorded gap remains for a later checkpoint: C2 wired only the
+`ActionResult{Failed, TRANSFER_ABANDONED}` route into `Incomplete -> Failed`. The
+`m0-data-plane-and-storage-contracts.md` "Artifact lifecycle" clause also names a pure
+authoritative `Cancelled` Attempt outcome (a `CancelAck{Cancelled}` with no follow-up
+`ActionResult`) as a trigger; composing that leg into `apply_cancel_ack`'s transaction is not
+yet implemented.
+
+## Implemented integrated RF-005 transfer vertical
+
+Issue #19 checkpoint C3 composes the already-implemented C1 and C2 pieces into one
+deterministic successful Agent -> Server capture with every boundary real. It adds no Server
+business logic and no Simulator code: it is an integration harness
+(`crates/server/tests/rf005_transfer_vertical.rs`) plus glue that drives the committed
+`bamep_simulator::DataPlaneTransferAgent` from a real Agent Protocol v1 WSS session, exactly
+as `action_dispatch_wss.rs` drives `SimulatedActionAgent`.
+
+The one run crosses: a durable non-destructive `commit_transfer_dispatch`
+(`Attempt{Dispatched}`, the seven-item destructive gate never evaluated — the JobStep
+carries no `authorized_inventory_revision_id`/`authorized_target_fingerprint`); a real
+loopback TCP -> pinned TLS 1.3 -> WebSocket delivery of the RF-005 `ActionDispatch` through
+the same `OutboundSessionDirectory`/`ActionDispatchService.dispatch_transfer` path #26/#40
+use; C1 `accept` -> `ActionAck{Accepted}`; a real WSS `TransferAuthorizationRequest`
+carrying a freshly generated ephemeral Ed25519 proof public key ->
+`TransferAuthorizationService::issue` (the same instance the Worker UDS side consumes, its
+`data_plane_base_url` resolved to the real in-process Worker HTTPS origin) ->
+`TransferAuthorizationGrant{token, data_plane_base_url}`; C1 `run` performing real hyper-1
+HTTPS GET-resume / PUT-chunks / POST-seal against the real
+`bamep_worker::data_plane::DataPlane`, its real IPC client + D1 staging + D2 reconstruction,
+the real `WorkerControlPlane` over AF_UNIX (`bamep-worker-protocol` v1), into real
+PostgreSQL-backed chunk acceptance / manifest seal / independent SHA-256 verification ->
+durable Artifact `Verified`; `ActionProgress{bytes_processed}` streamed over the same WSS
+session as C1 produces it, consumed by the real gateway `handle_action_progress`; then
+`ActionResult{Succeeded, TRANSFER_VERIFIED}` over the same session, consumed by C2's
+`TransferTerminalEvidenceService` through the real gateway -> `Attempt`/`JobStep`/`Job`
+`Succeeded`.
+
+Ordering is proven directly: at the instant C1's `run` returns, the harness observes the
+Artifact already `Verified` while the workflow is still `Running` and no `ActionResult` has
+crossed the wire — which, with C2's CASE A durable-`Verified`-under-lock gate, establishes
+that workflow success cannot precede `Verified`. The Worker never touches a
+workflow table; the sole terminal workflow transition rides the Agent's WSS `ActionResult`
+through C2 (one terminal audit record). The Simulator pins exactly one
+`ServerCertFingerprint` — the value it verified for WSS is the value it reuses for Worker
+HTTPS (both listeners present the same leaf).
+
+The Worker runs as an in-process `DataPlane` + IPC-client runtime rather than a spawned
+`bamep-worker` process, matching `worker_data_plane_transfer_interop.rs` (Issue #39 Phase
+E2B); process/runtime isolation is proven separately by `worker_process_supervision.rs` and
+`worker_runtime_ownership.rs`. The C3 vertical does not exercise `bamepd`'s production
+composition root, which remains #20's concern.
 
 ## Implemented isolated Worker runtime and control boundary
 
