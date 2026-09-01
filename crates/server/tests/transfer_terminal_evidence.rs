@@ -31,8 +31,8 @@ use bamep_server::adapters::postgres::{
 use bamep_server::application::{
     parse_transfer_result_detail, ActionEvidenceService, BootOrchestrationService,
     BootstrapEvidenceService, EnrollmentService, TransferActionClassification, TransferResultCode,
-    TransferResultDetailError, TransferService, TransferTerminalEvidenceService,
-    TransferTerminalOutcome,
+    TransferResultDetailError, TransferService, TransferStatusReportOutcome,
+    TransferTerminalEvidenceService, TransferTerminalOutcome,
 };
 use bamep_server::ports::JobRepository;
 use bamep_server::runtime::reservation_registry::AttemptReservationRegistry;
@@ -663,6 +663,149 @@ async fn case_c_transaction_failure_at_the_artifact_write_leaves_no_partial_stat
     assert_eq!(job_state(&db.pool, fixture.job_id).await, "Running");
 
     db.teardown().await;
+}
+
+#[tokio::test]
+async fn reconciled_transfer_cancellation_rolls_back_artifact_and_workflow_together() {
+    let db = TestDatabase::setup().await;
+    let fixture = Fixture::create(&db.pool, "c2-reconcile-cancel-atomic-audit").await;
+    let svc = fixture.service(&db.pool);
+
+    // Reproduce the authoritative #28 input state without introducing
+    // CancelAck or ActionResult as terminal evidence.
+    sqlx::query("UPDATE jobs SET state = 'Cancelling' WHERE id = $1")
+        .bind(fixture.job_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE attempts SET state = 'AwaitingReconciliation' WHERE id = $1")
+        .bind(fixture.attempt_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Abort the final audit INSERT after the Artifact and workflow writes.
+    // PostgreSQL must roll the whole transfer-aware reconciliation back.
+    sqlx::query(
+        "CREATE FUNCTION reject_reconciled_cancel_audit() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.detail LIKE 'attempt %reached terminal state%' THEN \
+         RAISE EXCEPTION 'forced reconciled cancellation audit failure'; END IF; \
+         RETURN NEW; END $$",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_reconciled_cancel_audit BEFORE INSERT ON audit_records \
+         FOR EACH ROW EXECUTE FUNCTION reject_reconciled_cancel_audit()",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let err = svc
+        .apply_status_report_cancelled(fixture.base.action_id, fixture.base.endpoint_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        bamep_server::application::ApplicationError::Repository(_)
+    ));
+
+    assert_eq!(
+        artifact_state(&db.pool, fixture.base.transfer_id.0).await,
+        "Incomplete"
+    );
+    assert_eq!(
+        attempt_state(&db.pool, fixture.attempt_id).await,
+        "AwaitingReconciliation"
+    );
+    assert_eq!(
+        job_step_state(&db.pool, fixture.step_id).await.0,
+        "Dispatching"
+    );
+    assert_eq!(job_state(&db.pool, fixture.job_id).await, "Cancelling");
+    assert_eq!(
+        event_count(&db.pool, fixture.job_id, "JobCancelled").await,
+        0
+    );
+
+    sqlx::query("DROP TRIGGER reject_reconciled_cancel_audit ON audit_records")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let outcome = svc
+        .apply_status_report_cancelled(fixture.base.action_id, fixture.base.endpoint_id)
+        .await
+        .unwrap();
+    assert_eq!(outcome, TransferStatusReportOutcome::Consumed);
+    assert_eq!(
+        artifact_state(&db.pool, fixture.base.transfer_id.0).await,
+        "Failed"
+    );
+    assert_eq!(
+        attempt_state(&db.pool, fixture.attempt_id).await,
+        "Cancelled"
+    );
+    assert_eq!(
+        job_step_state(&db.pool, fixture.step_id).await.0,
+        "Cancelled"
+    );
+    assert_eq!(job_state(&db.pool, fixture.job_id).await, "Cancelled");
+    assert_eq!(
+        event_count(&db.pool, fixture.job_id, "JobCancelled").await,
+        1
+    );
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn reconciled_transfer_cancellation_never_rewrites_non_incomplete_artifacts() {
+    for terminal_state in ["PendingVerification", "Verified", "Failed"] {
+        let db = TestDatabase::setup().await;
+        let fixture =
+            Fixture::create(&db.pool, &format!("c2-reconcile-cancel-{terminal_state}")).await;
+
+        match terminal_state {
+            "PendingVerification" => fixture.drive_to_pending_verification(&db.pool).await,
+            "Verified" => fixture.drive_artifact_verified(&db.pool).await,
+            "Failed" => fixture.drive_artifact_verification_failed(&db.pool).await,
+            _ => unreachable!(),
+        }
+        sqlx::query("UPDATE jobs SET state = 'Cancelling' WHERE id = $1")
+            .bind(fixture.job_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE attempts SET state = 'AwaitingReconciliation' WHERE id = $1")
+            .bind(fixture.attempt_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let outcome = fixture
+            .service(&db.pool)
+            .apply_status_report_cancelled(fixture.base.action_id, fixture.base.endpoint_id)
+            .await
+            .unwrap();
+        assert_eq!(outcome, TransferStatusReportOutcome::Consumed);
+        assert_eq!(
+            artifact_state(&db.pool, fixture.base.transfer_id.0).await,
+            terminal_state
+        );
+        assert_eq!(
+            attempt_state(&db.pool, fixture.attempt_id).await,
+            "Cancelled"
+        );
+        assert_eq!(job_state(&db.pool, fixture.job_id).await, "Cancelled");
+        assert_eq!(
+            event_count(&db.pool, fixture.job_id, "JobCancelled").await,
+            1
+        );
+
+        db.teardown().await;
+    }
 }
 
 // ---------------------------------------------------------------------

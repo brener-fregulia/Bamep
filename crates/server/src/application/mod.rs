@@ -1353,6 +1353,17 @@ pub enum TransferCancelAckOutcome {
     NotTransferAction,
 }
 
+/// The transfer-aware routing result for an authoritative reconciliation
+/// `StatusReport{Cancelled}`. The workflow decision remains #28's
+/// `bamep_domain::apply_status_report`; this type only tells the gateway
+/// whether the existing transfer transaction consumed it or whether the
+/// action must stay on the generic reconciliation path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferStatusReportOutcome {
+    Consumed,
+    NotTransferAction,
+}
+
 /// Consumes a terminal `bamep.m1.data-plane-transfer` `ActionResult` through
 /// the durable Server facts (Issue #19 checkpoint C2;
 /// `m1-simulated-vertical-slice-and-baseline-validation.md` RF-005;
@@ -1532,6 +1543,51 @@ impl TransferTerminalEvidenceService {
             | TransferTerminalEvidenceResult::FailClosed) => {
                 Err(ApplicationError::Repository(RepositoryError::Backend(
                     format!("transfer CancelAck evidence produced an unexpected {other:?}"),
+                )))
+            }
+        }
+    }
+
+    /// Applies transfer-bound `StatusReport{Cancelled}` through #28's
+    /// unchanged reconciliation decision while composing an additional
+    /// `Artifact Incomplete -> Failed` leg in the same C2/C4 PostgreSQL
+    /// transaction. Terminal Artifacts and `PendingVerification` remain the
+    /// responsibility of their existing paths and are never rewritten.
+    pub async fn apply_status_report_cancelled(
+        &self,
+        action_id: ProtocolId,
+        authenticated_endpoint_id: EndpointId,
+    ) -> Result<TransferStatusReportOutcome, ApplicationError> {
+        let domain_action_id = ActionId(action_id.as_uuid());
+        let clock = Arc::clone(&self.clock);
+        let decide: crate::ports::TransferTerminalEvidenceDecision = Box::new(
+            move |facts: crate::ports::TransferTerminalEvidenceLockedFacts| {
+                decide_transfer_status_report_cancelled(facts, clock.now())
+            },
+        );
+
+        let result = self
+            .repo
+            .apply_transfer_terminal_evidence(domain_action_id, authenticated_endpoint_id, decide)
+            .await?;
+
+        match result {
+            TransferTerminalEvidenceResult::Applied(applied) => {
+                if applied.terminal {
+                    if let Some(reservation) = self.reservations.take(applied.attempt.id) {
+                        self.arbiter.release(reservation);
+                    }
+                }
+                Ok(TransferStatusReportOutcome::Consumed)
+            }
+            TransferTerminalEvidenceResult::NoOp => Ok(TransferStatusReportOutcome::Consumed),
+            TransferTerminalEvidenceResult::NotTransferAction => {
+                Ok(TransferStatusReportOutcome::NotTransferAction)
+            }
+            other @ (TransferTerminalEvidenceResult::Conflict
+            | TransferTerminalEvidenceResult::FailClosed) => {
+                Err(ApplicationError::Repository(RepositoryError::Backend(
+                    format!("transfer StatusReport cancellation produced an unexpected {other:?}"),
                 )))
             }
         }
@@ -1716,6 +1772,82 @@ fn decide_transfer_cancel_ack(
             outcome.job_step.id,
             if artifact_failed.is_some() {
                 " (bamep.m1.data-plane-transfer: artifact Incomplete -> Failed)"
+            } else {
+                ""
+            },
+        ),
+        job_id: Some(facts.job.id),
+        job_step_id: Some(outcome.job_step.id),
+        attempt_id: Some(outcome.attempt.id),
+        action_id: Some(outcome.attempt.action_id),
+    });
+
+    Out::Applied {
+        commit: ActionEvidenceCommit { outcome, audit },
+        artifact_failed,
+    }
+}
+
+/// The pure transfer-aware composition for #28
+/// `StatusReport{Cancelled}`. Reconciliation remains the sole workflow
+/// state machine; this adds only the Artifact leg required when that
+/// decision authoritatively reaches `AttemptState::Cancelled`.
+fn decide_transfer_status_report_cancelled(
+    facts: crate::ports::TransferTerminalEvidenceLockedFacts,
+    now: DateTime<Utc>,
+) -> TransferTerminalEvidenceDecisionOutcome {
+    use TransferTerminalEvidenceDecisionOutcome as Out;
+
+    if facts.transfer.artifact_id != facts.artifact.id
+        || facts.transfer.attempt_id != Some(facts.attempt.id)
+    {
+        return Out::NoOp;
+    }
+
+    let applied = match bamep_domain::apply_status_report(
+        &facts.job,
+        &facts.job_step,
+        &facts.attempt,
+        bamep_domain::StatusReportEvidence::Cancelled,
+        now,
+    ) {
+        bamep_domain::ReconciliationOutcome::NoOp => return Out::NoOp,
+        bamep_domain::ReconciliationOutcome::Applied(applied) => applied,
+    };
+
+    let fails_artifact = applied.terminal
+        && applied.attempt.state == AttemptState::Cancelled
+        && facts.artifact.state == ArtifactState::Incomplete;
+    let artifact_failed = if fails_artifact {
+        match fail_incomplete(&facts.artifact) {
+            Ok(failed) => Some(failed),
+            Err(_) => return Out::NoOp,
+        }
+    } else {
+        None
+    };
+
+    let outcome = ActionEvidenceApplied {
+        attempt: applied.attempt,
+        job_step: applied.job_step,
+        job: applied.job,
+        events: applied.events,
+        terminal: applied.terminal,
+    };
+    let audit = outcome.terminal.then(|| AuditRecord {
+        audit_id: Uuid::new_v4(),
+        endpoint_id: facts.job.endpoint_id,
+        actor: Actor::System,
+        occurred_at: now,
+        detail: format!(
+            "attempt {:?} action {:?} reached terminal state {:?} for job_step {:?} \
+             via reconciliation evidence{}",
+            outcome.attempt.id,
+            outcome.attempt.action_id,
+            outcome.attempt.state,
+            outcome.job_step.id,
+            if artifact_failed.is_some() {
+                ", artifact Incomplete -> Failed"
             } else {
                 ""
             },

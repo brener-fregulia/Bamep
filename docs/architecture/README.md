@@ -509,6 +509,15 @@ when the action has a bound `Transfer` (classified from durable facts, never fro
 every non-transfer `CancelAck` stays exactly on `CancellationService` (Issue #27,
 unchanged). No new event, no new state, no new wire message.
 
+The same transfer-aware transaction also consumes an authoritative Issue #28
+`StatusReport{Cancelled}` after session-loss reconciliation. It reuses
+`bamep_domain::apply_status_report` for the unchanged workflow decision and atomically adds the
+Specification-owned `Artifact Incomplete -> Failed` transition when that decision terminates the
+owning transfer Attempt as `Cancelled`. Durable action-to-Transfer classification controls this
+routing; non-transfer Attempts and every other `StatusReport` state remain on the generic Issue
+#28 path. Terminal Artifacts and `PendingVerification` retain the lifecycle behavior described
+above.
+
 ## Implemented integrated RF-005 transfer matrix
 
 Issue #19 checkpoints C3 and C4 compose the already-implemented C1 and C2 pieces into an

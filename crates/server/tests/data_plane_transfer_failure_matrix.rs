@@ -302,6 +302,103 @@ async fn wss_disconnect_then_reconnect_resumes_the_data_plane_and_reconciliation
     db.teardown().await;
 }
 
+#[tokio::test]
+async fn reconciled_transfer_cancellation_fails_the_incomplete_artifact_atomically() {
+    let db = TestDatabase::setup().await;
+    let v = Vertical::start(&db, "c4-reconciled-cancelled").await;
+    let (transfer_id, artifact_id) = v.transfer_and_artifact_ids().await;
+    let action_id = v.fixture.action_id;
+
+    let mut s1 = v.connect_agent().await;
+    v.dispatch_transfer(&s1).await;
+    let dispatch = s1.expect_dispatch().await;
+    let agent = v.agent();
+    let response = agent.accept(&dispatch);
+    let accepted = response.accepted.expect("accepted");
+    s1.send(AgentProtocolMessage::ActionAck(response.ack)).await;
+
+    let (key, grant) = s1.obtain_grant(action_id, transfer_id).await;
+    let authorization = AgentTransferAuthorization::new(
+        key,
+        grant.body.token,
+        transfer_id,
+        artifact_id,
+        DataPlaneTransferDirection::AgentToServer,
+        grant.body.data_plane_base_url,
+    );
+    let source = InMemoryTransferSource::pattern(SOURCE_LEN, 53);
+    let run = run_transfer_streaming_progress(
+        &agent,
+        &accepted,
+        &authorization,
+        &source,
+        &TransferRunOptions {
+            interrupt_after_newly_held_chunks: Some(1),
+            ..Default::default()
+        },
+        &mut s1,
+        action_id,
+    )
+    .await;
+    assert!(matches!(run.outcome, TransferRunOutcome::Suspended(_)));
+    assert_eq!(v.artifact_state().await, "Incomplete");
+    assert_eq!(v.held_chunk_indices().await, vec![0]);
+
+    v.cancellation_service()
+        .request(
+            JobId(v.fixture.job_id),
+            Actor::Operator {
+                label: "reconciled-cancel-operator".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let AgentProtocolMessage::CancelAction(cancel) = s1.recv().await else {
+        panic!("expected CancelAction");
+    };
+    assert_eq!(cancel.body.action_id, action_id);
+
+    // Lose the session without CancelAck or ActionResult. The reconnect uses
+    // #28 StatusQuery/StatusReport and is the sole terminal evidence path.
+    s1.drop_ungracefully().await;
+    assert_eq!(v.attempt_state().await, "AwaitingReconciliation");
+
+    let mut s2 = v.connect_agent().await;
+    let AgentProtocolMessage::StatusQuery(query) = s2.recv().await else {
+        panic!("expected StatusQuery");
+    };
+    assert_eq!(query.body.action_id, action_id);
+    s2.send(AgentProtocolMessage::StatusReport(
+        StatusReportMessage::new(action_id, bamep_agent_protocol::KnownActionState::Cancelled),
+    ))
+    .await;
+    poll_until(|| async { v.attempt_state().await == "Cancelled" }).await;
+
+    // A matching duplicate and conflicting late success both cross the same
+    // real WSS path. The first committed terminal outcome must remain final.
+    s2.send(AgentProtocolMessage::StatusReport(
+        StatusReportMessage::new(action_id, bamep_agent_protocol::KnownActionState::Cancelled),
+    ))
+    .await;
+    s2.send(AgentProtocolMessage::StatusReport(
+        StatusReportMessage::new(action_id, bamep_agent_protocol::KnownActionState::Succeeded),
+    ))
+    .await;
+    s2.close_and_join().await;
+
+    assert_eq!(v.artifact_state().await, "Failed");
+    assert_eq!(v.attempt_state().await, "Cancelled");
+    assert_eq!(v.job_step_state().await, "Cancelled");
+    assert_eq!(v.job_state().await, "Cancelled");
+    assert_eq!(v.held_chunk_indices().await, vec![0]);
+    assert_eq!(v.event_count("JobCancelled").await, 1);
+    assert_eq!(v.event_count("JobSucceeded").await, 0);
+    assert_eq!(v.terminal_audit_count().await, 1);
+
+    drop(v);
+    db.teardown().await;
+}
+
 /// Polls `cond` until true or the test timeout elapses.
 async fn poll_until<F, Fut>(mut cond: F)
 where

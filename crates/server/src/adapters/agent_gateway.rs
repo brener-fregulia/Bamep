@@ -46,7 +46,8 @@ use crate::application::{
     parse_transfer_result_detail, ActionEvidenceService, ApplicationError,
     BootstrapEvidenceService, CancellationService, EnrollmentService, RedeemResult,
     TransferActionClassification, TransferAuthorizationOutcome, TransferAuthorizationService,
-    TransferCancelAckOutcome, TransferTerminalEvidenceService, TransferTerminalOutcome,
+    TransferCancelAckOutcome, TransferStatusReportOutcome, TransferTerminalEvidenceService,
+    TransferTerminalOutcome,
 };
 use crate::ports::{
     ApplyActionEvidenceResult, ApplyReconciliationResult, CredentialRedemptionRepository,
@@ -862,6 +863,44 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
         if report.envelope.correlation_id != Some(report.body.action_id) {
             return self.send_protocol_error(write, Some(message_id)).await;
         }
+
+        // Only the authoritative terminal Cancelled outcome has an
+        // additional transfer Artifact effect. Classify from durable Server
+        // facts, never from the StatusReport payload, and reuse C2/C4's
+        // transfer transaction. Every other status remains on #28's generic
+        // reconciliation path below.
+        if report.body.known_state == KnownActionState::Cancelled {
+            if let Some(transfer_terminal) = self.transfer_terminal_evidence.as_ref() {
+                match transfer_terminal
+                    .classify(report.body.action_id, endpoint_id)
+                    .await
+                {
+                    Ok(TransferActionClassification::Unknown) => return Ok(()),
+                    Ok(TransferActionClassification::DataPlaneTransfer) => {
+                        return match transfer_terminal
+                            .apply_status_report_cancelled(report.body.action_id, endpoint_id)
+                            .await
+                        {
+                            Ok(TransferStatusReportOutcome::Consumed) => Ok(()),
+                            Ok(TransferStatusReportOutcome::NotTransferAction) => {
+                                self.apply_generic_status_report(
+                                    report.body.action_id,
+                                    endpoint_id,
+                                    bamep_domain::StatusReportEvidence::Cancelled,
+                                )
+                                .await
+                            }
+                            Err(ApplicationError::UnknownAction) => Ok(()),
+                            Err(e) => Err(AgentGatewayError::Application(e)),
+                        };
+                    }
+                    Ok(TransferActionClassification::SimulatedExecution) => { /* generic below */ }
+                    Err(ApplicationError::UnknownAction) => return Ok(()),
+                    Err(e) => return Err(AgentGatewayError::Application(e)),
+                }
+            }
+        }
+
         let service = self
             .reconciliation
             .as_ref()
@@ -906,6 +945,26 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
                 }
                 Ok(())
             }
+            Err(ApplicationError::UnknownAction) => Ok(()),
+            Err(e) => Err(AgentGatewayError::Application(e)),
+        }
+    }
+
+    async fn apply_generic_status_report(
+        &self,
+        action_id: ProtocolId,
+        endpoint_id: EndpointId,
+        evidence: bamep_domain::StatusReportEvidence,
+    ) -> Result<(), AgentGatewayError> {
+        let service = self
+            .reconciliation
+            .as_ref()
+            .ok_or(AgentGatewayError::ReconciliationServiceNotConfigured)?;
+        match service
+            .apply_status_report(action_id, endpoint_id, evidence)
+            .await
+        {
+            Ok(_) => Ok(()),
             Err(ApplicationError::UnknownAction) => Ok(()),
             Err(e) => Err(AgentGatewayError::Application(e)),
         }
