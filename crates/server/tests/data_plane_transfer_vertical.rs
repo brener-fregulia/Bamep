@@ -376,7 +376,7 @@ async fn send_msg(ws: &mut ClientWs, message: AgentProtocolMessage) {
 // =====================================================================
 
 #[tokio::test]
-async fn rf005_happy_path_agent_to_server_capture_end_to_end() {
+async fn agent_to_server_transfer_happy_path_reaches_verified_artifact_and_succeeded_job() {
     let db = TestDatabase::setup().await;
     let identity = SharedServerIdentity::generate();
     let (shutdown, shutdown_rx) = watch::channel(false);

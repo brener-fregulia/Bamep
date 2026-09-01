@@ -494,7 +494,7 @@ yet implemented.
 Issue #19 checkpoint C3 composes the already-implemented C1 and C2 pieces into one
 deterministic successful Agent -> Server capture with every boundary real. It adds no Server
 business logic and no Simulator code: it is an integration harness
-(`crates/server/tests/rf005_transfer_vertical.rs`) plus glue that drives the committed
+(`crates/server/tests/data_plane_transfer_vertical.rs`) plus glue that drives the committed
 `bamep_simulator::DataPlaneTransferAgent` from a real Agent Protocol v1 WSS session, exactly
 as `action_dispatch_wss.rs` drives `SimulatedActionAgent`.
 
