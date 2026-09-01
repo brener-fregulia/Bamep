@@ -775,14 +775,48 @@ disk-replacement case.
 **The fail-closed provenance case, clarified.** Source/destination fingerprint *inequality*
 is, by itself, never a provenance failure — it is the expected shape of the legitimate
 capture/replace/restore workflow above. The provenance fact this Specification requires to
-fail closed is *inconsistency within the same Transfer/Artifact's own source-provenance
-context*: for example, source evidence observed during capture unexpectedly changes
-mid-Transfer, or does not match the source identity durably bound to that Transfer/Attempt
-when it was authorized. That is an internal-consistency failure of one Artifact's provenance
-record, not a comparison against a later, unrelated destructive target. Destructive-use
-composition (above) already independently revalidates the current target immediately before
-execution regardless of any Artifact's recorded source; provenance consistency and target
-revalidation remain two independent checks, and neither substitutes for the other.
+fail closed is *inconsistency within the same Transfer/Artifact's own source context*: source
+bytes previously associated with the same logical source/Transfer can no longer reproduce a
+chunk identity already durably recorded for that Transfer's manifest. That is an
+internal-consistency failure of one Artifact's own capture, detected through the immutable
+chunk-identity and resume rules ("Chunk transfer and resumability" above), not a comparison
+against a later, unrelated destructive target. Expected chunk identity, manifest identity,
+`transfer_id`, and `artifact_id` are never rewritten to accommodate the changed source; the
+Artifact fails closed instead. Destructive-use composition (above) already independently
+revalidates the current target immediately before execution regardless of any Artifact's
+recorded source; provenance consistency and target revalidation remain two independent
+checks, and neither substitutes for the other.
+
+### M1 scope of `SourceProvenance`
+
+For M1, `SourceProvenance` is **immutable descriptive provenance bound to the Transfer**: it
+records what source the capture is understood to represent, is fixed when the Transfer is
+created, and is never rewritten. It is **not**, in M1, an independently re-observed
+hardware-identity credential.
+
+The operational same-Transfer consistency guarantee M1 implements is exactly:
+
+- immutable expected chunk identity;
+- authoritative durable resume state;
+- source reproducibility.
+
+If bytes previously associated with the same logical source/Transfer can no longer reproduce
+the durably recorded chunk identity, the transfer **fails closed**; the recorded expected
+identity is never rewritten to accept the changed source.
+
+M1 does **not** define, require, or exercise:
+
+- disk WWN comparison;
+- disk/controller serial-number comparison;
+- GPT/partition-table fingerprint as source identity;
+- a composite hardware `SourceIdentity`;
+- repeated hardware-source re-observation during a transfer;
+- a provenance token, field, or message in Agent Protocol or Worker Protocol.
+
+A concrete independently re-observed physical source identity — should one be required — is
+deferred to the future physical-disk / hardware-integration milestone, which must define its
+schema and authority explicitly before implementation. Nothing in M1 detects a physical
+source-hardware substitution that still reproduces every durably recorded chunk identity.
 
 ## Storage capability model
 
@@ -833,7 +867,9 @@ capture-consistency rules.
 - capability token internal serialization/signing format (kept opaque; see "Capability
   opacity");
 - planned hardware-change authorization workflow;
-- exact Artifact provenance schema (only the fail-closed/legitimate-inequality distinction is
+- exact Artifact provenance schema, and any independently re-observed physical source
+  identity — deferred to the future physical-disk / hardware-integration milestone (only the
+  fail-closed/legitimate-inequality distinction and M1's descriptive-provenance scope are
   clarified above);
 - final production backup/snapshot format;
 - RAID/filesystem/device layout;

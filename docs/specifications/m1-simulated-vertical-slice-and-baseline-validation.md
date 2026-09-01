@@ -303,6 +303,19 @@ Transfer so far. This is action-specific meaning for the otherwise generic optio
 defined by `m0-agent-protocol-contract.md`, which itself defines no transfer-specific
 semantics for it.
 
+Source provenance in M1 composes with — and never extends — the data-plane contract. RF-005
+keeps three easily-conflated things distinct: (A) **source mutation / reproducibility
+failure**, already an M1 operational failure case — when source bytes previously associated
+with the same logical Transfer can no longer reproduce a durably recorded chunk identity, the
+transfer fails closed via `CHUNK_VERIFICATION_FAILED` above without rewriting that identity;
+(B) **immutable descriptive `SourceProvenance`**, which stays bound to the Transfer and is
+never rewritten; and (C) an **independently re-observed physical source identity**, which M1
+does not select, require, or exercise, and which composes no field or message into Agent
+Protocol or Worker Protocol. `m0-data-plane-and-storage-contracts.md` "Artifact provenance
+and target identity" owns the full rule, including the deferral of (C) to the future
+physical-disk / hardware-integration milestone; the same authority keeps source provenance
+distinct from any later destructive target identity.
+
 Required fail-closed cases remain those owned by the data-plane and Simulator Specifications.
 
 ### RF-006 — Administrative API and Web observation
