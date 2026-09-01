@@ -274,6 +274,21 @@ async fn establish_and_dispatch(
         .await
         .unwrap();
 
+    // The spawned `run_authenticated_session` registers Runtime Presence
+    // asynchronously; `commit_destructive_dispatch`'s seven-item gate consumes
+    // it. Wait for it explicitly so the commitment below is deterministic
+    // under heavy parallel test load (it was previously racy).
+    {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !gateway.presence().is_present(endpoint_id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the authenticated session never became present"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     let dispatch_service = FinalDispatchService::new(
         Arc::clone(&services.job_repo),
         gateway.presence(),

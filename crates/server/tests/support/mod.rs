@@ -21,6 +21,8 @@
 //! the module as a whole.
 #![allow(dead_code)]
 
+pub mod transfer_vertical;
+
 use std::sync::Arc;
 use std::sync::Mutex;
 

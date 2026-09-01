@@ -46,7 +46,7 @@ use crate::application::{
     parse_transfer_result_detail, ActionEvidenceService, ApplicationError,
     BootstrapEvidenceService, CancellationService, EnrollmentService, RedeemResult,
     TransferActionClassification, TransferAuthorizationOutcome, TransferAuthorizationService,
-    TransferTerminalEvidenceService, TransferTerminalOutcome,
+    TransferCancelAckOutcome, TransferTerminalEvidenceService, TransferTerminalOutcome,
 };
 use crate::ports::{
     ApplyActionEvidenceResult, ApplyReconciliationResult, CredentialRedemptionRepository,
@@ -762,9 +762,19 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
     }
 
     /// Validates the protocol-wide `correlation_id == action_id` rule, then
-    /// applies the evidence through [`CancellationService`] (Issue #27
-    /// "CancelAck handling"). Unknown/foreign `action_id` is deliberately
-    /// silent and non-terminal, mirroring [`Self::handle_action_ack`].
+    /// applies the evidence.
+    ///
+    /// The owning action is classified from durable Server facts, never from
+    /// the wire (Issue #19 §9): a `bamep.m1.data-plane-transfer` `CancelAck`
+    /// goes through [`TransferTerminalEvidenceService::apply_cancel_ack`]
+    /// (Issue #27's `bamep_domain::apply_cancel_ack` decision, unchanged, plus
+    /// the atomic `Incomplete -> Failed` Artifact leg when the CancelAck drives
+    /// an authoritative terminal `Cancelled` for a still-`Incomplete` Artifact
+    /// — Issue #19 checkpoint C4). The RF-004 `bamep.m1.simulated-execution`
+    /// path — and any action with no bound `Transfer` — stays exactly on
+    /// [`CancellationService`] (Issue #27 "CancelAck handling"). Unknown/
+    /// foreign `action_id` is deliberately silent and non-terminal, mirroring
+    /// [`Self::handle_action_ack`].
     async fn handle_cancel_ack<W: MessageSink>(
         &self,
         write: &mut W,
@@ -775,18 +785,59 @@ impl<R: EndpointRepository, C: CredentialRedemptionRepository> AgentControlGatew
         if ack.envelope.correlation_id != Some(ack.body.action_id) {
             return self.send_protocol_error(write, Some(message_id)).await;
         }
-        let service = self
-            .cancellation
-            .as_ref()
-            .ok_or(AgentGatewayError::CancellationServiceNotConfigured)?;
         let evidence = match ack.body.outcome {
             CancelAckOutcome::Cancelled => CancelAckEvidence::Cancelled,
             CancelAckOutcome::AlreadyCompleted => CancelAckEvidence::AlreadyCompleted,
             CancelAckOutcome::CannotCancel => CancelAckEvidence::CannotCancel,
             CancelAckOutcome::Unknown => CancelAckEvidence::Unknown,
         };
+
+        if let Some(transfer_terminal) = self.transfer_terminal_evidence.as_ref() {
+            match transfer_terminal
+                .classify(ack.body.action_id, endpoint_id)
+                .await
+            {
+                Ok(TransferActionClassification::Unknown) => return Ok(()),
+                Ok(TransferActionClassification::DataPlaneTransfer) => {
+                    return match transfer_terminal
+                        .apply_cancel_ack(ack.body.action_id, endpoint_id, evidence)
+                        .await
+                    {
+                        Ok(TransferCancelAckOutcome::Consumed) => Ok(()),
+                        // `classify` said DataPlaneTransfer under a plain read;
+                        // an intervening change is possible but vanishingly
+                        // rare — fall through to the generic path.
+                        Ok(TransferCancelAckOutcome::NotTransferAction) => {
+                            self.apply_generic_cancel_ack(ack.body.action_id, endpoint_id, evidence)
+                                .await
+                        }
+                        Err(ApplicationError::UnknownAction) => Ok(()),
+                        Err(e) => Err(AgentGatewayError::Application(e)),
+                    };
+                }
+                Ok(TransferActionClassification::SimulatedExecution) => { /* generic below */ }
+                Err(ApplicationError::UnknownAction) => return Ok(()),
+                Err(e) => return Err(AgentGatewayError::Application(e)),
+            }
+        }
+
+        self.apply_generic_cancel_ack(ack.body.action_id, endpoint_id, evidence)
+            .await
+    }
+
+    /// The unchanged Issue #27 `CancelAck` path — [`CancellationService`].
+    async fn apply_generic_cancel_ack(
+        &self,
+        action_id: ProtocolId,
+        endpoint_id: EndpointId,
+        evidence: CancelAckEvidence,
+    ) -> Result<(), AgentGatewayError> {
+        let service = self
+            .cancellation
+            .as_ref()
+            .ok_or(AgentGatewayError::CancellationServiceNotConfigured)?;
         match service
-            .apply_cancel_ack(ack.body.action_id, endpoint_id, evidence)
+            .apply_cancel_ack(action_id, endpoint_id, evidence)
             .await
         {
             Ok(_) => Ok(()),

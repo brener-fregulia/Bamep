@@ -18,15 +18,16 @@ use bamep_domain::presented_credential::{CredentialKind, PresentedCredential};
 use bamep_domain::{
     build_proof_transcript, capability_is_current, capability_matches_request,
     evaluate_final_destructive_dispatch, evaluate_transfer_dispatch, fail_incomplete,
-    proof_is_fresh, transitions, verify_proof_signature, ActionEvidence, ActionEvidenceOutcome,
-    ActionId, Actor, Artifact, ArtifactState, Attempt, AttemptState, AuditRecord,
-    AuthorizationOperation, BootContext, BootNonce, CancelAckEvidence, CancellationRequestOutcome,
-    CapabilityBinding, CapabilityId, CapabilityToken, DestructiveIntent, DigestAlgorithm,
-    EmptyWorkflow, EndpointId, FinalDispatchInputs, FinalDispatchOutcome, FinalDispatchRejection,
-    IdentityState, InvalidIdentityTransition, InventoryRevision, InventorySnapshot, Job, JobId,
-    JobStepId, ProofId, ProofPublicKey, ProofSignature, ProofTranscriptFields, RequestedOperation,
-    Transfer, TransferDirection, TransferDispatchInputs, TransferDispatchRejection, TransferId,
-    TrustedBootstrapState, DEFAULT_CAPABILITY_TTL_MILLIS, DEFAULT_CREDENTIAL_TTL,
+    proof_is_fresh, transitions, verify_proof_signature, ActionEvidence, ActionEvidenceApplied,
+    ActionEvidenceOutcome, ActionId, Actor, Artifact, ArtifactState, Attempt, AttemptState,
+    AuditRecord, AuthorizationOperation, BootContext, BootNonce, CancelAckEvidence,
+    CancellationRequestOutcome, CapabilityBinding, CapabilityId, CapabilityToken,
+    DestructiveIntent, DigestAlgorithm, EmptyWorkflow, EndpointId, FinalDispatchInputs,
+    FinalDispatchOutcome, FinalDispatchRejection, IdentityState, InvalidIdentityTransition,
+    InventoryRevision, InventorySnapshot, Job, JobId, JobStepId, ProofId, ProofPublicKey,
+    ProofSignature, ProofTranscriptFields, RequestedOperation, Transfer, TransferDirection,
+    TransferDispatchInputs, TransferDispatchRejection, TransferId, TrustedBootstrapState,
+    DEFAULT_CAPABILITY_TTL_MILLIS, DEFAULT_CREDENTIAL_TTL,
 };
 use bamep_trusted_bootstrap::{AcceptedSiteKeys, BootstrapAssertion, ServerCertFingerprint};
 use chrono::{DateTime, Duration, Utc};
@@ -1334,6 +1335,24 @@ pub enum TransferTerminalOutcome {
     FailClosed,
 }
 
+/// The outcome the gateway maps after
+/// [`TransferTerminalEvidenceService::apply_cancel_ack`] (Issue #19 checkpoint
+/// C4). `CancelAck` never produces a wire response, so — unlike
+/// [`TransferTerminalOutcome`] — there is no fail-closed variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferCancelAckOutcome {
+    /// The `CancelAck` evidence was applied (or was a matching-duplicate /
+    /// non-applicable no-op) against the bound transfer. When it drove an
+    /// authoritative terminal `Cancelled` outcome for the owning Attempt while
+    /// its bound Artifact was still `Incomplete`, `Incomplete -> Failed`
+    /// committed atomically with the unchanged Issue #27 cancellation terminal
+    /// transition, in one transaction.
+    Consumed,
+    /// `action_id` resolved to no bound `Transfer` — the caller falls back to
+    /// the generic Issue #27 [`CancellationService::apply_cancel_ack`].
+    NotTransferAction,
+}
+
 /// Consumes a terminal `bamep.m1.data-plane-transfer` `ActionResult` through
 /// the durable Server facts (Issue #19 checkpoint C2;
 /// `m1-simulated-vertical-slice-and-baseline-validation.md` RF-005;
@@ -1453,6 +1472,70 @@ impl TransferTerminalEvidenceService {
             }
         }
     }
+
+    /// Applies inbound `CancelAck` evidence for a `bamep.m1.data-plane-transfer`
+    /// action (Issue #19 checkpoint C4). The workflow decision is
+    /// `bamep_domain::apply_cancel_ack` (Issue #27), **unchanged** — this
+    /// method only *adds* the `Incomplete -> Failed` Artifact leg into the
+    /// *same* PostgreSQL transaction as the #27 terminal Attempt/JobStep/Job
+    /// transition when that decision drove the owning Attempt to an
+    /// authoritative terminal `Cancelled` while its bound Artifact was still
+    /// `Incomplete` (`m0-data-plane-and-storage-contracts.md` "Artifact
+    /// lifecycle" — `Incomplete -> Failed` ownership and ordering). No new
+    /// event, no new Attempt/Artifact state, no new wire message. Reuses
+    /// [`JobRepository::apply_transfer_terminal_evidence`]'s exact
+    /// lock/decide/persist boundary (`transfers -> artifacts -> attempts ->
+    /// job_steps -> jobs`), so the transfer-cancel path and the
+    /// terminal-`ActionResult` path share one atomic-persistence
+    /// implementation.
+    pub async fn apply_cancel_ack(
+        &self,
+        action_id: ProtocolId,
+        authenticated_endpoint_id: EndpointId,
+        evidence: CancelAckEvidence,
+    ) -> Result<TransferCancelAckOutcome, ApplicationError> {
+        let domain_action_id = ActionId(action_id.as_uuid());
+        let clock = Arc::clone(&self.clock);
+
+        let decide: crate::ports::TransferTerminalEvidenceDecision = Box::new(
+            move |facts: crate::ports::TransferTerminalEvidenceLockedFacts| {
+                decide_transfer_cancel_ack(evidence, facts, clock.now())
+            },
+        );
+
+        let result = self
+            .repo
+            .apply_transfer_terminal_evidence(domain_action_id, authenticated_endpoint_id, decide)
+            .await?;
+
+        match result {
+            TransferTerminalEvidenceResult::Applied(applied) => {
+                if applied.terminal {
+                    // Exactly-once reservation release, mirroring
+                    // `ActionEvidenceService`/`CancellationService`.
+                    if let Some(reservation) = self.reservations.take(applied.attempt.id) {
+                        self.arbiter.release(reservation);
+                    }
+                }
+                Ok(TransferCancelAckOutcome::Consumed)
+            }
+            TransferTerminalEvidenceResult::NoOp => Ok(TransferCancelAckOutcome::Consumed),
+            TransferTerminalEvidenceResult::NotTransferAction => {
+                Ok(TransferCancelAckOutcome::NotTransferAction)
+            }
+            // `bamep_domain::apply_cancel_ack` has no `Conflict`, and the
+            // guarded `Incomplete -> Failed` UPDATE runs against a row already
+            // `FOR UPDATE`-locked in this transaction — neither is reachable.
+            // Surface it loudly rather than silently dropping the #27
+            // transition.
+            other @ (TransferTerminalEvidenceResult::Conflict
+            | TransferTerminalEvidenceResult::FailClosed) => {
+                Err(ApplicationError::Repository(RepositoryError::Backend(
+                    format!("transfer CancelAck evidence produced an unexpected {other:?}"),
+                )))
+            }
+        }
+    }
 }
 
 /// The pure CASE A/B/C decision over freshly locked durable facts. Never
@@ -1555,6 +1638,96 @@ fn decide_transfer_terminal_evidence(
             outcome: applied,
             audit,
         },
+        artifact_failed,
+    }
+}
+
+/// The pure decision for inbound `CancelAck` evidence against a bound transfer
+/// (Issue #19 checkpoint C4), over freshly locked durable facts. The workflow
+/// decision is delegated entirely to `bamep_domain::apply_cancel_ack` (Issue
+/// #27, unchanged); this function only decides the *additional*
+/// `Incomplete -> Failed` Artifact leg — and only when the CancelAck drove the
+/// owning Attempt to an authoritative terminal `Cancelled` while its bound
+/// Artifact is still `Incomplete`. A terminal Artifact (`Verified`/`Failed`)
+/// is never rewritten; a `PendingVerification` Artifact keeps its own
+/// seal-path outcome; a non-terminal (`AwaitingReconciliation`) CancelAck
+/// outcome never touches the Artifact (Issue #19 §21 — no data-plane
+/// rollback; a still-uncertain Attempt has not authoritatively cancelled).
+fn decide_transfer_cancel_ack(
+    evidence: CancelAckEvidence,
+    facts: crate::ports::TransferTerminalEvidenceLockedFacts,
+    now: DateTime<Utc>,
+) -> TransferTerminalEvidenceDecisionOutcome {
+    use TransferTerminalEvidenceDecisionOutcome as Out;
+
+    // Correlation: the locked Artifact must be exactly the one this
+    // #40-committed Transfer/Attempt owns (mirrors
+    // `decide_transfer_terminal_evidence`). A structurally impossible binding
+    // is a no-op — never a mutation.
+    if facts.transfer.artifact_id != facts.artifact.id
+        || facts.transfer.attempt_id != Some(facts.attempt.id)
+    {
+        return Out::NoOp;
+    }
+
+    let applied = match bamep_domain::apply_cancel_ack(
+        &facts.job,
+        &facts.job_step,
+        &facts.attempt,
+        evidence,
+        now,
+    ) {
+        bamep_domain::CancelAckOutcome::NoOp => return Out::NoOp,
+        bamep_domain::CancelAckOutcome::Applied(applied) => applied,
+    };
+
+    let fails_artifact = applied.terminal
+        && applied.attempt.state == AttemptState::Cancelled
+        && facts.artifact.state == ArtifactState::Incomplete;
+    let artifact_failed: Option<Artifact> = if fails_artifact {
+        match fail_incomplete(&facts.artifact) {
+            Ok(failed) => Some(failed),
+            // Unreachable: guarded by the `Incomplete` check just above.
+            Err(_) => return Out::NoOp,
+        }
+    } else {
+        None
+    };
+
+    let outcome = ActionEvidenceApplied {
+        attempt: applied.attempt,
+        job_step: applied.job_step,
+        job: applied.job,
+        events: applied.events,
+        terminal: applied.terminal,
+    };
+
+    let audit = outcome.terminal.then(|| AuditRecord {
+        audit_id: Uuid::new_v4(),
+        endpoint_id: facts.job.endpoint_id,
+        actor: Actor::System,
+        occurred_at: now,
+        detail: format!(
+            "attempt {:?} action {:?} reached terminal state {:?} for job_step {:?} \
+             via cancellation evidence{}",
+            outcome.attempt.id,
+            outcome.attempt.action_id,
+            outcome.attempt.state,
+            outcome.job_step.id,
+            if artifact_failed.is_some() {
+                " (bamep.m1.data-plane-transfer: artifact Incomplete -> Failed)"
+            } else {
+                ""
+            },
+        ),
+        job_id: Some(facts.job.id),
+        job_step_id: Some(outcome.job_step.id),
+        attempt_id: Some(outcome.attempt.id),
+        action_id: Some(outcome.attempt.action_id),
+    });
+
+    Out::Applied {
+        commit: ActionEvidenceCommit { outcome, audit },
         artifact_failed,
     }
 }

@@ -384,12 +384,19 @@ owning Attempt. Agent Protocol transfer authorization (#38) is implemented — s
 "Sender-constrained transfer authorization" below. The authenticated HTTPS chunk transport,
 storage, and Artifact verification through the Worker (#39) are implemented — see "Implemented
 Worker data-plane chunk transport" below. The Agent-side C1 transfer participant (#19), the
-Server-side C2 terminal-`ActionResult` consumption (#19), and the C3 end-to-end RF-005
-happy-path vertical wiring them together over real WSS + Worker HTTPS + Worker UDS +
-PostgreSQL in one run are implemented — see "Implemented transfer terminal-result
-consumption" and "Implemented integrated RF-005 transfer vertical" below. The failure/resume
-matrix (interruption, corruption, source mutation, authorization denial, Worker/Server
-restart, cancellation race, reconnect) remains for checkpoint C4. The isolated
+Server-side C2 terminal-`ActionResult` consumption (#19), the C3 end-to-end RF-005
+happy-path vertical, and the C4 interruption/resume + fail-closed matrix (interruption and
+legitimate resume, real WSS disconnect/reconnect, corrupted-chunk rejection, source-mutation
+reproducibility failure, invalid/replayed/wrong-binding authorization, Worker runtime
+restart, `bamepd`-restart transient-authorization invalidation + startup reconciliation,
+`Verified`/`Failed`-but-`ActionResult`-lost reconciliation, `capture_consistency`
+independence, source-vs-target identity independence, transfer cancellation, and a
+lock-order concurrency regression) are implemented — see "Implemented transfer
+terminal-result consumption", "Implemented transfer cancellation Artifact-failure
+composition", and "Implemented integrated RF-005 transfer matrix" below. #19's integrated
+functional matrix is implemented; physical firmware/PXE/Secure-Boot/WinPE behaviour,
+20–24-Endpoint scale, physical-disk capture, and the production backup format are not in its
+scope. The isolated
 Worker process/control boundary itself (#37) is implemented — see "Implemented isolated Worker
 runtime and control boundary" below.
 
@@ -482,21 +489,38 @@ codes, Worker Protocol v1, the 137-byte proof transcript, and the HTTPS `/api/da
 surface are all unchanged), no new Domain event, and the C1 Simulator participant is
 unchanged.
 
-One recorded gap remains for a later checkpoint: C2 wired only the
-`ActionResult{Failed, TRANSFER_ABANDONED}` route into `Incomplete -> Failed`. The
-`m0-data-plane-and-storage-contracts.md` "Artifact lifecycle" clause also names a pure
-authoritative `Cancelled` Attempt outcome (a `CancelAck{Cancelled}` with no follow-up
-`ActionResult`) as a trigger; composing that leg into `apply_cancel_ack`'s transaction is not
-yet implemented.
+## Implemented transfer cancellation Artifact-failure composition
 
-## Implemented integrated RF-005 transfer vertical
+Issue #19 checkpoint C4 closes the one gap C2/C3 recorded: the
+`m0-data-plane-and-storage-contracts.md` "Artifact lifecycle" clause names an authoritative
+`Cancelled` Attempt outcome for a still-`Incomplete` Artifact as a `bamepd`-driven
+`Incomplete -> Failed` trigger, atomic with the unchanged Issue #27 cancellation terminal
+transition. `TransferTerminalEvidenceService::apply_cancel_ack` implements it: it reuses
+`bamep_domain::apply_cancel_ack` (Issue #27, byte-for-byte unchanged) for the workflow
+decision, and — only when that decision drives the owning Attempt to a terminal `Cancelled`
+while the bound Artifact is `Incomplete` — adds `bamep_domain::fail_incomplete`'s
+`Incomplete -> Failed` into the **same** transaction as the #27 terminal
+Attempt/JobStep/Job transition, reusing `JobRepository::apply_transfer_terminal_evidence`'s
+existing lock/decide/persist boundary (no new repository method). A terminal Artifact
+(`Verified`/`Failed`) is never rewritten; a `PendingVerification` Artifact keeps its own
+seal-path outcome; a non-terminal (`AwaitingReconciliation`) CancelAck outcome never touches
+the Artifact. `AgentControlGateway::handle_cancel_ack` routes a `CancelAck` to this path only
+when the action has a bound `Transfer` (classified from durable facts, never from the wire);
+every non-transfer `CancelAck` stays exactly on `CancellationService` (Issue #27,
+unchanged). No new event, no new state, no new wire message.
 
-Issue #19 checkpoint C3 composes the already-implemented C1 and C2 pieces into one
-deterministic successful Agent -> Server capture with every boundary real. It adds no Server
-business logic and no Simulator code: it is an integration harness
-(`crates/server/tests/data_plane_transfer_vertical.rs`) plus glue that drives the committed
-`bamep_simulator::DataPlaneTransferAgent` from a real Agent Protocol v1 WSS session, exactly
-as `action_dispatch_wss.rs` drives `SimulatedActionAgent`.
+## Implemented integrated RF-005 transfer matrix
+
+Issue #19 checkpoints C3 and C4 compose the already-implemented C1 and C2 pieces into an
+integrated matrix — one deterministic successful capture plus the interruption/resume +
+fail-closed adversarial set — with every boundary real. They add the cancellation
+composition above and otherwise no Server business logic and no Simulator code: a shared
+harness (`crates/server/tests/support/transfer_vertical.rs`) plus the happy-path vertical
+(`data_plane_transfer_vertical.rs`) and the matrix
+(`data_plane_transfer_failure_matrix.rs`), which drive the committed
+`bamep_simulator::DataPlaneTransferAgent` (and its committed deterministic
+`TransferRunOptions`/`InMemoryTransferSource` hooks) from a real Agent Protocol v1 WSS
+session, exactly as `action_dispatch_wss.rs` drives `SimulatedActionAgent`.
 
 The one run crosses: a durable non-destructive `commit_transfer_dispatch`
 (`Attempt{Dispatched}`, the seven-item destructive gate never evaluated — the JobStep
@@ -527,11 +551,33 @@ through C2 (one terminal audit record). The Simulator pins exactly one
 `ServerCertFingerprint` — the value it verified for WSS is the value it reuses for Worker
 HTTPS (both listeners present the same leaf).
 
+The matrix reuses the same harness for every adversarial case: C1's interrupt/corruption
+hooks and `InMemoryTransferSource::mutate_chunk` drive the inputs; resume always obtains a
+fresh WSS `TransferAuthorizationGrant` for the same durable `transfer_id`/`artifact_id`/
+`action_id` and never redispatches; a real WSS `drop_ungracefully` exercises #28's
+connection-loss path (`AwaitingReconciliation`) and a `StatusReport{Running}` returns the
+Attempt to `InProgress` so the data plane can resume; `Verified`/`Failed`-but-lost
+`ActionResult` resolves through #28's `StatusReport` path without re-running the transfer or
+rewriting the Artifact; `restart_worker` tears the HTTPS listener + IPC client + control
+plane down and rebuilds them against restart-stable staging and unchanged durable state;
+`restart_bamepd_transient_authority` + `reconcile_on_startup` proves an in-flight Attempt
+becomes `AwaitingReconciliation` and pre-restart capabilities fail closed with the single
+non-enumerable `401`; a proof against the wrong chunk/operation binding and a replayed
+`proof_id` reach the real `CapabilityStore`/`ReplayCache`/Worker `AuthorizationQuery` and
+produce that same `401`. Every terminal-failure case asserts the Artifact is `Failed` (never
+`Verified`, `Incomplete`, or `PendingVerification`) for `CHUNK_VERIFICATION_FAILED`/
+`TRANSFER_ABANDONED`, and a durable per-chunk recorded identity is never rewritten. A
+dedicated concurrency regression drives `commit_transfer_dispatch` and
+`apply_transfer_terminal_evidence` back to back many times under real PostgreSQL and
+observes no deadlock (SQLSTATE `40P01`).
+
 The Worker runs as an in-process `DataPlane` + IPC-client runtime rather than a spawned
 `bamep-worker` process, matching `worker_data_plane_transfer_interop.rs` (Issue #39 Phase
 E2B); process/runtime isolation is proven separately by `worker_process_supervision.rs` and
-`worker_runtime_ownership.rs`. The C3 vertical does not exercise `bamepd`'s production
-composition root, which remains #20's concern.
+`worker_runtime_ownership.rs`. The vertical does not exercise `bamepd`'s production
+composition root, which remains #20's concern; `bamepd`/Server restart is represented by
+#28's `reconcile_on_startup` plus transient-authority replacement, not an OS process
+restart.
 
 ## Implemented isolated Worker runtime and control boundary
 
