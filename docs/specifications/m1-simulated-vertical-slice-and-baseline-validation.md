@@ -1,4 +1,4 @@
-# M1 — Simulated Vertical Slice & Baseline Validation
+# M1 — Hardware-Independent Operational Core
 
 Status: **Approved**
 
@@ -6,7 +6,7 @@ Status: **Approved**
 
 Type: Feature/Epic-level Specification for the first post-M0 implementation milestone.
 
-Execution grouping: GitHub Milestone #2, **M1 — Simulated Vertical Slice & Baseline Validation**.
+Execution grouping: GitHub Milestone #2.
 
 ## Context
 
@@ -15,15 +15,19 @@ record is `docs/specifications/m0-architecture-baseline.md`; current detailed be
 owned by the individual M0 Specifications and ADRs.
 
 M1 implements and empirically validates the hardware-independent successor slice recorded by M0.
-At the time M1 was approved no product implementation existed; that is historical context, not a
-claim about current repository state.
+At the time M1 was originally approved no product implementation existed and the successor slice
+included a minimal Administrative API/Web observation checkpoint. The owner-approved M1 roadmap
+rebaseline later removed that Presentation checkpoint from M1 completion so the milestone reflects
+the operational core actually being proven. This is historical context, not a claim about current
+repository state.
 
 ADR-0013 later superseded ADR-0007's SQLite backend selection and made PostgreSQL the current
 persistence baseline without removing M1's persistence-load validation obligation.
 
 ## Goal
 
-Implement and validate the first integrated executable Bamep vertical slice:
+Implement and validate Bamep's first integrated hardware-independent operational core across its
+real internal protocol and process boundaries:
 
 ```text
 Simulated Endpoint connects
@@ -37,11 +41,11 @@ Simulated Endpoint connects
 -> durable state/events persisted
 -> disconnect/reconnect handled
 -> Job reaches terminal state
--> Web reflects result
 ```
 
-The milestone remains entirely hardware-independent and includes empirical validation of the
-PostgreSQL persistence baseline and the **20–24 concurrent Simulated Endpoint** target.
+The milestone remains entirely hardware-independent and headless. It includes empirical validation
+of the PostgreSQL persistence baseline and the **20–24 concurrent Simulated Endpoint** target; it
+does not require a human Presentation layer or physical Endpoint hardware.
 
 ## Scope
 
@@ -55,7 +59,6 @@ M1 covers:
 - the complete destructive-operation authorization gate;
 - PostgreSQL-backed durable/transient persistence, domain events, and audit records;
 - authenticated chunked data-plane transfer and Artifact lifecycle;
-- Administrative API v1 read behavior and a minimal Bamep Web read view;
 - required Simulator scenarios at deterministic scale or at the explicit 20–24 Endpoint target.
 
 This Specification does not prescribe a particular crate/package/module layout beyond the
@@ -70,13 +73,16 @@ M1 does not implement or validate:
 - the physical/operator ceremony for ADR-0011 site-key pairing;
 - real Windows deployment or destructive physical-disk operations;
 - MikroTik-specific production integration;
+- production operator Web or final operator UX;
+- product Administrative API implementation;
+- human identity and access management;
 - production administrative authentication/RBAC;
 - Web-originated Job creation, enrollment approval, cancellation, or other write operations;
 - live-Windows backup or the final production backup/snapshot format;
 - HA, multi-site, or ERP integration.
 
-Actions required by the vertical slice but intentionally absent from Bamep Web are originated by
-the Simulator/test harness or another internal development control path.
+Actions required by the headless vertical slice are originated by the Simulator/test harness or
+another internal development control path.
 
 ## Functional requirements
 
@@ -322,12 +328,12 @@ distinct from any later destructive target identity.
 
 Required fail-closed cases remain those owned by the data-plane and Simulator Specifications.
 
-### RF-006 — Administrative API and Web observation
+### RF-006 — Headless completion boundary
 
-Bamep Web observes the required Endpoint/Job/JobStep/Attempt/Transfer/Artifact state exclusively
-through Administrative API v1 reads.
-
-M1 introduces no Web write path.
+M1 completion does not require Administrative API or Web implementation. Presentation clients and
+their versioned Administrative API boundary remain approved future product work governed by
+`m0-administrative-api-web-read-contract.md`, ADR-0016, and ADR-0017; this milestone neither
+implements nor supersedes those Presentation decisions.
 
 ### RF-007 — Concurrency target
 
@@ -409,7 +415,6 @@ M1 directly consumes:
 - `m0-data-plane-and-storage-contracts.md` — transfer/Artifact contract;
 - `m0-simulator-contract-and-validation-strategy.md` — Simulator fidelity, scenarios, concurrency,
   and persistence-load validation;
-- `m0-administrative-api-web-read-contract.md` — Administrative API v1 read boundary;
 - `m0-stack-and-boundaries-baseline.md` — product/component dependency boundaries;
 - `m1-worker-data-plane-control-contract.md` — Server↔Worker UDS contract for RF-005;
 - ADR-0004, ADR-0005, ADR-0006, ADR-0008, ADR-0010, ADR-0012, ADR-0013, and ADR-0018 for the
@@ -429,6 +434,11 @@ per-contract test cases already owned by those Specifications.
 The Integration Environment is not required to complete M1 because physical boot, firmware,
 network-boot, hardware, and real-disk behavior are outside this milestone.
 
+Issue #21 owns the final M1 empirical evidence boundary: 20–24 concurrent Simulated Endpoint
+scheduler/resource contention, PostgreSQL persistence-load measurement, and chunked data-plane
+transfer at scale, together with confirmation of the remaining required headless deterministic
+Simulator coverage. No Presentation implementation or observation is required for that evidence.
+
 ## Integration Environment boundary
 
 Passing M1 does not validate physical provisioning.
@@ -442,6 +452,6 @@ the Simulator and trusted-bootstrap boundaries.
 
 1. Concrete implementation of the operator-approval control path (harness, CLI, development
    fixture, or equivalent); its semantic independence from the Agent is already decided.
-2. Concrete implementation of Job-creation origination outside Web.
+2. Concrete implementation of Job-creation origination outside a product Administrative API.
 3. Numeric persistence-load acceptance thresholds, which may only be established from NF-001
    empirical evidence.

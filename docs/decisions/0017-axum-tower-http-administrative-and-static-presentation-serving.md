@@ -12,16 +12,17 @@ actually expose Administrative API v1 and the static Presentation build from the
 `bamepd` origin while preserving ADR-0016's routing, fallback, caching, and packaging
 invariants.
 
-`crates/server` already depends on Tokio for its runtime, but at the time this question was
+`crates/server` already depended on Tokio for its runtime, but at the time this question was
 raised it had no HTTP-server framework dependency and no Administrative HTTP route or
-static-file module. Issue #20 needs that composition to implement its read surface and
-minimal Web view.
+static-file module. Issue #20 was the original planned implementation vehicle. The later
+owner-approved M1 roadmap rebaseline removed Presentation delivery from M1 completion; it did
+not reopen the composition selected here.
 
 Routing, SPA-fallback, and cache-header behavior are correctness- and security-sensitive:
 an incorrect composition can let the Administrative API namespace fall through to the SPA
 shell, serve a stale fingerprinted asset as if it were current, or cache a transient miss as
-if it were a permanent one. This should not be improvised inside Issue #20's implementation;
-it required its own evidence and decision.
+if it were a permanent one. This composition required its own evidence and decision rather than
+being improvised during future Presentation implementation.
 
 A Technical Spike empirically investigated Axum 0.8 + Tower/`tower-http` against ADR-0016's
 invariants using a disposable fixture outside the repository. The original experiment
@@ -58,7 +59,7 @@ does not reproduce that evidence.
    transformed into the shell, nor receive immutable long-lived caching.
 
 8. SPA fallback exists only for valid HTML-navigation semantics, not an unconditional "any
-   unknown path → `index.html`" rule. The accepted M1 baseline may use the empirically
+   unknown path → `index.html`" rule. The accepted baseline may use the empirically
    validated conservative rule:
 
    ```text
@@ -104,8 +105,8 @@ continue to record versions empirically tested during the Spike.
 
 ## Consequences
 
-- Issue #20 may add Axum and Tower/`tower-http` dependencies to `crates/server` during
-  implementation.
+- Future Presentation implementation may add Axum and Tower/`tower-http` dependencies to
+  `crates/server`.
 - Administrative API and static Presentation delivery can share one HTTP origin and one
   router/service composition.
 - The routing/fallback/cache-header boundaries this ADR records need automated regression
@@ -114,7 +115,7 @@ continue to record versions empirically tested during the Spike.
   miss, or unconditional shell fallback on any miss).
 - The Reference Spike's negative cases (status-aware `/_app/**` caching, navigation-aware
   fallback, `ServeDir::not_found_service()` misuse) should become production test cases where
-  applicable during Issue #20.
+  applicable during implementation.
 - Axum/Tower is an Adapter/runtime-composition concern; it does not enter Domain and does not
   change Domain's dependency constraints from `m0-stack-and-boundaries-baseline.md`.
 - This ADR does not define Administrative API business behavior, request/response bodies, or
@@ -122,6 +123,9 @@ continue to record versions empirically tested during the Spike.
   `m0-administrative-api-web-read-contract.md`.
 - This ADR does not define TLS, authentication, RBAC, or realtime/push transport for the
   Administrative HTTP surface; those remain deferred per ADR-0016 and the read contract.
+- Before production implementation, this composition must be revalidated against the eventual
+  approved IAM, session, TLS, CSP, and related security constraints. This requirement does not
+  select or design those mechanisms here.
 - `docs/architecture/README.md` remains unchanged until this composition is actually
   implemented; Architecture describes implemented structure only.
 
@@ -140,7 +144,7 @@ continue to record versions empirically tested during the Spike.
 
 ## Related work
 
-- Issue #20 — the Work Package that implements this composition to expose M1 state through
-  Administrative API v1 and a minimal Web view.
+- Issue #20 — the original planned M1 implementation vehicle; it is no longer an M1 completion
+  requirement after the owner-approved roadmap rebaseline.
 
 Status: Accepted.

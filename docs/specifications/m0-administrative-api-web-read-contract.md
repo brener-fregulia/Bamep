@@ -7,6 +7,11 @@ used by Bamep Web. It owns Server ↔ Web resource representations, versioning, 
 semantics, and minimum HTTP reads. Domain lifecycle semantics remain authoritative in their
 owning Specifications; this contract projects them without redefining them.
 
+This approved contract is retained as minimum Presentation-contract evidence and future product
+input. It is not implemented at current HEAD, is no longer required for M1 completion, and is not
+a complete future operator-plane API. Later approved Specification work may revise or supersede it
+before production implementation without weakening the boundary constraints below.
+
 ## Boundary
 
 Bamep has three distinct communication responsibilities:
@@ -23,7 +28,7 @@ boundaries are not the Web API.
 
 Administrative API v1 defines:
 
-- M1-required current-state reads;
+- minimum current-state reads for a future Presentation implementation;
 - Endpoint and Job representations, including nested JobStep/Attempt state;
 - progress/reconciliation and Transfer/Artifact summaries;
 - stable cross-boundary identifiers;
@@ -40,7 +45,7 @@ browser push/change notifications, list/search/filter/pagination APIs, persisten
 Agent Protocol/data-plane mechanics, external ERP APIs, or public third-party compatibility
 guarantees.
 
-A development/M1 implementation may exercise this read contract before production administrative
+A non-production implementation may exercise this read contract before production administrative
 authentication exists, but must not be represented as production-secure.
 
 ## Delivery model
@@ -72,7 +77,7 @@ Identifier ownership and persistence correlation remain defined by
 
 ## Minimum HTTP reads
 
-Administrative API v1 defines exactly these M1-required reads:
+Administrative API v1 defines exactly these minimum reads:
 
 - `GET /api/admin/v1/endpoints/{endpoint_id}`
   - existing Endpoint → HTTP `200` with the Endpoint representation;
@@ -174,7 +179,7 @@ Web-specific lifecycle vocabulary must not diverge from the authoritative Domain
 
 ## Deferred decisions
 
-Future work, not implicit M1 decisions:
+Future work not defined by this minimum read contract:
 
 - production administrative authentication/authorization;
 - Web-originated command/write semantics;
@@ -198,13 +203,14 @@ Implementation requires at least:
 - correct Job nesting of JobStep, Attempt, progress, and Transfer/Artifact summaries;
 - `AwaitingReconciliation`, `Indeterminate`, and every `failure_reason` represented without
   collapsing/substitution;
-- verification that M1 introduces no Web-originated write route.
+- verification that an implementation of this contract introduces no Web-originated write route.
 
 General test-layer policy is owned by `docs/development/testing.md`.
 
 ## Related
 
-- `m1-simulated-vertical-slice-and-baseline-validation.md` — M1 scope consuming this contract.
+- `m1-simulated-vertical-slice-and-baseline-validation.md` — headless M1 scope, which does not
+  require this contract's implementation.
 - `m0-endpoint-identity-lifecycle.md` — Endpoint state vocabulary.
 - `m0-job-lifecycle-and-scheduling.md` — Job/JobStep/Attempt state vocabulary.
 - `m0-agent-protocol-contract.md` — `action_id` and progress semantics.

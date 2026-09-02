@@ -591,10 +591,10 @@ observes no deadlock (SQLSTATE `40P01`).
 The Worker runs as an in-process `DataPlane` + IPC-client runtime rather than a spawned
 `bamep-worker` process, matching `worker_data_plane_transfer_interop.rs` (Issue #39 Phase
 E2B); process/runtime isolation is proven separately by `worker_process_supervision.rs` and
-`worker_runtime_ownership.rs`. The vertical does not exercise `bamepd`'s production
-composition root, which remains #20's concern; `bamepd`/Server restart is represented by
-#28's `reconcile_on_startup` plus transient-authority replacement, not an OS process
-restart.
+`worker_runtime_ownership.rs`. The vertical does not exercise `bamepd` as a complete production
+composition root; no current implementation composes all Server responsibilities there.
+`bamepd`/Server restart is represented by #28's `reconcile_on_startup` plus transient-authority
+replacement, not an OS process restart.
 
 ## Implemented isolated Worker runtime and control boundary
 

@@ -14,9 +14,10 @@ selects a frontend stack, a static-vs-server-rendered delivery model, a Web
 packaging/versioning relationship to the Server executable, a styling/design-system
 direction, or a browser/desktop/mobile platform boundary.
 
-Issue #20 requires a minimal Bamep Web view over Administrative API v1 reads. Making that
-Work Package architecture-ready requires these choices to be decided once, durably, rather
-than improvised during implementation.
+Issue #20 originally required a minimal Bamep Web view over Administrative API v1 reads. Making
+that planned work architecture-ready required these choices to be decided once, durably, rather
+than improvised during implementation. The later owner-approved M1 roadmap rebaseline removed
+Presentation delivery from M1 completion; it did not reopen this ADR's accepted decisions.
 
 An owner-reviewed architectural discovery examined the available alternatives for each of
 these questions. That discovery was investigation only; its durable conclusions are
@@ -106,12 +107,12 @@ create hidden administrative write paths.
 
 ### 7. Deferred decisions
 
-Explicitly kept outside this ADR and outside M1: Tauri desktop delivery; Tauri mobile;
+Explicitly kept outside this ADR: Tauri desktop delivery; Tauri mobile;
 Capacitor selection; PWA installability/offline caching; local TLS strategy for PWA/mobile
 browser capabilities; push notifications; the final SSE/WebSocket/realtime transport;
 remote administration; administrative auth/RBAC; Web-originated writes; OpenAPI/codegen;
 non-root Web deployment; the Rust HTTP framework and static-serving composition. Polling
-remains an allowed M1 snapshot-refresh mechanism under
+remains an allowed snapshot-refresh mechanism under
 `m0-administrative-api-web-read-contract.md`; it is not a new contract or a realtime
 decision.
 
@@ -125,10 +126,11 @@ decision.
 - **Embedding Web assets in the `bamepd` executable.** Rejected: breaks independent
   Server/Web SemVer and forces a Server rebuild to ship a compatible Web update, contrary
   to the accepted packaging direction in `m0-stack-and-boundaries-baseline.md`.
-- **A separate standalone static Web server process.** Rejected for M1: adds a second
+- **A separate standalone static Web server process.** Rejected for the selected single-server
+  delivery model: adds a second
   deployable/operational surface, a second origin (or a reverse-proxy requirement), and
   cross-origin handling with no current requirement justifying it; serving from `bamepd`'s
-  existing origin is simpler for the M1 target.
+  existing origin is simpler for the accepted Presentation target.
 - **Direct native-shell imports from product features.** Rejected: creates hidden coupling
   to a specific shell and the risk of an alternative backend/authorization bypass.
 - **Scoped/plain CSS as the sole styling strategy.** Rejected: without a token/utility layer,
@@ -141,12 +143,10 @@ decision.
 ## Consequences
 
 - Bamep gains a durable frontend stack (Svelte 5, SvelteKit, strict TypeScript,
-  `adapter-static`) and a narrow Administrative API client boundary that Issue #20 and
-  future Presentation work implement against without re-deciding.
-- Web ships as independently versioned static assets served by `bamepd`; a future Technical
-  Spike must still prove the concrete Rust HTTP/static-serving composition (SPA fallback,
-  `/api/` exclusion, fingerprinted-asset `404` behavior, cache headers) before
-  implementation.
+  `adapter-static`) and a narrow Administrative API client boundary that future Presentation
+  work implements against without re-deciding.
+- Web ships as independently versioned static assets served by `bamepd`; ADR-0017 owns the
+  concrete Rust HTTP/static-serving composition selected from the completed Technical Spike.
 - The design-system layering (tokens → primitives → semantic components → features) and the
   Tailwind v4 / selective-Bits-UI styling direction apply to all future Presentation work
   until reconsidered.
@@ -164,16 +164,20 @@ decision.
 
 - `docs/architecture/README.md` is intentionally not updated by this ADR: it describes
   implemented structure only, and no Presentation/static-serving implementation exists yet.
-- A future Technical Spike will investigate SvelteKit static-fallback behavior, `/api/`
-  exclusion, missing-fingerprinted-asset `404` behavior, cache headers, same-origin root
-  deployment, an independently replaceable static-asset directory, and the actual Rust HTTP
-  adapter/framework composition. It will select the Rust HTTP framework; this ADR does not.
+- ADR-0017 owns the Axum/Tower HTTP adapter and static-serving composition selected from the
+  completed Technical Spike; this ADR continues to own the Presentation client and platform
+  boundary rather than that Server Adapter choice.
+
+Production implementation remains subject to approved product, UX, IAM, session, authorization,
+and security work. Those concerns may constrain how this architecture is composed without
+reopening the selected frontend stack absent new evidence.
 
 ## Related work
 
-- Issue #20 — implements the static Presentation client selected by this ADR.
-- Issue #19 — Transfer/Artifact result state Bamep Web observes; remains an open functional
-  dependency of Issue #20, not resolved by this ADR.
+- Issue #20 — the original planned M1 implementation vehicle; it is no longer an M1 completion
+  requirement after the owner-approved roadmap rebaseline.
+- Issue #19 — Transfer/Artifact result state future Bamep Presentation may observe; completed and
+  not changed by this ADR.
 - Issue #28 — reconciliation state/outcomes Bamep Web observes; completed and owner-accepted
   before this ADR, not a pending dependency.
 - `docs/specifications/m0-stack-and-boundaries-baseline.md` — Presentation component

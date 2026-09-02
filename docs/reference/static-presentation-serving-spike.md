@@ -323,5 +323,6 @@ constitute owner-accepted architecture.
   the accepted decision this Spike's evidence informs.
 - `docs/specifications/m0-administrative-api-web-read-contract.md` - the Administrative
   API v1 read contract the mock fixture routes were shaped after.
-- Issue #20 - the Work Package this evidence makes architecture-ready, pending a
-  corresponding ADR.
+- ADR-0017 - the accepted Axum/Tower composition decision supported by this evidence. The later
+  M1 roadmap rebaseline deferred Presentation implementation without invalidating the Spike's
+  empirical findings.

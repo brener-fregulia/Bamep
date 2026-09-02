@@ -46,6 +46,12 @@ Simulated Endpoint connects
 
 Its representative high-density scenario targets **20–24 concurrent Simulated Endpoints**.
 
+The sequence above records the successor slice as planned when M0 closed. The later owner-approved
+M1 roadmap rebaseline removed its Administrative API/Web observation checkpoint from M1 completion
+and defined the milestone as proof of the hardware-independent headless operational core. This
+historical completion record does not otherwise rewrite the M0 baseline that preceded that
+rebaseline.
+
 Execution and validation of this scope are now owned by
 `docs/specifications/m1-simulated-vertical-slice-and-baseline-validation.md`; Simulator
 fidelity/concurrency semantics are owned by
