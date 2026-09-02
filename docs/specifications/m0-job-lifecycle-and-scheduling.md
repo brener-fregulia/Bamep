@@ -182,6 +182,15 @@ Admission may also consume an Application-supplied effective capacity policy lim
 
 Ordering, fairness, and priority among queued Jobs/leases remain implementation-time.
 
+## Operator submission correlation
+
+Job creation may be correlated to an operator submission that translates one operator intent
+over `1..N` Endpoints into independent one-Endpoint Jobs
+(`docs/specifications/m0-persistence-observability-and-domain-events.md` "Operator submission
+persistence and correlation"; ADR-0019). That submission's creation-processing state owns no
+Job admission, scheduling, dispatch, cancellation, reconciliation, or execution authority,
+and does not add or change any Job, JobStep, or Attempt state or transition defined here.
+
 ## Out of scope
 
 - partial-failure/skip semantics;
@@ -196,6 +205,7 @@ Ordering, fairness, and priority among queued Jobs/leases remain implementation-
 ## Related
 
 - ADR-0006 — Job/JobStep/Attempt and scheduling rationale.
+- ADR-0019 — operator submission boundary correlated to Job creation.
 - ADR-0015 — effective capacity-policy boundary.
 - `docs/specifications/m0-endpoint-identity-lifecycle.md` — authoritative destructive-operation gate.
 - `docs/specifications/m0-agent-protocol-contract.md` — Agent action/status/cancellation wire contract.

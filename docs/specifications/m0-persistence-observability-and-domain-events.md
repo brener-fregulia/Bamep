@@ -19,6 +19,8 @@ Persist meaningful domain state and transitions, not every observation.
 - domain events;
 - safety-relevant audit records;
 - correlation needed for recovery and authorization.
+- operator submission acceptance and per-target creation outcomes (see "Operator submission
+  persistence and correlation").
 
 **Transient/high-frequency by default:**
 - Agent connection/presence;
@@ -111,6 +113,124 @@ distinct even when related 1:1.
 
 `transfer_id` is the durable logical transfer identity defined by
 `m0-data-plane-and-storage-contracts.md`, not an HTTP request/connection identity.
+
+## Operator submission persistence and correlation
+
+One operator intent over `1..N` Endpoints is accepted as a single operator submission and
+then translated into independent one-Endpoint Jobs. This section is the normative owner of
+what a submission persists and how it correlates to Jobs. ADR-0019 owns the rationale and the
+rejected alternatives. This section defines no Administrative API, HTTP, or schema.
+
+### Submission identity and content
+
+An accepted submission durably records:
+
+- `request_key` — the caller-provided logical-command identity (below);
+- `submission_id` — the Server-minted durable identity of the accepted submission (below);
+- the requested target Endpoint set;
+- a canonical intent/configuration descriptor sufficient to verify retry equivalence;
+- the accepted-at timestamp;
+- one creation outcome per requested Endpoint (below).
+
+### `request_key`
+
+- exists before the first request completes;
+- identifies one logical operator command across transport retries;
+- is supplied by the caller / operator-plane client, not minted by the Server;
+- a retry carrying the same `request_key` and an equivalent canonical command resolves to
+  the same already-accepted submission;
+- the same retained `request_key` presented with a non-equivalent target set, configuration,
+  or intent is rejected;
+- a deliberately new operator command uses a new `request_key`.
+
+The future actor/IAM identity is not part of the canonical command-equivalence descriptor.
+
+For the period during which idempotency is guaranteed, one retained `request_key` must not
+identify more than one accepted submission. The concrete idempotency-retention duration and
+any post-retention `request_key` reuse policy remain implementation/operations policy unless
+a later product requirement constrains them.
+
+Concrete wire representation of `request_key` is owned by future Administrative API work.
+
+### `submission_id`
+
+- is minted by the Server/Application when the submission is durably accepted;
+- is the durable identity of that accepted submission;
+- is distinct from any HTTP request, connection, or session identity;
+- carries no Job admission, scheduling, dispatch, cancellation, reconciliation, or execution
+  authority.
+
+### Acceptance ordering
+
+```text
+accept the submission durably
+→ then process individual targets
+```
+
+The acceptance commit must establish the immutable submission core (identities, the complete
+requested target set, the canonical descriptor, accepted-at) and one durable per-target
+creation state initialized to `Undecided` for every requested Endpoint. No Job for a
+submission may be durably created before that submission is itself durable and discoverable.
+
+### Per-target creation state
+
+Each requested Endpoint has one durable per-target creation state. `Undecided` is durable
+non-terminal creation-phase state; it is not transient.
+
+```text
+Undecided → Created(job_id)
+Undecided → Rejected(reason)
+```
+
+- the state transitions exactly once;
+- `Created(job_id)` is final for that submission;
+- `Rejected(reason)` is final for that submission;
+- a transport retry never re-evaluates a target that already holds a final outcome;
+- only a target still durably `Undecided` — because processing was interrupted before it was
+  decided — may be resumed;
+- trying a previously `Rejected` Endpoint after circumstances change requires a new operator
+  command and a new submission, not a re-drive of the settled one.
+
+The concrete rejection-reason vocabulary is follow-up contract work and is not defined here.
+
+### Atomic target creation
+
+For one target, the `Undecided → Created(job_id)` transition and the durable creation of
+that target's Job and its JobSteps commit in the same persistence transaction. Therefore:
+
+- no durable Job exists for a submission target whose outcome is not `Created(job_id)`;
+- no `Created(job_id)` outcome exists without that Job;
+- a rolled-back attempt leaves the target `Undecided`, so resume is safe.
+
+This is a normative atomicity requirement. It prescribes no repository type, transaction
+API, statement, or schema.
+
+### Rejected target
+
+`Undecided → Rejected(reason)` is independently durable. `AuditRecord` is not the
+authoritative source for ordinary submission creation outcomes; operational reconstruction
+comes from authoritative submission and Job state. Security-relevant audit may later
+correlate to a submission without becoming that authoritative source.
+
+### Settled submission
+
+Once no target remains `Undecided`, creation processing is settled. Settlement is not Job
+success, execution success, cancellation state, or reconciliation state, and creates no
+supervisory execution lifecycle. An aggregate "k of N created" view is derived, not
+authoritative state.
+
+### Correlation and events
+
+`submission_id` is durable correlation state owned by the submission and carried by every
+Job successfully created for that submission. Job-creation paths that are not operator
+submissions do not carry it.
+
+This contract does not add `submission_id` to the generic durable correlation-identifier
+list in "Correlation" and does not extend the domain-event envelope. An event correlated to
+a Job created from a submission is reachable only through that Job. A future requirement for
+direct submission correlation on domain events, an outbox, or external integrations must
+extend the relevant contract explicitly; it is not implied by this section. This section
+adds no new domain event.
 
 ## Atomic persistence
 
@@ -257,7 +377,12 @@ PostgreSQL/SQLx schema, query, migration, and Adapter conventions belong to
 - telemetry retention policy;
 - external event publication;
 - lifecycle/wire semantics owned by other Specifications;
-- fixed numeric persistence-performance thresholds.
+- fixed numeric persistence-performance thresholds;
+- Administrative API routes, HTTP methods, payloads, and the `request_key` wire form;
+- the concrete submission rejection-reason vocabulary;
+- the canonical intent/configuration descriptor format and its equivalence algorithm;
+- exact idempotency-retention duration and post-retention `request_key` reuse policy;
+- actor/IAM attribution of operator submissions.
 
 ## Validation
 
@@ -279,6 +404,19 @@ At minimum:
 
 Implementation-level persistence tests use the real adopted backend.
 
+**Operator submission**
+- the acceptance commit establishes the immutable core and an `Undecided` state for every
+  requested Endpoint before any Job for that submission is durably created;
+- a retry with the same `request_key` and an equivalent canonical command resolves to the
+  same submission and creates no duplicate Job;
+- a retained `request_key` presented with a non-equivalent command is rejected;
+- `Undecided → Created(job_id)` and that target's Job/JobStep creation commit atomically; a
+  rolled-back target remains `Undecided`;
+- `Created` and `Rejected` are never re-evaluated by a transport retry; only `Undecided`
+  targets resume;
+- per-target creation outcomes are reconstructable from submission and Job state without the
+  audit trail.
+
 **Representative load**
 Issue #21 owns M1 validation at 20–24 concurrent Simulated Endpoints, measuring actual
 durable write volume, contention, latency, and backpressure. No numeric threshold is
@@ -294,5 +432,7 @@ of the persistence baseline.
 - `m0-agent-protocol-contract.md` — Agent wire correlation/evidence.
 - `m0-data-plane-and-storage-contracts.md` — Artifact/transfer semantics.
 - `docs/development/persistence.md` — PostgreSQL/SQLx implementation conventions.
+- ADR-0019 — operator submission boundary for bulk Job creation (rationale and rejected
+  alternatives).
 - `docs/development/testing.md` — test-layer responsibilities.
 - Issue #21 — M1 persistence-load validation.
