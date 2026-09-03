@@ -208,14 +208,24 @@ from another and none satisfied by an operator acknowledgement alone:
    destructive target is re-resolved and revalidated against current hardware
    (`docs/specifications/m0-endpoint-identity-lifecycle.md` "Planned hardware replacement" and
    "Destructive-operation authorization preconditions");
-5. an automated-execution capacity slot is reacquired; if none is available the Job waits and
-   is not failed, and a resuming Job never preempts already executing work;
+5. an automated-execution capacity slot is reacquired (see "Job admission and capacity");
 6. the complete applicable final pre-dispatch gate runs before any Attempt, unchanged and
    additive.
 
+Reacquiring the slot in step 5 is a concurrency/readmission operation on already-authorized
+work, not a new commercial authorization of the Job. Parking does not revoke the commercial
+authorization the Job established at admission: post-checkpoint readmission is "continuation
+of already-authorized work" in the sense of ADR-0015 §11, so it is never blocked by
+entitlement expiry, later-discovered invalidity, or commercial-platform unavailability, and
+lack of capacity is never a Job failure. The parked Job still waits for a free slot, never
+preempts currently executing work, and — while a currently valid capacity policy exists —
+waits until its continuation fits within that policy; a valid capacity reduction delays
+continuation but never fails the parked Job.
+
 This section defines the observable behavior above. It does not decide whether the parked
-condition is a new JobStep state or an existing state plus durable checkpoint metadata; that
-representation is implementation-time. Rationale is owned by ADR-0020.
+condition is a new JobStep state or an existing state plus durable checkpoint metadata, nor
+whether and how an implementation retains the last valid capacity policy for already-authorized
+work; those are implementation-time. Rationale is owned by ADR-0020.
 
 ## Job admission and capacity
 
@@ -232,6 +242,9 @@ numeric/technical policy, not commercial edition/license concepts. A Job blocked
 capacity at first admission remains `Pending`; a Job blocked only by capacity at
 post-checkpoint readmission stays parked. Neither is a Job failure. Later capacity-policy
 reduction does not terminate an already-executing or `Cancelling` Job.
+
+Post-checkpoint readmission of a parked Job is continuation of already-authorized work
+(ADR-0015 §11), not a new commercial admission; see "Planned intervention checkpoint".
 
 Ordering, fairness, and priority among queued Jobs/leases remain implementation-time.
 

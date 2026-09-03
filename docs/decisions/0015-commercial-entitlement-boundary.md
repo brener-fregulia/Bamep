@@ -193,13 +193,16 @@ not a vague term like "supported machines." This capacity constraint does
 connected-but-idle Agents, or historical Endpoints — only the count of
 currently active Job-scoped endpoint-exclusivity leases.
 
-> **Revision note (ADR-0020, Proposed):** this section's equivalence between commercial
-> capacity and the Job-scoped endpoint-exclusivity lease is revised by ADR-0020. A Job parked
-> at a planned operator-intervention checkpoint retains its endpoint-exclusivity lease but
-> consumes no automated-execution capacity slot. When ADR-0020 is accepted, the generic
-> capacity unit becomes "the maximum number of Endpoints concurrently admitted to automated
-> execution"; every other decision in this ADR is unaffected. Normative wording is owned by
-> `docs/specifications/m0-job-lifecycle-and-scheduling.md` "Job admission and capacity".
+> **Revision note — partial supersession by ADR-0020 (Accepted):** ADR-0020 partially
+> supersedes this section. This section's equivalence between commercial capacity and the
+> count of granted Job-scoped endpoint-exclusivity leases (Jobs in `Running` or `Cancelling`)
+> no longer holds: a Job parked at a planned operator-intervention checkpoint retains its
+> endpoint-exclusivity lease but consumes no automated-execution capacity slot. The generic
+> capacity unit is now "the maximum number of Endpoints concurrently admitted to automated
+> execution." Every other decision in this ADR — including §11's separation of new gated
+> admission from continuation of already-authorized work — is unaffected. Normative wording is
+> owned by `docs/specifications/m0-job-lifecycle-and-scheduling.md` "Job admission and
+> capacity" and "Planned intervention checkpoint".
 
 ### 7. No technical "Full/Unlimited" edition
 

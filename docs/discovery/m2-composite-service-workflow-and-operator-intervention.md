@@ -16,56 +16,66 @@ longer restates them:
   aggregate.** A composed service is one Endpoint's Job with more ordered JobSteps, composed
   at the Application/submission boundary. Reaffirms ADR-0019.
 - **Planned operator-intervention checkpoint; separation of Endpoint exclusivity from
-  automated-execution capacity; safe continuation after intentional hardware replacement.**
-  → ADR-0020 (WHY, `Proposed`);
+  automated-execution capacity; parked work as already-authorized continuation across
+  entitlement expiry/unavailability; safe continuation after intentional hardware
+  replacement.** → ADR-0020 (WHY, Accepted);
   `docs/specifications/m0-job-lifecycle-and-scheduling.md` "Planned intervention checkpoint"
   and "Job admission and capacity" (WHAT);
   `docs/specifications/m0-endpoint-identity-lifecycle.md` "Planned hardware replacement"
   (WHAT).
-- **ADR-0015 §6 capacity-measurement semantic** is revised by ADR-0020; all other ADR-0015
-  commercial-boundary decisions are unchanged.
+- **ADR-0020 partially supersedes ADR-0015 §6's capacity-accounting semantic**; all other
+  ADR-0015 commercial-boundary decisions are unchanged.
 
 ## Unresolved investigation this document still owns
 
-These are **not** decided and must not be turned into contracts without the narrow NTFS
-Technical Spike and explicit owner approval:
+None of the following is decided. They must not be turned into contracts without the relevant
+work below and explicit owner approval.
 
-1. **Typed JobStep classification.** Whether `JobStep` needs a durable "kind"
-   (backup-volume / backup-selective / os-install / debloat / driver-install / restore /
-   validate / operator-intervention) and per-kind precondition/postcondition hooks, and how
-   that is represented. Runtime `Skipped` / `NotApplicable` semantics are explicitly out of
-   scope for now — the working hypothesis is that non-applicable steps are simply absent from
-   a target's Job (resolved at creation), not skipped at runtime.
-2. **Cross-step preservation-sufficiency policy.** When a backup is composed of required and
-   optional preservation groups, which layer owns the fail-closed decision "may the
-   destructive step proceed given these results". Working hypothesis: a precondition on the
-   destructive JobStep, additive to the seven-item gate, never narrowing it. No bypass flow
-   exists in current authority; do not invent one.
-3. **Selective backup model.** Volume/Image vs Selective as JobStep kinds rather than a
-   boolean; Artifact granularity (candidate: one Artifact per operator-meaningful preservation
-   group); the resolved selective-capture-set descriptor (operator request, discovery
-   evidence + timestamp, resolved roots with required/optional flags, Artifact mapping);
-   same-offline-session / stale-selection detection.
-4. **Assisted discovery.** Working principle only: suggestion is advisory; explicit operator
-   inclusion overrides any exclusion heuristic; file extension alone is never preservation
-   authority. Its authorization timing (a distinct non-destructive discovery submission
-   preceding the destructive one) is a future boundary question after the Spike.
-5. **Selective restore correlation and NTFS specifics** — restore destination/SID mapping,
-   path representation for an offline filesystem, reparse points / ACL / ADS / EFS behavior,
-   size estimation accuracy, final backup format, and the re-observed physical disk identity
-   model (WWN/serial/GPT) — all deferred to the Spike / a later Work Package.
+### A. Does NOT depend on the NTFS Spike — resolve when a real provisioning action needs it
+
+Through ordinary ADR / Specification work when the first concrete provisioning action forces
+the question, not before:
+
+- whether `JobStep` needs durable semantic classification at all;
+- the exact `JobStep.kind` representation;
+- `Skipped` / `NotApplicable` lifecycle semantics (working hypothesis: non-applicable steps
+  are simply absent from a target's Job, resolved at creation, not skipped at runtime — but
+  this is not fixed);
+- general typed provisioning-action modeling (os-install, debloat, driver-install, restore,
+  validate) and per-kind precondition/postcondition hooks;
+- which layer owns the fail-closed "may the destructive step proceed given the backup
+  results" decision (working hypothesis: a precondition on the destructive JobStep, additive
+  to the seven-item gate, never narrowing it; no bypass flow — do not invent one).
+
+### B. DOES depend on the NTFS Spike
+
+The Spike bounds what a Selective contract can safely promise:
+
+- offline Selective filesystem discovery (feasibility, tooling, reliability);
+- Artifact granularity for Selective (candidate: one Artifact per operator-meaningful
+  preservation group);
+- resolved capture-scope evidence (operator request, discovery evidence + timestamp, resolved
+  roots with required/optional flags, Artifact mapping);
+- offline path representation (filesystem not mounted at a Windows drive letter);
+- ACL / alternate data streams / EFS behavior in offline file-granular capture;
+- reparse-point / junction / symlink traversal and capture semantics;
+- Selective restore mapping onto a fresh Windows install (destination paths, profile/SID);
+- stale-selection / same-offline-session evidence (source changed between discovery and
+  capture);
+- selected-data size estimation accuracy;
+- feasible preservation metadata;
+- assisted-discovery authorization timing (whether discovery is a distinct non-destructive
+  submission preceding the destructive one). Working principle only: suggestion is advisory;
+  explicit operator inclusion overrides any exclusion heuristic; file extension alone is never
+  preservation authority.
+
+### C. Does NOT belong to the NTFS Spike — future physical-hardware integration
+
+- re-observed physical disk identity: WWN, serial, GPT / composite target identity.
 
 ## Recommended next step for the Selective branch
 
-**One narrow Technical Spike — offline NTFS selective discovery/capture feasibility.** It
-bounds what the resolved-capture-set descriptor and a Selective Artifact contract can safely
-promise; it is **not** a production heuristic catalog and **not** a restore engine. The
-composed-service composition model and the intervention checkpoint do not depend on it.
-
-## #44
-
-Unchanged product conclusion: #44 remains the next M2 UX Work Package under Option B — same
-post-submit per-Endpoint result invariant (one submitted request → independent per-Endpoint
-creation outcomes, no aggregate success/failure), with a representative composed
-reinstall/service mock replacing `Capturar imagem do sistema`, and not depending on
-unresolved Selective mechanics. No repository document needs the full prototype scenario.
+**One narrow Technical Spike — offline NTFS selective discovery/capture feasibility**, scoped
+to group B above. It is **not** a production heuristic catalog and **not** a restore engine.
+The composed-service composition model, the intervention checkpoint, and the capacity
+decision do not depend on it.
