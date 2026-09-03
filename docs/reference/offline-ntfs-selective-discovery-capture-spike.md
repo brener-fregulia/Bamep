@@ -1,10 +1,10 @@
 # Offline NTFS Selective Discovery / Capture — Spike Evidence
 
-Status: **#46 evidence complete; #47 Windows-created-fixture follow-up BLOCKED on an
-evidence dependency** (see the last section). Evidence gathering only.
+Status: **Completed empirical reference.** Evidence gathering only. Covers a Linux-created
+NTFS fixture; Windows-created NTFS behaviour remains an untested evidence gap (see
+*Limitations*).
 
-This document preserves reproducible local evidence for Issue #46, plus (final section) the
-handoff needed to close the Windows-specific gaps under Issue #47. It does **not** define a
+This document preserves reproducible local evidence for Issue #46. It does **not** define a
 Bamep contract. `docs/specifications/m0-data-plane-and-storage-contracts.md` owns Artifact
 integrity/completeness and `capture_consistency`; ADR-0008 owns data-plane rationale;
 ADR-0020 (not reopened) owns the composed-service/intervention model. Anything here that
@@ -396,8 +396,8 @@ case-insensitivity, and dirty volumes.
   case-insensitivity + preservation, 8.3 names, real SIDs / ACLs, genuine reparse points,
   compression, EFS, USN journal, hibernation / dirty state — is **Not tested**. A
   Linux-created (`ntfs-3g`, POSIX-namespace, mapped-root) fixture cannot stand in for
-  these. Issue #47 is the tracked follow-up; it is currently **blocked** — see
-  *Windows-created NTFS interoperability follow-up (#47)* below.
+  these. Follow-up empirical work on a genuine Windows-created (and dirty / hibernated)
+  volume is tracked by Issue #47.
 - **No root, no loop devices, no `mount(8)`** in the Spike environment. Kernel `ntfs3` was
   not exercised at all. `ntfs-3g` mounting required a `podman unshare` user namespace; a
   `podman unshare` that exits can leave the `ntfs-3g` FUSE server alive holding the image.
@@ -425,8 +425,7 @@ case-insensitivity, and dirty volumes.
 - Restore contract and SID / profile mapping onto a fresh Windows install.
 - **A follow-up Spike on a genuine Windows-created (and a dirty / hibernated) NTFS volume**
   is required before a Selective Specification can promise reparse, case, ACL, compression,
-  EFS, or USN behaviour. This is Issue #47; it is **blocked on an evidence dependency** —
-  see the follow-up section below for the fixture-generation handoff.
+  EFS, or USN behaviour. Tracked by Issue #47.
 
 ## Reproduction
 
@@ -446,204 +445,6 @@ session scratchpad and are **not** committed: `build-fixture.sh`, `exp-readonly.
 5. Cleanup: `fusermount3 -u`, then
    `ps -eo pid,comm | awk '$2=="ntfs-3g"{print $1}' | xargs -r kill`.
 
-## Windows-created NTFS interoperability follow-up (#47)
-
-Status: **Blocked — evidence dependency.** No experiment in this section has run. Every
-result is **Not tested — pending an owner-generated Windows fixture and a privileged Linux
-read path**. This section does not weaken any #46 finding or limitation; it records the
-handoff so a later session can execute without re-deriving it.
-
-### Execution-host audit (2026-09-03)
-
-- **Observed** — host is Fedora Linux 44 Server, kernel `7.1.10-200.fc44.x86_64`; `ntfs-3g`
-  / `libntfs-3g` / `ntfsprogs` 2026.2.25; kernel `ntfs3` module present.
-- **Observed** — **no Windows and no way to create a Windows fixture here**: no `qemu-img`,
-  `qemu-nbd`, `qemu-system-*`, `libguestfs`/`guestfish`/`virt-*`, `virsh`, VirtualBox; no
-  `/dev/kvm`; no VHD/VHDX/VMDK/qcow2/raw image anywhere on the host; no Windows peer
-  session. (`qemu-user-static`, `qemu-guest-agent` are installed but neither runs a Windows
-  OS.)
-- **Observed** — `sudo` requires a password (non-interactive → unavailable); no loop-device
-  creation, no `mount(8)`. Kernel `ntfs3` cannot be exercised, and no volume
-  mount-acceptance test (dirty / hibernated) can be run.
-
-### Two blockers
-
-1. **No genuine Windows-created NTFS fixture.** Per Issue #47 and the Spike's critical
-   rule, another Linux-created fixture is **not** an acceptable substitute.
-2. **No privileged Linux read path.** The userspace `libntfs-3g` half and `ntfs-3g` FUSE
-   (via `podman unshare`, as in #46) can run unprivileged once a fixture exists, but the
-   kernel `ntfs3` comparison and every mount-acceptance observation need root on some
-   Linux host.
-
-### Owner handoff — Windows fixture generation
-
-Run in a **disposable Windows 10/11 VM, as Administrator**. Targets a **new fixed-size
-`.vhd`** only (a *fixed* VHD file is a raw disk image + a 512-byte trailing footer, so Linux
-reads it losslessly with no conversion tool). Never point this at a physical disk.
-
-```powershell
-$ErrorActionPreference='Stop'
-$Root='C:\bamep-spike'; $Vhd="$Root\bamep-win-ntfs.vhd"; $SizeMB=384
-New-Item -ItemType Directory -Force $Root | Out-Null
-
-@"
-create vdisk file="$Vhd" maximum=$SizeMB type=fixed
-select vdisk file="$Vhd"
-attach vdisk
-"@ | diskpart
-$disk = Get-DiskImage -ImagePath $Vhd | Get-Disk
-if (-not $disk -or $disk.Size -gt 1GB) { throw "refusing unexpected disk $($disk.Number)" }
-Initialize-Disk -Number $disk.Number -PartitionStyle MBR
-$part = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter
-$drv  = "$($part.DriveLetter):"
-Format-Volume -DriveLetter $part.DriveLetter -FileSystem NTFS -NewFileSystemLabel BAMEPWIN -Confirm:$false
-$d = "$drv\Users\Operator\Documents"; New-Item -ItemType Directory -Force "$d\Nested Folder\Deep" | Out-Null
-
-# ordinary names
-'hello world' | Set-Content "$d\normal.txt"; New-Item -ItemType File -Force "$d\empty.txt" | Out-Null
-fsutil file createnew "$d\medium.bin" 3145728 | Out-Null
-'spaces' | Set-Content "$d\name with spaces.txt"
-'unicode' | Set-Content "$d\relat$([char]0xF3)rio-caf$([char]0xE9)-a$([char]0xE7)$([char]0xE3)o.txt"
-'lower' | Set-Content "$d\casetest.txt"
-
-# case behaviour  (record what Windows allows/rejects)
-try { 'CASE' | Set-Content "$d\CASETEST.TXT"; 'COLLISION-ALLOWED' } catch { "collision rejected: $_" }
-New-Item -ItemType Directory -Force "$drv\casedir" | Out-Null
-fsutil file setCaseSensitiveInfo "$drv\casedir" enable
-'a' | Set-Content "$drv\casedir\File.txt"; try { 'b' | Set-Content "$drv\casedir\file.txt" } catch { $_ }
-
-# 8.3
-fsutil 8dot3name query $drv
-'x' | Set-Content "$d\LongName With Spaces And More.txt"
-
-# reparse: junction / dir symlink / file symlink / cycle / escape-pressure (all inside the VM)
-New-Item -ItemType Directory -Force "$drv\link-targets\real" | Out-Null
-'target file' | Set-Content "$drv\link-targets\real\payload.txt"
-cmd /c "mklink /J `"$drv\junction-to-real`" `"$drv\link-targets\real`""
-cmd /c "mklink /D `"$drv\dirsym-to-real`" `"$drv\link-targets\real`""
-cmd /c "mklink `"$drv\filesym-to-payload.txt`" `"$drv\link-targets\real\payload.txt`""
-New-Item -ItemType Directory -Force "$drv\loop\sub" | Out-Null
-cmd /c "mklink /J `"$drv\loop\sub\back`" `"$drv\loop`""
-cmd /c "mklink /J `"$drv\escape-to-system`" `"C:\Windows\System32`""   # target leaves the fixture volume
-
-# ACL / SID  (disposable local principal + built-ins)
-net user BamepSpikeUser 'Disp0sable!x' /add
-icacls "$d\normal.txt" /inheritance:r /grant:r "BamepSpikeUser:(R)" "BUILTIN\Administrators:(F)"
-icacls "$d\name with spaces.txt" /grant:r "BamepSpikeUser:(M)"
-icacls "$drv\link-targets" /save "$Root\acls.txt" /t
-(Get-Acl "$d\normal.txt").Sddl | Set-Content "$Root\sddl-normal.txt"
-
-# ADS (native)
-Set-Content "$d\withads.txt" 'primary stream'
-Set-Content "$d\withads.txt" -Stream 'Zone.Identifier' -Value "[ZoneTransfer]`r`nZoneId=3"
-Add-Content  "$d\withads.txt" -Stream 'note' -Value 'hidden-stream-payload'
-
-# sparse
-fsutil file createnew "$d\sparse.bin" 8388608 | Out-Null
-fsutil sparse setflag "$d\sparse.bin"; fsutil sparse setrange "$d\sparse.bin" 0 8388096
-
-# genuine NTFS compression
-New-Item -ItemType Directory -Force "$drv\compressed" | Out-Null
-compact /c "$drv\compressed" | Out-Null
-1..20000 | %{ 'the quick brown fox jumps over the lazy dog' } | Set-Content "$drv\compressed\text.txt"
-compact /c "$drv\compressed\text.txt" | Out-Null
-compact /q "$drv\compressed\text.txt"
-
-# EFS (optional; disposable user; DO NOT export keys)
-try { 'secret plaintext' | Set-Content "$d\efs-secret.txt"; cipher /e "$d\efs-secret.txt"; cipher /c "$d\efs-secret.txt" }
-catch { "EFS skipped: $_" }
-
-# USN journal + activity
-fsutil usn createjournal m=33554432 a=4194304 $drv
-1..200 | %{ "line $_" | Add-Content "$d\churn.log"
-           if ($_ % 7 -eq 0) { Rename-Item "$d\churn.log" "$d\churn.$_.log"; 'new' | Set-Content "$d\churn.log" } }
-Remove-Item "$d\casetest.txt"; 'x' | Set-Content "$d\late-created.txt"
-
-# --- ground truth to return alongside the image ---
-fsutil fsinfo ntfsinfo $drv        | Set-Content "$Root\ntfsinfo.txt"
-fsutil usn queryjournal $drv       | Set-Content "$Root\usn-query.txt"
-fsutil usn readjournal $drv csv    | Set-Content "$Root\usn-readjournal.csv"
-cmd /c "dir /x /s /a `"$drv\`""     | Set-Content "$Root\dir-x-s.txt"
-Get-ChildItem -Recurse -Force $drv | Get-Item -Stream * -ErrorAction SilentlyContinue |
-  Select FileName,Stream,Length | Export-Csv "$Root\streams.csv" -NoTypeInformation
-(Get-Item "$drv\compressed\text.txt").Attributes | Out-File "$Root\compress-attr.txt"
-foreach ($p in 'junction-to-real','dirsym-to-real','filesym-to-payload.txt','loop\sub\back','escape-to-system') {
-  "=== $p ==="; fsutil reparsepoint query "$drv\$p" } *>> "$Root\reparse.txt"
-
-# clean dismount => pristine baseline, then hash
-Dismount-DiskImage -ImagePath $Vhd
-Get-FileHash $Vhd -Algorithm SHA256 | Tee-Object "$Root\vhd.sha256"
-
-# dirty-state COPY for Experiment G (controlled, copy only)
-Copy-Item $Vhd "$Root\bamep-win-ntfs.DIRTY.vhd"
-Mount-DiskImage -ImagePath "$Root\bamep-win-ntfs.DIRTY.vhd"
-$dd=Get-DiskImage -ImagePath "$Root\bamep-win-ntfs.DIRTY.vhd"|Get-Disk
-$dl=(Get-Partition -DiskNumber $dd.Number|? DriveLetter).DriveLetter
-fsutil dirty set "$dl`:"; fsutil dirty query "$dl`:"
-Dismount-DiskImage -ImagePath "$Root\bamep-win-ntfs.DIRTY.vhd"
-Get-FileHash "$Root\bamep-win-ntfs.DIRTY.vhd" -Algorithm SHA256 | Tee-Object "$Root\vhd-dirty.sha256"
-```
-
-**Experiment H (hibernated / Fast Startup)**: needs a Windows VM that hibernates with this
-data `.vhd` still attached, then a copy of the `.vhd` taken while "hibernated". If that
-cannot be produced safely, record `Not tested — safe disposable reproduction unavailable`.
-
-### Files to return to the Linux environment
-
-`bamep-win-ntfs.vhd`, `bamep-win-ntfs.DIRTY.vhd`, and the whole `C:\bamep-spike\*.txt` /
-`*.csv` / `*.sha256` ground-truth set. Transfer the `.vhd` files **byte-for-byte** (they are
-raw NTFS + footer — do not re-archive their contents through another filesystem). Record the
-SHA-256 values.
-
-### Linux-side steps the next session will run
-
-Unprivileged (works on this host once the `.vhd` is present):
-
-1. `partx -g --bytes -o START,SECTORS,TYPE bamep-win-ntfs.vhd` → NTFS partition start/size.
-2. `dd if=bamep-win-ntfs.vhd of=ntfs.img bs=1M iflag=skip_bytes,count_bytes skip=<START> count=<SECTORS*512>` → carved partition image (no root).
-3. libntfs-3g userspace on `ntfs.img`: `ntfsls -R`, `ntfsinfo -F <path>`, `ntfscat`,
-   `ntfssecaudit`.
-4. `ntfs-3g` FUSE read-only, as in #46: `podman unshare bash -c 'ntfs-3g -o ro,streams_interface=xattr ntfs.img mnt && … && fusermount3 -u mnt'`.
-
-Privileged (**needs a second owner decision** — grant scoped `sudo` on this host, or run in
-WSL2 / a Linux VM with the `.vhd` attached):
-
-5. kernel `ntfs3` read-only: `mount -t ntfs3 -o ro,loop bamep-win-ntfs.vhd /mnt/x` and repeat
-   the enumeration / path / reparse / ADS / compression observations.
-6. dirty volume: mount **`ntfs.img` carved from `bamep-win-ntfs.DIRTY.vhd`** with each of
-   `ntfs-3g` and `ntfs3`; record open / refuse / warn / ro-only / needs-force / log-replay /
-   source-mutation (hash before/after).
-
-### Experiments still owed
-
-| # | Experiment | Status |
-|---|---|---|
-| A | Win32 namespace, case, 8.3, Unicode, path identity | Not tested — pending fixture |
-| B | Genuine reparse objects (junction / symlink / cycle) across libntfs / `ntfs-3g` / `ntfs3` | Not tested — pending fixture |
-| C | Real ACL / SID / security-descriptor visibility and extraction | Not tested — pending fixture |
-| D | Genuine NTFS compression — logical read, digest, metadata, per-candidate | Not tested — pending fixture |
-| E | EFS — Windows state vs offline Linux visibility / readability | Not tested — pending fixture (and may stay Not tested) |
-| F | USN / change-journal evidence for stale-selection detection + its limits | Not tested — pending fixture |
-| G | Dirty volume behaviour per Linux read path | Not tested — pending fixture + privileged path |
-| H | Hibernated / Fast Startup state | Not tested — safe disposable reproduction unavailable |
-| — | `ntfs3` vs `ntfs-3g` vs libntfs matrix (enumeration, paths, case, reparse, ADS, ACL, compression, USN, dirty, ro-safety) | Not tested — pending fixture + privileged path |
-
-### Revalidation of #46 findings against Windows-created NTFS
-
-| #46 finding | Against Windows-created NTFS |
-|---|---|
-| 1 — volume-relative selection independent of mountpoint / drive letter | NOT TESTED — pending fixture |
-| 2 — MFT reference is discovery-time corroboration, not permanent identity | NOT TESTED — pending fixture |
-| 3 — explicit ordinary file/dir selection needs no heuristic | NOT TESTED — pending fixture |
-| 4 — generic archive/copy tools lose important NTFS metadata | NOT TESTED — pending fixture |
-| 5 — Artifact/container digest ≠ resolved-selection completeness | NOT TESTED — pending fixture |
-| 6 — requested / resolved / encountered / captured / verified are distinct | NOT TESTED — pending fixture |
-| 7 — per-object reconciliation is needed for semantic completeness | NOT TESTED — pending fixture |
-| 8 — cheap metadata alone does not prove content freshness | NOT TESTED — pending fixture (USN evidence, Experiment F, may refine this) |
-
-The #46 evidence remains valid **only** for the Linux-created POSIX-namespace fixture it
-used; this follow-up does not extend it to Windows.
-
 ## Related
 
 - `docs/discovery/m2-composite-service-workflow-and-operator-intervention.md` §B — the
@@ -656,5 +457,6 @@ used; this follow-up does not extend it to Windows.
   reopened by this Spike).
 - `docs/reference/transfer-resumability-spike.md` — companion evidence; the
   detect-change ≠ reproduce-capture distinction applies here too.
-- Issue #47 — Windows-created NTFS interoperability follow-up (blocked; handoff recorded in
-  the follow-up section above).
+- Issue #47 — follow-up empirical work on Windows-created NTFS (namespace/case, genuine
+  reparse points, real ACL/SID, compression, EFS, USN journal, dirty/hibernated volumes,
+  `ntfs3` vs `ntfs-3g`); owns that work's scope, dependencies, and fixture procedure.
