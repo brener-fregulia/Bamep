@@ -188,8 +188,8 @@ fresh `mkntfs` image.
 | Alternate Data Streams | **preserved within the `ntfs-3g` toolchain**: each named `$DATA` is exposed as a `user.*` xattr; `tar --xattrs` / `rsync -X` carry it; extraction onto a fresh `ntfs-3g` image recreates the named `$DATA` (confirmed with `ntfsinfo`). Depends on every hop preserving `user.*` xattrs **and** on a stream-name mapping convention — fidelity was imperfect here (`ads:Zone.Identifier` prefixing). |
 | Sparse allocation | **preserved** — 8 MiB logical / 4 KiB allocated survived `rsync -S`, `tar --sparse`, and the round trip; `ntfsinfo` shows sparse flag `0x8000` + compressed-size 4096 |
 | NTFS security descriptor | **observed / capturable as an opaque blob** — `getfattr system.ntfs_acl` returns the raw self-relative `SECURITY_DESCRIPTOR`; per-file Security ID via `ntfsinfo`. `ntfssecaudit` **crashed** on this build (`free(): invalid pointer`). Remap onto a different install (different SIDs) not tested. |
-| NTFS transparent compression | **Unsupported by candidate** — could not create it; reading a genuinely-compressed file not tested |
-| EFS-encrypted content | **Not tested** — cannot construct without Windows + user key |
+| NTFS transparent compression | **Not tested for capture/restore** — the tested fixture-generation path (`ntfs-3g` FUSE, `setfattr system.ntfs_compression`, `chattr +c`) could not produce a genuinely NTFS-compressed file, so reading / capturing / restoring an already-compressed Windows-created file was never exercised |
+| EFS-encrypted content | **Not tested** — could not be constructed without a Windows-created fixture and a user key; offline readability, preservation, and restore behaviour all unverified |
 | Hard links | **Not tested** — not constructed |
 | Object ID / `$UsnJrnl` / `$LogFile` | **Not tested / unavailable** — left empty by `mkntfs`/`ntfs-3g` |
 
@@ -210,10 +210,16 @@ remapped to a new SID namespace) was **not** demonstrated for anything.
 - **Observed** — resolution naturally yields three lists: *requested* (operator text),
   *resolved* (concrete objects, with a `MISSING` marker for entries that do not resolve),
   *captured* (per object: path, size, digest, or `FAILED`).
-- **Inferred** — explicit selection is fully representable as `{volume identity} + {list of
-  path-component sequences} + {per-object resolved facts}`, entirely independent of any
-  "important data" heuristic. A heuristic can only *propose*; the authoritative selection
-  is the explicit resolved list.
+- **Inferred (scoped to the tested fixture and object classes)** — arbitrary *ordinary*
+  file/directory selections in this Linux-created NTFS fixture were representable and
+  capturable as `{volume identity} + {list of volume-relative path-component sequences} +
+  {per-object observed facts}`, with no heuristic involved. This was **not** exercised for
+  genuine Win32-namespace names, 8.3 aliases, real reparse points, Windows-created case
+  behaviour, or other Windows-only object forms — those remain open (see Limitations).
+- The separate, already-accepted product invariant — heuristics may *propose* but must not
+  silently override an explicit operator inclusion — is not established or altered by this
+  Spike; the evidence here only shows that an explicit resolved list is a workable
+  representation for the tested cases.
 
 ### Discovery-to-capture drift
 
@@ -230,14 +236,22 @@ change; and a **forged-metadata** case (same-size content edit followed by `touc
 | mtime (`$STANDARD_INFORMATION`) | useful; oversensitive (fired on a content-identical `touch`), so safe-direction — **but forgeable**: after `touch -m -a`, size + mtime + creation time were all identical while SHA-256 differed → **cheap metadata gave a false "unchanged"** |
 | Creation time | corroborating only — unchanged by content edits, changed on name reuse |
 | `$STANDARD_INFORMATION` MFT-changed time | moved on the forged-mtime edit (not settable via `utimes()`), so tamper-evident against casual tooling — but reset by any later legitimate access, not authoritative |
-| Content digest | **the only signal that caught every real change**, including the forged-metadata case |
+| Full SHA-256 of the observed content | **detected every content mutation exercised** — same-size edit, in-place byte patch, and the forged-metadata case (identical size + mtime + creation time) |
 | NTFS USN change journal (`$UsnJrnl`) | **unavailable** here (empty) — potentially the strongest cheap Windows signal, untested |
 
-- **Inferred** — no cheap metadata tuple is sufficient on its own to prove a discovery is
-  still fresh; only re-reading content (full digest, or at least a bounded sampled digest)
-  is decisive. Metadata comparison is a cheap *fast-fail* that reduces, not eliminates, the
-  digesting required before destructive continuation. "Same path + same size + same mtime"
-  must **not** be treated as "unchanged".
+- **Inferred (scoped to the content-change question tested here)** — none of the cheap
+  metadata tuples exercised (size, mtime, creation time, MFT reference, MFT-changed time)
+  proved that a file's content was still the content seen at discovery; a same-size edit
+  with forged timestamps defeated all of them together. A **full SHA-256 digest of the
+  observed content** did detect every content mutation exercised. This Spike did **not**
+  test a bounded / sampled digest — a sample can miss a mutation outside the sampled
+  regions, so no sampled scheme is claimed here. Nor is a full content digest claimed to be
+  sufficient for other staleness dimensions (directory membership, streams, metadata,
+  reparse semantics) — those are separate and were not covered by this signal.
+- **Inferred** — the cheap metadata comparisons are still useful as a *fast-fail* and as
+  corroboration; they reduce, not eliminate, the content re-reading needed before
+  destructive continuation. "Same path + same size + same mtime" must **not** be treated as
+  "unchanged".
 
 ### Captured-result evidence
 
@@ -333,15 +347,20 @@ case-insensitivity, and dirty volumes.
 2. A read-only `ntfs-3g` mount, and the userspace tools, did not modify the (clean) image.
 3. Mount-path- and drive-letter-independent object identity is available: volume serial +
    exact path-component sequence, with the MFT reference as a discovery-time corroborator.
-4. Explicit arbitrary operator selection is fully representable and capturable independent
-   of any heuristic; heuristics can only propose.
+4. In the tested Linux-created fixture, arbitrary *ordinary* file/directory selections —
+   including a portable executable, a game save under `_cache`, and a `license.key` under
+   `\Windows\Temp` — were explicitly selectable and capturable with no heuristic, using
+   volume-relative path-component sequences plus per-object observed facts. Not generalised
+   to Windows-only object forms.
 5. ADS and sparseness can be represented and round-tripped **within the `ntfs-3g` +
    tar/rsync toolchain**; creation time, DOS attribute bits, and the security descriptor
    are readable but are **not** captured by generic copy tools and must be captured
    explicitly.
-6. No cheap metadata tuple proves discovery freshness; a same-size content edit with
-   forged timestamps defeats size + mtime + creation-time. Content digesting is the only
-   decisive check before destructive continuation.
+6. For the content-change question tested: no cheap metadata tuple proved a file's content
+   was still fresh — a same-size edit with forged timestamps defeated size + mtime +
+   creation time together, while a full SHA-256 of the observed content caught every
+   content mutation exercised. Sampled digests were not tested and are not claimed; other
+   staleness dimensions (membership, streams, metadata, reparse) are separate.
 7. A clean container/Artifact digest does not prove the captured object set equals the
    resolved selection — per-object manifest reconciliation is a distinct requirement.
 8. Isolating an unsupported/failed object to the smallest useful capture unit materially
@@ -356,11 +375,13 @@ case-insensitivity, and dirty volumes.
 - `cp` / `rsync` / `tar` silently drop NTFS **creation time**, **DOS attribute bits**, and
   the **security descriptor**. Capture built on a generic archiver loses them with no
   error.
-- NTFS **transparent compression** could not be produced; reading a compressed file was
-  not tested — capture behaviour on compressed data is unknown.
-- **EFS** not tested — an encrypted file read offline without the key yields ciphertext; a
-  capturer must detect the `ENCRYPTED` attribute and refuse/flag rather than store unusable
-  bytes.
+- NTFS **transparent compression**: the tested fixture-generation path could not create a
+  genuinely compressed file, so capture / restore of already-compressed Windows-created
+  data is **Not tested** — its behaviour is unknown, in either direction.
+- **EFS**: **Not tested** — no Windows-created fixture and no user key were available.
+  Offline readability, preservation semantics, key requirements, and usable restore
+  behaviour are all unverified and need Windows-created-fixture evidence. Whether the NTFS
+  `ENCRYPTED` attribute is observable from the tested tooling was not established.
 - The NTFS **USN change journal** and **object IDs** were empty/unavailable — the
   potentially strongest cheap staleness signal is unproven.
 - ADS stream-name fidelity was imperfect (`ads:` prefixing) in the tested xattr
