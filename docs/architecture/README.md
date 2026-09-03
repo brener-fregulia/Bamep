@@ -20,6 +20,40 @@ Bamep currently has seven Rust crates:
 
 Planned components remain outside Architecture until corresponding code exists.
 
+## Bamep Web (Presentation foundation)
+
+`web/` is the Bamep operator-console Presentation client, an independently versioned
+component outside the Rust workspace. It is implemented with Svelte 5 and SvelteKit under
+strict TypeScript, styled with Tailwind CSS v4, and built by `@sveltejs/adapter-static`
+into a fully static, client-rendered SPA (`ssr = false`, no prerendering). The build
+output (`web/build/`) is a single `index.html` application-shell fallback plus
+fingerprinted `_app/immutable/` assets and `static/` files — no server bundle or runtime
+handler. This is the shape ADR-0017's future `bamepd` rule expects (HTML navigation misses
+resolve to the application shell, which the client router then routes, including future
+deep links such as `/endpoints/LAB-03`). `npm` with a committed `package-lock.json` is the
+dependency boundary; Vitest is the test runner.
+
+Implemented at this stage:
+
+- the operator-console application shell — product identity, a persistent sidebar, and
+  route-aware active navigation among `Endpoints`, `Operações`, `Atenção`, and
+  `Configurações`, with a fluid content area that carries no global `max-width`;
+- a small local localization boundary (`src/lib/i18n/`) rendering `pt-BR`, structured so a
+  later `en-US` catalog needs no call-site changes;
+- a local design-token layer (`src/lib/styles/app.css`) covering only what the shell uses,
+  dark by default with light values under `prefers-color-scheme`;
+- self-hosted fonts, so the build needs no runtime network access.
+
+The component operates entirely on local foundation/placeholder state. It performs no HTTP
+requests, defines no Administrative API client, and mirrors no Server/Domain types.
+Administrative API v1 integration (contract owned by
+`m0-administrative-api-web-read-contract.md`) and the `bamepd` static-serving integration
+(ADR-0017) remain unimplemented; feature routes contain localized placeholders only, and
+the #41–#44 product flows are not implemented.
+
+ADR-0016 owns the Presentation stack, static-delivery model, and platform-boundary
+rationale; this section records only what now exists in `web/`.
+
 ## Dependency boundaries
 
 The implemented structure preserves these rules:

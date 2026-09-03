@@ -1,0 +1,75 @@
+@import 'tailwindcss';
+
+/* Self-hosted for offline operation (no runtime font CDN). Latin + Latin-ext
+   subsets cover pt-BR and the planned en-US locale. */
+@import '@fontsource/ibm-plex-sans/latin-400.css';
+@import '@fontsource/ibm-plex-sans/latin-500.css';
+@import '@fontsource/ibm-plex-sans/latin-600.css';
+@import '@fontsource/ibm-plex-sans/latin-700.css';
+@import '@fontsource/ibm-plex-sans/latin-ext-400.css';
+@import '@fontsource/ibm-plex-sans/latin-ext-500.css';
+@import '@fontsource/ibm-plex-sans/latin-ext-600.css';
+@import '@fontsource/ibm-plex-sans/latin-ext-700.css';
+
+/*
+ * Bamep Presentation design tokens.
+ *
+ * ADR-0016 layering: tokens -> primitives -> semantic patterns -> feature UI.
+ * This WP materialises only the tokens the operator-console shell actually
+ * uses. The palette continues the accepted #41-#44 prototype direction:
+ * restrained dark operator console, subdued surfaces/borders, one blue accent.
+ * Success/attention tokens are intentionally deferred until a feature needs
+ * them.
+ *
+ * Dark is the committed default. Light values are provided structurally under
+ * `prefers-color-scheme` so a future light theme is a token change, not a
+ * component rewrite; this WP does not add a theme-switch interaction.
+ */
+@theme {
+	--font-sans:
+		'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+
+	--color-bmp-ground: #10131a;
+	--color-bmp-surface: #181c25;
+	--color-bmp-surface-2: #1f242f;
+	--color-bmp-border: #2a303c;
+	--color-bmp-border-strong: #3b424f;
+	--color-bmp-ink: #e6e9f0;
+	--color-bmp-ink-soft: #a3abbb;
+	--color-bmp-ink-faint: #6f7889;
+	--color-bmp-accent: #8aa1ec;
+	--color-bmp-accent-strong: #a3b4f0;
+	--color-bmp-selected: #1e2740;
+}
+
+@media (prefers-color-scheme: light) {
+	:root {
+		--color-bmp-ground: #f5f6f8;
+		--color-bmp-surface: #ffffff;
+		--color-bmp-surface-2: #f0f2f5;
+		--color-bmp-border: #e2e5eb;
+		--color-bmp-border-strong: #cbd0da;
+		--color-bmp-ink: #1b2030;
+		--color-bmp-ink-soft: #586074;
+		--color-bmp-ink-faint: #8b93a4;
+		--color-bmp-accent: #2c4bb0;
+		--color-bmp-accent-strong: #233d92;
+		--color-bmp-selected: #e9edfa;
+	}
+}
+
+@layer base {
+	html {
+		background-color: var(--color-bmp-ground);
+		color: var(--color-bmp-ink);
+		font-family: var(--font-sans);
+		-webkit-font-smoothing: antialiased;
+		text-rendering: optimizeLegibility;
+	}
+
+	:focus-visible {
+		outline: 2px solid var(--color-bmp-accent);
+		outline-offset: 2px;
+		border-radius: 3px;
+	}
+}
