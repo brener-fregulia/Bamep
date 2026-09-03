@@ -104,11 +104,21 @@ Two points are decisions, not mechanics:
   "continuation of already-authorized work" and shields the latter from entitlement expiry,
   later-discovered invalidity, and commercial-platform unavailability; post-checkpoint
   readmission of a parked Job is in that "continuation" category. The parked Job still waits
-  for a free slot, never preempts currently executing work, and — while a currently valid
-  capacity policy exists — waits until its continuation fits within that policy. A valid
-  capacity reduction delays continuation; it never fails the parked Job. Whether an
-  implementation must retain the last valid policy for already-authorized work, and how, is
-  implementation-time and not decided here.
+  for a free slot and never preempts currently executing work.
+- **A currently valid capacity policy cannot be a precondition for that continuation.** An
+  entitlement can expire or become unreachable while a technician spends hours or days on a
+  disk swap; if continuation then required a currently valid policy, the accepted
+  "already-authorized work must not be stranded" invariant would contradict itself.
+  Continuation therefore resolves against a stable capacity reference: the current effective
+  policy when a newer valid one exists (a valid reduction included — it then governs and may
+  delay continuation, without failing the Job), and otherwise the last valid policy applicable
+  to that installation and work. A newer entitlement artifact that is present but invalid or
+  unverifiable is not a capacity authority and does not replace or erase that reference; new
+  commercially gated admission still fails closed. Readmission never oversubscribes the
+  governing value and never bypasses a safety gate. The architecture requires only that this
+  last valid capacity reference remain semantically available for already-authorized
+  continuation; the mechanism (last verified entitlement, a persisted effective-policy
+  projection, a per-installation or per-Job reference, or an equivalent) is implementation-time.
 
 ### 4. Intentional hardware replacement does not create a new Endpoint
 
@@ -195,8 +205,9 @@ representation is chosen later, alongside the still-open JobStep-classification 
 - Bulk cancellation (Application fan-out keyed by `submission_id`), operator-submission
   correlation, the seven-item destructive gate, and every Job/JobStep/Attempt state and
   transition are unchanged.
-- Left open: the exact durable representation of the parked condition; JobStep semantic
-  classification; and all Selective-backup questions — see the Issue #45 Discovery.
+- Left open: the exact durable representation of the parked condition; the concrete mechanism
+  by which the last valid capacity reference is retained; JobStep semantic classification; and
+  all Selective-backup questions — see the Issue #45 Discovery.
 
 ## Related architecture
 

@@ -217,15 +217,29 @@ work, not a new commercial authorization of the Job. Parking does not revoke the
 authorization the Job established at admission: post-checkpoint readmission is "continuation
 of already-authorized work" in the sense of ADR-0015 §11, so it is never blocked by
 entitlement expiry, later-discovered invalidity, or commercial-platform unavailability, and
-lack of capacity is never a Job failure. The parked Job still waits for a free slot, never
-preempts currently executing work, and — while a currently valid capacity policy exists —
-waits until its continuation fits within that policy; a valid capacity reduction delays
-continuation but never fails the parked Job.
+lack of capacity is never a Job failure. The parked Job still waits for a free slot and never
+preempts currently executing work.
 
-This section defines the observable behavior above. It does not decide whether the parked
-condition is a new JobStep state or an existing state plus durable checkpoint metadata, nor
-whether and how an implementation retains the last valid capacity policy for already-authorized
-work; those are implementation-time. Rationale is owned by ADR-0020.
+The capacity value governing this readmission is:
+
+- the current effective automated-execution capacity policy when a newer valid one exists — a
+  valid reduction then governs and may delay continuation further, without ever failing or
+  cancelling the parked Job;
+- otherwise, the last valid automated-execution capacity policy applicable to that
+  installation and to that already-authorized work.
+
+A newer entitlement artifact that is present but invalid or unverifiable is not a capacity
+authority and does not replace or erase that last valid reference. Readmission never
+oversubscribes the governing value and still runs every safety gate. This reference governs
+only continuation of already-authorized work; it never authorizes new commercially gated Job
+admission, which remains fail-closed under an expired, invalid, or absent entitlement
+(ADR-0015 §11).
+
+This section defines the observable behavior above, including that a last valid capacity
+reference must remain semantically available for already-authorized continuation. It does not
+decide whether the parked condition is a new JobStep state or an existing state plus durable
+checkpoint metadata, nor the concrete mechanism by which the last valid capacity reference is
+retained; those are implementation-time. Rationale is owned by ADR-0020.
 
 ## Job admission and capacity
 
