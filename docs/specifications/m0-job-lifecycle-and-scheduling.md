@@ -40,8 +40,8 @@ The Job remains `Cancelling` until execution is known terminal or explicitly res
 
 **Endpoint exclusivity is Job-scoped.**
 - Acquired at `Pending -> Running`; a competing Job for that Endpoint remains `Pending`.
-- Retained across JobSteps, Attempts, retries, cancellation, and `AwaitingReconciliation`.
-- Released only at terminal Job state; never while execution outcome is uncertain.
+- Retained across JobSteps, Attempts, retries, cancellation, `AwaitingReconciliation`, and a planned intervention checkpoint.
+- Released only at terminal Job state; never while execution outcome is uncertain and never merely because the Job is parked at a planned intervention checkpoint.
 
 Bamep does not interleave active Jobs against one Endpoint.
 
@@ -174,11 +174,64 @@ A destructive Attempt resolved to `Indeterminate` requires an explicit recorded 
 
 Exact retry bounds/backoff are implementation-time policy.
 
+## Planned intervention checkpoint
+
+A JobStep may declare a planned point at which automated execution stops and waits for an
+external human physical action (for example, a disk replacement) before the workflow
+continues. This is distinct from `AwaitingReconciliation` — which recovers a **live** Attempt
+whose outcome became uncertain — and from `Failed`/`Cancelling`: the workflow is healthy and
+deliberately paused at a known-good boundary, with no Attempt in flight.
+
+While a Job is parked at such a checkpoint:
+
+- the Job is non-terminal and retains its Job-scoped Endpoint-exclusivity lease; no other Job
+  may be admitted against that Endpoint;
+- no Attempt is executing, and the parked condition alone never makes one so;
+- no Attempt-scoped resource lease (network, storage, CPU/Worker) is held or retained by the
+  parked condition;
+- the Job holds no automated-execution capacity slot (see "Job admission and capacity");
+- the Endpoint may disconnect entirely; the checkpoint state is durable and survives Server
+  restart with no reconciliation, because no Attempt is in flight.
+
+Resuming automated execution past the checkpoint requires all of the following, none inferred
+from another and none satisfied by an operator acknowledgement alone:
+
+1. the same durable Endpoint is recognized through the existing identity/authentication model
+   (`docs/specifications/m0-endpoint-identity-lifecycle.md`);
+2. the recorded operator intervention decision exists, plus any intervention-specific evidence
+   the JobStep declares;
+3. current machine facts are freshly established as applicable: current inventory revision
+   observed and adopted, authoritative current bootstrap re-established, an authenticated
+   Agent session present, and hardware confidence resolved under
+   `docs/specifications/m0-endpoint-identity-lifecycle.md`;
+4. for a destructive continuation, stale target authorization is invalidated and the
+   destructive target is re-resolved and revalidated against current hardware
+   (`docs/specifications/m0-endpoint-identity-lifecycle.md` "Planned hardware replacement" and
+   "Destructive-operation authorization preconditions");
+5. an automated-execution capacity slot is reacquired; if none is available the Job waits and
+   is not failed, and a resuming Job never preempts already executing work;
+6. the complete applicable final pre-dispatch gate runs before any Attempt, unchanged and
+   additive.
+
+This section defines the observable behavior above. It does not decide whether the parked
+condition is a new JobStep state or an existing state plus durable checkpoint metadata; that
+representation is implementation-time. Rationale is owned by ADR-0020.
+
 ## Job admission and capacity
 
 At `Pending -> Running`, the Job must acquire its Endpoint-exclusivity lease.
 
-Admission may also consume an Application-supplied effective capacity policy limiting active Job-scoped Endpoint leases. The Scheduler receives only generic numeric/technical policy, not commercial edition/license concepts. A Job blocked only by capacity remains `Pending`; later capacity-policy reduction does not terminate already `Running` or `Cancelling` Jobs.
+Admission may also consume an Application-supplied effective automated-execution capacity
+policy. This policy limits the number of Endpoints concurrently admitted to automated
+execution — not the number of Job-scoped Endpoint-exclusivity leases, non-terminal Jobs, or
+registered Endpoints (ADR-0015 §6; ADR-0020). A Job consumes one automated-execution slot
+from execution admission until it either reaches a terminal state or is parked at a planned
+intervention checkpoint (see "Planned intervention checkpoint"); a parked Job holds no slot
+and must reacquire one before automated work resumes. The Scheduler receives only generic
+numeric/technical policy, not commercial edition/license concepts. A Job blocked only by
+capacity at first admission remains `Pending`; a Job blocked only by capacity at
+post-checkpoint readmission stays parked. Neither is a Job failure. Later capacity-policy
+reduction does not terminate an already-executing or `Cancelling` Job.
 
 Ordering, fairness, and priority among queued Jobs/leases remain implementation-time.
 
@@ -195,7 +248,8 @@ and does not add or change any Job, JobStep, or Attempt state or transition defi
 
 - partial-failure/skip semantics;
 - DAG/branching/parallel JobSteps;
-- exact scheduling/fairness/priority algorithm;
+- exact scheduling/fairness/priority algorithm, including ordering between a resuming parked Job and fresh `Pending` Jobs competing for a freed automated-execution slot;
+- exact durable representation of a planned intervention checkpoint (new JobStep state vs. existing state plus checkpoint metadata) and checkpoint timeout/abandonment durations;
 - non-exclusivity lease retention during `AwaitingReconciliation`;
 - exact retry bounds/backoff;
 - whether repeated revalidation failure eventually becomes terminal `Failed{PreconditionNotMet}`;
@@ -207,6 +261,7 @@ and does not add or change any Job, JobStep, or Attempt state or transition defi
 - ADR-0006 — Job/JobStep/Attempt and scheduling rationale.
 - ADR-0019 — operator submission boundary correlated to Job creation.
 - ADR-0015 — effective capacity-policy boundary.
+- ADR-0020 — planned intervention checkpoint and the separation of Endpoint exclusivity from automated-execution capacity.
 - `docs/specifications/m0-endpoint-identity-lifecycle.md` — authoritative destructive-operation gate.
 - `docs/specifications/m0-agent-protocol-contract.md` — Agent action/status/cancellation wire contract.
 - `docs/specifications/m0-persistence-observability-and-domain-events.md` — durable state and persist-before-send contract.

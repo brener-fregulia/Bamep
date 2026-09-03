@@ -158,6 +158,34 @@ Identity continuity alone does not override credential state: `CredentialRevoked
 
 Reconnect never implies that an interrupted destructive operation may be replayed or resumed. That decision belongs to the Job lifecycle contract.
 
+## Planned hardware replacement
+
+A workflow may intentionally replace Endpoint hardware — most commonly the system disk — at a
+planned intervention checkpoint (`docs/specifications/m0-job-lifecycle-and-scheduling.md`
+"Planned intervention checkpoint"). This does not create a new Endpoint:
+
+- persistent Endpoint identity is unchanged; the reconnecting Endpoint is resolved through the
+  credential-chain / identity model above, never through disk, NIC, serial, or other
+  inventory evidence;
+- current boot, authenticated Agent session, current inventory revision, and hardware
+  confidence are re-established from fresh observation exactly as for any genuine reboot with
+  a meaningful hardware change — a disk replacement is a meaningful hardware change and does
+  not silently return hardware confidence to `Consistent`;
+- Artifact source provenance already bound to earlier captured data is immutable and
+  continues to describe the pre-replacement source; source provenance and destructive target
+  identity remain independent.
+
+Any destructive-target authorization resolved against the pre-replacement disk is stale and
+must not be reused. Before any destructive Attempt after the replacement, the destructive
+target is re-resolved against current inventory and revalidated under
+"Destructive-operation authorization preconditions" — preconditions 4 (fresh inventory), 5
+(target-disk revalidation), and 6 (consistent hardware confidence) in particular. Ambiguity
+(more than one plausible target disk) or capability shortfall (for example, a replacement
+smaller than required) fails closed.
+
+The concrete re-observed physical disk identity model (WWN/serial/GPT/composite descriptors)
+remains future physical-hardware work and is not defined here.
+
 ## Destructive-operation authorization preconditions
 
 Before any destructive operation executes, **all seven independent preconditions must hold**. None may be inferred from another:
@@ -207,6 +235,7 @@ Implementations must cover at least:
 - ADR-0011 — site trust-anchor establishment.
 - ADR-0012 — runtime credential rotation/recovery rationale.
 - ADR-0014 — credential lookup and BootContext rationale.
+- ADR-0020 — planned intervention checkpoint and safe continuation after intentional hardware replacement.
 - `docs/specifications/m0-agent-protocol-contract.md` — authentication/session wire contract.
 - `docs/specifications/m0-trusted-bootstrap-and-server-fingerprint-contract.md` — trusted-bootstrap verification contract.
 - `docs/specifications/m0-job-lifecycle-and-scheduling.md` — destructive dispatch composition.

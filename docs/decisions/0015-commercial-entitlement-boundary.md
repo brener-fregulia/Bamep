@@ -193,6 +193,14 @@ not a vague term like "supported machines." This capacity constraint does
 connected-but-idle Agents, or historical Endpoints — only the count of
 currently active Job-scoped endpoint-exclusivity leases.
 
+> **Revision note (ADR-0020, Proposed):** this section's equivalence between commercial
+> capacity and the Job-scoped endpoint-exclusivity lease is revised by ADR-0020. A Job parked
+> at a planned operator-intervention checkpoint retains its endpoint-exclusivity lease but
+> consumes no automated-execution capacity slot. When ADR-0020 is accepted, the generic
+> capacity unit becomes "the maximum number of Endpoints concurrently admitted to automated
+> execution"; every other decision in this ADR is unaffected. Normative wording is owned by
+> `docs/specifications/m0-job-lifecycle-and-scheduling.md` "Job admission and capacity".
+
 ### 7. No technical "Full/Unlimited" edition
 
 Bamep itself receives only a numeric effective capacity value, never an
