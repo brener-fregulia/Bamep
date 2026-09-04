@@ -38,18 +38,23 @@ Implemented at this stage:
 - the operator-console application shell — product identity, a persistent sidebar, and
   route-aware active navigation among `Endpoints`, `Operações`, `Atenção`, and
   `Configurações`, with a fluid content area that carries no global `max-width`;
-- a small local localization boundary (`src/lib/i18n/`) rendering `pt-BR`, structured so a
-  later `en-US` catalog needs no call-site changes;
-- a local design-token layer (`src/lib/styles/app.css`) covering only what the shell uses,
-  dark by default with light values under `prefers-color-scheme`;
+- the `/endpoints` fleet list — a dense, selectable Endpoints table rendered from
+  deterministic local presentation fixtures (`src/lib/fixtures/`), with feature-local
+  components under `src/lib/components/endpoints/`; the other feature routes are localized
+  placeholders;
+- a small local localization boundary (`src/lib/i18n/`) rendering `pt-BR` with
+  `{placeholder}` interpolation, structured so a later `en-US` catalog needs no call-site
+  changes;
+- a local design-token layer (`src/lib/styles/app.css`) — shell tokens plus a small set of
+  situation tones — dark by default with light values under `prefers-color-scheme`;
 - self-hosted fonts, so the build needs no runtime network access.
 
-The component operates entirely on local foundation/placeholder state. It performs no HTTP
-requests, defines no Administrative API client, and mirrors no Server/Domain types.
-Administrative API v1 integration (contract owned by
-`m0-administrative-api-web-read-contract.md`) and the `bamepd` static-serving integration
-(ADR-0017) remain unimplemented; feature routes contain localized placeholders only, and
-the #41–#44 product flows are not implemented.
+The component operates entirely on local presentation state and fixtures. It performs no
+HTTP requests, defines no Administrative API client, and mirrors no Server/Domain types;
+the fixtures are demo data, not Simulator output. Administrative API v1 integration
+(contract owned by `m0-administrative-api-web-read-contract.md`) and the `bamepd`
+static-serving integration (ADR-0017) remain unimplemented, and the #42–#44 operation
+flows are not implemented.
 
 ADR-0016 owns the Presentation stack, static-delivery model, and platform-boundary
 rationale; this section records only what now exists in `web/`.

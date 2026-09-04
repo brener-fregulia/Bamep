@@ -15,11 +15,11 @@
  * Bamep Presentation design tokens.
  *
  * ADR-0016 layering: tokens -> primitives -> semantic patterns -> feature UI.
- * This WP materialises only the tokens the operator-console shell actually
- * uses. The palette continues the accepted #41-#44 prototype direction:
- * restrained dark operator console, subdued surfaces/borders, one blue accent.
- * Success/attention tokens are intentionally deferred until a feature needs
- * them.
+ * The palette continues the accepted #41-#44 prototype direction: restrained
+ * dark operator console, subdued surfaces/borders, one blue accent, and a small
+ * set of situation tones (calm, never the loudest thing on screen). Situation
+ * tones and the attention row treatment were added when the Endpoints list (#49)
+ * first needed them.
  *
  * Dark is the committed default. Light values are provided structurally under
  * `prefers-color-scheme` so a future light theme is a token change, not a
@@ -40,6 +40,15 @@
 	--color-bmp-accent: #8aa1ec;
 	--color-bmp-accent-strong: #a3b4f0;
 	--color-bmp-selected: #1e2740;
+
+	/* situation tones */
+	--color-bmp-ok: #5cbe88;
+	--color-bmp-work: #6fb0e6;
+	--color-bmp-enroll: #a99ee8;
+	--color-bmp-attention: #e0a35c;
+	--color-bmp-muted: #8b93a4;
+	--color-bmp-attention-surface: #2a2216;
+	--color-bmp-attention-bar: #c98a44;
 }
 
 @media (prefers-color-scheme: light) {
@@ -55,6 +64,14 @@
 		--color-bmp-accent: #2c4bb0;
 		--color-bmp-accent-strong: #233d92;
 		--color-bmp-selected: #e9edfa;
+
+		--color-bmp-ok: #256d47;
+		--color-bmp-work: #1f5f9e;
+		--color-bmp-enroll: #534aa6;
+		--color-bmp-attention: #8f4e0c;
+		--color-bmp-muted: #606776;
+		--color-bmp-attention-surface: #f8efe2;
+		--color-bmp-attention-bar: #c07a26;
 	}
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createTranslator, defaultLocale, supportedLocales, t } from './index';
+import { createTranslator, defaultLocale, supportedLocales, t, tCount } from './index';
 
 describe('localization boundary', () => {
 	it('ships pt-BR as the only supported locale', () => {
@@ -26,5 +26,23 @@ describe('localization boundary', () => {
 		const translate = createTranslator('pt-BR');
 		// @ts-expect-error - exercising the missing-key path
 		expect(translate('nav.doesNotExist')).toBe('nav.doesNotExist');
+	});
+
+	it('substitutes named placeholders from params', () => {
+		expect(t('endpoints.contact.minutesAgo', { count: 6 })).toBe('há 6 min');
+		expect(t('endpoints.bench', { code: 'A-03' })).toBe('bancada A-03');
+	});
+
+	it('leaves an unmatched placeholder intact', () => {
+		expect(t('endpoints.contact.minutesAgo', { other: 1 })).toBe('há {count} min');
+	});
+
+	it('tCount picks the singular or plural entry', () => {
+		expect(
+			tCount(t, 'endpoints.selection.heading.one', 'endpoints.selection.heading.other', 1)
+		).toBe('1 Endpoint selecionado');
+		expect(
+			tCount(t, 'endpoints.selection.heading.one', 'endpoints.selection.heading.other', 3)
+		).toBe('3 Endpoints selecionados');
 	});
 });
