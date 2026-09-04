@@ -27,6 +27,16 @@ Integration Environment behavior of the selected chain.
 
 This remains intentionally deferred from the completed M0 architecture/contract baseline.
 
+Physical Integration Environment work in #50 and #52 has now established, on one real
+UEFI x86-64 Endpoint, that the isolated Bamep network boundary can complete PXE DHCP
+and network-deliver/execute a Fedora shim → GRUB chain through to a visible inert
+GRUB menu. See `docs/reference/physical-uefi-pxe-boot-chain.md` for the evidence.
+
+This does **not** establish network-delivered WinPE, physical Secure Boot
+qualification, physical portability beyond the one tested Endpoint, or a production
+network-delivery mechanism selection. The remaining question continues to be the
+concrete production path from the network boot boundary into WinPE.
+
 Constraints:
 
 - do not treat the FORGE PoC's GRUB behavior as a Bamep requirement;
