@@ -7,13 +7,16 @@
 //! migration path the running Server uses.
 //!
 //! Requires a real, reachable PostgreSQL instance (ADR-0013). The admin
-//! connection used to create/drop each per-test database defaults to
-//! `postgres://postgres@localhost:5432/postgres` — this machine's local,
-//! trust-authenticated development instance — and can be overridden with
-//! `BAMEP_TEST_PG_ADMIN_URL` for other environments. No production
-//! credential is hardcoded; every database this harness creates or drops
-//! carries the `bamep_wp1_test_` prefix it generates itself, so teardown
-//! never touches a database this harness did not itself create.
+//! connection that creates/drops each per-test database is
+//! `BAMEP_TEST_PG_ADMIN_URL` when set; otherwise it is derived for the
+//! current OS user over the local PostgreSQL Unix socket (peer
+//! authentication — no password, no `pg_hba.conf` change, no hard-coded
+//! username), targeting the `postgres` maintenance database. That role must
+//! be able to CREATE/DROP databases (`docs/development/testing.md`
+//! "PostgreSQL integration tests"). No production credential is hardcoded;
+//! every database this harness creates or drops carries the
+//! `bamep_wp1_test_` prefix it generates itself, so teardown never touches a
+//! database this harness did not itself create.
 //!
 //! Shared across multiple `tests/*.rs` integration-test binaries, each
 //! compiled separately: an item unused by one particular binary (e.g. a
@@ -397,9 +400,65 @@ impl Clock for ManualClock {
     }
 }
 
+/// Admin PostgreSQL connection string for creating/dropping the per-test
+/// databases. `BAMEP_TEST_PG_ADMIN_URL` is the explicit override for any
+/// environment (it may legitimately carry a password). With no override, a
+/// peer-authenticated DSN is derived for the current OS user over the local
+/// PostgreSQL Unix socket — no password, no `pg_hba.conf` change, no
+/// hard-coded username (`docs/development/testing.md` "PostgreSQL integration
+/// tests"). The derived DSN targets the always-present `postgres`
+/// maintenance database; [`with_database`] swaps in each per-test name.
 fn admin_url() -> String {
-    std::env::var("BAMEP_TEST_PG_ADMIN_URL")
-        .unwrap_or_else(|_| "postgres://postgres@localhost:5432/postgres".to_string())
+    if let Some(url) = std::env::var("BAMEP_TEST_PG_ADMIN_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
+    {
+        return url;
+    }
+    #[cfg(unix)]
+    {
+        let user = std::env::var("PGUSER")
+            .or_else(|_| std::env::var("USER"))
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "cannot derive a PostgreSQL admin connection: none of $PGUSER, $USER, or \
+                     $LOGNAME is set.\n\
+                     Set BAMEP_TEST_PG_ADMIN_URL to a DSN whose role can CREATE/DROP \
+                     databases, e.g.\n  \
+                     BAMEP_TEST_PG_ADMIN_URL=postgresql://<role>@%2Frun%2Fpostgresql/postgres"
+                )
+            });
+        let socket = local_pg_socket_dir().replace('/', "%2F");
+        match std::env::var("PGPORT").ok().filter(|p| !p.is_empty()) {
+            Some(port) => format!("postgresql://{user}@{socket}:{port}/postgres"),
+            None => format!("postgresql://{user}@{socket}/postgres"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        panic!(
+            "no default PostgreSQL admin connection on non-Unix.\n\
+             Set BAMEP_TEST_PG_ADMIN_URL to a DSN whose role can CREATE/DROP databases."
+        )
+    }
+}
+
+/// The local PostgreSQL Unix-socket directory: honour `$PGHOST` when it names
+/// an absolute path, otherwise the first conventional location that exists.
+#[cfg(unix)]
+fn local_pg_socket_dir() -> String {
+    if let Ok(pghost) = std::env::var("PGHOST") {
+        if pghost.starts_with('/') {
+            return pghost;
+        }
+    }
+    for candidate in ["/run/postgresql", "/var/run/postgresql"] {
+        if std::path::Path::new(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+    "/tmp".to_string()
 }
 
 fn with_database(url: &str, db_name: &str) -> String {
@@ -425,8 +484,11 @@ impl TestDatabase {
 
         let admin_pool = PgPool::connect(&admin_url).await.unwrap_or_else(|e| {
             panic!(
-                "connect to PostgreSQL admin database at {admin_url} \
-                 (override with BAMEP_TEST_PG_ADMIN_URL): {e}"
+                "cannot connect to the admin PostgreSQL database at `{admin_url}`: {e}\n\
+                 By default this harness connects as the current OS user over the local \
+                 PostgreSQL Unix socket (peer authentication). Ensure PostgreSQL is running \
+                 and a matching role exists, or set BAMEP_TEST_PG_ADMIN_URL \
+                 (see docs/development/testing.md \"PostgreSQL integration tests\")."
             )
         });
         // `name` is generated by this harness (UUID-based), never external
@@ -435,7 +497,15 @@ impl TestDatabase {
         sqlx::query(sqlx::AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))
             .execute(&admin_pool)
             .await
-            .expect("create per-test database");
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to CREATE the per-test database `{name}`: {e}\n\
+                     The PostgreSQL role in the admin connection must be able to CREATE and \
+                     DROP databases (hold CREATEDB, or be a superuser).\n  \
+                     grant it:  ALTER ROLE \"<role>\" CREATEDB;\n  \
+                     or set BAMEP_TEST_PG_ADMIN_URL to a DSN for a role that can."
+                )
+            });
         admin_pool.close().await;
 
         let db_url = with_database(&admin_url, &name);
@@ -460,7 +530,13 @@ impl TestDatabase {
         self.pool.close().await;
         let admin_pool = PgPool::connect(&self.admin_url)
             .await
-            .expect("connect to PostgreSQL admin database for teardown");
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cannot reconnect to the admin PostgreSQL database at `{}` for teardown: \
+                     {e} (the per-test database `{}` may need manual DROP)",
+                    self.admin_url, self.name
+                )
+            });
         sqlx::query(sqlx::AssertSqlSafe(format!(
             r#"DROP DATABASE IF EXISTS "{}" WITH (FORCE)"#,
             self.name

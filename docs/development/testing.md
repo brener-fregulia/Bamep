@@ -366,6 +366,26 @@ They must not be treated as faithful substitutes for behavior that materially de
 physical PXE/DHCP networks, firmware/UEFI, Secure Boot, physical NICs, real storage
 hardware, WinPE, or hardware-specific compatibility.
 
+### PostgreSQL integration tests
+
+The PostgreSQL-backed Server integration tests (`crates/server/tests/`) each create,
+migrate, and drop their own uniquely named `bamep_wp1_test_*` database through the real
+Adapter connect path, then tear it down.
+
+To issue those `CREATE`/`DROP` statements the shared harness first connects to an
+admin/maintenance database. With no configuration it derives that connection for the
+current OS user over the local PostgreSQL Unix socket (peer authentication);
+`BAMEP_TEST_PG_ADMIN_URL` overrides it for any other environment, including a containerised
+disposable PostgreSQL. The connecting role must be able to CREATE and DROP databases — hold
+`CREATEDB`, or be a superuser:
+
+```sql
+ALTER ROLE "<your-os-user>" CREATEDB;
+```
+
+No PostgreSQL password is required or used, and `pg_hba.conf` is not modified. When a
+prerequisite is missing the harness fails with a message naming exactly what is required.
+
 ## Integration Environment
 
 The Bamep Integration Environment exists for behavior that cannot be established
