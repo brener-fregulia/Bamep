@@ -1,0 +1,9 @@
+#!ipxe
+echo Bamep Issue 53 Phase 9d
+show efi/SecureBoot
+kernel http://192.168.99.1:8080/wimboot pause
+initrd http://192.168.99.1:8080/BCD BCD
+initrd http://192.168.99.1:8080/boot.sdi boot.sdi
+initrd http://192.168.99.1:8080/boot.wim boot.wim
+imgstat
+boot

@@ -1,0 +1,14 @@
+# This directory preserves textual/authored harness artifacts only.
+# Never version binaries, upstream tarballs, captures, logs, or runtime
+# output recovered alongside them.
+*.wim
+*.sdi
+BCD
+wimboot
+*.efi
+*.tar.gz
+*.pcap
+*.pcapng
+*.log
+*.lease
+*.leases
