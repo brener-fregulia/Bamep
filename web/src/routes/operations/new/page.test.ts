@@ -91,18 +91,103 @@ describe('/operations/new', () => {
 		expect(screen.queryByRole('button', { name: 'Revisar operação' })).toBeNull();
 	});
 
-	it('Revisar operação never submits or executes: no form, no navigation, only a local notice', async () => {
+	it('Revisar operação transitions from Configurar to Revisar locally, without a form or navigation', async () => {
 		const { container } = renderScenario();
 		expect(container.querySelector('form')).toBeNull();
 
 		const review = screen.getByRole('button', { name: 'Revisar operação' });
 		expect((review as HTMLButtonElement).type).toBe('button');
-		expect(screen.queryByRole('status')).toBeNull();
 
 		await fireEvent.click(review);
 
-		expect(screen.getByRole('status').textContent).toContain('Nada foi enviado ou executado');
-		// still on the configuration surface with the draft in memory
+		expect(container.querySelector('form')).toBeNull();
+		// the editable Configurar controls are gone — this is a distinct stage, not a placeholder overlay
+		expect(screen.queryByRole('checkbox', { name: 'Instalar drivers em todos os alvos' })).toBeNull();
+		expect(screen.queryByRole('button', { name: 'Revisar operação' })).toBeNull();
+		// Revisar is now the active step
+		const reviewStep = screen.getByText('Revisar').closest('li');
+		expect(reviewStep?.getAttribute('aria-current')).toBe('step');
+	});
+
+	it('reflects the exact current in-memory draft on Revisar rather than reseeding the scenario', async () => {
+		renderScenario();
+
+		await fireEvent.click(toggle('Instalar drivers em todos os alvos'));
+		await fireEvent.click(toggle('Preservar e restaurar os dados do usuário em LAB-03'));
+		await fireEvent.click(screen.getByRole('button', { name: 'Revisar operação' }));
+
+		expect(screen.getByText('Reinstalar Windows')).toBeTruthy();
+		expect(screen.getByText('Desativado')).toBeTruthy();
+		expect(screen.getByText('1 Endpoint com ajustes · 2 seguem apenas a configuração comum')).toBeTruthy();
+		// LAB-03's disabled adjustment must show as common-only, not the seeded scenario delta
+		expect(screen.getAllByText('Sem ajustes — segue a configuração comum.').length).toBe(2);
+		expect(screen.getByText('Aplicar o debloat configurado')).toBeTruthy();
+		expect(screen.getByText('Comum + debloat')).toBeTruthy();
+	});
+
+	it('keeps LAB-03/LAB-07/LAB-09 visible with their mixed situations on Revisar', async () => {
+		renderScenario();
+		await fireEvent.click(screen.getByRole('button', { name: 'Revisar operação' }));
+
+		for (const id of ACCEPTANCE_TARGETS) {
+			expect(screen.getAllByText(id).length).toBeGreaterThan(0);
+		}
+		expect(screen.getByText('Disponível')).toBeTruthy();
+		expect(screen.getByText('Requer atenção')).toBeTruthy();
+		expect(screen.getByText('Não pronto')).toBeTruthy();
+		expect(
+			screen.getByText(
+				'LAB-07 possui um resultado anterior ainda incerto — configurar esta operação não resolve a condição.'
+			)
+		).toBeTruthy();
+		expect(
+			screen.getByText('LAB-09 não está pronto para uma nova operação neste momento.')
+		).toBeTruthy();
+	});
+
+	it('communicates on Revisar that acceptance/execution is independent and not guaranteed, without exposing an outcome', async () => {
+		renderScenario();
+		await fireEvent.click(screen.getByRole('button', { name: 'Revisar operação' }));
+
+		expect(
+			screen.getByText(
+				'Enviar não garante aceitação nem execução para todos os Endpoints selecionados; cada um é avaliado de forma independente.'
+			)
+		).toBeTruthy();
+		expect(screen.queryByRole('status')).toBeNull();
+	});
+
+	it('Editar configuração returns to Configurar and preserves the local draft in memory', async () => {
+		renderScenario();
+
+		await fireEvent.click(toggle('Preservar e restaurar os dados do usuário em LAB-03'));
+		await fireEvent.click(screen.getByRole('button', { name: 'Revisar operação' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Editar configuração' }));
+
 		expect(screen.getByText('Ajustes por Endpoint')).toBeTruthy();
+		const configureStep = screen.getByText('Configurar').closest('li');
+		expect(configureStep?.getAttribute('aria-current')).toBe('step');
+		// the earlier toggle-off is still in effect
+		expect((toggle('Preservar e restaurar os dados do usuário em LAB-03') as HTMLInputElement).checked).toBe(
+			false
+		);
+		expect(screen.getByText('1 Endpoint com ajustes · 2 seguem apenas a configuração comum')).toBeTruthy();
+	});
+
+	it('Enviar operação never submits or executes: no form, no HTTP/navigation, only a local notice', async () => {
+		const { container } = renderScenario();
+		await fireEvent.click(screen.getByRole('button', { name: 'Revisar operação' }));
+		expect(container.querySelector('form')).toBeNull();
+
+		const submit = screen.getByRole('button', { name: 'Enviar operação' });
+		expect((submit as HTMLButtonElement).type).toBe('button');
+		expect(screen.queryByRole('status')).toBeNull();
+
+		await fireEvent.click(submit);
+
+		expect(container.querySelector('form')).toBeNull();
+		expect(screen.getByRole('status').textContent).toContain('Nada foi enviado ou executado');
+		// still on Revisar, no fabricated creation/execution outcome
+		expect(screen.getByText('Serviço solicitado')).toBeTruthy();
 	});
 });

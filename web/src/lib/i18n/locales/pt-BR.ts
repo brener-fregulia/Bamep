@@ -141,8 +141,17 @@ export const ptBR = {
 
 	'operationsNew.review.cta': 'Revisar operação',
 	'operationsNew.review.next': 'Próxima etapa: revisar a operação',
+	'operationsNew.review.lead':
+		'Revise a operação antes de enviar. Nada é enviado ou executado nesta etapa.',
+	'operationsNew.review.service.title': 'Serviço solicitado',
+	'operationsNew.review.enabled': 'Ativado',
+	'operationsNew.review.disabled': 'Desativado',
+	'operationsNew.review.backToConfig': 'Editar configuração',
+	'operationsNew.review.submitNote':
+		'Enviar não garante aceitação nem execução para todos os Endpoints selecionados; cada um é avaliado de forma independente.',
+	'operationsNew.review.submit.cta': 'Enviar operação',
 	'operationsNew.review.placeholder':
-		'A revisão será implementada na próxima etapa. Nada foi enviado ou executado; a configuração permanece apenas neste console.',
+		'O envio da operação ainda não foi implementado. Nada foi enviado ou executado; a configuração permanece apenas neste console.',
 
 	'attention.title': 'Atenção',
 	'attention.lead': 'Endpoints e resultados que precisam de revisão do operador.',

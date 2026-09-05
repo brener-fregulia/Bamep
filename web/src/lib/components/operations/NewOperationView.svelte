@@ -5,18 +5,22 @@
 	import { resolveTargets } from './targets';
 	import TargetsPanel from './TargetsPanel.svelte';
 	import ToggleSwitch from './ToggleSwitch.svelte';
+	import AttentionNotice from './AttentionNotice.svelte';
+	import ReviewStage from './ReviewStage.svelte';
 
 	let { requestedIds }: { requestedIds: readonly string[] } = $props();
 
 	const targets = $derived(resolveTargets(requestedIds, fleet));
 	const plans = $derived(planTargets(targets));
 
-	// Local Presentation state only: the common driver choice plus which seeded
-	// per-Endpoint adjustments are currently disabled. Nothing is persisted and
-	// nothing leaves this client.
+	// Local Presentation state only: the common driver choice, which seeded
+	// per-Endpoint adjustments are currently disabled, and which of the two
+	// local stages (Configurar/Revisar) is visible. Nothing is persisted and
+	// nothing leaves this client. Switching `stage` never resets this state —
+	// both stages read/write the same draft owned by this component.
 	let installDrivers = $state(true);
 	let disabledAdjustments = $state<string[]>([]);
-	let reviewRequested = $state(false);
+	let stage = $state<'configure' | 'review'>('configure');
 
 	function adjustmentOn(endpointId: string): boolean {
 		return !disabledAdjustments.includes(endpointId);
@@ -89,24 +93,39 @@
 		>
 			<div>
 				<h1 class="text-xl font-semibold tracking-tight text-bmp-ink">{t('operationsNew.title')}</h1>
-				<p class="mt-1 text-xs text-bmp-ink-faint">{t('operationsNew.lead')}</p>
+				<p class="mt-1 text-xs text-bmp-ink-faint">
+					{stage === 'configure' ? t('operationsNew.lead') : t('operationsNew.review.lead')}
+				</p>
 			</div>
 			<ol class="flex items-center gap-2 text-[11.5px]" aria-label={t('operationsNew.steps.label')}>
 				<li
-					aria-current="step"
-					class="flex items-center gap-1.5 font-semibold text-bmp-accent-strong"
+					aria-current={stage === 'configure' ? 'step' : undefined}
+					class="flex items-center gap-1.5 font-semibold {stage === 'configure'
+						? 'text-bmp-accent-strong'
+						: 'font-medium text-bmp-ink-faint'}"
 				>
 					<span
-						class="flex h-4 w-4 items-center justify-center rounded-full bg-bmp-accent text-[10px] tabular-nums text-bmp-ground"
+						class="flex h-4 w-4 items-center justify-center rounded-full text-[10px] tabular-nums {stage ===
+						'configure'
+							? 'bg-bmp-accent text-bmp-ground'
+							: 'border border-current'}"
 					>
 						1
 					</span>
 					{t('operationsNew.steps.configure')}
 				</li>
 				<li aria-hidden="true" class="text-bmp-border-strong">→</li>
-				<li class="flex items-center gap-1.5 font-medium text-bmp-ink-faint">
+				<li
+					aria-current={stage === 'review' ? 'step' : undefined}
+					class="flex items-center gap-1.5 font-semibold {stage === 'review'
+						? 'text-bmp-accent-strong'
+						: 'font-medium text-bmp-ink-faint'}"
+				>
 					<span
-						class="flex h-4 w-4 items-center justify-center rounded-full border border-current text-[10px] tabular-nums"
+						class="flex h-4 w-4 items-center justify-center rounded-full text-[10px] tabular-nums {stage ===
+						'review'
+							? 'bg-bmp-accent text-bmp-ground'
+							: 'border border-current'}"
 					>
 						2
 					</span>
@@ -115,212 +134,176 @@
 			</ol>
 		</header>
 
-		<div class="grid items-start gap-5 lg:grid-cols-[minmax(0,1fr)_320px]">
-			<div class="flex min-w-0 flex-col gap-3">
-				<div class="divide-y divide-bmp-border rounded-[7px] border border-bmp-border bg-bmp-surface">
-					<section class="px-4 py-3">
-						<h2 class={sectionTitle}>{t('operationsNew.intent.title')}</h2>
-						<div class="mt-2" role="radiogroup" aria-label={t('operationsNew.intent.title')}>
-							<label
-								class="flex items-start gap-3 rounded-md border border-bmp-accent bg-bmp-selected px-3 py-2.5 shadow-[inset_3px_0_0_var(--color-bmp-accent)]"
-							>
-								<input
-									type="radio"
-									name="intent"
-									checked
-									class="mt-0.5 h-[15px] w-[15px] shrink-0 accent-bmp-accent"
-								/>
-								<span class="min-w-0">
-									<span class="block text-[13px] font-semibold text-bmp-ink">
-										{t('operationsNew.intent.reinstallWindows')}
-									</span>
-									<span class="block text-xs leading-snug text-bmp-ink-soft">
-										{t('operationsNew.intent.reinstallWindowsDesc')}
-									</span>
-								</span>
-							</label>
-						</div>
-					</section>
-
-					<section class="px-4 py-3">
-						<div class="flex items-center justify-between gap-3">
-							<h2 class={sectionTitle}>{t('operationsNew.common.title')}</h2>
-							<span class={scopeTag}>{t('operationsNew.common.scope')}</span>
-						</div>
-						<ul class="mt-1 divide-y divide-bmp-border">
-							<li class="flex items-center justify-between gap-4 py-2">
-								<span class="min-w-0">
-									<span class="block text-[13px] font-medium text-bmp-ink">
-										{t('operationsNew.common.reinstall')}
-									</span>
-									<span class="block text-[11.5px] text-bmp-ink-faint">
-										{t('operationsNew.common.reinstallHint')}
-									</span>
-								</span>
-								<span
-									class="inline-flex shrink-0 items-center gap-1.5 text-[11px] font-medium text-bmp-ink-soft"
+		{#if stage === 'review'}
+			<ReviewStage
+				{plans}
+				{targetRows}
+				{installDrivers}
+				{adjustSummary}
+				{attentionTargets}
+				{notReadyTargets}
+				onBack={() => (stage = 'configure')}
+			/>
+		{:else}
+			<div class="grid items-start gap-5 lg:grid-cols-[minmax(0,1fr)_320px]">
+				<div class="flex min-w-0 flex-col gap-3">
+					<div class="divide-y divide-bmp-border rounded-[7px] border border-bmp-border bg-bmp-surface">
+						<section class="px-4 py-3">
+							<h2 class={sectionTitle}>{t('operationsNew.intent.title')}</h2>
+							<div class="mt-2" role="radiogroup" aria-label={t('operationsNew.intent.title')}>
+								<label
+									class="flex items-start gap-3 rounded-md border border-bmp-accent bg-bmp-selected px-3 py-2.5 shadow-[inset_3px_0_0_var(--color-bmp-accent)]"
 								>
-									<svg
-										width="13"
-										height="13"
-										viewBox="0 0 16 16"
-										fill="none"
-										stroke="currentColor"
-										stroke-width="1.8"
-										stroke-linecap="round"
-										stroke-linejoin="round"
-										aria-hidden="true"
-										class="text-bmp-ok"
-									>
-										<path d="m3.5 8.5 3 3 6-7" />
-									</svg>
-									{t('operationsNew.common.included')}
-								</span>
-							</li>
-							<li class="flex items-center justify-between gap-4 py-2">
-								<span class="min-w-0">
-									<span class="block text-[13px] font-medium text-bmp-ink">
-										{t('operationsNew.common.drivers')}
+									<input
+										type="radio"
+										name="intent"
+										checked
+										class="mt-0.5 h-[15px] w-[15px] shrink-0 accent-bmp-accent"
+									/>
+									<span class="min-w-0">
+										<span class="block text-[13px] font-semibold text-bmp-ink">
+											{t('operationsNew.intent.reinstallWindows')}
+										</span>
+										<span class="block text-xs leading-snug text-bmp-ink-soft">
+											{t('operationsNew.intent.reinstallWindowsDesc')}
+										</span>
 									</span>
-									<span class="block text-[11.5px] text-bmp-ink-faint">
-										{t('operationsNew.common.driversHint')}
-									</span>
-								</span>
-								<ToggleSwitch
-									checked={installDrivers}
-									label={t('operationsNew.common.driversToggle')}
-									onchange={(checked) => (installDrivers = checked)}
-								/>
-							</li>
-						</ul>
-					</section>
+								</label>
+							</div>
+						</section>
 
-					<section class="px-4 py-3">
-						<div class="flex items-center justify-between gap-3">
-							<h2 class={sectionTitle}>{t('operationsNew.adjust.title')}</h2>
-							<span class={scopeTag}>{t('operationsNew.adjust.scope')}</span>
-						</div>
-						<p class="mt-0.5 text-[11.5px] text-bmp-ink-faint">{t('operationsNew.adjust.hint')}</p>
-						<ul class="mt-1 divide-y divide-bmp-border">
-							{#each plans as plan (plan.endpoint.id)}
-								<li class="flex items-center gap-4 py-2">
-									<span
-										class="w-[104px] shrink-0 text-[13px] font-semibold tracking-[0.02em] tabular-nums text-bmp-ink"
-									>
-										{plan.endpoint.id}
+						<section class="px-4 py-3">
+							<div class="flex items-center justify-between gap-3">
+								<h2 class={sectionTitle}>{t('operationsNew.common.title')}</h2>
+								<span class={scopeTag}>{t('operationsNew.common.scope')}</span>
+							</div>
+							<ul class="mt-1 divide-y divide-bmp-border">
+								<li class="flex items-center justify-between gap-4 py-2">
+									<span class="min-w-0">
+										<span class="block text-[13px] font-medium text-bmp-ink">
+											{t('operationsNew.common.reinstall')}
+										</span>
+										<span class="block text-[11.5px] text-bmp-ink-faint">
+											{t('operationsNew.common.reinstallHint')}
+										</span>
 									</span>
-									{#if plan.adjustment}
-										{@const text = adjustmentText[plan.adjustment]}
-										{@const on = adjustmentOn(plan.endpoint.id)}
-										<span class="min-w-0 flex-1">
-											<span
-												class="block text-[12.5px] {on
-													? 'font-medium text-bmp-ink'
-													: 'text-bmp-ink-soft'}"
-											>
-												{t(text.nameKey)}
-											</span>
-											<span class="block text-[11.5px] text-bmp-ink-faint">{t(text.hintKey)}</span>
-										</span>
-										<ToggleSwitch
-											checked={on}
-											label={t(text.toggleKey, { id: plan.endpoint.id })}
-											onchange={(checked) => setAdjustment(plan.endpoint.id, checked)}
-										/>
-									{:else}
-										<span class="min-w-0 flex-1 text-xs text-bmp-ink-faint">
-											{t('operationsNew.adjust.none')}
-										</span>
-									{/if}
+									<span
+										class="inline-flex shrink-0 items-center gap-1.5 text-[11px] font-medium text-bmp-ink-soft"
+									>
+										<svg
+											width="13"
+											height="13"
+											viewBox="0 0 16 16"
+											fill="none"
+											stroke="currentColor"
+											stroke-width="1.8"
+											stroke-linecap="round"
+											stroke-linejoin="round"
+											aria-hidden="true"
+											class="text-bmp-ok"
+										>
+											<path d="m3.5 8.5 3 3 6-7" />
+										</svg>
+										{t('operationsNew.common.included')}
+									</span>
 								</li>
-							{/each}
-						</ul>
-						<p
-							class="mt-1 border-t border-bmp-border pt-2 text-[11.5px] tabular-nums text-bmp-ink-soft"
-						>
-							{adjustSummary}
-						</p>
-					</section>
+								<li class="flex items-center justify-between gap-4 py-2">
+									<span class="min-w-0">
+										<span class="block text-[13px] font-medium text-bmp-ink">
+											{t('operationsNew.common.drivers')}
+										</span>
+										<span class="block text-[11.5px] text-bmp-ink-faint">
+											{t('operationsNew.common.driversHint')}
+										</span>
+									</span>
+									<ToggleSwitch
+										checked={installDrivers}
+										label={t('operationsNew.common.driversToggle')}
+										onchange={(checked) => (installDrivers = checked)}
+									/>
+								</li>
+							</ul>
+						</section>
+
+						<section class="px-4 py-3">
+							<div class="flex items-center justify-between gap-3">
+								<h2 class={sectionTitle}>{t('operationsNew.adjust.title')}</h2>
+								<span class={scopeTag}>{t('operationsNew.adjust.scope')}</span>
+							</div>
+							<p class="mt-0.5 text-[11.5px] text-bmp-ink-faint">{t('operationsNew.adjust.hint')}</p>
+							<ul class="mt-1 divide-y divide-bmp-border">
+								{#each plans as plan (plan.endpoint.id)}
+									<li class="flex items-center gap-4 py-2">
+										<span
+											class="w-[104px] shrink-0 text-[13px] font-semibold tracking-[0.02em] tabular-nums text-bmp-ink"
+										>
+											{plan.endpoint.id}
+										</span>
+										{#if plan.adjustment}
+											{@const text = adjustmentText[plan.adjustment]}
+											{@const on = adjustmentOn(plan.endpoint.id)}
+											<span class="min-w-0 flex-1">
+												<span
+													class="block text-[12.5px] {on
+														? 'font-medium text-bmp-ink'
+														: 'text-bmp-ink-soft'}"
+												>
+													{t(text.nameKey)}
+												</span>
+												<span class="block text-[11.5px] text-bmp-ink-faint">{t(text.hintKey)}</span>
+											</span>
+											<ToggleSwitch
+												checked={on}
+												label={t(text.toggleKey, { id: plan.endpoint.id })}
+												onchange={(checked) => setAdjustment(plan.endpoint.id, checked)}
+											/>
+										{:else}
+											<span class="min-w-0 flex-1 text-xs text-bmp-ink-faint">
+												{t('operationsNew.adjust.none')}
+											</span>
+										{/if}
+									</li>
+								{/each}
+							</ul>
+							<p
+								class="mt-1 border-t border-bmp-border pt-2 text-[11.5px] tabular-nums text-bmp-ink-soft"
+							>
+								{adjustSummary}
+							</p>
+						</section>
+					</div>
+
+					<footer
+						class="flex flex-wrap items-center justify-between gap-3 border-t border-bmp-border pt-3"
+					>
+						<a href="/endpoints" class={ghostButton}>{t('operationsNew.backToEndpoints')}</a>
+						<div class="flex items-center gap-3.5">
+							<span class="text-[11.5px] text-bmp-ink-faint">{t('operationsNew.review.next')}</span>
+							<button type="button" class={primaryButton} onclick={() => (stage = 'review')}>
+								{t('operationsNew.review.cta')}
+								<svg
+									width="14"
+									height="14"
+									viewBox="0 0 16 16"
+									fill="none"
+									stroke="currentColor"
+									stroke-width="1.8"
+									stroke-linecap="round"
+									stroke-linejoin="round"
+									aria-hidden="true"
+								>
+									<path d="M6 3.5 10.5 8 6 12.5" />
+								</svg>
+							</button>
+						</div>
+					</footer>
 				</div>
 
-				<footer
-					class="flex flex-wrap items-center justify-between gap-3 border-t border-bmp-border pt-3"
-				>
-					<a href="/endpoints" class={ghostButton}>{t('operationsNew.backToEndpoints')}</a>
-					<div class="flex items-center gap-3.5">
-						<span class="text-[11.5px] text-bmp-ink-faint">{t('operationsNew.review.next')}</span>
-						<button type="button" class={primaryButton} onclick={() => (reviewRequested = true)}>
-							{t('operationsNew.review.cta')}
-							<svg
-								width="14"
-								height="14"
-								viewBox="0 0 16 16"
-								fill="none"
-								stroke="currentColor"
-								stroke-width="1.8"
-								stroke-linecap="round"
-								stroke-linejoin="round"
-								aria-hidden="true"
-							>
-								<path d="M6 3.5 10.5 8 6 12.5" />
-							</svg>
-						</button>
-					</div>
-				</footer>
-
-				{#if reviewRequested}
-					<p
-						role="status"
-						class="rounded-[7px] border border-bmp-border bg-bmp-surface-2 px-3.5 py-2.5 text-xs leading-relaxed text-bmp-ink-soft"
-					>
-						{t('operationsNew.review.placeholder')}
-					</p>
-				{/if}
+				<aside class="flex min-w-0 flex-col gap-3 lg:sticky lg:top-4">
+					<TargetsPanel rows={targetRows} />
+					<AttentionNotice {attentionTargets} {notReadyTargets} />
+				</aside>
 			</div>
-
-			<aside class="flex min-w-0 flex-col gap-3 lg:sticky lg:top-4">
-				<TargetsPanel rows={targetRows} />
-
-				{#if attentionTargets.length > 0 || notReadyTargets.length > 0}
-					<section
-						aria-label={t('operationsNew.attention.title')}
-						class="rounded-[7px] border border-bmp-border border-l-[3px] border-l-bmp-attention-bar bg-bmp-surface px-3.5 py-2.5"
-					>
-						<h2 class="flex items-center gap-2 text-[12.5px] font-semibold text-bmp-ink">
-							<svg
-								width="14"
-								height="14"
-								viewBox="0 0 16 16"
-								fill="none"
-								stroke="currentColor"
-								stroke-width="1.6"
-								aria-hidden="true"
-								class="shrink-0 text-bmp-attention"
-							>
-								<path d="M8 2.4 14.4 13.2H1.6L8 2.4Z" stroke-linejoin="round" />
-								<path d="M8 6.2v3.2" stroke-linecap="round" />
-								<circle cx="8" cy="11.2" r=".6" fill="currentColor" stroke="none" />
-							</svg>
-							{t('operationsNew.attention.title')}
-						</h2>
-						<ul class="mt-1.5 flex flex-col gap-1">
-							{#each attentionTargets as target (target.id)}
-								<li class="text-[12px] leading-snug text-bmp-ink">
-									{t('operationsNew.attention.uncertain', { id: target.id })}
-								</li>
-							{/each}
-							{#each notReadyTargets as target (target.id)}
-								<li class="text-[12px] leading-snug text-bmp-ink">
-									{t('operationsNew.attention.notReady', { id: target.id })}
-								</li>
-							{/each}
-						</ul>
-						<p class="mt-2 border-t border-bmp-border pt-2 text-[11px] leading-snug text-bmp-ink-soft">
-							{t('operationsNew.attention.eligibility')}
-						</p>
-					</section>
-				{/if}
-			</aside>
-		</div>
+		{/if}
 	</div>
 {/if}
