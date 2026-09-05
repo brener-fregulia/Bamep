@@ -62,7 +62,18 @@ describe('/endpoints', () => {
 		expect(screen.getByText('3 selecionados')).toBeTruthy();
 
 		const link = screen.getByRole('link', { name: 'Nova operação' });
-		expect(link.getAttribute('href')).toBe('/operations/new');
+		expect(link.getAttribute('href')).toBe(
+			'/operations/new?target=LAB-03&target=LAB-07&target=LAB-09'
+		);
+	});
+
+	it('hands off selected targets in deterministic fleet order regardless of click order', async () => {
+		render(Page);
+		await fireEvent.click(rowCheckbox('LAB-09'));
+		await fireEvent.click(rowCheckbox('LAB-03'));
+
+		const link = screen.getByRole('link', { name: 'Nova operação' });
+		expect(link.getAttribute('href')).toBe('/operations/new?target=LAB-03&target=LAB-09');
 	});
 
 	it('deselecting a row updates the count and breakdown', async () => {

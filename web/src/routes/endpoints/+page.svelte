@@ -1,17 +1,20 @@
 <script lang="ts">
 	import EndpointsTable from '$lib/components/endpoints/EndpointsTable.svelte';
+	import { newOperationHref } from '$lib/components/operations/targets';
 	import SelectionSummary from '$lib/components/endpoints/SelectionSummary.svelte';
 	import { summarizeSelection } from '$lib/components/endpoints/situation';
 	import { fleet } from '$lib/fixtures/endpoints';
 	import { t, tCount } from '$lib/i18n';
 
 	// Selection is local Presentation state for this feature only. It is not
-	// persisted and is intentionally not carried across routes yet (see
-	// /operations/new).
+	// persisted; the `Nova operação` continuation hands it to /operations/new as
+	// repeated `target` query parameters (Presentation navigation only, #51).
 	let selectedIds = $state<string[]>([]);
 
 	const selectedEndpoints = $derived(fleet.filter((endpoint) => selectedIds.includes(endpoint.id)));
 	const summary = $derived(summarizeSelection(selectedEndpoints));
+	// Fleet order (not click order) keeps the handoff deterministic.
+	const newOperationLink = $derived(newOperationHref(selectedEndpoints.map(({ id }) => id)));
 
 	function toggle(id: string): void {
 		selectedIds = selectedIds.includes(id)
@@ -55,7 +58,7 @@
 				>
 					{badge}
 				</span>
-				<a href="/operations/new" class={primaryButton}>{t('endpoints.newOperation')}</a>
+				<a href={newOperationLink} class={primaryButton}>{t('endpoints.newOperation')}</a>
 			{:else}
 				<button type="button" class="{primaryButton} cursor-not-allowed opacity-45" disabled>
 					{t('endpoints.newOperation')}

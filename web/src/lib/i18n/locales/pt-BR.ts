@@ -81,8 +81,68 @@ export const ptBR = {
 	'operations.lead': 'Operações enviadas pelo operador e seu acompanhamento.',
 
 	'operationsNew.title': 'Nova operação',
-	'operationsNew.lead':
-		'A configuração da operação e a confirmação dos Endpoints selecionados serão feitas aqui.',
+	'operationsNew.lead': 'Configure o serviço para os Endpoints selecionados antes de revisar.',
+
+	'operationsNew.steps.label': 'Etapas do fluxo',
+	'operationsNew.steps.configure': 'Configurar',
+	'operationsNew.steps.review': 'Revisar',
+
+	'operationsNew.guard.heading': 'Nenhum Endpoint válido selecionado',
+	'operationsNew.guard.body':
+		'Volte à lista de Endpoints e selecione ao menos um Endpoint para configurar uma nova operação.',
+	'operationsNew.backToEndpoints': 'Voltar para Endpoints',
+
+	'operationsNew.intent.title': 'Tipo de operação',
+	'operationsNew.intent.reinstallWindows': 'Reinstalar Windows',
+	'operationsNew.intent.reinstallWindowsDesc':
+		'Reinstala o Windows nos Endpoints selecionados. Instalação limpa por padrão; os detalhes de execução são resolvidos pelo Bamep.',
+
+	'operationsNew.common.title': 'Configuração comum',
+	'operationsNew.common.scope': 'Todos os alvos',
+	'operationsNew.common.reinstall': 'Reinstalação do Windows',
+	'operationsNew.common.reinstallHint': 'É o serviço desta operação e não pode ser removida aqui.',
+	'operationsNew.common.included': 'Incluída no serviço',
+	'operationsNew.common.drivers': 'Instalar drivers',
+	'operationsNew.common.driversHint': 'Após a reinstalação, conforme o hardware de cada Endpoint.',
+	'operationsNew.common.driversToggle': 'Instalar drivers em todos os alvos',
+
+	'operationsNew.adjust.title': 'Ajustes por Endpoint',
+	'operationsNew.adjust.scope': 'Somente diferenças',
+	'operationsNew.adjust.hint': 'Apenas o que muda em relação à configuração comum.',
+	'operationsNew.adjust.none': 'Sem ajustes — segue a configuração comum.',
+	'operationsNew.adjust.preserveRestore': 'Preservar e restaurar os dados do usuário',
+	'operationsNew.adjust.preserveRestoreHint':
+		'Os dados são preservados antes da reinstalação e restaurados ao final.',
+	'operationsNew.adjust.preserveRestoreToggle':
+		'Preservar e restaurar os dados do usuário em {id}',
+	'operationsNew.adjust.debloat': 'Aplicar o debloat configurado',
+	'operationsNew.adjust.debloatHint':
+		'Remove aplicativos desnecessários conforme o perfil já configurado.',
+	'operationsNew.adjust.debloatToggle': 'Aplicar o debloat configurado em {id}',
+	'operationsNew.adjust.adjusted.one': '{count} Endpoint com ajustes',
+	'operationsNew.adjust.adjusted.other': '{count} Endpoints com ajustes',
+	'operationsNew.adjust.commonOnly.one': '{count} segue apenas a configuração comum',
+	'operationsNew.adjust.commonOnly.other': '{count} seguem apenas a configuração comum',
+	'operationsNew.adjust.allCommon': 'Todos os Endpoints seguem apenas a configuração comum',
+
+	'operationsNew.targets.title': 'Alvos da operação',
+	'operationsNew.targets.deltaCommon': 'Configuração comum',
+	'operationsNew.targets.deltaPreserve': 'Comum + preservação de dados',
+	'operationsNew.targets.deltaDebloat': 'Comum + debloat',
+	'operationsNew.targets.note':
+		'Selecionar um Endpoint não resolve a condição indicada. A aceitação de cada Endpoint não é garantida.',
+
+	'operationsNew.attention.title': 'Atenção antes de continuar',
+	'operationsNew.attention.uncertain':
+		'{id} possui um resultado anterior ainda incerto — configurar esta operação não resolve a condição.',
+	'operationsNew.attention.notReady': '{id} não está pronto para uma nova operação neste momento.',
+	'operationsNew.attention.eligibility':
+		'A elegibilidade de cada Endpoint é verificada antes de a operação prosseguir.',
+
+	'operationsNew.review.cta': 'Revisar operação',
+	'operationsNew.review.next': 'Próxima etapa: revisar a operação',
+	'operationsNew.review.placeholder':
+		'A revisão será implementada na próxima etapa. Nada foi enviado ou executado; a configuração permanece apenas neste console.',
 
 	'attention.title': 'Atenção',
 	'attention.lead': 'Endpoints e resultados que precisam de revisão do operador.',
