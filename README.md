@@ -16,9 +16,20 @@ Development did not simply continue from FORGE. Bamep was started as a ground-up
 
 ## Project status
 
-The M0 architecture and contract baseline ("Architecture Baseline & Simulated Provisioning Contract") is complete and owner-approved.
+Bamep has moved beyond its initial architecture-and-contract baseline.
 
-Implementation is now the current project phase. Production provisioning is not implemented yet. The first post-M0 implementation work is the simulated vertical slice defined by the approved baseline.
+- **M0** — architecture and contract baseline: complete.
+- **M1** — hardware-independent operational core: established.
+- **M2** — Operator Plane: current development phase.
+
+The Web client foundation and physical Endpoint fleet surface are implemented, with the
+operator workflow progressing through operation configuration and review.
+
+Physical Integration Environment work has also validated diskless UEFI PXE boot under
+Secure Boot through the selected iPXE + wimboot Boot Adapter baseline into functional WinPE.
+
+Bamep remains pre-release. Production provisioning, backup/recovery, the physical
+maintenance Agent, and complete production hardware integration are not yet complete.
 
 The initial production target is:
 
@@ -37,7 +48,13 @@ Bamep is structured around independently evolvable components such as:
 - **Bamep Agent**
 - **Bamep Simulator**
 
-The M0 architecture baseline is established through Specification-Driven Development, Accepted Architecture Decision Records, and Approved Specifications. Implementation follows those contracts.
+The architecture baseline is established through Specification-Driven Development, Accepted Architecture Decision Records, and Approved Specifications. Implementation follows those contracts.
+
+## Development
+
+- [Technical documentation](docs/)
+- [Issues](https://github.com/brener-fregulia/Bamep/issues)
+- [Bamep Development project](https://github.com/users/brener-fregulia/projects/4)
 
 ## License
 
