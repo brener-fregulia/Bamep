@@ -12,3 +12,5 @@ wimboot
 *.log
 *.lease
 *.leases
+*.p7
+*.p7b

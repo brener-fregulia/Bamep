@@ -68,5 +68,7 @@ as its own explicit piece of work.
 Binary, proprietary, and third-party artifacts are not versioned here (see
 `.gitignore`): `boot.wim`, `BCD`, `boot.sdi`, `wimboot`, `.efi` binaries,
 upstream tarballs, packet captures, logs, DHCP leases, and other runtime
-output. These remain only in the original recovery location outside the
-repository.
+output. These artifacts are intentionally excluded from this repository. Their
+provenance and the evidence derived from them remain documented in the
+authoritative References/ADR above; any surviving local copies remain
+outside Git.
