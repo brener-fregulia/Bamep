@@ -847,6 +847,13 @@ deferred to the future physical-disk / hardware-integration milestone, which mus
 schema and authority explicitly before implementation. Nothing in M1 detects a physical
 source-hardware substitution that still reproduces every durably recorded chunk identity.
 
+`m2-endpoint-capture-service-intent-and-source-reference-contract.md` gives `SourceProvenance`
+a concrete structured shape for its new `bamep.m2.endpoint-capture-transfer` action —
+`{inventory_revision_id, source_observation_id, agent_source_id}` — while remaining within
+this same immutable-descriptive category and not becoming an independently re-observed
+hardware-identity credential. This M1 scope description remains historically accurate for
+`bamep.m1.data-plane-transfer`, which that Specification does not modify.
+
 ## Storage capability model
 
 A Storage Target exposes:
@@ -896,10 +903,12 @@ capture-consistency rules.
 - capability token internal serialization/signing format (kept opaque; see "Capability
   opacity");
 - planned hardware-change authorization workflow;
-- exact Artifact provenance schema, and any independently re-observed physical source
-  identity — deferred to the future physical-disk / hardware-integration milestone (only the
-  fail-closed/legitimate-inequality distinction and M1's descriptive-provenance scope are
-  clarified above);
+- a universal Artifact provenance schema for every future action, and any independently
+  re-observed physical source identity — deferred to the future physical-disk /
+  hardware-integration milestone (only the fail-closed/legitimate-inequality distinction and
+  M1's descriptive-provenance scope are clarified above; the concrete schema for the
+  `bamep.m2.endpoint-capture-transfer` action is owned by
+  `m2-endpoint-capture-service-intent-and-source-reference-contract.md`);
 - final production backup/snapshot format;
 - RAID/filesystem/device layout;
 - database schema/index layout;

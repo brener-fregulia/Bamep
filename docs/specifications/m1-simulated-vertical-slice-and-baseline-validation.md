@@ -328,6 +328,11 @@ distinct from any later destructive target identity.
 
 Required fail-closed cases remain those owned by the data-plane and Simulator Specifications.
 
+`bamep.m1.data-plane-transfer` v1's `parameters` schema remains closed and M1/Simulator-scoped
+and is not extended in place. The first product-facing, source-selecting capture action —
+`bamep.m2.endpoint-capture-transfer` — is a new, distinct concrete action defined by
+`m2-endpoint-capture-service-intent-and-source-reference-contract.md`.
+
 ### RF-006 — Headless completion boundary
 
 M1 completion does not require Administrative API or Web implementation. Presentation clients and

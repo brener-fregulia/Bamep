@@ -379,8 +379,14 @@ PostgreSQL/SQLx schema, query, migration, and Adapter conventions belong to
 - lifecycle/wire semantics owned by other Specifications;
 - fixed numeric persistence-performance thresholds;
 - Administrative API routes, HTTP methods, payloads, and the `request_key` wire form;
-- the concrete submission rejection-reason vocabulary;
-- the canonical intent/configuration descriptor format and its equivalence algorithm;
+- the concrete submission rejection-reason vocabulary in general (the one
+  `SourceReferenceStale` per-target creation meaning for `bamep.m2.endpoint-capture` is owned
+  by `m2-endpoint-capture-service-intent-and-source-reference-contract.md`, which still
+  defers that reason's exact Administrative API wire string to future submission-write work);
+- the canonical intent/configuration descriptor format and its equivalence algorithm in
+  general (the concrete descriptor/per-target configuration content for the first intent,
+  `bamep.m2.endpoint-capture`, is owned by
+  `m2-endpoint-capture-service-intent-and-source-reference-contract.md`);
 - exact idempotency-retention duration and post-retention `request_key` reuse policy;
 - actor/IAM attribution of operator submissions.
 
