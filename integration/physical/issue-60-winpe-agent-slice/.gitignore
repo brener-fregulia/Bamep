@@ -1,0 +1,17 @@
+# Issue #60 Physical Integration Spike — build + runtime output.
+# Authored source (probe/, sink/, README) is kept; everything below is
+# regenerable or physical-run output and is never versioned.
+target/
+evidence/
+*.ndjson
+*.log
+*.pcap
+*.pcapng
+*.exe
+*.pdb
+# Lab certificate / credential material must never be committed.
+*.pem
+*.key
+*.crt
+*.der
+smb-share/

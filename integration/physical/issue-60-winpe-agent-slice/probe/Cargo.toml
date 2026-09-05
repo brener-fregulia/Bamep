@@ -1,0 +1,47 @@
+# Issue #60 Physical Integration Spike — WinPE-native Bamep probe.
+#
+# THROWAWAY Spike artifact. NOT production. NOT the Bamep Agent.
+# Standalone workspace (empty [workspace] table below) so it never joins the
+# main Bamep workspace and never inherits its members/lints/profiles.
+[package]
+name = "bamep-winpe-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bamep-winpe-probe"
+path = "src/main.rs"
+
+[dependencies]
+# Checkpoint 2 was std-only. Checkpoint 3 adds exactly the real Agent
+# Protocol v1 transport stack the Server/Simulator use: rustls (TLS 1.3,
+# ring) + sync tungstenite for the WebSocket upgrade. TLS is established
+# explicitly before the upgrade; the Server leaf-cert SHA-256 is pinned.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+sha2 = "0.10"
+# Checkpoint 4: the real Agent Protocol v1 message envelope/framing the
+# Server and Simulator use — no hand-rolled JSON for AuthRequest.
+bamep-agent-protocol = { path = "../../../../crates/agent-protocol" }
+serde_json = "1"
+# Checkpoint 5: read-only physical disk enumeration via Win32.
+getrandom = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

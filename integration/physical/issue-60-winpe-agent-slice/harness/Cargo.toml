@@ -1,0 +1,33 @@
+# Issue #60 Physical Integration Spike — narrow Server-side physical-integration harness.
+#
+# THROWAWAY Spike artifact. Standalone workspace so it never joins the main
+# Bamep workspace. It COMPOSES the existing Server Adapter/Application code
+# (path deps below) to expose the real Agent Protocol v1 transport/gateway
+# boundary for the physical experiment. It is NOT and must not become the
+# production `bamepd` composition root (Issue #60 "Implementation/harness
+# boundary").
+[package]
+name = "bamep-physint-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bamep-physint-harness"
+path = "src/main.rs"
+
+[dependencies]
+bamep-server = { path = "../../../../crates/server" }
+bamep-domain = { path = "../../../../crates/domain" }
+bamep-trusted-bootstrap = { path = "../../../../crates/trusted-bootstrap", features = ["fixture-signing"] }
+bamep-agent-protocol = { path = "../../../../crates/agent-protocol" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "io-util", "signal"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+serde_json = "1"

@@ -1,0 +1,20 @@
+# Issue #60 Physical Integration Spike — lab evidence sink.
+#
+# THROWAWAY Spike artifact. Runs on the Fedora lab Server on the isolated
+# #53 provisioning link ONLY. This is plain-TCP lab diagnostic plumbing for
+# collecting probe NDJSON without manual console transcription; it is NOT the
+# Bamep Agent control plane and carries no authentication or TLS.
+# Standalone workspace so it never joins the main Bamep workspace.
+[package]
+name = "bamep-probe-sink"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bamep-probe-sink"
+path = "src/main.rs"
+
+[dependencies]
