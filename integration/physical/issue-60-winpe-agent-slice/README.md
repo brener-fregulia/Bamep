@@ -121,33 +121,78 @@ cd ../sink  && cargo build --release
 
 ## Run (isolated #53 lab link, Fedora = lab Server, `enp8s0` = 192.168.99.1)
 
-```bash
-# PostgreSQL: a non-superuser role + owned database, peer auth via Unix socket
-#   createuser -s is NOT required; role owning its own db is enough.
-#   DSN: postgresql://<role>@%2Frun%2Fpostgresql/bamep_physint_spike
-createdb bamep_physint_spike
+### 1. PostgreSQL
 
+A non-superuser role that owns its own database is enough — `createuser -s`
+is **not** required, and `pg_hba.conf` is not touched.
+
+```bash
+createdb bamep_physint_spike          # owned by the current OS user
+```
+
+The harness connects, with no env var, via a peer-auth Unix-socket DSN
+derived for the current OS user
+(`postgresql://$USER@%2Frun%2Fpostgresql/bamep_physint_spike`). Override with
+`BAMEP_PHYSINT_DB_URL` for anything else (a value there may carry a password;
+the harness only ever logs scheme/host/database).
+
+### 2. Server-side services (Fedora)
+
+```bash
 cd integration/physical/issue-60-winpe-agent-slice
+mkdir -p evidence                     # shell redirections below need it (git-ignored)
+
 setsid nohup harness/target/release/bamep-physint-harness serve 192.168.99.1:8443 \
   > evidence/harness.serve.log 2>&1 < /dev/null & disown
 setsid nohup sink/target/release/bamep-probe-sink 192.168.99.1:9099 \
   evidence/probe-events.ndjson > evidence/sink.stdout.log 2>&1 < /dev/null & disown
 
-harness/target/release/bamep-physint-harness provision physint-lab   # -> smb-share/agent-credential.txt
+# The server prints its leaf-cert SHA-256 fingerprint on startup, and also
+# writes it to evidence/harness-fingerprint.txt.
+FP=$(cat evidence/harness-fingerprint.txt)
+
+# Mint a disposable enrollment credential (24h TTL) into smb-share/ (git-ignored,
+# owner-only mode). Re-run before each physical attempt.
+harness/target/release/bamep-physint-harness provision physint-lab
 ```
 
-In WinPE (probe + `run-cpN.cmd` delivered over a temporary read-only SMB
-share on 192.168.99.1 — stock WinPE has no `curl`/`certutil`/`where`):
+### 3. Stage probe + credential for WinPE over a temporary read-only SMB share
+
+Stock WinPE has no `curl` / `certutil` / `where`, so delivery is via SMB
+(the Windows SMB redirector always uses TCP 445, a privileged port). Run the
+share server as root — do **not** change `net.ipv4.ip_unprivileged_port_start`:
+
+```bash
+mkdir -p smb-share
+cp probe/target/x86_64-pc-windows-msvc/release/bamep-winpe-probe.exe smb-share/
+# smb-share/agent-credential.txt was written by `provision` above.
+
+# impacket smbserver, run as root; PYTHONPATH points at the invoking user's
+# --user site-packages (adjust the python version):
+sudo env "PYTHONPATH=$HOME/.local/lib/python3.14/site-packages" \
+  "$HOME/.local/bin/smbserver.py" -readonly -smb2support -ip 192.168.99.1 \
+  PROBE "$PWD/smb-share"
+```
+
+Neither `smb-share/` nor its contents are ever tracked (`.gitignore`).
+
+### 4. In WinPE — direct probe invocation (CP6: auth + InventoryReport)
 
 ```bat
 net use \\192.168.99.1\PROBE
-copy /Y \\192.168.99.1\PROBE\run-cp6.cmd X:\
-X:\run-cp6.cmd
+copy /Y \\192.168.99.1\PROBE\bamep-winpe-probe.exe X:\
+copy /Y \\192.168.99.1\PROBE\agent-credential.txt X:\
+X:\bamep-winpe-probe.exe --sink 192.168.99.1:9099 --wss 192.168.99.1:8443 --pin <FP> --auth-credential-file X:\agent-credential.txt --inventory-report
+echo EXITCODE=%ERRORLEVEL%
 ```
+
+`<FP>` is the fingerprint from step 2. Drop `--inventory-report` for CP4/CP5,
+drop `--auth-credential-file` too for CP3, drop `--wss`/`--pin` for CP2.
 
 Probe exit codes: `0` ok · `2` local-file sink failed · `3` TLS/WSS crossing
 failed · `4` authentication not established · `5` inventory-report sequence
-incomplete.
+incomplete (including a #59 RF-4 duplicate-`agent_source_id` epoch, which is
+never sent).
 
 ## Security
 

@@ -15,8 +15,10 @@
 //!   selftest            Checkpoint 3: drive the raw AgentTransportAcceptor
 //!                       over loopback (TLS 1.3 + WSS only, no gateway).
 //!
-//! PostgreSQL DSN: $BAMEP_PHYSINT_DB_URL, default
-//! postgresql://brener@%2Frun%2Fpostgresql/bamep_physint_spike
+//! PostgreSQL: set $BAMEP_PHYSINT_DB_URL. With no env var, a peer-auth
+//! Unix-socket DSN is derived for the current OS user
+//! (postgresql://$USER@%2Frun%2Fpostgresql/bamep_physint_spike). Connection
+//! logs show only scheme/host/database — never userinfo or query.
 
 mod evidence;
 mod pinned;
@@ -44,7 +46,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
 const DEFAULT_BIND: &str = "192.168.99.1:8443";
-const DEFAULT_DB_URL: &str = "postgresql://brener@%2Frun%2Fpostgresql/bamep_physint_spike";
+const DEFAULT_DB_NAME: &str = "bamep_physint_spike";
 const EVIDENCE_FILE: &str = "evidence/harness-events.ndjson";
 const CERT_DER_PATH: &str = "evidence/harness-cert.der";
 const KEY_DER_PATH: &str = "evidence/harness-key.pkcs8.der";
@@ -62,9 +64,44 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// PostgreSQL connection string. Prefer an explicit `$BAMEP_PHYSINT_DB_URL`
+/// (which may legitimately carry a password). With no env var, derive a
+/// peer-auth Unix-socket DSN for the *current* OS user — no hard-coded role
+/// name — targeting the `bamep_physint_spike` database.
 fn db_url() -> String {
-    std::env::var("BAMEP_PHYSINT_DB_URL").unwrap_or_else(|_| DEFAULT_DB_URL.to_string())
+    if let Ok(url) = std::env::var("BAMEP_PHYSINT_DB_URL") {
+        return url;
+    }
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| {
+            eprintln!(
+                "bamep-physint-harness: set $BAMEP_PHYSINT_DB_URL — could not derive the \
+                 current OS user for a peer-auth default"
+            );
+            std::process::exit(1);
+        });
+    format!("postgresql://{user}@%2Frun%2Fpostgresql/{DEFAULT_DB_NAME}")
 }
+
+/// A non-secret description of a PostgreSQL connection target: scheme, host,
+/// and database only. Userinfo and query parameters are dropped because a
+/// future DSN may carry a password in either.
+fn redact_dsn(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("postgresql", url));
+    let rest = rest.split('?').next().unwrap_or(rest);
+    let (authority, db) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    format!("{scheme}://<redacted>@{host}/{db}")
+}
+
+#[cfg(unix)]
+fn restrict_to_owner(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &str) {}
 
 /// Loads a persisted self-signed cert/key pair, or generates and persists a
 /// fresh one so the pinned fingerprint is stable across harness restarts.
@@ -85,6 +122,8 @@ fn load_or_make_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let _ = std::fs::create_dir_all("evidence");
     std::fs::write(CERT_DER_PATH, &cert_der).expect("persist cert der");
     std::fs::write(KEY_DER_PATH, &key_der).expect("persist key der");
+    // Lab Server private key: owner-only.
+    restrict_to_owner(KEY_DER_PATH);
     (
         CertificateDer::from(cert_der),
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)),
@@ -93,7 +132,7 @@ fn load_or_make_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
 
 async fn build_gateway(log: &Log) -> Arc<Gateway> {
     let url = db_url();
-    log.emit("info", "db.connecting", &[("dsn", s(&url))]);
+    log.emit("info", "db.connecting", &[("target", s(redact_dsn(&url)))]);
     let pool = bamep_server::adapters::postgres::connect(&url)
         .await
         .unwrap_or_else(|e| {
@@ -290,7 +329,7 @@ async fn serve(bind: &str) {
 async fn provision(label: &str) {
     let log = Arc::new(Log::new(EVIDENCE_FILE));
     let url = db_url();
-    log.emit("info", "provision.db_connecting", &[("dsn", s(&url))]);
+    log.emit("info", "provision.db_connecting", &[("target", s(redact_dsn(&url)))]);
     let pool = bamep_server::adapters::postgres::connect(&url)
         .await
         .unwrap_or_else(|e| {
@@ -317,17 +356,14 @@ async fn provision(label: &str) {
     // lab share file, never to stdout or the evidence log.
     let wire = credential.to_wire_value();
     let _ = std::fs::create_dir_all("smb-share");
-    // A prior run may have left the file mode 0444; replace it outright.
+    // A prior run may have left the file read-only; replace it outright.
     let _ = std::fs::remove_file(CREDENTIAL_FILE);
     std::fs::write(CREDENTIAL_FILE, format!("{wire}\n")).unwrap_or_else(|e| {
         log.emit("error", "provision.write_failed", &[("error", s(e.to_string()))]);
         std::process::exit(1);
     });
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(CREDENTIAL_FILE, std::fs::Permissions::from_mode(0o444));
-    }
+    // Bearer credential: owner-only.
+    restrict_to_owner(CREDENTIAL_FILE);
 
     log.emit(
         "info",

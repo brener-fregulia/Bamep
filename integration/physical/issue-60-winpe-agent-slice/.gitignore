@@ -1,6 +1,6 @@
 # Issue #60 Physical Integration Spike — build + runtime output.
-# Authored source (probe/, sink/, README) is kept; everything below is
-# regenerable or physical-run output and is never versioned.
+# Authored source (probe/, harness/, sink/, README) is kept; everything below
+# is regenerable or physical-run output and is never versioned.
 target/
 evidence/
 *.ndjson

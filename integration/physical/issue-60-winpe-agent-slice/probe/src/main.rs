@@ -475,6 +475,9 @@ fn run_inventory_reports<S: Read + Write>(log: &Log, ws: &mut tungstenite::WebSo
 
     let epoch_a = sources::enumerate();
     log_source_epoch(log, &epoch_a, "A");
+    if !epoch_selectable(log, &epoch_a, "A") {
+        return false;
+    }
     let inv_a = build_inventory_map(&epoch_a);
 
     let mut ok = send_report("epoch_a_first", inv_a.clone());
@@ -482,11 +485,37 @@ fn run_inventory_reports<S: Read + Write>(log: &Log, ws: &mut tungstenite::WebSo
 
     let epoch_b = sources::enumerate();
     log_source_epoch(log, &epoch_b, "B");
+    if !epoch_selectable(log, &epoch_b, "B") {
+        return false;
+    }
     let inv_b = build_inventory_map(&epoch_b);
     ok &= send_report("epoch_b_fresh", inv_b);
 
     log.emit("info", "inventory.reports_done", &[("all_barriers_ok", F::B(ok))]);
     ok
+}
+
+/// #59 RF-4 fail-closed gate: an epoch whose `capturable_sources` contains a
+/// duplicate `agent_source_id` yields **no** selectable cross-boundary source
+/// projection. The probe must not build or send an `InventoryReport` for it;
+/// `--inventory-report` then fails with the ordinary failure semantics
+/// (probe exit code 5). This is a local structural guard — it does not, and
+/// this Spike did not, physically exercise a malformed-duplicate consumer
+/// path (Issue #60 CP7 remains NOT EXERCISED).
+fn epoch_selectable(log: &Log, epoch: &sources::SourceEpoch, tag: &str) -> bool {
+    if epoch.duplicate_ids.is_empty() {
+        return true;
+    }
+    log.emit(
+        "error",
+        "inventory.aborted_duplicate_source_ids",
+        &[
+            ("epoch", s(tag)),
+            ("duplicate_ids", s(epoch.duplicate_ids.join(","))),
+            ("note", s("#59 RF-4: no selectable cross-boundary projection; InventoryReport not sent")),
+        ],
+    );
+    false
 }
 
 /// Builds the reported `InventoryReport.inventory` object: stable host facts
@@ -552,6 +581,13 @@ fn log_source_epoch(log: &Log, epoch: &sources::SourceEpoch, tag: &str) {
             ],
         );
     }
+    // When an epoch is ambiguous (#59 RF-4), do not even render a
+    // cross-boundary fragment for it — it is not a selectable projection.
+    let fragment = if epoch.duplicate_ids.is_empty() {
+        s(epoch.capture_fragment_json())
+    } else {
+        s("<withheld: duplicate agent_source_id — no selectable projection>")
+    };
     log.emit(
         "info",
         "source.capture_epoch",
@@ -561,7 +597,7 @@ fn log_source_epoch(log: &Log, epoch: &sources::SourceEpoch, tag: &str) {
             ("observation_id_len", F::I(epoch.observation_id.len() as i64)),
             ("capturable_sources_count", F::I(epoch.sources.len() as i64)),
             ("duplicates", F::B(!epoch.duplicate_ids.is_empty())),
-            ("capture_fragment_json", s(epoch.capture_fragment_json())),
+            ("capture_fragment_json", fragment),
         ],
     );
 }

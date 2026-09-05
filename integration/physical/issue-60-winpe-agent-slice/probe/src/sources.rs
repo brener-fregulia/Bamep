@@ -276,7 +276,11 @@ mod win {
                 )
             };
             if ok != 0 && (returned as usize) >= std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
-                let d = unsafe { &*(buf.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR) };
+                // `buf` is a byte array (alignment 1); read the descriptor by
+                // value without forming a reference to unaligned storage.
+                let d: STORAGE_DEVICE_DESCRIPTOR = unsafe {
+                    std::ptr::read_unaligned(buf.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR)
+                };
                 vendor = ascii_at(&buf, d.VendorIdOffset);
                 product = ascii_at(&buf, d.ProductIdOffset);
                 serial = ascii_at(&buf, d.SerialNumberOffset);
