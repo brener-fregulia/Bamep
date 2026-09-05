@@ -95,7 +95,12 @@ every section below):
 - the Administrative API HTTP envelope, routes, methods, and `request_key` wire form (#55
   follow-up owns this; this Specification defines only the typed semantic material that
   contract must canonicalize/reference);
-- the Endpoint collection/inventory read surface (#57);
+- the Endpoint collection/discovery read surface (#57 — `GET /api/admin/v1/endpoints`
+  fleet enumeration only; #57 explicitly keeps richer inventory content out of its own
+  scope and is not amended by this Specification);
+- the future richer inventory/source-selection Administrative API read surface that will
+  expose `capture_source_observation_id`/`capturable_sources` to Web — not yet materialized
+  as an Issue, and distinct from #57;
 - a Web API client or replacing current Presentation fixtures;
 - post-submit result/monitoring UI;
 - IAM/RBAC/MFA/actor attribution;
@@ -233,9 +238,25 @@ topology, friendly names, or generic hardware schema):
 - `capturable_sources` lists every source currently eligible for capture under that epoch,
   each identified only by its `agent_source_id`. An empty array is valid and means no source
   is currently capturable; the Server/Application must never fabricate a synthetic entry.
+- **Duplicate `agent_source_id` values are fail-closed, making the existing RF-3 uniqueness
+  rule ("`agent_source_id` is unique and stable only inside its owning epoch") operational
+  rather than merely declarative.** If `capturable_sources` for one
+  `capture_source_observation_id` epoch contains two or more entries with the same
+  `agent_source_id`, that capture-source projection is invalid/ambiguous for this intent: no
+  `SourceReference` may be selected from it for that `agent_source_id` while the duplication
+  persists. The Application/Web must never pick the first occurrence, deduplicate silently,
+  or otherwise guess a single winner. This is a fail-closed consequence of the uniqueness
+  invariant already stated in RF-3, not a new validation mechanism, and it does not redesign
+  or otherwise constrain the generic opaque `InventoryReport` envelope
+  (`m0-agent-protocol-contract.md` "Inventory reporting") beyond this one already-opaque
+  fragment.
 - The Agent supplies no other cross-boundary source metadata in this fragment. Human-facing
-  presentation of sources (labels, size, type) is explicitly deferred to a future Endpoint
-  inventory read surface (#57) and is not defined here.
+  presentation of sources (labels, size, type) and the operator-selectable projection of
+  `capture_source_observation_id`/`capturable_sources` are deferred to a future, still
+  unmaterialized Administrative API read surface, and are not defined here. This is
+  distinct from #57, which is narrowly scoped to `GET /api/admin/v1/endpoints` fleet/Endpoint
+  collection discovery and explicitly keeps richer inventory content out of its own scope;
+  #57 does not own or expose this fragment.
 
 ## Wire representation for `source_observation_id` and `agent_source_id`
 
@@ -414,21 +435,49 @@ action_id`), and idempotency rules (`m0-agent-protocol-contract.md`) without red
 ## RF-8 — Restart/reconnect/resume semantics
 
 This reconciles directly with `m0-data-plane-and-storage-contracts.md` "Disconnect and
-restart" and "Authorization lifetime versus transfer identity":
+restart" and "Authorization lifetime versus transfer identity", composing with
+`m0-agent-protocol-contract.md` "Renewal and restart", "Idempotency, retry, and uncertain
+delivery", and "Reconnect and reconciliation": after an Agent process restart, the Server
+does not resend the original `ActionDispatch` — it sends `StatusQuery` for any action it
+still considers in flight — and the existing generic transfer-restart contract requires
+Agent-local retention only of `transfer_id`, `artifact_id`, and the owning `action_id`. That
+generic retention is not by itself sufficient for this source-selecting action.
 
-- **Same-boot Agent process restart, mapping restored.** If durable state still authorizes
-  the Transfer (existing rule) **and** the Agent can restore the exact
-  `(source_observation_id, agent_source_id) -> local source` mapping for this Transfer's
-  recorded `SourceProvenance` without ambiguity, the Agent reauthenticates, obtains a new
-  transfer-authorization capability, and continues the same `transfer_id`/`artifact_id`,
-  resuming only chunks not yet durably held — unchanged from the existing chunk-resume
-  contract. No new Transfer lifecycle state is introduced.
-- **Same-boot Agent process restart, mapping cannot be restored.** The Agent must not open a
-  merely similar source. The capture fails/abandons through the existing
-  `Incomplete -> Failed` rule via `ActionResult{Failed, TRANSFER_ABANDONED}` (or the
-  equivalent `#28` reconciliation path when that terminal evidence is lost), exactly as
-  `m0-data-plane-and-storage-contracts.md` "`Incomplete -> Failed` ownership and ordering"
-  already defines. No new lifecycle state or rejection code is introduced for this case.
+**Agent-local source-selection retention.** Same-boot resumability for
+`bamep.m2.endpoint-capture-transfer` additionally requires the Agent to retain/restore,
+associated with that same `transfer_id`/`action_id`, either the originally dispatched
+`source_reference` verbatim or an exactly equivalent local action-state value sufficient to
+recover both `source_observation_id` and `agent_source_id` for that Transfer. Concrete
+Agent-local persistence/storage mechanics remain implementation-time, exactly like the
+existing `transfer_id`/`artifact_id`/`action_id` retention they compose with. The Agent never
+queries the Server for this value — no Agent Protocol message exposes durable
+`SourceProvenance` to the Agent, and this Specification adds none merely for this purpose. If
+this local action/source-selection state has been lost, the Agent does not have authoritative
+local knowledge of which mapping entry the Transfer originally selected, **even if its
+current live mapping happens to contain a textually identical `agent_source_id`**; it must
+never silently resume against that lookalike entry. This is the ordinary local-state-loss
+case already owned by the generic contract: the Agent reports `StatusReport{Unknown}` for
+that `action_id`, and recovery proceeds through the existing Job-lifecycle
+reconciliation/abandonment path below — never a fresh silent source selection, and never a
+new protocol message or Server-side lookup invented to recover it.
+
+- **Same-boot Agent process restart, mapping and local source-selection state restored.** If
+  durable state still authorizes the Transfer (existing rule), the Agent retains/restores its
+  local `source_reference`-equivalent action state per the paragraph above, **and** the Agent
+  can restore the exact `(source_observation_id, agent_source_id) -> local source` mapping for
+  this Transfer's recorded `SourceProvenance` without ambiguity, the Agent reauthenticates,
+  obtains a new transfer-authorization capability, and continues the same
+  `transfer_id`/`artifact_id`, resuming only chunks not yet durably held — unchanged from the
+  existing chunk-resume contract. No new Transfer lifecycle state is introduced.
+- **Same-boot Agent process restart, mapping or local source-selection state cannot be
+  restored.** Whether the local mapping cannot be reconstructed without ambiguity, or the
+  local action/source-selection state itself was lost, the Agent must not open a merely
+  similar source. The capture fails/abandons through the existing `Incomplete -> Failed` rule
+  via `ActionResult{Failed, TRANSFER_ABANDONED}` (or the equivalent `#28` reconciliation path
+  when that terminal evidence is lost, reached through the `StatusReport{Unknown}` path
+  above), exactly as `m0-data-plane-and-storage-contracts.md` "`Incomplete -> Failed`
+  ownership and ordering" already defines. No new lifecycle state or rejection code is
+  introduced for this case.
 - **Genuine reboot.** Not guaranteed resumable by this first contract. This Specification
   introduces no persistent cross-boot physical-source identity; a genuine reboot is treated
   under the same "mapping cannot be restored" rule above unless a future milestone defines a
@@ -507,8 +556,11 @@ This Specification defines no Administrative API HTTP envelope, route, or wire l
 - The exact Administrative API HTTP envelope, `request_key` wire location, and the exact
   wire string for the `SourceReferenceStale` per-target creation rejection reason (#55
   follow-up).
-- The Endpoint/inventory read surface exposing `capturable_sources` for human operator
-  selection (#57).
+- The Administrative API read surface exposing `capture_source_observation_id`/
+  `capturable_sources` for human operator source selection. This is future, still
+  unmaterialized read work, distinct from #57 — #57 is narrowly scoped to
+  `GET /api/admin/v1/endpoints` fleet/Endpoint collection discovery and explicitly keeps
+  richer inventory content out of its own scope.
 - `JobStep.kind` / general typed provisioning-action modeling (unresolved; see
   `docs/discovery/m2-composite-service-workflow-and-operator-intervention.md` group A).
 - Any independently re-observed cross-boot physical source identity (WWN/serial/GPT/
@@ -537,8 +589,13 @@ Packages must validate at minimum:
 - final pre-dispatch revalidation failure returns the JobStep to `Pending` without creating
   an Attempt;
 - Agent-side `SOURCE_REFERENCE_STALE` rejection before any chunk is requested;
-- same-boot restart with mapping restored resumes; same-boot restart/reboot with mapping
-  lost reaches `Incomplete -> Failed` via `TRANSFER_ABANDONED`;
+- same-boot restart with both mapping and local source-selection state restored resumes;
+  same-boot restart/reboot with either the mapping or the local source-selection state lost
+  reaches `Incomplete -> Failed` via `TRANSFER_ABANDONED`, reached through
+  `StatusReport{Unknown}` when local action state was lost, never through silent reselection
+  against a textually similar `agent_source_id`;
+- a `capturable_sources` projection containing a duplicate `agent_source_id` within one
+  epoch yields no selectable `SourceReference` for that id;
 - `SourceProvenance` immutability across the Transfer's lifetime;
 - retry with an identical `request_key` but a different `source_reference` for the same
   target is rejected as non-equivalent (once the #55 submission contract exists).
