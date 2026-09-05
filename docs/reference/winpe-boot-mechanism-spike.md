@@ -257,6 +257,8 @@ Neither network-path failure is evidence of a fundamental Bamep incompatibility.
 
 Physical Integration Environment validation remains necessary for real PXE/DHCP/TFTP, firmware, NIC, and network-delivered WinPE behavior.
 
+Later physical work in Issue #53 established a working network-delivered WinPE path (iPXE + wimboot) under actual physical Secure Boot enforcement; see `docs/reference/physical-secure-boot-winpe-network-delivery.md`. The V1 network-delivery mechanism decision now belongs to ADR-0021. This does not change the conclusions above, which remain correct for the virtualized experiments actually run here.
+
 ## Limits
 
 Not established:
@@ -278,5 +280,7 @@ Secure Boot must not be inferred from this Secure-Boot-off experiment.
 - `docs/reference/secure-boot-hardened-chain-spike.md` — Secure Boot evidence using related tooling/artifacts.
 - `docs/reference/hardware-compatibility.md` — earlier FORGE PoC boot-chain evidence.
 - `docs/reference/driver-provisioning.md` — physical driver/injection evidence.
+- `docs/reference/physical-secure-boot-winpe-network-delivery.md` — later physical network-delivered WinPE evidence under Secure Boot.
 - ADR-0009 — driver-provider integration rationale.
+- ADR-0021 — network-delivered WinPE Boot Adapter baseline mechanism.
 - `docs/specifications/m0-stack-and-boundaries-baseline.md` — Boot Port/Adapter boundary.

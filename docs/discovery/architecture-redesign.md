@@ -14,44 +14,6 @@ material, and GitHub work items according to `docs/development/documentation-pol
 Git history preserves the former discovery baseline. Do not reintroduce resolved M0
 architecture decisions here.
 
-## Network-delivered WinPE production mechanism
-
-Issue #8 established that WinPE is viable under UEFI and recorded detailed empirical
-evidence in `docs/reference/winpe-boot-mechanism-spike.md`.
-
-That evidence does **not** establish the final production network-delivery mechanism.
-
-The remaining question is the concrete production path from Bamep's network boot boundary
-into WinPE on real UEFI x86-64 endpoints, including physical firmware portability and the
-Integration Environment behavior of the selected chain.
-
-This remains intentionally deferred from the completed M0 architecture/contract baseline.
-
-Physical Integration Environment work in #50 and #52 has now established, on one real
-UEFI x86-64 Endpoint, that the isolated Bamep network boundary can complete PXE DHCP
-and network-deliver/execute a Fedora shim → GRUB chain through to a visible inert
-GRUB menu. See `docs/reference/physical-uefi-pxe-boot-chain.md` for the evidence.
-
-This does **not** establish network-delivered WinPE, physical Secure Boot
-qualification, physical portability beyond the one tested Endpoint, or a production
-network-delivery mechanism selection. The remaining question continues to be the
-concrete production path from the network boot boundary into WinPE.
-
-Constraints:
-
-- do not treat the FORGE PoC's GRUB behavior as a Bamep requirement;
-- do not infer physical-firmware portability from virtualized evidence;
-- keep the Secure Boot / trusted-bootstrap security model separate from the choice of
-  network-delivery mechanism;
-- preserve UEFI x86-64 as the V1 firmware scope unless an approved Specification changes it.
-
-When this question is resolved:
-
-- empirical findings belong in `docs/reference/`;
-- a durable architectural choice with meaningful alternatives belongs in an ADR;
-- normative boot behavior belongs in the appropriate Specification;
-- implemented structure belongs in `docs/architecture/`.
-
 ## Future: pre/post provisioning diagnostics
 
 This is a future product use case recorded during M0 review. It is **not** an M0 or M1
@@ -109,6 +71,12 @@ The former discovery baseline also discussed product boundaries, component bound
 runtime topology, language choices, control plane, data plane, persistence, storage,
 scheduling, security, Endpoint identity, artifact lifecycle, observability, packaging,
 versioning, Simulator strategy, and completed Technical Spikes.
+
+The V1 network-delivered WinPE production mechanism question previously tracked here is
+now resolved: ADR-0021 selects an iPXE + wimboot Boot Adapter baseline, physically
+validated in `docs/reference/physical-secure-boot-winpe-network-delivery.md`, and
+`docs/specifications/m0-stack-and-boundaries-baseline.md` owns the resulting boot-orchestration
+boundary statement.
 
 Those subjects must now be read from their authoritative Specifications, ADRs,
 Architecture, Reference material, or GitHub history rather than reconstructed from this

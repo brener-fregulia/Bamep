@@ -175,6 +175,15 @@ intentionally executed no disk-write, partition, format, install, or other
 destructive storage action — but the Spike did not attempt to prove the absence of
 incidental disk reads by firmware, shim, or GRUB.
 
+## Later evidence
+
+Issue #53 subsequently qualified a different physical chain — iPXE + wimboot, not
+Fedora shim/GRUB — through actual physical Secure Boot enforcement into a functional
+WinPE shell, on the same Endpoint. See
+`docs/reference/physical-secure-boot-winpe-network-delivery.md` and ADR-0021. This does
+not change the #50/#52 conclusions above, which remain correctly scoped to the Fedora
+shim/GRUB chain those Issues actually exercised.
+
 ## Related
 
 - Issues #50 and #52 — execution history for this evidence;
@@ -182,8 +191,9 @@ incidental disk reads by firmware, shim, or GRUB.
   evidence;
 - `docs/reference/secure-boot-hardened-chain-spike.md` — virtualized Secure Boot
   evidence;
-- `docs/discovery/architecture-redesign.md` — open network-delivered WinPE
-  production-mechanism question;
+- `docs/reference/physical-secure-boot-winpe-network-delivery.md` — later physical
+  Secure Boot/WinPE network-delivery evidence (Issue #53);
 - ADR-0010 — Secure Boot V1 baseline decision;
+- ADR-0021 — network-delivered WinPE Boot Adapter baseline mechanism;
 - `docs/specifications/m0-stack-and-boundaries-baseline.md` — Boot Port/Adapter
   boundary.

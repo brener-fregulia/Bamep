@@ -134,9 +134,12 @@ mechanisms remain behind that boundary unless explicitly made normative later.
 WinPE UEFI x86-64 viability has been validated in the tested environment; evidence is in
 `docs/reference/winpe-boot-mechanism-spike.md`.
 
-The production network-delivered WinPE mechanism remains unresolved in
-`docs/discovery/architecture-redesign.md` and requires Integration Environment evidence
-before production boot implementation.
+Bamep V1 has an approved network-delivery baseline: ADR-0021 selects an
+iPXE + wimboot Boot Adapter mechanism family, validated physically in
+`docs/reference/physical-secure-boot-winpe-network-delivery.md`. The required outcome
+remains network-delivered WinPE on UEFI x86-64 with the V1 Secure Boot baseline
+preserved; ADR-0021 owns the concrete mechanism rationale and this Specification does not
+duplicate it.
 
 Trusted-bootstrap integrity is orthogonal to network delivery. ADR-0010 owns the Secure
 Boot/trusted-bootstrap decision; it does not select GRUB, iPXE, wimboot, or another
@@ -161,7 +164,8 @@ v1.
 
 This Specification does not define:
 
-- the production WinPE network-delivery mechanism;
+- the concrete WinPE network-delivery procedure/artifacts (ADR-0021) or their empirical
+  basis (`docs/reference/physical-secure-boot-winpe-network-delivery.md`);
 - concrete packaging-pipeline implementation;
 - final backup/snapshot format;
 - Endpoint, Job, persistence, data-plane, Agent Protocol, or Simulator contracts owned by
@@ -178,6 +182,7 @@ This Specification does not define:
 - ADR-0013 — PostgreSQL persistence backend.
 - ADR-0015 — commercial entitlement boundary.
 - ADR-0016 — static SvelteKit Presentation client and platform boundary.
-- `docs/reference/winpe-boot-mechanism-spike.md` — WinPE boot evidence.
-- `docs/discovery/architecture-redesign.md` — unresolved production network-delivery
-  mechanism.
+- ADR-0021 — network-delivered WinPE Boot Adapter baseline mechanism.
+- `docs/reference/winpe-boot-mechanism-spike.md` — virtualized WinPE boot evidence.
+- `docs/reference/physical-secure-boot-winpe-network-delivery.md` — physical Secure
+  Boot/WinPE network-delivery evidence.
