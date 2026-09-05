@@ -1,6 +1,6 @@
 # M2 — Endpoint Capture Service Intent and Source-Reference Contract
 
-Status: **Proposed — pending owner approval**
+Status: **Approved**
 
 ## Classification
 
