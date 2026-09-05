@@ -383,8 +383,10 @@ disposable PostgreSQL. The connecting role must be able to CREATE and DROP datab
 ALTER ROLE "<your-os-user>" CREATEDB;
 ```
 
-No PostgreSQL password is required or used, and `pg_hba.conf` is not modified. When a
-prerequisite is missing the harness fails with a message naming exactly what is required.
+The default Unix-socket peer-authentication path requires no password and does not modify
+`pg_hba.conf`. An explicit `BAMEP_TEST_PG_ADMIN_URL` override may use whatever authentication
+its environment requires. When a prerequisite is missing the harness fails with a message
+naming exactly what is required.
 
 ## Integration Environment
 
