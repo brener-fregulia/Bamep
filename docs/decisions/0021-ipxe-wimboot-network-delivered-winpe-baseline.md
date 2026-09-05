@@ -86,9 +86,9 @@ GRUB → WinPE completion exists; the corresponding virtualized experiment
 also did not establish a working chainload.
 
 ### iPXE + wimboot
-Accepted. It physically reached a functional stock WinPE shell
-(`wpeinit` → `X:\Windows\System32\cmd.exe`) while Secure Boot remained
-enabled and active on the diskless Endpoint throughout.
+Accepted. It physically reached a functional stock WinPE shell, with
+functional wpeinit also demonstrated, while Secure Boot remained enabled
+and active on the diskless Endpoint throughout.
 
 ## Consequences
 

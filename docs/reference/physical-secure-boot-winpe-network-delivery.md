@@ -32,11 +32,14 @@ this Spike's runs:
 - Secure Boot Mode: **Standard**;
 - factory/default keys restored immediately before enabling Secure Boot.
 
-Every successful/attempted chain below ran with iPXE's own `show
-efi/SecureBoot` reporting `efi/SecureBoot:hex = 01` at the point each script
-reached it, corroborating that Secure Boot remained enabled and active for
-the whole physical run, from the firmware's own executing second-stage
-loader, not only from pre-boot configuration intent.
+Firmware pre-boot state showed Secure Boot Enabled/Active/Standard. Every
+successful/attempted chain below then also had iPXE itself report
+`efi/SecureBoot:hex = 01` via `show efi/SecureBoot`, and wimboot separately
+reported Secure Boot enabled; `bootmgfw_EX.efi` also encountered an
+`EFI_SECURITY_VIOLATION`-class rejection before falling back to the classic
+boot manager (see Important negative/reusable findings). Together these
+corroborate that Secure Boot remained enabled and active through the whole
+physical run, not only as pre-boot configuration intent.
 
 No more specific firmware-security semantics (db/dbx contents, revocation
 state, PK/KEK provenance beyond "factory/default") were observed or are
@@ -56,21 +59,23 @@ UEFI PXE
   lineage)
 → Windows Boot Manager
 → WinPE
-→ wpeinit
 → X:\Windows\System32\cmd.exe
 ```
 
 This chain physically completed with Secure Boot enabled the whole time, on
-the diskless Endpoint, over the isolated provisioning link.
+the diskless Endpoint, over the isolated provisioning link. Functional
+`wpeinit` was also demonstrated on this shell (see WinPE completion, below).
 
 The observed shim fallback to a root-level `/ipxe.efi` is preserved as
 **compatibility evidence for this exact tested shim/iPXE build and this exact
-physical firmware**, not as a universal Bamep TFTP-layout requirement. It
-reproduces the interoperability class reported upstream in ipxe/ipxe#1684:
-on firmware where the shim cannot read its own `LoadedImage.FilePath`, it
-cannot derive its sibling second-stage filename and falls back to its
-compiled `DEFAULT_LOADER` (`ipxe.efi`) at the TFTP root instead of the
-directory it was itself loaded from.
+physical firmware**, not as a universal Bamep TFTP-layout requirement. The
+behavior matches the interoperability class documented upstream in
+ipxe/ipxe#1684: serving the exact pinned `snponly.efi` bytes at the TFTP
+root allowed progression past the shim. The exact internal firmware/shim
+cause for why this Endpoint took that fallback path — for example whether
+it could not read its own `LoadedImage.FilePath` — was not independently
+established by this experiment; it was not instrumented beyond the
+observable request/response behavior on the wire.
 
 ## Material tested artifacts
 

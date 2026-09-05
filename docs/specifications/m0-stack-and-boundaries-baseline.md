@@ -129,7 +129,8 @@ Domain must not depend on a concrete network-boot mechanism.
 
 Boot mechanics are Adapter concerns coordinated through Application-level Boot
 Orchestration and the boot Port. GRUB, iPXE, wimboot, PXE delivery, and equivalent future
-mechanisms remain behind that boundary unless explicitly made normative later.
+mechanisms remain behind that boundary. ADR-0021 selects the V1 Boot Adapter mechanism
+family without exposing those implementation details to Domain or Application logic.
 
 WinPE UEFI x86-64 viability has been validated in the tested environment; evidence is in
 `docs/reference/winpe-boot-mechanism-spike.md`.
