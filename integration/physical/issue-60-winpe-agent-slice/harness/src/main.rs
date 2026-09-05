@@ -95,18 +95,35 @@ fn redact_dsn(url: &str) -> String {
     format!("{scheme}://<redacted>@{host}/{db}")
 }
 
+/// Enforces owner-only (0600) permissions on a secret file. This is not
+/// best-effort: if the mode cannot be established, the harness refuses to
+/// continue rather than leave a private key or bearer credential readable.
 #[cfg(unix)]
 fn restrict_to_owner(path: &str) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap_or_else(|e| {
+        eprintln!(
+            "bamep-physint-harness: refusing to continue — cannot enforce owner-only (0600) \
+             permissions on {path}: {e}"
+        );
+        std::process::exit(1);
+    });
 }
 #[cfg(not(unix))]
-fn restrict_to_owner(_path: &str) {}
+fn restrict_to_owner(path: &str) {
+    eprintln!(
+        "bamep-physint-harness: refusing to continue — owner-only permissions for the secret \
+         file {path} can only be enforced on Unix"
+    );
+    std::process::exit(1);
+}
 
 /// Loads a persisted self-signed cert/key pair, or generates and persists a
 /// fresh one so the pinned fingerprint is stable across harness restarts.
 fn load_or_make_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     if Path::new(CERT_DER_PATH).exists() && Path::new(KEY_DER_PATH).exists() {
+        // Enforce owner-only on the persisted private key before reading it.
+        restrict_to_owner(KEY_DER_PATH);
         let cert = std::fs::read(CERT_DER_PATH).expect("read cert der");
         let key = std::fs::read(KEY_DER_PATH).expect("read key der");
         return (

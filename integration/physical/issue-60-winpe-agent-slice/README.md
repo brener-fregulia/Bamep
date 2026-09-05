@@ -176,18 +176,28 @@ sudo env "PYTHONPATH=$HOME/.local/lib/python3.14/site-packages" \
 
 Neither `smb-share/` nor its contents are ever tracked (`.gitignore`).
 
-### 4. In WinPE — direct probe invocation (CP6: auth + InventoryReport)
+### 4. In WinPE — direct probe invocation
 
 ```bat
 net use \\192.168.99.1\PROBE
 copy /Y \\192.168.99.1\PROBE\bamep-winpe-probe.exe X:\
 copy /Y \\192.168.99.1\PROBE\agent-credential.txt X:\
-X:\bamep-winpe-probe.exe --sink 192.168.99.1:9099 --wss 192.168.99.1:8443 --pin <FP> --auth-credential-file X:\agent-credential.txt --inventory-report
+X:\bamep-winpe-probe.exe <checkpoint flags>
 echo EXITCODE=%ERRORLEVEL%
 ```
 
-`<FP>` is the fingerprint from step 2. Drop `--inventory-report` for CP4/CP5,
-drop `--auth-credential-file` too for CP3, drop `--wss`/`--pin` for CP2.
+`<FP>` is the fingerprint from step 2. Each checkpoint adds one capability:
+
+| CP | `<checkpoint flags>` |
+|----|----------------------|
+| 2  | `--sink 192.168.99.1:9099` |
+| 3  | `--sink 192.168.99.1:9099 --wss 192.168.99.1:8443 --pin <FP>` |
+| 4  | `--sink 192.168.99.1:9099 --wss 192.168.99.1:8443 --pin <FP> --auth-credential-file X:\agent-credential.txt` |
+| 5  | *(CP4 flags)* `--enumerate-sources` — one read-only source-observation epoch, no InventoryReport |
+| 6  | *(CP4 flags)* `--inventory-report` — enumerates internally, then the epoch-A / unchanged-repeat / fresh-epoch-B InventoryReport sequence |
+
+`--enumerate-sources` and `--inventory-report` are independent: `--inventory-report`
+does its own enumeration, so it does not need `--enumerate-sources`.
 
 Probe exit codes: `0` ok · `2` local-file sink failed · `3` TLS/WSS crossing
 failed · `4` authentication not established · `5` inventory-report sequence
