@@ -1,13 +1,14 @@
 # Issue #61 endpoint-capture data-plane Spike — build + runtime output.
 # Authored source is kept and versioned:
-#   harness/src/**  (incl. harness/src/bin/{cp3-context,cp6-harness}.rs),
-#   probe/src/**, probe6/src/**, each build.rs, every Cargo.toml + Cargo.lock,
-#   README.md, this .gitignore.
+#   harness/src/**  (incl. harness/src/bin/{cp3-context,cp6-harness,cp7-harness}.rs),
+#   probe/src/**, probe6/src/**, probe7/src/**, each build.rs, every Cargo.toml +
+#   Cargo.lock, README.md, this .gitignore.
 # Everything below is regenerable, runtime, or physical-run output and is
 # never versioned.
 target/
 runtime/
 runtime-cp6/
+runtime-cp7a/
 evidence/
 *.log
 *.ndjson

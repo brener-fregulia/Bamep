@@ -285,13 +285,73 @@ export PATH="$HOME/.local/bin:$PATH" XWIN_ACCEPT_LICENSE=1
 RUSTFLAGS="-C target-feature=+crt-static" cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
 
-## Layout (21 authored files)
+## CP7A — bounded-prefix physical data-plane pressure (`harness/src/bin/cp7-harness.rs` + `probe7/`)
+
+**Status: built + host-verified; not yet physically run.** Owner-approved for the
+bounded pressure stage only. CP7B full-device scale characterization is **not**
+authorized.
+
+CP7A does **not** continue the CP6 Transfer. `probe7` mints a **fresh** source
+epoch (fresh random `source_observation_id` + `agent_source_id`s, held only in
+this one process) and the harness creates a **fresh** Job / Transfer / Artifact
+lineage in `bamep_physint_spike`. The CP6 lineage, its held chunk 0, and
+`runtime-cp6/` are never touched. The action remains
+`bamep.m1.data-plane-transfer`; **no RF-2 / RF-6 / RF-7 production
+source-authority layer is implemented** — its absence is the exact recorded
+blocker and the expected final Issue #61 classification is **Outcome B**.
+
+Bounded extent: **2,148,532,224 bytes** (`2 GiB + 1 MiB`) at an 8 MiB chunk
+size → **257 chunks** = 256 × 8,388,608 B + one final **1,048,576 B** chunk.
+This is a **bounded M1 pressure Artifact** — the durable `source_provenance`
+carries `capture_extent: "bounded_prefix_pressure"`,
+`not_a_complete_source_capture: true`, `prefix_bytes: 2148532224`. It is **NOT**
+a complete `\\.\PhysicalDrive0` capture, **NOT** walkthrough D, **NOT** Outcome A.
+
+`probe7` reads the bounded prefix **single-pass** — each logical chunk is read at
+most once and enters the rolling full-Artifact SHA-256 exactly once; retries
+reuse the same buffered bytes (invariant + host invariant tests in
+`probe7/src/stream.rs`, plus mutation-based sensitivity verification). One
+controlled **data-plane-only** Worker-listener interruption is auto-fired by the
+harness once ~`CP7_INTERRUPT_AFTER_HELD` chunks are durably held (WSS /
+PostgreSQL / storage-root / durable chunk files / Agent process all preserved);
+the probe re-acquires a fresh grant, re-runs resume discovery, reconciles held
+identities from memory, and continues. Then it seals (`chunk_count = 257`, the
+rolling digest), the Worker independently reconstructs and verifies, the Artifact
+reaches durable `Verified`, and the probe sends
+`ActionResult{Succeeded, TRANSFER_VERIFIED}` — which the harness-wired
+`TransferTerminalEvidenceService` consumes to drive the Job to a durable terminal
+state.
+
+New CP7A pieces vs CP6: a **mandatory `--storage-root <path>`** (fails closed
+before the Worker starts — absent / not a directory / not writable / under
+`runtime-cp6` / obviously insufficient free space); a narrow lab-only coord
+**response** carrying the Server's current UTC so the probe runs an **asymmetric
+clock pre-flight gate** (`agent_now − server_utc ∈ [−60 s, +10 s]`, checked
+**before** any `CreateFileW`/read/upload; proof freshness is **not** widened);
+`cp7-harness issue-credential <signal>` to mint a fresh first-contact credential;
+and a read-only fixture SQL final-state readout. Seal uncertain-delivery follows
+the **current** M1 behavior (idempotent re-seal while `Incomplete`/
+`PendingVerification`; a fresh-but-still-`401` data plane after a lost seal
+response means the terminal verdict is **not observable** via the protocol —
+recorded as finding **N1**, never fabricated as `TRANSFER_VERIFIED` or
+`TRANSFER_ABANDONED`).
+
+```bash
+# host: invariant tests + host-loopback vertical + WinPE cross-build
+cd probe7 && cargo test                              # 14 pass; the 2.15 GB digest test is #[ignore]
+cargo test --release -- --ignored e_full_bounded     # the exact 2,148,532,224-byte digest + exactly-once
+cd ../harness && cargo build --release --bin cp7-harness
+export PATH="$HOME/.local/bin:$PATH" XWIN_ACCEPT_LICENSE=1
+cd ../probe7 && RUSTFLAGS="-C target-feature=+crt-static" cargo xwin build --release --target x86_64-pc-windows-msvc
+```
+
+## Layout (29 authored files)
 
 ```text
 issue-61-endpoint-capture-data-plane/
 ├── README.md
 ├── .gitignore
-├── harness/                       CP2 + CP3 + CP6 (Server-side; one crate, three binaries)
+├── harness/                       CP2 + CP3 + CP6 + CP7A (Server-side; one crate, four binaries)
 │   ├── Cargo.toml
 │   ├── Cargo.lock
 │   └── src/
@@ -300,8 +360,10 @@ issue-61-endpoint-capture-data-plane/
 │       ├── testdb.rs             disposable PostgreSQL helper (CP2)
 │       └── bin/
 │           ├── cp3-context.rs    CP3 driver (physical selected-source M1-shaped context; + --dump-only)
-│           └── cp6-harness.rs    CP6 harness: WSS gateway + network Worker HTTPS + UDS +
-│                                 coord listener + orchestrator, against bamep_physint_spike
+│           ├── cp6-harness.rs    CP6 harness (FROZEN) — one chunk PUT + idempotent retry
+│           └── cp7-harness.rs    CP7A harness: CP6 boundaries + TransferTerminalEvidenceService +
+│                                 mandatory --storage-root + Server-UTC coord response +
+│                                 auto data-plane-only interruption + issue-credential + final-state SQL
 ├── probe/                         CP4 + CP5 (WinPE-native, sync, no bamep-simulator)
 │   ├── Cargo.toml
 │   ├── Cargo.lock
@@ -310,22 +372,36 @@ issue-61-endpoint-capture-data-plane/
 │       ├── main.rs               CLI + CP4 runner + CP5 runner + exit codes
 │       ├── resolver.rs           pure (obs, id) tuple resolver + host red->green tests
 │       └── sources.rs            read-only enumeration + GENERIC_READ raw reads + 3-IOCTL device length
-└── probe6/                        CP6 (WinPE-native, async; links bamep-simulator M1 client)
+├── probe6/                        CP6 (FROZEN; WinPE-native, async; links bamep-simulator M1 client)
+│   ├── Cargo.toml
+│   ├── Cargo.lock
+│   ├── build.rs
+│   └── src/
+│       ├── main.rs               CLI + async Agent session + one chunk PUT + idempotent retry
+│       ├── resolver.rs           byte-identical copy of probe/src/resolver.rs
+│       └── sources.rs            ~copy of probe/src/sources.rs (+ read_bytes_at; non-Windows stub = 8 MiB pattern)
+└── probe7/                        CP7A (WinPE-native, async; links bamep-simulator M1 client)
     ├── Cargo.toml
     ├── Cargo.lock
     ├── build.rs
     └── src/
-        ├── main.rs               CLI + async Agent session + one chunk PUT + idempotent retry
-        ├── resolver.rs           byte-identical copy of probe/src/resolver.rs
-        └── sources.rs            ~copy of probe/src/sources.rs (+ read_bytes_at; non-Windows stub = 8 MiB pattern)
+        ├── main.rs               CLI + clock pre-flight + async Agent session + single-pass stream +
+        │                         interruption/resume + seal (A/B/C/D) + terminal ActionResult
+        ├── resolver.rs           byte-identical copy of probe6/src/resolver.rs
+        ├── sources.rs            ~copy of probe6/src/sources.rs (non-Windows stub = position-keyed pattern)
+        └── stream.rs             the single-pass streaming INVARIANT + retry-safe loop + host invariant tests
 ```
 
-`probe/src/resolver.rs`/`sources.rs` and `probe6/src/resolver.rs`/`sources.rs`
-are deliberately duplicated so each WinPE probe is an independently
-reproducible standalone physical participant (`probe/` is sync with zero
-`bamep-simulator`; `probe6/` necessarily links it). This is intentional and is
-**not** being refactored in this Spike, matching the #60 self-contained-probe
-convention.
+`probe/`, `probe6/`, and `probe7/` each keep a standalone `resolver.rs` /
+`sources.rs` so every WinPE probe is an independently reproducible physical
+participant (`probe/` is sync with zero `bamep-simulator`; `probe6/`/`probe7/`
+necessarily link it). This duplication is intentional and is **not** being
+refactored in this Spike; cross-checkpoint refactoring is deferred until after
+Issue #61. `probe7/src/stream.rs` additionally exists (vs `probe6/`) because the
+single-pass streaming/retry/hash invariant is host-test-covered there, with
+mutation-based RED/sensitivity verification demonstrating the tests detect a
+physical reread, a duplicate rolling-hash update, an uncertain-PUT re-send, and
+a held-digest mismatch.
 
-Generated binaries, `runtime/`, `runtime-cp6/`, evidence/NDJSON/logs,
-credentials, and TLS key material stay ignored/untracked.
+Generated binaries, `runtime/`, `runtime-cp6/`, `runtime-cp7a/`,
+evidence/NDJSON/logs, credentials, and TLS key material stay ignored/untracked.

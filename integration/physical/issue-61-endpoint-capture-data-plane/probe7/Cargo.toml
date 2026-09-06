@@ -1,0 +1,66 @@
+# Issue #61 CP7A — WinPE-native bounded-prefix physical data-plane pressure probe.
+#
+# THROWAWAY Spike artifact. NOT production, NOT the Bamep Agent, NOT crates/agent,
+# NOT the `bamepd` composition root. Standalone workspace. Reuses the EXISTING M1
+# reference components from bamep-simulator (DataPlaneClient + AgentProofKey +
+# AgentTransferAuthorization + proof transcript + connect_pinned_wss + authenticate
+# + send_inventory_report); no second transfer protocol, no sync re-implementation.
+#
+# CP7A captures ONE bounded prefix of the selected disposable physical source
+# (2 GiB + 1 MiB = 2,148,532,224 bytes -> 257 chunks; the final chunk is 1 MiB),
+# streams it single-pass through the real Worker HTTPS data plane, exercises one
+# controlled same-process Worker-listener interruption/resume, then seals and
+# verifies the bounded Artifact. It is explicitly NOT a complete PhysicalDrive0
+# capture, NOT walkthrough D, NOT Outcome A, and NOT the production
+# `bamep.m2.endpoint-capture-transfer` action (that RF-2/RF-6/RF-7 layer is
+# absent and MUST NOT be implemented here).
+#
+# It is a SEPARATE crate from probe6 (frozen CP6 evidence). Limited duplication
+# of resolver.rs / sources.rs is intentional; do not refactor across checkpoints.
+[package]
+name = "bamep-issue61-cp7a-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bamep-issue61-cp7a-probe"
+path = "src/main.rs"
+
+[dependencies]
+bamep-simulator = { path = "../../../../crates/simulator" }
+bamep-agent-protocol = { path = "../../../../crates/agent-protocol" }
+bamep-trusted-bootstrap = { path = "../../../../crates/trusted-bootstrap" }
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "time",
+    "io-util",
+    "macros",
+    "sync",
+] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+sha2 = "0.10"
+getrandom = "0.2"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
