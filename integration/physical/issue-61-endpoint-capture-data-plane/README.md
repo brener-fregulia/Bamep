@@ -198,9 +198,10 @@ selection (model substring, **local evidence only**) → lab-only coord TCP line
 `{cp6_coord, source_observation_id, selected_agent_source_id}` (no
 PhysicalDriveN/model/serial) → pinned TLS 1.3 WSS → real Agent auth →
 `InventoryReport` carrying that epoch → the harness waits for the
-`InventoryRevision` to persist, reads the current `InventoryRevisionId` through
-the real repository path, verifies the selected observation/id are in it, builds
-the exact descriptive `SourceProvenance` tuple, `create_workflow` → `admit` →
+`InventoryRevision` carrying that exact fresh source-observation epoch to
+persist, correlates it through fixture-local read-only SQL, verifies the
+selected `agent_source_id` is present, builds the exact descriptive
+`SourceProvenance` tuple, `create_workflow` → `admit` →
 `satisfy` → `create_transfer_context(8 MiB, that tuple)` → `commit_transfer_dispatch`
 → `ActionDispatch` (`bamep.m1.data-plane-transfer`) over the live session →
 `ActionAck{Accepted}` → `TransferAuthorizationRequest`/`Grant` → resolver
@@ -248,9 +249,9 @@ Transfer / Artifact.
 - production clock synchronization (see below).
 
 The action is `bamep.m1.data-plane-transfer` — **not**
-`bamep.m2.endpoint-capture-transfer`. No product backup policy is implied: the
-future path is expected to become filesystem-/allocation-aware; whole-device
-RAW may remain a fallback. That is not CP6.
+`bamep.m2.endpoint-capture-transfer`. No product backup policy is implied.
+Filesystem-/allocation-aware capture, whole-device RAW fallback, and other
+capture modes remain subjects for later Discovery. That is not CP6.
 
 ### Clock-skew Spike finding
 

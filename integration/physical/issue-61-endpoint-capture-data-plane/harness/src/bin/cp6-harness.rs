@@ -17,10 +17,10 @@
 //! SourceReference validation, NOT an Admin API, NOT a new Agent message):
 //! the probe sends one lab-only TCP line `{cp6_coord, source_observation_id,
 //! selected_agent_source_id}` (NO PhysicalDriveN/model/serial). The harness
-//! then waits for the matching InventoryRevision to persist, reads the current
-//! InventoryRevisionId through the real repository path, verifies the selected
-//! observation/id exist in it, and builds the exact descriptive SourceProvenance
-//! tuple for a fresh M1-shaped context.
+//! then waits for the matching InventoryRevision to persist, correlates it
+//! through fixture-local read-only SQL, verifies the selected agent_source_id
+//! is present, and builds the exact descriptive SourceProvenance tuple for a
+//! fresh M1-shaped context.
 //!
 //! The action is `bamep.m1.data-plane-transfer`. CP6 transfers EXACTLY ONE
 //! 8 MiB chunk (index 0) + one idempotent retry, then STOPS. It never seals,
