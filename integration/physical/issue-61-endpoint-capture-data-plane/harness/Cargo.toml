@@ -1,0 +1,44 @@
+# Issue #61 CP2 — off-device endpoint-capture data-plane Spike harness.
+#
+# THROWAWAY Spike artifact. Standalone workspace (empty [workspace] table) so it
+# never joins the main Bamep workspace. It COMPOSES the existing real Server
+# Application services + PostgreSQL adapter + Worker control plane + Worker HTTPS
+# data plane + filesystem chunk store (path deps below) and drives them with the
+# existing `bamep-simulator` M1 Agent-side reference participant.
+#
+# It is NOT production architecture, NOT `crates/agent`, and NOT the `bamepd`
+# composition root. The action it exercises is the existing
+# `bamep.m1.data-plane-transfer` reference path — NOT `bamep.m2.endpoint-capture-transfer`.
+[package]
+name = "bamep-issue61-cp2-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bamep-issue61-cp2-harness"
+path = "src/main.rs"
+
+[dependencies]
+bamep-domain = { path = "../../../../crates/domain" }
+bamep-server = { path = "../../../../crates/server" }
+bamep-simulator = { path = "../../../../crates/simulator" }
+bamep-worker = { path = "../../../../crates/worker" }
+bamep-worker-protocol = { path = "../../../../crates/worker-protocol" }
+bamep-agent-protocol = { path = "../../../../crates/agent-protocol" }
+bamep-trusted-bootstrap = { path = "../../../../crates/trusted-bootstrap", features = ["fixture-signing"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "io-util", "signal"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "uuid", "chrono", "migrate", "json", "macros"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+uuid = { version = "1", features = ["v4"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+sha2 = "0.10"
+base64 = "0.22"
+serde_json = "1"

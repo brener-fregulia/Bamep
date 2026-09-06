@@ -1,0 +1,23 @@
+# Issue #61 endpoint-capture data-plane Spike — build + runtime output.
+# Authored source is kept and versioned:
+#   harness/src/**  (incl. harness/src/bin/{cp3-context,cp6-harness}.rs),
+#   probe/src/**, probe6/src/**, each build.rs, every Cargo.toml + Cargo.lock,
+#   README.md, this .gitignore.
+# Everything below is regenerable, runtime, or physical-run output and is
+# never versioned.
+target/
+runtime/
+runtime-cp6/
+evidence/
+*.log
+*.ndjson
+# Generated executables / debug info (the WinPE probes are rebuilt from source
+# and staged into the lab SMB share, never committed).
+*.exe
+*.pdb
+# Lab certificate / credential / key material must never be committed.
+*.pem
+*.key
+*.crt
+*.der
+*.pkcs8

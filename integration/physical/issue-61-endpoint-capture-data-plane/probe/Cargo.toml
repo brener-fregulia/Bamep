@@ -1,0 +1,45 @@
+# Issue #61 CP4/CP5 — WinPE-native Agent-local source-authority + read-only
+# physical byte-access probe.
+#
+# THROWAWAY Spike artifact. NOT production. NOT the Bamep Agent. NOT
+# `crates/agent`. Standalone workspace (empty [workspace] table) so it never
+# joins the main Bamep workspace.
+#
+# CP4: prove — at the narrowest honest Agent-local boundary — that the current
+#      source-observation epoch's tuple resolves to exactly the mapped SSD, and
+#      that a stale/unrecognised SourceReference is rejected BEFORE any
+#      GENERIC_READ device handle is opened, with no fallback.
+# CP5: only after CP4 PASS, open the resolved source with GENERIC_READ (never
+#      GENERIC_WRITE), obtain the exact device length via read-only IOCTLs, and
+#      perform small bounded reproducible raw reads.
+[package]
+name = "bamep-issue61-cp45-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bamep-issue61-cp45-probe"
+path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"
+getrandom = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
