@@ -51,7 +51,14 @@
 #   ./run-cp7a-lab.sh --help
 #
 # Env overrides: CP7A_LAB_IFACE (enp8s0), CP7A_LAB_IP (192.168.99.1),
-#   CP7A_FW_ZONE (trusted), CP7_INTERRUPT_AFTER_HELD (8).
+#   CP7A_FW_ZONE (trusted).
+#
+# Fault mode (exactly one; the launcher passes BOTH thresholds explicitly and
+# fails closed if both are > 0):
+#   DEFAULT — Gate-4 Subtest A, one deterministic auth-denial episode:
+#     CP7A_AUTH_DENY_AFTER_HELD (8)   CP7A_INTERRUPT_AFTER_HELD (0)
+#   Transport-outage experiment (previous ~400 ms listener restart):
+#     CP7A_AUTH_DENY_AFTER_HELD=0 CP7A_INTERRUPT_AFTER_HELD=8 ./run-cp7a-lab.sh
 #
 set -euo pipefail
 export LC_ALL=C
@@ -81,7 +88,30 @@ PORT_DP=9107            # cp7-harness Worker HTTPS data plane   (CP7_DP_PORT)
 # CP7A bounded-prefix pressure parameters (DO NOT widen — see CP7A SAFETY).
 CP7A_PREFIX_BYTES=2148532224
 CP7A_SEAL_TIMEOUT_SECS=120
-CP7_INTERRUPT_AFTER_HELD="${CP7_INTERRUPT_AFTER_HELD:-8}"
+
+# ---------------------------------------------------------------------
+# Fault mode for THIS run (explicit — the launcher never relies on
+# inherited implicit env state). Exactly ONE fault may be armed.
+#
+#   Gate-4 Subtest A (DEFAULT) — one deterministic auth-denial episode:
+#       CP7A_AUTH_DENY_AFTER_HELD=8   CP7A_INTERRUPT_AFTER_HELD=0
+#   Transport-outage experiment (the previous ~400 ms listener restart):
+#       CP7A_AUTH_DENY_AFTER_HELD=0   CP7A_INTERRUPT_AFTER_HELD=8
+#   No fault:
+#       both 0
+# ---------------------------------------------------------------------
+CP7A_AUTH_DENY_AFTER_HELD="${CP7A_AUTH_DENY_AFTER_HELD:-8}"
+CP7A_INTERRUPT_AFTER_HELD="${CP7A_INTERRUPT_AFTER_HELD:-0}"
+FAULT_MODE="none"
+if [ "${CP7A_AUTH_DENY_AFTER_HELD}" -gt 0 ] && [ "${CP7A_INTERRUPT_AFTER_HELD}" -gt 0 ]; then
+    echo "FATAL: CP7A_AUTH_DENY_AFTER_HELD and CP7A_INTERRUPT_AFTER_HELD are both > 0." >&2
+    echo "       Choose exactly one fault per run: set the other to 0." >&2
+    exit 1
+elif [ "${CP7A_AUTH_DENY_AFTER_HELD}" -gt 0 ]; then
+    FAULT_MODE="auth_denial"
+elif [ "${CP7A_INTERRUPT_AFTER_HELD}" -gt 0 ]; then
+    FAULT_MODE="listener_restart"
+fi
 
 PHASE9D_DIR="/var/tmp/bamep-issue53-phase9d-winpe-completion"
 PHASE9D_HTTP="${PHASE9D_DIR}/http"
@@ -187,7 +217,7 @@ resolve_smbserver() {
 }
 
 usage() {
-    sed -n '3,54p' "${SCRIPT_PATH}" | sed 's/^#\{1,\} \{0,1\}//;s/^#$//'
+    sed -n '3,61p' "${SCRIPT_PATH}" | sed 's/^#\{1,\} \{0,1\}//;s/^#$//'
 }
 
 # ---------------------------------------------------------------------
@@ -301,8 +331,11 @@ log "evidence directory: ${EVID}"
     echo "staged_probe_exe  ${STAGED_PROBE_EXE}"
     echo "ports             http=${PORT_HTTP} smb=${PORT_SMB} sink=${PORT_SINK} wss=${PORT_WSS} coord=${PORT_COORD} dp=${PORT_DP}"
     echo "cp7a_prefix_bytes ${CP7A_PREFIX_BYTES}"
-    echo "cp7_interrupt_after_held ${CP7_INTERRUPT_AFTER_HELD}"
+    echo "fault_mode        ${FAULT_MODE}"
+    echo "cp7_auth_deny_after_held  ${CP7A_AUTH_DENY_AFTER_HELD}"
+    echo "cp7_interrupt_after_held  ${CP7A_INTERRUPT_AFTER_HELD}"
 } > "${EVID}/resolved-paths.txt"
+log "FAULT MODE: ${FAULT_MODE}  (auth_deny_after_held=${CP7A_AUTH_DENY_AFTER_HELD}, interrupt_after_held=${CP7A_INTERRUPT_AFTER_HELD})"
 
 # ---------------------------------------------------------------------
 # 3. cleanup / supervision trap  (installed BEFORE any mutation)
@@ -461,10 +494,13 @@ log "[sink] bamep-probe-sink on ${LAB_IP}:${PORT_SINK} -> ${SINK_NDJSON}"
 register_child "probe-sink" "$!" 0
 await "sink tcp/${PORT_SINK}" 30 tcp_up "${PORT_SINK}" || die "probe-sink did not bind tcp/${PORT_SINK} — see ${EVID}/sink.log"
 
-# 5e. FRESH cp7-harness — explicit storage root + explicit interruption threshold
+# 5e. FRESH cp7-harness — explicit storage root + BOTH fault thresholds
+#     passed explicitly (mode = ${FAULT_MODE}). The harness itself fails
+#     closed if both are > 0.
 HARNESS_LOG="${EVID}/cp7-harness.log"
-log "[cp7-harness] fresh process; CP7_INTERRUPT_AFTER_HELD=${CP7_INTERRUPT_AFTER_HELD}; --storage-root ${STORAGE_ROOT}"
-env CP7_INTERRUPT_AFTER_HELD="${CP7_INTERRUPT_AFTER_HELD}" \
+log "[cp7-harness] fresh process; fault_mode=${FAULT_MODE}; CP7_AUTH_DENY_AFTER_HELD=${CP7A_AUTH_DENY_AFTER_HELD}; CP7_INTERRUPT_AFTER_HELD=${CP7A_INTERRUPT_AFTER_HELD}; --storage-root ${STORAGE_ROOT}"
+env CP7_AUTH_DENY_AFTER_HELD="${CP7A_AUTH_DENY_AFTER_HELD}" \
+    CP7_INTERRUPT_AFTER_HELD="${CP7A_INTERRUPT_AFTER_HELD}" \
     CP7_LAB_IP="${LAB_IP}" CP7_WSS_PORT="${PORT_WSS}" \
     CP7_COORD_PORT="${PORT_COORD}" CP7_DP_PORT="${PORT_DP}" \
     "${HARNESS_BIN}" --storage-root "${STORAGE_ROOT}" > "${HARNESS_LOG}" 2>&1 &
@@ -584,6 +620,8 @@ gate "cp7a.cred present and mode 600"          bash -c "[ \"\$(stat -c '%a' '${C
 gate "Phase 9d boot assets present"            bash -c "[ -f '${PHASE9D_HTTP}/wimboot' ] && [ -f '${PHASE9D_HTTP}/boot.wim' ] && [ -f '${PHASE9D_HTTP}/BCD' ] && [ -f '${PHASE9D_HTTP}/boot.sdi' ]"
 gate "staged CP7A probe present"               bash -c "[ -f '${STAGED_PROBE_EXE}' ]"
 gate "staged run-cp7a.cmd carries this fingerprint" grep -qF "${FINGERPRINT}" "${RUN_CMD}"
+gate "cp7-harness fault_mode == ${FAULT_MODE}" \
+    grep -qF "\"event\":\"fault.mode\",\"mode\":\"${FAULT_MODE}\"" "${HARNESS_LOG}"
 
 # per-child liveness
 for i in "${!CHILD_PID[@]}"; do
@@ -595,6 +633,15 @@ done
     echo "ready_at     $(date -Is)"
     echo "fingerprint  ${FINGERPRINT}"
     echo "gate_fail    ${gate_fail}"
+    echo
+    echo "FAULT MODE         ${FAULT_MODE}"
+    echo "  auth_deny_after_held  ${CP7A_AUTH_DENY_AFTER_HELD}"
+    echo "  interrupt_after_held  ${CP7A_INTERRUPT_AFTER_HELD}"
+    case "${FAULT_MODE}" in
+      auth_denial)     echo "  => ONE deterministic auth-denial episode (2 real backend 401s: chunk-PUT masked as transport transient + bodyless resume delivered as AuthDenied) after >= ${CP7A_AUTH_DENY_AFTER_HELD} held chunks. Listener restart is NOT active." ;;
+      listener_restart) echo "  => ~400 ms data-plane listener restart after >= ${CP7A_INTERRUPT_AFTER_HELD} held chunks. Auth-denial is NOT active." ;;
+      none)            echo "  => no fault injected this run." ;;
+    esac
     echo
     for i in "${!CHILD_PID[@]}"; do
         printf 'pid %-8s sudo=%s  %s\n' "${CHILD_PID[$i]}" "${CHILD_SUDO[$i]}" "${CHILD_DESC[$i]}"
@@ -644,10 +691,16 @@ PXE/DHCP/TFTP : READY   (dnsmasq, Phase 9d conf, ${LAB_IFACE})
 WinPE HTTP    : READY   (${LAB_IP}:${PORT_HTTP}  ${PHASE9D_HTTP})
 SMB           : READY   (\\\\${LAB_IP}\\${SMB_SHARE_NAME}  read-only  ${SMB_SHARE})
 Probe sink    : READY   (${LAB_IP}:${PORT_SINK})
-CP7 harness   : READY   (fresh process, CP7_INTERRUPT_AFTER_HELD=${CP7_INTERRUPT_AFTER_HELD})
+CP7 harness   : READY   (fresh process)
 Worker HTTPS  : READY   (${LAB_IP}:${PORT_DP})
 WSS           : READY   (${LAB_IP}:${PORT_WSS})
 Coord         : READY   (${LAB_IP}:${PORT_COORD})
+
+FAULT MODE    : ${FAULT_MODE}
+  auth_deny_after_held = ${CP7A_AUTH_DENY_AFTER_HELD}   interrupt_after_held = ${CP7A_INTERRUPT_AFTER_HELD}
+  (default is Gate-4 Subtest A: one auth-denial episode -> suspend -> fresh grant
+   -> resume -> continue. To run the transport-outage experiment instead:
+   CP7A_AUTH_DENY_AFTER_HELD=0 CP7A_INTERRUPT_AFTER_HELD=8 ./run-cp7a-lab.sh)
 
 Fingerprint:
   ${FINGERPRINT}

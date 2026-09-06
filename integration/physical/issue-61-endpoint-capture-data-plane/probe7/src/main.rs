@@ -58,7 +58,7 @@ use tokio_tungstenite::tungstenite::Message;
 mod stream;
 use stream::{
     run_stream_pass, ChunkReader, DataPlane, PassOutcome, ProgressTick, PutStatus, ResumeStatus,
-    StreamError, StreamState,
+    StreamError, StreamEvent, StreamState,
 };
 
 const PROBE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -436,6 +436,14 @@ where
         match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(Message::Text(t)))) => match decode(&t) {
                 Ok(AgentProtocolMessage::TransferAuthorizationGrant(g)) => {
+                    // Centralised: EVERY successful obtain_grant() — the initial
+                    // one and every post-suspension re-grant — emits exactly one
+                    // grant_received. No token/proof-key/capability bytes logged.
+                    log.emit(
+                        "info",
+                        "cp7a.transfer_auth.grant_received",
+                        &[("data_plane_base_url", s(g.body.data_plane_base_url.clone()))],
+                    );
                     return Ok((proof_key, g.body.token.clone(), g.body.data_plane_base_url.clone()));
                 }
                 Ok(AgentProtocolMessage::TransferAuthorizationDenied(_)) => {
@@ -798,6 +806,7 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
     log.emit("info", "cp7a.action.ack_sent", &[("outcome", s("Accepted"))]);
 
     // ---- 8. initial TransferAuthorizationGrant -----------------
+    // obtain_grant emits cp7a.transfer_auth.request_sent + grant_received.
     let (mut proof_key, mut token, base_url) =
         match obtain_grant(&mut ws, log, action_id, transfer_uuid).await {
             Ok(v) => v,
@@ -806,11 +815,6 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
                 return exit::NO_GRANT;
             }
         };
-    log.emit(
-        "info",
-        "cp7a.transfer_auth.grant_received",
-        &[("data_plane_base_url", s(&base_url))],
-    );
 
     // ---- 9. resolver: (obs_id, agent_source_id) -> local SSD ----
     counters.resolution_attempt_count += 1;
@@ -901,7 +905,7 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
     let mut suspensions = 0u32;
     loop {
         let mut last_logged_chunks = 0u64;
-        let outcome = run_stream_pass(&mut state, &reader, &mut dp, &mut |tick: ProgressTick| {
+        let mut on_progress = |tick: ProgressTick| {
             // Log a progress line only every ~16 newly-held chunks (and always
             // the last), to keep the CP7A NDJSON readable at 257 chunks.
             if tick.held_chunks == 257
@@ -917,8 +921,63 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
                     ],
                 );
             }
-        })
-        .await;
+        };
+        // Spike-only lifecycle observability (Gate-4 subtests). No secrets.
+        let mut on_lifecycle = |e: StreamEvent| match e {
+            StreamEvent::ResumeBegin => {
+                log.emit("info", "cp7a.resume_discovery.begin", &[]);
+            }
+            StreamEvent::ResumeResult { outcome, held_chunks, sealed } => log.emit(
+                "info",
+                "cp7a.resume_discovery.result",
+                &[
+                    ("outcome", s(outcome)),
+                    ("held_chunks", V::U(held_chunks)),
+                    ("sealed", V::B(sealed)),
+                ],
+            ),
+            StreamEvent::ResumeReconciled {
+                held_count,
+                pending_chunk_index,
+                pending_already_held,
+            } => log.emit(
+                "info",
+                "cp7a.resume_discovery.reconciled",
+                &[
+                    ("held_count", V::U(held_count)),
+                    (
+                        "pending_chunk_index",
+                        pending_chunk_index.map_or(V::I(-1), |i| V::I(i as i64)),
+                    ),
+                    ("pending_already_held", V::B(pending_already_held)),
+                ],
+            ),
+            StreamEvent::PutAuthDenied { chunk_index } => log.emit(
+                "warn",
+                "cp7a.stream.put_auth_denied",
+                &[("chunk_index", V::U(chunk_index))],
+            ),
+            StreamEvent::PutTransient { chunk_index, local_attempt, detail } => log.emit(
+                "warn",
+                "cp7a.stream.put_transient",
+                &[
+                    ("chunk_index", V::U(chunk_index)),
+                    ("local_attempt", V::U(local_attempt as u64)),
+                    ("detail", s(detail)),
+                ],
+            ),
+            StreamEvent::ResumeTransient { local_attempt, detail } => log.emit(
+                "warn",
+                "cp7a.stream.resume_transient",
+                &[
+                    ("local_attempt", V::U(local_attempt as u64)),
+                    ("detail", s(detail)),
+                ],
+            ),
+        };
+        let outcome =
+            run_stream_pass(&mut state, &reader, &mut dp, &mut on_progress, &mut on_lifecycle)
+                .await;
         match outcome {
             Ok(PassOutcome::Complete) => {
                 log.emit(
@@ -931,16 +990,21 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
                 );
                 break;
             }
-            Ok(PassOutcome::SuspendedNeedsAuthorization)
-            | Ok(PassOutcome::SuspendedDataPlaneUnreachable) => {
+            Ok(outcome @ (PassOutcome::SuspendedNeedsAuthorization
+            | PassOutcome::SuspendedDataPlaneUnreachable)) => {
                 suspensions += 1;
+                let reason = match outcome {
+                    PassOutcome::SuspendedNeedsAuthorization => "authorization_denied",
+                    PassOutcome::SuspendedDataPlaneUnreachable => "data_plane_unreachable",
+                    PassOutcome::Complete => unreachable!(),
+                };
                 log.emit(
                     "warn",
                     "cp7a.stream.suspended",
                     &[
                         ("suspension_count", V::U(suspensions as u64)),
                         ("held_chunks", V::U(state.held_count())),
-                        ("note", s("controlled interruption OR transient loss; re-acquiring a fresh grant and resuming")),
+                        ("reason", s(reason)),
                     ],
                 );
                 if suspensions > MAX_OUTER_SUSPENSIONS {

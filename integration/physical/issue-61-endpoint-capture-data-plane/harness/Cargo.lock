@@ -198,6 +198,7 @@ dependencies = [
 name = "bamep-issue61-cp2-harness"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bamep-agent-protocol",
  "bamep-domain",
  "bamep-server",

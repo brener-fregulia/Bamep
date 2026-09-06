@@ -338,12 +338,50 @@ recorded as finding **N1**, never fabricated as `TRANSFER_VERIFIED` or
 
 ```bash
 # host: invariant tests + host-loopback vertical + WinPE cross-build
-cd probe7 && cargo test                              # 14 pass; the 2.15 GB digest test is #[ignore]
+cd probe7 && cargo test                              # host invariant + episode tests; 2 heavy tests are #[ignore]
 cargo test --release -- --ignored e_full_bounded     # the exact 2,148,532,224-byte digest + exactly-once
 cd ../harness && cargo build --release --bin cp7-harness
 export PATH="$HOME/.local/bin:$PATH" XWIN_ACCEPT_LICENSE=1
 cd ../probe7 && RUSTFLAGS="-C target-feature=+crt-static" cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
+
+### CP7A Gate-4 subtests — proving the interruption-recovery state machine
+
+The single `data-plane-only` interruption above proved end-to-end verification
+but did **not** exercise the Agent-side
+`suspend → fresh grant → resume discovery → continue` recovery path: physical
+run 2's PCAP showed the ~400 ms Worker-listener restart is absorbed by the WinPE
+TCP stack (one SYN retransmit) before it reaches the probe's application layer.
+The recovery machinery is therefore proven separately, in two subtests split by
+the launcher's fault mode (exactly one per run; the harness fails closed if both
+are armed):
+
+- **Subtest A — `auth_denial` (launcher default).** A Spike-local decorator over
+  the real `bamep_server::ports::TransferAuthorizationRepository` Port produces
+  one deterministic **authorization-denial episode** for the run's own Transfer,
+  once `>= CP7_AUTH_DENY_AFTER_HELD` chunks are durably held. The episode is
+  exactly **two** consecutive `Ok(None)` returns — the Port's existing
+  contractual value — each flowing through the unchanged real
+  `authorize_request → WorkerAuthorizationOutcome::Denied →
+  AuthorizationDecision::denied → HTTP 401 {"error":{"code":"AUTHORIZATION_DENIED"}}`
+  chain. **Denial #1** lands on the first qualifying chunk-PUT authorize; because
+  the Worker authorizes *before* draining the ~8 MiB request body (unchanged
+  production behaviour), the 401 is emitted mid-upload and the client observes a
+  **transport `Transient`** (`cp7a.stream.put_transient`, `local_attempt=1`), not
+  `AuthDenied`. **Denial #2** lands on the probe's bodyless post-transient
+  `discover_resume` authorize — a `GET` with no body delivers the 401 cleanly →
+  `ResumeStatus::AuthDenied` → **`SuspendedNeedsAuthorization`**. The probe then
+  requests a fresh grant, re-enters `run_stream_pass` with the **same
+  `StreamState`**, resume discovery reconciles the held chunks, the buffered
+  `pending` chunk is re-`PUT` with **no source re-read and no rolling-hash
+  double-update**, and the transfer verifies normally with `suspensions == 1`.
+  This intentionally exercises the recovery state machine; it is **NOT** a
+  transport-outage simulation. No `crates/**` change; Worker authorization
+  ordering is untouched.
+- **Subtest B — `listener_restart`** (`CP7A_AUTH_DENY_AFTER_HELD=0
+  CP7A_INTERRUPT_AFTER_HELD=8`). The original ~400 ms data-plane listener
+  restart. A later separate validation will exercise a real transport/link
+  failure that the WinPE stack cannot mask.
 
 ## Layout (29 authored files)
 

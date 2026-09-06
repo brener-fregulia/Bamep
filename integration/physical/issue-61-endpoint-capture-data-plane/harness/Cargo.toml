@@ -42,3 +42,7 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 sha2 = "0.10"
 base64 = "0.22"
 serde_json = "1"
+# Issue #61 CP7A Gate-4 Subtest A only: the Spike-local one-shot decorator over
+# `bamep_server::ports::TransferAuthorizationRepository` (an `#[async_trait]`
+# Port) needs the same attribute macro the Port itself is declared with.
+async-trait = "0.1"
