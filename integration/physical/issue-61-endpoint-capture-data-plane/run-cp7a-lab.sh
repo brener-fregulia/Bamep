@@ -524,31 +524,36 @@ X:\\cp7a-probe.exe ^
   --auth-credential-file X:\\cp7a.cred ^
   --prefix-bytes ${CP7A_PREFIX_BYTES} ^
   --seal-timeout-secs ${CP7A_SEAL_TIMEOUT_SECS}
-
+set "CP7A_EXITCODE=%ERRORLEVEL%"
 echo.
-echo CP7A_EXITCODE=%ERRORLEVEL%
+echo CP7A_EXITCODE=%CP7A_EXITCODE%
+exit /b %CP7A_EXITCODE%
 EOF
 chmod 600 "${RUN_CMD}"
 
-log "[stage] regenerating ${PREP_CMD}  (copies probe + credential to X:\\; NO clock set here)"
+log "[stage] regenerating ${PREP_CMD}  (copies probe + credential + run-cmd to X:\\)"
 cat > "${PREP_CMD}" <<'EOF'
 @echo off
-rem  Bamep Issue #61 CP7A prep — copy the probe + this run's credential to X:\
+rem  Bamep Issue #61 CP7A prep — copy the probe + this run's credential + the run
+rem  wrapper to X:\ so the transfer no longer depends on SMB after prep.
 rem  Map the share first, e.g.:  net use P: \\192.168.99.1\PROBE
 copy /Y P:\cp7a-probe.exe X:\cp7a-probe.exe
 copy /Y P:\cp7a.cred X:\cp7a.cred
+copy /Y P:\run-cp7a.cmd X:\run-cp7a.cmd
 echo CP7A_PREP_DONE
-echo NEXT: run  P:\set-clock.cmd  (regenerate it on the Fedora side JUST BEFORE booting)
+echo NEXT: run stage-winpe-clock.sh in Terminal 3, then  P:\set-clock.cmd  here, then  X:\run-cp7a.cmd
 EOF
 chmod 600 "${PREP_CMD}"
 
-# fresh clock file now; helper lets the operator regenerate it right before boot
+# The WinPE clock file is deliberately NOT generated now: it must be created only
+# once the WinPE CMD prompt is actually reached (a PXE/WinPE boot can exceed the
+# probe's 60 s clock-freshness floor). Clear any stale leftover from a prior run.
+rm -f "${CLOCK_CMD}"
 if [ -x "${CLOCK_HELPER}" ]; then
-    "${CLOCK_HELPER}" >> "${LAUNCHER_LOG}" 2>&1 || log "  warn: ${CLOCK_HELPER} failed; regenerate ${CLOCK_CMD} manually"
+    log "  clock: NOT staged yet — run ${CLOCK_HELPER} in Terminal 3 AFTER the WinPE CMD prompt is reached"
 else
-    log "  warn: ${CLOCK_HELPER} not executable; ${CLOCK_CMD} not staged"
+    log "  warn: ${CLOCK_HELPER} not executable — the operator cannot stage the WinPE clock file"
 fi
-log "  staged ${CLOCK_CMD} with the current lab clock (REGENERATE it just before PXE boot)"
 
 # ---------------------------------------------------------------------
 # 9. READINESS GATE — verify every boundary, then and only then print READY
@@ -659,19 +664,19 @@ Staged into the SMB share (git-ignored):
   ${CRED_DEST}    (fresh, mode 600 — one per launcher run)
   ${RUN_CMD}
   ${PREP_CMD}
-  ${CLOCK_CMD}    (STALE the moment it is written — regenerate before boot)
+  set-clock.cmd is NOT staged yet — generated on demand once WinPE CMD is up
 
 Next (ALL MANUAL — this launcher does none of it):
-  1. In Terminal 3, regenerate the clock file right before booting:
-       ${CLOCK_HELPER}
-  2. PXE boot the MiniPC (192.168.99.66) by hand.
+  1. PXE boot the MiniPC (192.168.99.66) by hand.
      (WinPE "Press any key to continue booting..." is a KNOWN follow-up, not solved here.)
-  3. Wait for the WinPE command prompt.
-  4. Map + prep + align the clock inside WinPE:
+  2. Wait for the WinPE command prompt to actually appear.
+  3. Inside WinPE — map the share and prep (copies probe + cred + run-cmd to X:\\):
        net use P: \\\\${LAB_IP}\\${SMB_SHARE_NAME}
        P:\\prep-cp7a.cmd
-       P:\\set-clock.cmd
-  5. Run the staged CP7A command by hand:
+  4. NOW that WinPE CMD is up, align the clock (stock-WinPE Bias workaround):
+       Terminal 3 :  ${CLOCK_HELPER}
+       then in WinPE, immediately:  P:\\set-clock.cmd
+  5. Run the CP7A command from X:\\ (no SMB dependency after prep):
        X:\\run-cp7a.cmd
 
 DO NOT start the physical transfer automatically.
@@ -683,6 +688,14 @@ EOF
 # ---------------------------------------------------------------------
 # 12. foreground supervise — block on the harness; watchdog covers the rest
 # ---------------------------------------------------------------------
-wait "${HARNESS_PID}" 2>/dev/null || true
-log "cp7-harness (pid ${HARNESS_PID}) exited — shutting the CP7A lab down"
-exit 0
+# The harness is meant to run until the operator stops the launcher (Ctrl-C),
+# which on_signal handles and which never reaches the code below. Reaching here
+# means cp7-harness exited on its own: an unexpected required-child exit. Quiesce
+# the watchdog, then exit NON-ZERO after cleanup — never report success here.
+harness_rc=0
+wait "${HARNESS_PID}" 2>/dev/null || harness_rc=$?
+touch "${SENTINEL}" 2>/dev/null || true
+trap '' INT TERM   # ignore a racing watchdog TERM; the EXIT trap still runs cleanup
+[ "${harness_rc}" -ne 0 ] || harness_rc=1
+log "!!! cp7-harness (pid ${HARNESS_PID}) EXITED UNEXPECTEDLY (rc=${harness_rc}) while supervising — tearing the CP7A lab down"
+exit "${harness_rc}"
