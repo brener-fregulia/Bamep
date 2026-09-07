@@ -354,7 +354,8 @@ CP7A ran on the physical MiniPC (`cp7a-lab-20260906T222258`, Gate-4a / Subtest A
 `auth_denial`) and **passed**:
 
 - bounded extent **2,148,532,224 B** = **257 chunks** (256 × 8,388,608 B + one
-  final 1,048,576 B), read from the CP4-resolved disposable SSD with
+  final 1,048,576 B), read from the disposable SSD resolved from CP7A's fresh
+  current `(source_observation_id, agent_source_id)` epoch with
   `CreateFileW` requesting **`GENERIC_READ` only** — no source write, no
   format/partition/repair/restore, no mount, no CP7B, no full-device claim;
 - real physical bytes crossed the real sender-constrained Worker HTTPS data
