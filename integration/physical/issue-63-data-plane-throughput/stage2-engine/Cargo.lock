@@ -3,14 +3,6 @@
 version = 4
 
 [[package]]
-name = "bamep-i63-stage1-coordinator"
-version = "0.1.0"
-dependencies = [
- "bamep-i63-stage2-engine",
- "serde_json",
-]
-
-[[package]]
 name = "bamep-i63-stage2-engine"
 version = "0.1.0"
 dependencies = [

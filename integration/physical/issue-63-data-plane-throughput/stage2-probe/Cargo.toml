@@ -1,0 +1,57 @@
+# Issue #63 Stage 2 — WinPE-native transfer probe (THROWAWAY Spike).
+#
+# NOT production, NOT the Bamep Agent, NOT crates/agent, NOT bamepd. Standalone
+# workspace. Reuses the EXISTING M1 reference components from bamep-simulator
+# (DataPlaneClient + AgentProofKey + AgentTransferAuthorization + proof
+# transcript + connect_pinned_wss + authenticate + send_inventory_report); no
+# second transfer protocol, no sync re-implementation.
+#
+# One process invocation = ONE transfer case. Fresh same-boot source epoch ->
+# operator-local selection -> resolver -> Issue-63 source-safety predicate
+# (bamep-i63-stage2-engine::safety) -> GENERIC_READ open -> bounded single-pass
+# read -> serial transfer -> seal -> terminal Artifact::Verified -> exit.
+#
+# resolver.rs / sources.rs are copied from the closed Issue #61 probe7 (see the
+# PROVENANCE headers); stream.rs is adapted from probe7 with the CP7A Gate-4
+# fault-injection checkpoint REMOVED. The Issue-63 clean fast path does ZERO
+# deliberate fault injection. Nothing here arms a physical matrix.
+[package]
+name = "bamep-i63-stage2-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "bamep-i63-stage2-probe"
+path = "src/main.rs"
+
+[workspace]
+
+[dependencies]
+bamep-i63-stage2-engine = { path = "../stage2-engine" }
+bamep-simulator = { path = "../../../../crates/simulator" }
+bamep-agent-protocol = { path = "../../../../crates/agent-protocol" }
+bamep-trusted-bootstrap = { path = "../../../../crates/trusted-bootstrap" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+sha2 = "0.10"
+getrandom = "0.2"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

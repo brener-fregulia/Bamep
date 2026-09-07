@@ -1,7 +1,8 @@
 # Issue #63 physical data-plane throughput Spike — build + runtime + physical
 # evidence output. Authored source is versioned:
 #   coordinator/src/**, winpe-runner/src/**, winpe-runner/build.rs,
-#   */Cargo.toml, */Cargo.lock, stage1/**, README.md, this .gitignore.
+#   stage2-engine/src/**, */Cargo.toml, */Cargo.lock, stage1/**, README.md,
+#   this .gitignore.
 # Everything below is regenerable, runtime, or physical-run output.
 target/
 evidence/

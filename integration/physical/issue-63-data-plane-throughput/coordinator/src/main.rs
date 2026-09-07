@@ -107,7 +107,120 @@ struct Shared {
     utc_requests: u64,
 }
 
+/// Stage-2 sub-commands, intercepted BEFORE `parse()` so Stage-1 invocation
+/// (`--mode <physical|host-smoke> ...`) behaves EXACTLY as before.
+fn stage2_subcommand() -> Option<i32> {
+    match std::env::args().nth(1).as_deref() {
+        Some("--matrix-selftest") => Some(matrix_selftest()),
+        Some("--matrix") => {
+            println!("PHYSICAL MATRIX NOT ARMED");
+            println!(
+                "coordinator: the Stage-2 typed matrix coordinator (src/matrix.rs) is built and \
+                 unit-tested, but the Stage-3 networked wiring (per-case harness + WinPE probe + \
+                 real #61/CP7 Server/Worker orchestration) is NOT implemented and NOT armed. There \
+                 is deliberately no command here that starts the 36 physical transfers."
+            );
+            println!("Run `--matrix-selftest` for the deterministic in-memory sequencing check.");
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+/// In-memory: walk the full 36-case plan through the typed lab operations with
+/// stub results, proving deterministic ordering + stop-on-failure + aggregation.
+/// NO socket, NO transfer, NO device.
+fn matrix_selftest() -> i32 {
+    use bamep_i63_stage1_coordinator::matrix::{LabRequest, LabResponse, MatrixCoordinator};
+    use bamep_i63_stage2_engine::result::{CaseResult, ConnectionCount};
+
+    let run_id = "i63s2-matrix-selftest";
+    let mut c = match MatrixCoordinator::new(run_id, 120 * bamep_i63_stage2_engine::GIB) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("matrix-selftest: coordinator did not start: {e:?}");
+            return 1;
+        }
+    };
+    println!("MATRIX_SELFTEST budget={:?}", c.budget());
+
+    let mut handled = 0usize;
+    loop {
+        match c.handle(LabRequest::NextCase) {
+            LabResponse::Case(case) => {
+                let (b_mib, b_mb) = CaseResult::rates(case.extent_bytes, 60_000.0);
+                let (v_mib, v_mb) = CaseResult::rates(case.extent_bytes, 66_000.0);
+                let result = CaseResult {
+                    run_id: case.run_id.clone(),
+                    case_id: case.case_id.clone(),
+                    phase: case.phase,
+                    cycle: case.cycle,
+                    slot: case.slot,
+                    chunk_size_bytes: case.chunk_size_bytes,
+                    extent_bytes: case.extent_bytes,
+                    chunk_count: case.expected_chunk_count,
+                    transfer_id: Some(format!("stub-t-{handled}")),
+                    artifact_id: Some(format!("stub-a-{handled}")),
+                    source_safety_verdict: "stub".into(),
+                    clock_skew_verdict: "stub".into(),
+                    bulk_stream_wall_ms: 60_000.0,
+                    bulk_stream_mib_s: b_mib,
+                    bulk_stream_mb_s: b_mb,
+                    verified_transfer_wall_ms: 66_000.0,
+                    verified_transfer_mib_s: v_mib,
+                    verified_transfer_mb_s: v_mb,
+                    resume_ms: 3.0,
+                    seal_d2_ms: 5_000.0,
+                    read_ms: 0.0,
+                    chunk_sha_ms: 0.0,
+                    rolling_sha_ms: 0.0,
+                    proof_ms: 0.0,
+                    put_ack_ms: 0.0,
+                    connection_count: ConnectionCount::by_construction(case.expected_chunk_count),
+                    final_artifact_status: "Verified".into(),
+                    case_status: "completed".into(),
+                };
+                let cid = case.case_id.clone();
+                c.handle(LabRequest::CaseReady { case_id: cid.clone() });
+                c.handle(LabRequest::CaseStarted { case_id: cid.clone() });
+                match c.handle(LabRequest::CaseCompleted {
+                    case_id: cid.clone(),
+                    result: Box::new(result),
+                }) {
+                    LabResponse::Ack => handled += 1,
+                    other => {
+                        eprintln!("matrix-selftest: case {cid} not acked: {other:?}");
+                        return 1;
+                    }
+                }
+            }
+            LabResponse::MatrixCompleted { completed, analysis } => {
+                println!(
+                    "MATRIX_SELFTEST_COMPLETE handled={handled} completed={completed} \
+                     measured_sizes={} paired_ratios={} excluded_unverified={}",
+                    analysis.sizes.len(),
+                    analysis.paired.len(),
+                    analysis.excluded_unverified.len()
+                );
+                if completed == 36 && c.matrix_succeeded() {
+                    println!("MATRIX_SELFTEST_PASS");
+                    return 0;
+                }
+                eprintln!("matrix-selftest: expected 36 completed, got {completed}");
+                return 1;
+            }
+            other => {
+                eprintln!("matrix-selftest: unexpected {other:?}");
+                return 1;
+            }
+        }
+    }
+}
+
 fn main() {
+    if let Some(code) = stage2_subcommand() {
+        std::process::exit(code);
+    }
     let cfg = parse();
 
     let coord = TcpListener::bind(&cfg.coord_addr).unwrap_or_else(|e| {

@@ -1,0 +1,46 @@
+# Issue #63 Stage 2 — Linux one-transfer harness (THROWAWAY Spike).
+#
+# NOT production, NOT crates/agent, NOT bamepd. Standalone workspace. Reuses the
+# already-reviewed Phase-A shape (option (a), owner-approved for the Stage-2 host
+# smoke):
+#   - real bamep_worker::data_plane::DataPlane HTTPS listener
+#   - real bamep_worker::storage::FilesystemChunkStore staging/fsync/linkat
+#   - real bamep_worker::storage::FullArtifactHasher D2 reconstruction
+#   - real bamep_simulator::DataPlaneClient + AgentTransferAuthorization proof
+#   - fake bamepd over UDS (ADR-0018) — the authority seam only
+# The physical Stage-3 harness will use the #61/CP7-shaped real Postgres+WSS path
+# where needed; this crate deliberately does NOT.
+#
+# One transfer per invocation. Emits a bamep_i63_stage2_engine::result::CaseResult
+# per case. `--smoke` runs the 8/16/32/64 MiB host synthetic vertical at a 128 MiB
+# extent. Nothing here arms a physical matrix.
+[package]
+name = "bamep-i63-stage2-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bamep-i63-stage2-harness"
+path = "src/main.rs"
+
+[dependencies]
+bamep-i63-stage2-engine = { path = "../stage2-engine" }
+bamep-worker = { path = "../../../../crates/worker" }
+bamep-worker-protocol = { path = "../../../../crates/worker-protocol" }
+bamep-simulator = { path = "../../../../crates/simulator" }
+bamep-trusted-bootstrap = { path = "../../../../crates/trusted-bootstrap" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+sha2 = "0.10"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3

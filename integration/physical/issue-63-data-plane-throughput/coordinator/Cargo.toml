@@ -6,6 +6,13 @@
 #   * sink  — ingest: receives the runner's cumulative NDJSON event snapshot
 # and drives a small, unit-tested Stage-1 state machine to a deterministic
 # PASS/FAIL. Standalone workspace so it never joins the main Bamep workspace.
+#
+# Stage 2 adds `src/matrix.rs`: the typed Issue-63 lab operations
+# (next_case / case_ready / case_started / case_completed / matrix_completed),
+# deterministic 36-case sequencing, stop-on-first-failed/contaminated, and
+# result aggregation — all composed over `bamep-i63-stage2-engine`. Stage-1
+# behaviour is unchanged and its regression stays green. The Stage-2 matrix is
+# NOT wired into any physical boot payload and NOT armed.
 [package]
 name = "bamep-i63-stage1-coordinator"
 version = "0.1.0"
@@ -24,6 +31,7 @@ path = "src/lib.rs"
 
 [dependencies]
 serde_json = "1"
+bamep-i63-stage2-engine = { path = "../stage2-engine" }
 
 [profile.release]
 opt-level = "z"

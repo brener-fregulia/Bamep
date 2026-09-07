@@ -21,6 +21,7 @@
 //! closed WITHOUT inventing a registry/timezone fallback (per the Stage-1
 //! contract).
 
+mod matrix;
 mod pure;
 
 use std::io::{Read, Write};
@@ -684,6 +685,11 @@ fn run(log: &Log, args: &Args) -> i32 {
 }
 
 fn main() {
+    // Stage-2 `--matrix` subcommand, intercepted BEFORE `parse_args` so the
+    // committed Stage-1 invocation is completely unaffected. NOT ARMED.
+    if std::env::args().nth(1).as_deref() == Some("--matrix") {
+        std::process::exit(matrix::run_not_armed());
+    }
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {

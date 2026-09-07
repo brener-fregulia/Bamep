@@ -183,13 +183,43 @@ created is reverted). Evidence: `evidence/<run-id>/` (git-ignored).
 
 ---
 
-## Stages 2 and 3 (not built yet)
+---
 
-- **Stage 2** — Issue-63 probe adaptation (exact source-length/safety gate,
-  `CP7_CHUNK_SIZE`), fresh harness/transfer lineage per case, coordinator matrix
-  state machine, balanced 8/16/32/64 MiB ordering, paired-ratio analysis. Proven
-  off-device first. No physical matrix run.
-- **Stage 3** — one-command supervisor + the actual clean-fast-path physical
-  matrix (8/16/32/64 MiB, 2 GiB extent, 1 warm-up/size, 8 balanced cycles).
+## Stage 2 — build + validate the safe physical matrix engine OFF-DEVICE (NO transfer matrix)
 
-Each stage stops for owner review. No commit / push / GitHub mutation.
+Owner-approved. Stage 2 builds the throwaway measurement machinery Stage 3 will
+run on the disposable MiniPC, and proves as much as possible without the MiniPC.
+**PHYSICAL MATRIX NOT ARMED** — there is deliberately no command that starts the
+36 physical transfers.
+
+| Path | What it is | LOC (authored / adapted) |
+|---|---|---|
+| `stage2-engine/` | Pure deterministic authority: the exact **36-case matrix plan** (2048 MiB extent, 8/16/32/64 MiB, 4 warm-ups + 32 measured, 4×4 Latin square ×2), exact chunk arithmetic + runtime agreement gate, the **physical source-safety predicate** (fail-closed; a rejection performs ZERO bulk reads), the Stage-3 **disk-budget preflight** (72 GiB payload / 90 GiB gate), the typed **per-case lifecycle** + **matrix sequencer** (stop on first FAILED/CONTAMINATED), the per-case NDJSON **result schema** (both measurement boundaries), and **measured-only aggregation + within-cycle paired ratios**. No I/O. | ~1340 / ~30 (Phase-A stat helpers, re-derived) |
+| `coordinator/src/matrix.rs` | Typed Issue-63 lab ops (`next_case` / `case_ready` / `case_started` / `case_completed` / `matrix_completed`) over the engine; deterministic sequencing; stop-on-failure; result aggregation. `coordinator --matrix-selftest` walks the full 36-case plan in-memory with stub results; `coordinator --matrix` prints `PHYSICAL MATRIX NOT ARMED`. Stage-1 behaviour + regression unchanged. | ~430 / 0 |
+| `stage2-harness/` | Linux one-transfer harness, **Phase-A backend (option (a))**: real Worker HTTPS `DataPlane`, real `FilesystemChunkStore` staging/fsync/linkat, real D2 `FullArtifactHasher`, real `bamep_simulator::DataPlaneClient` + per-request proof; `bamepd` faked over UDS (ADR-0018). `--smoke` = the **8/16/32/64 MiB host synthetic vertical** at a 128 MiB extent (one transfer/size → `Artifact::Verified` + a structured `CaseResult` each). `--case-file <Case.json>` runs one synthetic transfer. | ~560 / ~120 (Phase-A `run_one_transfer` + fake bamepd) |
+| `stage2-probe/` | WinPE-native transfer probe (`x86_64-pc-windows-msvc`, static CRT). `resolver.rs` byte-identical copy from `#61` probe7; `sources.rs` minimally-adapted copy (`GENERIC_READ` only); `stream.rs` adapted from probe7 with the **CP7A Gate-4 fault-injection checkpoint removed** (Issue-63 clean fast path = ZERO deliberate fault injection); new `safety.rs` glue to the engine predicate; new smaller `main.rs`. One process = one transfer case: enumerate → mint epoch → operator selection → coord/Server-UTC → clock pre-flight → WSS/auth → dispatch → grant → resolver → GENERIC_READ open + 3-IOCTL length → **source-safety predicate** → **chunk-size agreement gate** → single-pass stream → seal → `Artifact::Verified` → `ActionResult`. `--self-check` proves the Accept + Reject paths and `bulk_read_count == 0` on the host. | ~700 / ~890 (resolver+sources copied, stream adapted) |
+| `winpe-runner/src/matrix.rs` | LAB-ONLY `--matrix` subcommand on the committed Stage-1 runner, **NOT ARMED**: pure `parse_case` / `probe_argv` helpers (propagate chunk size + extent verbatim) for the Stage-3 loop, plus a not-armed banner. Intercepted before `parse_args` so Stage-1 invocation is byte-for-byte unchanged. | ~160 / 0 |
+| `stage2/run-stage2-checks.sh` | Runs every Stage-2 off-device check in order. NO physical boot, NO device read, NO coordinator TCP, NO matrix. | ~55 |
+
+### Run it (off-device)
+
+```bash
+./stage2/run-stage2-checks.sh          # engine + coordinator + probe + host smoke + runner regression
+
+# WinPE cross-build + PE import inspection (owner-approved #60 toolchain)
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH" XWIN_ACCEPT_LICENSE=1
+export RUSTFLAGS="-C target-feature=+crt-static"
+( cd stage2-probe && cargo xwin build --release --target x86_64-pc-windows-msvc )
+llvm-readobj --coff-imports stage2-probe/target/x86_64-pc-windows-msvc/release/bamep-i63-stage2-probe.exe | grep 'DLL'
+```
+
+Probe PE imports (verified): `ADVAPI32 api-ms-win-core-synch-l1-2-0 bcrypt bcryptprimitives
+kernel32 ntdll ws2_32` — a strict subset of the #60/#61-proven stock-WinPE DLL set;
+no VCRUNTIME/UCRT, no new dependency.
+
+## Stage 3 (not built)
+
+One-command supervisor + the actual clean-fast-path physical matrix (8/16/32/64 MiB,
+2048 MiB extent, 1 warm-up/size, 8 balanced cycles = 36 transfers), the real
+#61/CP7-shaped Server/Worker orchestration, and the physical WinPE source. Stops
+for owner review first. No commit / push / GitHub mutation.
