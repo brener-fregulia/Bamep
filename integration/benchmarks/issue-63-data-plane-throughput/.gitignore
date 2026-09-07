@@ -1,0 +1,6 @@
+# Issue #63 data-plane throughput Spike — build output only.
+# Versioned: src/**, Cargo.toml, Cargo.lock, README.md, this .gitignore, and
+# runs/** (the *-FINDINGS.md reports and the raw *.log evidence they derive
+# from — small, sanitised, safe to publish; see README "Raw log sanitisation").
+# Everything below is regenerable.
+target/

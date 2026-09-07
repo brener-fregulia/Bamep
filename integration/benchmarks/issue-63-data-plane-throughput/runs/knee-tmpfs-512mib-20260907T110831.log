@@ -1,0 +1,140 @@
+=== Issue #63 Spike — CHUNK-SIZE KNEE SWEEP: 8 / 16 / 32 / 64 MiB (all else held equal) ===
+host: os=linux arch=x86_64 cpus=8
+storage_dir: [sanitised: host-local scratch dir removed]  (fs ~= tmpfs)
+extent per transfer: 512 MiB ; cycles: 8 ; chunk sizes: [8, 16, 32, 64] MiB (1 warm-up/size excluded)
+
+worker data-plane listening on 127.0.0.1:37611
+
+--- warm-up (excluded): one transfer per chunk size ---
+   8 MiB:   3.320 s   154.20 MiB/s   (warm-up)
+  16 MiB:   2.137 s   239.58 MiB/s   (warm-up)
+  32 MiB:   2.429 s   210.83 MiB/s   (warm-up)
+  64 MiB:   2.322 s   220.50 MiB/s   (warm-up)
+
+--- cycle 1/8 | order [8, 16, 32, 64] MiB | 512 MiB extent | fs=tmpfs ---
+   8 MiB ( 64 chunks):   3.288 s   155.72 MiB/s   163.28 MB/s  peakRSS 44 MiB
+  16 MiB ( 32 chunks):   2.581 s   198.36 MiB/s   207.99 MB/s  peakRSS 60 MiB
+  32 MiB ( 16 chunks):   2.337 s   219.07 MiB/s   229.71 MB/s  peakRSS 92 MiB
+  64 MiB (  8 chunks):   2.311 s   221.53 MiB/s   232.29 MB/s  peakRSS 156 MiB
+
+--- cycle 2/8 | order [64, 32, 16, 8] MiB | 512 MiB extent | fs=tmpfs ---
+  64 MiB (  8 chunks):   2.275 s   225.03 MiB/s   235.96 MB/s  peakRSS 156 MiB
+  32 MiB ( 16 chunks):   2.383 s   214.85 MiB/s   225.28 MB/s  peakRSS 92 MiB
+  16 MiB ( 32 chunks):   2.529 s   202.46 MiB/s   212.29 MB/s  peakRSS 60 MiB
+   8 MiB ( 64 chunks):   3.336 s   153.49 MiB/s   160.95 MB/s  peakRSS 44 MiB
+
+--- cycle 3/8 | order [16, 64, 8, 32] MiB | 512 MiB extent | fs=tmpfs ---
+  16 MiB ( 32 chunks):   2.436 s   210.21 MiB/s   220.42 MB/s  peakRSS 60 MiB
+  64 MiB (  8 chunks):   2.277 s   224.91 MiB/s   235.83 MB/s  peakRSS 156 MiB
+   8 MiB ( 64 chunks):   3.254 s   157.35 MiB/s   165.00 MB/s  peakRSS 44 MiB
+  32 MiB ( 16 chunks):   2.397 s   213.56 MiB/s   223.93 MB/s  peakRSS 108 MiB
+
+--- cycle 4/8 | order [32, 8, 64, 16] MiB | 512 MiB extent | fs=tmpfs ---
+  32 MiB ( 16 chunks):   2.329 s   219.88 MiB/s   230.56 MB/s  peakRSS 108 MiB
+   8 MiB ( 64 chunks):   3.214 s   159.28 MiB/s   167.02 MB/s  peakRSS 44 MiB
+  64 MiB (  8 chunks):   2.255 s   227.01 MiB/s   238.03 MB/s  peakRSS 172 MiB
+  16 MiB ( 32 chunks):   2.362 s   216.72 MiB/s   227.25 MB/s  peakRSS 60 MiB
+
+--- cycle 5/8 | order [8, 16, 32, 64] MiB | 512 MiB extent | fs=tmpfs ---
+   8 MiB ( 64 chunks):   3.300 s   155.14 MiB/s   162.67 MB/s  peakRSS 44 MiB
+  16 MiB ( 32 chunks):   2.694 s   190.06 MiB/s   199.29 MB/s  peakRSS 60 MiB
+  32 MiB ( 16 chunks):   2.459 s   208.20 MiB/s   218.31 MB/s  peakRSS 92 MiB
+  64 MiB (  8 chunks):   2.211 s   231.54 MiB/s   242.78 MB/s  peakRSS 156 MiB
+
+--- cycle 6/8 | order [64, 32, 16, 8] MiB | 512 MiB extent | fs=tmpfs ---
+  64 MiB (  8 chunks):   2.245 s   228.10 MiB/s   239.18 MB/s  peakRSS 156 MiB
+  32 MiB ( 16 chunks):   2.508 s   204.15 MiB/s   214.07 MB/s  peakRSS 92 MiB
+  16 MiB ( 32 chunks):   2.509 s   204.04 MiB/s   213.95 MB/s  peakRSS 60 MiB
+   8 MiB ( 64 chunks):   3.313 s   154.54 MiB/s   162.04 MB/s  peakRSS 44 MiB
+
+--- cycle 7/8 | order [16, 64, 8, 32] MiB | 512 MiB extent | fs=tmpfs ---
+  16 MiB ( 32 chunks):   2.396 s   213.69 MiB/s   224.07 MB/s  peakRSS 60 MiB
+  64 MiB (  8 chunks):   2.234 s   229.15 MiB/s   240.28 MB/s  peakRSS 156 MiB
+   8 MiB ( 64 chunks):   3.183 s   160.83 MiB/s   168.65 MB/s  peakRSS 44 MiB
+  32 MiB ( 16 chunks):   2.468 s   207.42 MiB/s   217.49 MB/s  peakRSS 108 MiB
+
+--- cycle 8/8 | order [32, 8, 64, 16] MiB | 512 MiB extent | fs=tmpfs ---
+  32 MiB ( 16 chunks):   2.458 s   208.26 MiB/s   218.37 MB/s  peakRSS 108 MiB
+   8 MiB ( 64 chunks):   3.386 s   151.20 MiB/s   158.55 MB/s  peakRSS 45 MiB
+  64 MiB (  8 chunks):   2.290 s   223.55 MiB/s   234.41 MB/s  peakRSS 173 MiB
+  16 MiB ( 32 chunks):   2.676 s   191.36 MiB/s   200.65 MB/s  peakRSS 61 MiB
+
+--- Worker D1 staging split (real ChunkStore API) + raw fsync decomposition ---
+   8 MiB x32: begin=0.053 ms  write+SHA=9.081 ms  finalize(fsync+link+fsync)=0.044 ms   [per chunk]
+           raw approx: write+flush=4.479 ms  fsync(file)=0.002 ms  hard_link=0.018 ms  fsync(dir)=0.008 ms
+  16 MiB x16: begin=0.054 ms  write+SHA=17.995 ms  finalize(fsync+link+fsync)=0.043 ms   [per chunk]
+           raw approx: write+flush=9.091 ms  fsync(file)=0.002 ms  hard_link=0.019 ms  fsync(dir)=0.009 ms
+  32 MiB x 8: begin=0.059 ms  write+SHA=36.514 ms  finalize(fsync+link+fsync)=0.044 ms   [per chunk]
+           raw approx: write+flush=18.797 ms  fsync(file)=0.002 ms  hard_link=0.020 ms  fsync(dir)=0.007 ms
+  64 MiB x 4: begin=0.076 ms  write+SHA=73.402 ms  finalize(fsync+link+fsync)=0.050 ms   [per chunk]
+           raw approx: write+flush=37.635 ms  fsync(file)=0.002 ms  hard_link=0.020 ms  fsync(dir)=0.009 ms
+
+--- Independent ceilings ---
+  SHA-256 single pass (64 MiB buf x40):        1917.7 MB/s (1.92 GB/s)
+  memcpy to_vec (64 MiB x80):                  1500.3 MB/s (1.50 GB/s)
+  bare TCP+TLS1.3+HTTP/1.1 handshake x60:       0.724 ms / connection
+
+============== KNEE ANALYSIS (tmpfs, 512 MiB equal-byte extent) ==============
+
+  8 MiB chunks  (64 chunks/xfer, 66 TCP/TLS conns/xfer, n=8)
+    raw rep wall (s):         [3.288, 3.336, 3.254, 3.214, 3.3, 3.313, 3.183, 3.386]
+    median throughput:        155.43 MiB/s   162.98 MB/s
+    chunks/GiB = 128.0   durability boundaries/GiB = 128.0  (1 fsync(file) + 1 fsync(dir) per chunk)
+    median per-chunk wall:    45.17 ms
+    full put_chunk (Agent-observed), per chunk: 26.40 ms
+    Agent per-chunk: materialize 1.223  chunkSHA 8.693  rollSHA 8.552  proof 0.164  (ms)
+    once/xfer: resume 1.44 ms   seal+D2 401.60 ms   (harness independent D2 recheck 355.84 ms)
+    peak process RSS: median 44 MiB   max 45 MiB
+
+  16 MiB chunks  (32 chunks/xfer, 34 TCP/TLS conns/xfer, n=8)
+    raw rep wall (s):         [2.581, 2.529, 2.436, 2.362, 2.694, 2.509, 2.396, 2.676]
+    median throughput:        203.25 MiB/s   213.12 MB/s
+    chunks/GiB = 64.0   durability boundaries/GiB = 64.0  (1 fsync(file) + 1 fsync(dir) per chunk)
+    median per-chunk wall:    67.65 ms
+    full put_chunk (Agent-observed), per chunk: 40.81 ms
+    Agent per-chunk: materialize 2.405  chunkSHA 13.373  rollSHA 10.972  proof 0.099  (ms)
+    once/xfer: resume 1.41 ms   seal+D2 352.88 ms   (harness independent D2 recheck 351.70 ms)
+    peak process RSS: median 60 MiB   max 61 MiB
+
+  32 MiB chunks  (16 chunks/xfer, 18 TCP/TLS conns/xfer, n=8)
+    raw rep wall (s):         [2.337, 2.383, 2.397, 2.329, 2.459, 2.508, 2.468, 2.458]
+    median throughput:        210.91 MiB/s   221.15 MB/s
+    chunks/GiB = 32.0   durability boundaries/GiB = 32.0  (1 fsync(file) + 1 fsync(dir) per chunk)
+    median per-chunk wall:    129.82 ms
+    full put_chunk (Agent-observed), per chunk: 73.38 ms
+    Agent per-chunk: materialize 20.518  chunkSHA 17.544  rollSHA 17.571  proof 0.091  (ms)
+    once/xfer: resume 1.42 ms   seal+D2 349.46 ms   (harness independent D2 recheck 351.90 ms)
+    peak process RSS: median 108 MiB   max 108 MiB
+
+  64 MiB chunks  (8 chunks/xfer, 10 TCP/TLS conns/xfer, n=8)
+    raw rep wall (s):         [2.311, 2.275, 2.277, 2.255, 2.211, 2.245, 2.234, 2.29]
+    median throughput:        226.02 MiB/s   237.00 MB/s
+    chunks/GiB = 16.0   durability boundaries/GiB = 16.0  (1 fsync(file) + 1 fsync(dir) per chunk)
+    median per-chunk wall:    239.12 ms
+    full put_chunk (Agent-observed), per chunk: 128.48 ms
+    Agent per-chunk: materialize 39.926  chunkSHA 35.119  rollSHA 35.147  proof 0.091  (ms)
+    once/xfer: resume 1.43 ms   seal+D2 350.95 ms   (harness independent D2 recheck 348.33 ms)
+    peak process RSS: median 156 MiB   max 173 MiB
+
+  -- marginal-return curve (median MiB/s) --
+     8 -> 16 MiB :  +30.8%  (x1.308)   |  vs 8 MiB baseline: x1.308
+    16 -> 32 MiB :   +3.8%  (x1.038)   |  vs 8 MiB baseline: x1.357
+    32 -> 64 MiB :   +7.2%  (x1.072)   |  vs 8 MiB baseline: x1.454
+
+  -- memory / retry envelope (design estimates; A = measured, B/C = envelope) --
+    size     A observed peak      A harness now   B ownership serial  C two-buffer pipeline      retry bytes
+    8MiB               44 MiB              44 MiB               ~8 MiB                 ~16 MiB             8 MiB
+    16MiB              60 MiB              60 MiB              ~16 MiB                 ~32 MiB            16 MiB
+    32MiB             108 MiB             108 MiB              ~32 MiB                 ~64 MiB            32 MiB
+    64MiB             156 MiB             156 MiB              ~64 MiB                ~128 MiB            64 MiB
+    (B ~= 1 owned chunk-sized buffer + small transport overhead;
+     C ~= 2 chunk-sized buffers + transport overhead; a lost/uncertain PUT
+     re-sends up to one whole chunk.)
+
+  Caveat: Case B + this sweep indicate the durability cost in THIS environment
+  is strongly fixed-durability-boundary dominated. This is NOT a claim that
+  fsync latency is universally fixed or independent of bytes.
+
+(Connection count falls only because there are fewer chunks — NOT evidence for reuse.)
+
+done.
