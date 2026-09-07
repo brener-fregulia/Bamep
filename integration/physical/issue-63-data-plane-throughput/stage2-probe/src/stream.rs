@@ -22,9 +22,21 @@
 //!     digest fails closed.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
+
+/// Aggregate per-stage nanosecond counters accumulated across the single pass.
+/// Issue #63 Stage 3 needs `read_ms` / `chunk_sha_ms` / `rolling_sha_ms`
+/// preserved in the `CaseResult` (the Stage-2 schema already carries the
+/// fields; only the fill was missing on the probe path). NOT high-frequency
+/// telemetry — three `u128` adds per chunk.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PassTimings {
+    pub read_ns: u128,
+    pub chunk_sha_ns: u128,
+    pub rolling_sha_ns: u128,
+}
 
 const MAX_LOCAL_PUT_RETRIES: u32 = 3;
 const LOCAL_BACKOFF: Duration = Duration::from_millis(50);
@@ -120,6 +132,7 @@ pub struct StreamState {
     total_len: u64,
     chunk_size: u64,
     chunk_count: u64,
+    timings: PassTimings,
 }
 
 impl StreamState {
@@ -145,11 +158,17 @@ impl StreamState {
             total_len,
             chunk_size,
             chunk_count,
+            timings: PassTimings::default(),
         })
     }
 
     pub fn chunk_count(&self) -> u64 {
         self.chunk_count
+    }
+
+    /// Aggregate per-stage timings accumulated over the pass.
+    pub fn timings(&self) -> PassTimings {
+        self.timings
     }
     pub fn held_count(&self) -> u64 {
         self.held.len() as u64
@@ -226,17 +245,23 @@ impl StreamState {
         if index == self.hashed_through {
             let len = self.expected_len(index);
             let offset = index * self.chunk_size;
+            let t = Instant::now();
             let bytes = reader
                 .read_chunk(index, offset, len)
                 .map_err(|e| StreamError::Fatal(format!("read chunk {index}: {e}")))?;
+            self.timings.read_ns += t.elapsed().as_nanos();
             if bytes.len() as u64 != len {
                 return Err(StreamError::Fatal(format!(
                     "chunk {index}: source returned {} bytes, expected {len}",
                     bytes.len()
                 )));
             }
+            let t = Instant::now();
             self.rolling.update(&bytes); // <-- the ONLY rolling.update for this index
+            self.timings.rolling_sha_ns += t.elapsed().as_nanos();
+            let t = Instant::now();
             let digest_wire = crate::sha256_wire(&bytes);
+            self.timings.chunk_sha_ns += t.elapsed().as_nanos();
             self.processed
                 .insert(index, ChunkFacts { digest_wire, size: len });
             self.hashed_through = index + 1;

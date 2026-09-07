@@ -2,4 +2,5 @@
 //! kept separate from `main.rs` so `cargo test` exercises it without any I/O.
 
 pub mod matrix;
+pub mod matrix_net;
 pub mod state;

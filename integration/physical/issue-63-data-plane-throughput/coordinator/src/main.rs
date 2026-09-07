@@ -113,12 +113,19 @@ fn stage2_subcommand() -> Option<i32> {
     match std::env::args().nth(1).as_deref() {
         Some("--matrix-selftest") => Some(matrix_selftest()),
         Some("--matrix") => {
+            // Stage 3: `--matrix --arm ...` runs the ARMED networked matrix
+            // authority (the Stage-3 lab supervisor passes `--arm` only after
+            // its own host-side preflight). Without `--arm` this is inert.
+            if std::env::args().any(|a| a == "--arm") {
+                let cfg = bamep_i63_stage1_coordinator::matrix_net::parse_cfg();
+                bamep_i63_stage1_coordinator::matrix_net::run(cfg); // -> !
+            }
             println!("PHYSICAL MATRIX NOT ARMED");
             println!(
                 "coordinator: the Stage-2 typed matrix coordinator (src/matrix.rs) is built and \
-                 unit-tested, but the Stage-3 networked wiring (per-case harness + WinPE probe + \
-                 real #61/CP7 Server/Worker orchestration) is NOT implemented and NOT armed. There \
-                 is deliberately no command here that starts the 36 physical transfers."
+                 unit-tested. The Stage-3 ARMED networked wiring lives behind `--matrix --arm` and \
+                 is started ONLY by run-stage3-lab.sh after host-side preflight. There is \
+                 deliberately no casual command that starts the 36 physical transfers."
             );
             println!("Run `--matrix-selftest` for the deterministic in-memory sequencing check.");
             Some(0)

@@ -218,6 +218,13 @@ struct Args {
     /// The plan case id, carried through to the result line for correlation.
     case_id: String,
     run_id: String,
+    /// If non-empty: after a successful WSS auth, write the freshly issued
+    /// `runtime_credential` (from `SessionEstablished`) here so the NEXT
+    /// per-case probe process can reuse it (ADR-0012 runtime-credential
+    /// rotation). Stage-3 matrix runner: case 0 authenticates with the
+    /// first-contact enrollment credential; cases 1..35 with the rotated
+    /// runtime credential this wrote.
+    runtime_credential_out: String,
 }
 fn parse_args() -> Args {
     let mut a = Args {
@@ -234,6 +241,7 @@ fn parse_args() -> Args {
         skew_ceil_ms: SKEW_CEIL_MS_DEFAULT,
         case_id: "i63s2-probe-case".into(),
         run_id: "i63s2-probe".into(),
+        runtime_credential_out: String::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -258,6 +266,9 @@ fn parse_args() -> Args {
             }
             "--case-id" => a.case_id = it.next().unwrap_or(a.case_id),
             "--run-id" => a.run_id = it.next().unwrap_or(a.run_id),
+            "--runtime-credential-out" => {
+                a.runtime_credential_out = it.next().unwrap_or_default()
+            }
             "--self-check" => { /* handled in main before this */ }
             _ => {}
         }
@@ -319,6 +330,10 @@ struct RealDataPlane {
     /// The chunk_size the Server's manifest reported on the last resume — the
     /// "Server Transfer chunk_size" input to the agreement gate.
     observed_manifest_chunk_size: Option<u64>,
+    /// Aggregate per-chunk proof-mint + PUT/ACK nanoseconds (Stage-3 CaseResult
+    /// `proof_ms` / `put_ack_ms`; the Stage-2 schema already carries both).
+    proof_ns: std::cell::Cell<u128>,
+    put_ack_ns: std::cell::Cell<u128>,
 }
 impl DataPlane for RealDataPlane {
     async fn discover_resume(&mut self) -> ResumeStatus {
@@ -362,6 +377,7 @@ impl DataPlane for RealDataPlane {
     }
 
     async fn put_chunk(&mut self, index: u64, digest_wire: &str, bytes: &[u8]) -> PutStatus {
+        let t_proof = Instant::now();
         let proof = match self
             .auth
             .create_proof_now(TransferOperation::ChunkUpload, Some(index))
@@ -369,7 +385,9 @@ impl DataPlane for RealDataPlane {
             Ok(p) => p,
             Err(e) => return PutStatus::Fatal(format!("chunk proof: {e}")),
         };
-        match self
+        self.proof_ns.set(self.proof_ns.get() + t_proof.elapsed().as_nanos());
+        let t_put = Instant::now();
+        let outcome = self
             .client
             .put_chunk(
                 self.auth.token(),
@@ -379,7 +397,9 @@ impl DataPlane for RealDataPlane {
                 &proof,
                 bytes.to_vec(),
             )
-            .await
+            .await;
+        self.put_ack_ns.set(self.put_ack_ns.get() + t_put.elapsed().as_nanos());
+        match outcome
         {
             Ok(PutChunkOutcome::Accepted { .. }) => PutStatus::Accepted,
             Ok(PutChunkOutcome::AlreadyHeld { .. }) => PutStatus::AlreadyHeld,
@@ -662,10 +682,15 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
     let sel_source = matched[0].clone();
 
     // ---- 2. lab coord + Server-UTC ACK ----
+    // The `chunk_size` is carried so the Stage-3 harness creates this case's
+    // fresh Transfer lineage with the exact plan chunk size (the harness
+    // ignores it for the Stage-1/#61 single-transfer shapes).
     let coord_line = format!(
-        r#"{{"cp7_coord":"source_selection","source_observation_id":"{}","selected_agent_source_id":"{}"}}"#,
+        r#"{{"cp7_coord":"source_selection","source_observation_id":"{}","selected_agent_source_id":"{}","chunk_size":{},"case_id":"{}"}}"#,
         esc(&obs_id),
-        esc(&sel_asid)
+        esc(&sel_asid),
+        args.chunk_size,
+        esc(&args.case_id)
     );
     let server_utc_ms = match coord_roundtrip(&args.coord, &coord_line) {
         Ok(v) => v,
@@ -724,8 +749,31 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
         }
     };
     match authenticate(&mut ws, &credential).await {
-        Ok(SimulatorHandshakeOutcome::Established(_)) => {
-            log.emit("info", "probe.auth.session_established", &[])
+        Ok(SimulatorHandshakeOutcome::Established(est)) => {
+            log.emit("info", "probe.auth.session_established", &[]);
+            // Persist the freshly issued runtime credential so the NEXT
+            // per-case probe process can authenticate without re-redeeming the
+            // (single-use) first-contact credential. Never logged.
+            if !args.runtime_credential_out.is_empty() {
+                match std::fs::write(
+                    &args.runtime_credential_out,
+                    est.body.runtime_credential.as_bytes(),
+                ) {
+                    Ok(()) => log.emit(
+                        "info",
+                        "probe.auth.runtime_credential_persisted",
+                        &[("path", s(&args.runtime_credential_out))],
+                    ),
+                    Err(e) => {
+                        log.emit(
+                            "error",
+                            "probe.auth.runtime_credential_persist_failed",
+                            &[("error", s(e.to_string()))],
+                        );
+                        return exit::WSS_AUTH;
+                    }
+                }
+            }
         }
         Ok(SimulatorHandshakeOutcome::Rejected(_)) => {
             log.emit("error", "probe.auth.rejected", &[]);
@@ -985,6 +1033,8 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
         transfer_uuid,
         chunk_size: args.chunk_size,
         observed_manifest_chunk_size: None,
+        proof_ns: std::cell::Cell::new(0),
+        put_ack_ns: std::cell::Cell::new(0),
     };
 
     // ---- measurement boundary B start (before resume / stream) ----
@@ -1136,11 +1186,20 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
             } else {
                 "completed"
             };
+            let ts = state.timings();
+            let ns_ms = |n: u128| (n as f64 / 1_000_000.0) as i64;
             emit_full_result(
                 log, args, state.chunk_count(), transfer_uuid, artifact_uuid,
                 &safety_verdict_token, &clock_verdict,
                 bulk_stream_wall_ms, verified_transfer_wall_ms, resume_ms_total, seal_d2_ms,
                 reader.counters.borrow().data_read_count, "Verified", case_status,
+                &[
+                    ("read_ms", ns_ms(ts.read_ns)),
+                    ("chunk_sha_ms", ns_ms(ts.chunk_sha_ns)),
+                    ("rolling_sha_ms", ns_ms(ts.rolling_sha_ns)),
+                    ("proof_ms", ns_ms(dp.proof_ns.get())),
+                    ("put_ack_ms", ns_ms(dp.put_ack_ns.get())),
+                ],
             );
             log.emit(
                 "info",
@@ -1190,6 +1249,7 @@ fn emit_full_result(
     device_read_count: u64,
     final_artifact_status: &str,
     case_status: &str,
+    extra_ms: &[(&str, i64)],
 ) {
     let mib_s = |wall_ms: f64| {
         if wall_ms <= 0.0 {
@@ -1198,31 +1258,31 @@ fn emit_full_result(
             (args.extent_bytes as f64 / (1024.0 * 1024.0)) / (wall_ms / 1000.0)
         }
     };
-    log.emit(
-        "info",
-        "probe.case_result",
-        &[
-            ("run_id", s(&args.run_id)),
-            ("case_id", s(&args.case_id)),
-            ("chunk_size_bytes", V::U(args.chunk_size)),
-            ("extent_bytes", V::U(args.extent_bytes)),
-            ("chunk_count", V::U(chunk_count)),
-            ("device_read_count", V::U(device_read_count)),
-            ("transfer_id", s(transfer_uuid.to_string())),
-            ("artifact_id", s(artifact_uuid.to_string())),
-            ("source_safety_verdict", s(safety_verdict)),
-            ("clock_skew_verdict", s(clock_verdict)),
-            ("bulk_stream_wall_ms", V::I(bulk_stream_wall_ms as i64)),
-            ("bulk_stream_mib_s", V::I(mib_s(bulk_stream_wall_ms) as i64)),
-            ("verified_transfer_wall_ms", V::I(verified_transfer_wall_ms as i64)),
-            ("verified_transfer_mib_s", V::I(mib_s(verified_transfer_wall_ms) as i64)),
-            ("resume_ms", V::I(resume_ms as i64)),
-            ("seal_d2_ms", V::I(seal_d2_ms as i64)),
-            ("connection_count_expected", V::U(chunk_count + 2)),
-            ("final_artifact_status", s(final_artifact_status)),
-            ("case_status", s(case_status)),
-        ],
-    );
+    let mut fields: Vec<(&str, V)> = vec![
+        ("run_id", s(&args.run_id)),
+        ("case_id", s(&args.case_id)),
+        ("chunk_size_bytes", V::U(args.chunk_size)),
+        ("extent_bytes", V::U(args.extent_bytes)),
+        ("chunk_count", V::U(chunk_count)),
+        ("device_read_count", V::U(device_read_count)),
+        ("transfer_id", s(transfer_uuid.to_string())),
+        ("artifact_id", s(artifact_uuid.to_string())),
+        ("source_safety_verdict", s(safety_verdict)),
+        ("clock_skew_verdict", s(clock_verdict)),
+        ("bulk_stream_wall_ms", V::I(bulk_stream_wall_ms as i64)),
+        ("bulk_stream_mib_s", V::I(mib_s(bulk_stream_wall_ms) as i64)),
+        ("verified_transfer_wall_ms", V::I(verified_transfer_wall_ms as i64)),
+        ("verified_transfer_mib_s", V::I(mib_s(verified_transfer_wall_ms) as i64)),
+        ("resume_ms", V::I(resume_ms as i64)),
+        ("seal_d2_ms", V::I(seal_d2_ms as i64)),
+        ("connection_count_expected", V::U(chunk_count + 2)),
+        ("final_artifact_status", s(final_artifact_status)),
+        ("case_status", s(case_status)),
+    ];
+    for (k, v) in extra_ms {
+        fields.push((k, V::I(*v)));
+    }
+    log.emit("info", "probe.case_result", &fields);
 }
 
 #[allow(clippy::too_many_arguments)]

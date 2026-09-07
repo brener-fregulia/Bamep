@@ -1,17 +1,22 @@
 # Issue #63 physical data-plane throughput Spike — build + runtime + physical
 # evidence output. Authored source is versioned:
 #   coordinator/src/**, winpe-runner/src/**, winpe-runner/build.rs,
-#   stage2-engine/src/**, */Cargo.toml, */Cargo.lock, stage1/**, README.md,
-#   this .gitignore.
+#   stage2-engine/src/**, stage2-probe/src/**, stage2-probe/build.rs,
+#   stage2-harness/src/**, stage3-harness/src/**, */Cargo.toml, */Cargo.lock,
+#   stage1/**, stage2/**, stage3/**, README.md, this .gitignore.
 # Everything below is regenerable, runtime, or physical-run output.
 target/
 evidence/
+# Stage-3 harness runtime: persisted self-signed leaf, chunk store, fingerprint.
+runtime-stage3/
 *.log
 *.ndjson
 # Generated / cross-built executables (rebuilt from source, staged at run time).
 *.exe
 *.pdb
-# There is NO credential/key/token material in Stage 1, but never commit any.
+# Stage 1 carries NO credential/key/token. Stage 3 mints ONE short-TTL
+# first-contact credential per run into the git-ignored evidence dir. Never
+# commit any key/credential material.
 *.pem
 *.key
 *.crt

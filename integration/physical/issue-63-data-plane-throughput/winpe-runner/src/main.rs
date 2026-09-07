@@ -685,9 +685,13 @@ fn run(log: &Log, args: &Args) -> i32 {
 }
 
 fn main() {
-    // Stage-2 `--matrix` subcommand, intercepted BEFORE `parse_args` so the
-    // committed Stage-1 invocation is completely unaffected. NOT ARMED.
+    // `--matrix` subcommand, intercepted BEFORE `parse_args` so the committed
+    // Stage-1 invocation is completely unaffected. `--matrix --arm` runs the
+    // Stage-3 physical matrix loop; `--matrix` alone is inert.
     if std::env::args().nth(1).as_deref() == Some("--matrix") {
+        if std::env::args().any(|x| x == "--arm") {
+            std::process::exit(matrix::run_armed());
+        }
         std::process::exit(matrix::run_not_armed());
     }
     let args = match parse_args() {

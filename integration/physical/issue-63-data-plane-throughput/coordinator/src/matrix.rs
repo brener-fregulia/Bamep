@@ -92,6 +92,12 @@ impl MatrixCoordinator {
         self.seq.plan().cases.len()
     }
 
+    /// The full deterministic 36-case plan, in run order (for the Stage-3 run
+    /// directory's `matrix-plan.json`).
+    pub fn plan_cases(&self) -> &[Case] {
+        &self.seq.plan().cases
+    }
+
     fn current_case_id(&self) -> Option<&str> {
         self.current.as_ref().map(|m| m.correlation().case_id.as_str())
     }

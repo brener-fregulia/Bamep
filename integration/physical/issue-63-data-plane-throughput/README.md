@@ -217,9 +217,153 @@ Probe PE imports (verified): `ADVAPI32 api-ms-win-core-synch-l1-2-0 bcrypt bcryp
 kernel32 ntdll ws2_32` — a strict subset of the #60/#61-proven stock-WinPE DLL set;
 no VCRUNTIME/UCRT, no new dependency.
 
-## Stage 3 (not built)
+---
 
-One-command supervisor + the actual clean-fast-path physical matrix (8/16/32/64 MiB,
-2048 MiB extent, 1 warm-up/size, 8 balanced cycles = 36 transfers), the real
-#61/CP7-shaped Server/Worker orchestration, and the physical WinPE source. Stops
-for owner review first. No commit / push / GitHub mutation.
+## Stage 3 — ARM the minimum physical matrix path (BUILT + PREFLIGHTED; NOT yet run)
+
+Owner-approved. Stage 3 composes the already-proven pieces into ONE foreground
+supervisor for the exact clean-fast-path matrix — **4 warm-ups + 8 balanced
+cycles × 4 = 36 transfers**, **2,147,483,648 bytes (2048 MiB) per case**, chunk
+sizes **8 / 16 / 32 / 64 MiB** (→ 256 / 128 / 64 / 32 chunks, no partial final
+chunk), **one WinPE boot for the whole matrix, NO reboot between cases**, and
+**ZERO deliberate fault injection** (no auth-denial, no listener restart, no
+retry/resume fault). The only intended experiment variable is `chunk_size`.
+
+**PHYSICAL MATRIX ARMED ONLY BEHIND `--arm`.** `./stage3/run-stage3-lab.sh`
+with no `--arm` prints `PHYSICAL MATRIX NOT ARMED` and exits 0. Even with
+`--arm` the supervisor runs every host-side preflight and only then prints
+`READY_FOR_MINIPC_POWER_ON`. It never powers the MiniPC, never starts a physical
+source read, never runs a transfer. **NO physical transfer has been executed.**
+
+| Path | What it is | LOC (authored / adapted) |
+|---|---|---|
+| `coordinator/src/matrix_net.rs` | The ARMED networked wiring around the pure Stage-2 `MatrixCoordinator`. `coordinator --matrix --arm` opens a matrix TCP listener (one JSON object per line, one request per connection: `server_utc` / `next_case` / `case_ready` / `case_started` / `case_completed` / `case_failed`) + a probe-evidence sink. On the first terminal outcome (36 completed, or any halt) it writes `analysis.json` + the one-word `matrix.verdict` (`matrix_pass` / `matrix_fail`), prints `STAGE3_MATRIX_TERMINAL`, drains, exits (0 / 10). `--matrix` WITHOUT `--arm` still prints `PHYSICAL MATRIX NOT ARMED`. No device, no transfer, no DB, no Agent/Worker protocols. | ~430 / 0 |
+| `winpe-runner/src/matrix.rs` | The `bamep-i63-runner --matrix --arm` loop (the committed `--matrix` alone stays inert). Per case: `next_case` from the matrix coordinator → re-check/re-align the WinPE UTC clock OUTSIDE the measured wall (the PROVEN Stage-1 `SetSystemTime` path) → `case_ready` → launch ONE Issue-63 transfer probe with explicit typed argv → observe its exit + `probe.case_result` line → on a verified Artifact `case_started` + `case_completed{result}`, on ANY other outcome `case_failed` and STOP (no retry). Opens no device, issues no IOCTL. | ~430 / 0 |
+| `stage2-probe/` (delta) | `--runtime-credential-out <path>`: persists the rotated `runtime_credential` from `SessionEstablished` so the NEXT per-case probe process authenticates without re-redeeming the single-use first-contact credential (ADR-0012 rotation). The coord `source_selection` line now also carries `chunk_size` + `case_id`. `stream.rs` accumulates `read_ms` / `chunk_sha_ms` / `rolling_sha_ms` and `main.rs` `proof_ms` / `put_ack_ms` into the existing `CaseResult` schema fields (fill only — no new metric, no new boundary). | ~90 / 0 |
+| `stage3-harness/` | The #61/CP7-shaped real Server/Postgres/WSS/Worker harness, **adapted from the closed Issue #61 CP7A harness** (`../issue-61-endpoint-capture-data-plane/harness/src/bin/cp7-harness.rs`). Removed: the Gate-4 auth-denial episode decorator, the `FaultMode` selection, the listener-restart supervisor. Added: a PER-CASE orchestration loop — one fresh Job / Transfer / Artifact lineage per matrix case (chunk size + `case_id` from the coord message), over ONE long-lived enrolled endpoint, runtime-credential rotation between per-case probe processes. Real boundaries unchanged: PostgreSQL adapter, `AgentControlGateway`/WSS, Worker control plane, Worker HTTPS `DataPlane`, `FilesystemChunkStore`, `TransferTerminalEvidenceService`. Mandatory `--storage-root` (≥ 90 GiB, fail closed). `bamep_physint_spike` is used, never created/dropped; #61 is not modified. | ~180 / ~600 |
+| `stage3/derive-stage3-runtime.sh` | Derives the Issue-63 Stage-3 PXE/WinPE runtime from the pinned Phase-9d assets **without modifying them** (identical lineage to Stage 1; re-hashed before/after). Adds FIVE `initrd` overlay lines: `winpeshl.ini` + the Stage-3 bootstrap `.cmd` + the Stage-1 runner `.exe` + the Stage-2 probe `.exe` + the single first-contact enrollment credential; `boot.wim` stays last, byte-identical. The credential is the ONLY secret-shaped file permitted in the derived tree (mode 600, isolated-link HTTP; a deliberate Spike simplification vs #61's SMB mode-600). | ~270 / 0 |
+| `stage3/run-stage3-lab.sh` | The one-command foreground supervisor. `--arm` required; `--preflight` and `--arm --preflight` run every host-side check and stop. Composes: derive → stage3-harness (real PG/WSS/Worker; fingerprint source) → ONE first-contact credential → matrix coordinator (`--matrix --arm`) → WinPE HTTP → dnsmasq → readiness gate → `READY_FOR_MINIPC_POWER_ON` → stream the coordinator verdict. Reverts only the lab network state it created. | ~470 / 0 |
+| `stage3/{winpeshl.ini, bamep-i63-stage3-bootstrap.cmd.template}` | The injected WinPE auto-start payload: `winpeshl.ini` → `cmd /k bootstrap.cmd`; the bootstrap runs `wpeinit` then `bamep-i63-runner.exe --matrix --arm` with the full typed argv. The operator types NOTHING in WinPE after the one wimboot keypress. | ~35 / 0 |
+| `stage3/run-stage3-checks.sh` | Every Stage-3 off-device check in order. NO physical boot, NO device read, NO 36-case matrix. | ~50 / 0 |
+
+### From `./stage3/run-stage3-lab.sh --arm` to `READY_FOR_MINIPC_POWER_ON`
+
+1. read-only host preflight (fails BEFORE any mutation): binaries built; runner
+   **and** probe PE imports a subset of the stock-WinPE set; Phase-9d 7/7
+   pinned; `coordinator --matrix-selftest` (36-case plan + chunk arithmetic +
+   72 GiB payload + 90 GiB budget gate); Worker storage root known, writable,
+   git-ignored, ≥ 90 GiB free; runtime/evidence dirs writable + git-ignored;
+   PostgreSQL reachable + `bamep_physint_spike` present (read-only; never
+   created/migrated here); lab interface; all six lab ports free + no stale
+   Issue-63 process; scratch space; a note that these ports are lab-only (no
+   production Bamep service is replaced);
+2. evidence dir + `trap cleanup EXIT` installed;
+3. lab network runtime (adds `192.168.99.1/24` + firewalld zone only if missing;
+   reverted on exit);
+4. start the stage3-harness; wait for `worker.https_listening` + WSS/coord/DP
+   listeners; capture the 64-hex server leaf fingerprint;
+5. mint exactly ONE fresh first-contact enrollment credential (umask 077, mode
+   600, never printed);
+6. derive the Stage-3 runtime with the fingerprint baked into the WinPE
+   bootstrap + the credential injected; assert Phase-9d byte-identical
+   before/after;
+7. start WinPE HTTP + dnsmasq (derived conf) + the matrix coordinator
+   (`--matrix --arm`, `--observed-free-bytes` from `df`);
+8. readiness gate — every port, HTTP serves the pinned Phase-9d bytes, all five
+   injections present + `boot.wim` last, bootstrap carries `--matrix --arm` +
+   this fingerprint, `matrix-plan.json` written, every child alive;
+9. health watchdog + print `READY_FOR_MINIPC_POWER_ON`.
+
+After power-on + the single wimboot keypress **no WinPE typing is needed**:
+`winpeshl.ini` auto-runs `bootstrap.cmd` → `wpeinit` → `bamep-i63-runner.exe
+--matrix --arm …`, which drives all 36 cases and reports each to the coordinator.
+
+### Per-case execution + failure/stop behaviour
+
+Per case: `next_case` (typed `Case`) → clock re-check/re-align outside the
+measured wall → fresh per-case Server/Transfer/Artifact lineage (harness) →
+fresh runtime credential as needed (rotated + persisted by the previous probe)
+→ source observation + Issue-63 source-safety predicate (fail-closed, ZERO bulk
+read on reject) → exact chunk-size agreement across plan / dispatch / Server
+Transfer / probe / manifest → single serial pass → seal → Worker D2 → require
+`Artifact::Verified` → complete `CaseResult` → only then `next_case`.
+
+Any source-safety failure, unexpected retry/resume/auth suspension, transport /
+read / digest / proof / Worker / seal failure, `Artifact != Verified`, malformed
+result, or per-case process death ⇒ the case is `FAILED` or `CONTAMINATED`, the
+coordinator **stops handing out cases**, all completed evidence is preserved,
+`analysis.json` + `matrix.verdict=matrix_fail` are written, and the matrix
+terminates NON-ZERO. **No "retry until green", no silent repeat of a measured
+case.**
+
+### Measurements (Stage-2 definitions, unchanged)
+
+`bulk_stream_wall` (first bounded source read → final expected chunk durably
+accepted) and `verified_transfer_wall` (before resume/stream → `Artifact
+Verified` after seal + D2) are separate. `resume_ms`, `seal_d2_ms`, `read_ms`,
+`chunk_sha_ms`, `rolling_sha_ms`, `proof_ms`, `put_ack_ms`, exact bytes/chunks,
+and the by-construction connection count are all preserved.
+
+### Evidence — one run directory `evidence/<run-id>/`
+
+`launcher.log` · `harness.log` · `http.log` · `dnsmasq.log` · `coordinator.log`
+· `derive.log` · `fingerprint.txt` · `matrix/{matrix-plan.json,
+case-results.ndjson, coordinator-events.ndjson, probe-evidence.ndjson,
+analysis.json}` · `derived-runtime/{phase9d-hashes-{before,after}.txt,
+derived-manifest.txt}` · `matrix.verdict`. No raw disk bytes, no credentials, no
+keys, no secrets. All runtime evidence is git-ignored.
+
+### Source safety (Spike level — unchanged from Stage 2)
+
+current source observation / `agent_source_id` → resolver → expected model
+(`NGFF 2280 256GB SSD`) → exact device length (`256,060,514,304` bytes) →
+bounded extent ≤ length → no ordinal/path-only authority → zero bulk read until
+PASS. `\\.\PhysicalDrive0` is NOT authority. `GENERIC_READ` only; no
+`GENERIC_WRITE`, no destructive IOCTL, no format/repartition/mount/repair.
+
+### Run it (off-device only — nothing here is armed)
+
+```bash
+./stage3/run-stage3-checks.sh                    # engine + coordinator + probe + runner + harness + scripts
+./stage3/run-stage3-lab.sh --preflight           # read-only host checks
+./stage3/run-stage3-lab.sh --arm --preflight     # armed interface, host checks only, still no boot
+
+# WinPE cross-build (owner-approved #60 toolchain) + PE import inspection
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH" XWIN_ACCEPT_LICENSE=1
+export RUSTFLAGS="-C target-feature=+crt-static"
+( cd winpe-runner && cargo xwin build --release --target x86_64-pc-windows-msvc )
+( cd stage2-probe && cargo xwin build --release --target x86_64-pc-windows-msvc )
+```
+
+### Non-physical validation performed
+
+- `stage3/run-stage3-checks.sh` — **STAGE3_CHECKS_PASS**: stage2-engine (53
+  tests) + coordinator (25 tests incl. 3 new `matrix_net` line-protocol tests) +
+  stage2-probe (14) + winpe-runner (23 incl. 7 matrix-loop tests) + stage3-harness
+  release build + `issue-credential` arg guard + `bash -n` all scripts + the
+  launcher `PHYSICAL MATRIX NOT ARMED` banner.
+- `stage3-harness` composes against **real PostgreSQL** (`db.connected_and_migrated`),
+  real WSS (`wss.listening`), real Worker control plane (`worker.ipc_available`),
+  real Worker HTTPS (`worker.https_listening`); stable 64-hex leaf fingerprint.
+- **End-to-end one-case host smoke** (127.0.0.1, real PG, synthetic STUB source,
+  full 2048 MiB / 256-chunk transfer): runner `next_case` → harness fresh
+  lineage `chunk_size=8388608` → WSS auth → endpoint enrolled → dispatch → 256
+  chunks streamed (each read once, `device_read_count=256`) → **seal →
+  `Artifact::Verified` via real Worker D2 of 2 GiB** → `probe.case_result` with
+  every field incl. the new sub-timings → the rotated `runtime_credential`
+  persisted for the next process. The loaded host loopback induced one transient
+  PUT ⇒ the case came back `CONTAMINATED` ⇒ the coordinator halted, wrote
+  `matrix_fail` + `analysis.json`, handed out no more cases (**fail-closed, no
+  retry — exactly the required behaviour**).
+- `run-stage3-lab.sh --preflight` and `--arm --preflight` — green on the wired
+  physical lab host (Phase-9d 7/7, PG reachable, 164 GiB free under the storage
+  root, all ports free).
+- WinPE cross-build clean; PE imports (`llvm-readobj --coff-imports`):
+  runner `api-ms-win-core-synch-l1-2-0 kernel32 ntdll ws2_32`; probe
+  `ADVAPI32 api-ms-win-core-synch-l1-2-0 bcrypt bcryptprimitives kernel32 ntdll
+  ws2_32` — both a strict subset of the #60/#61-proven stock-WinPE set; the
+  Stage-3 deltas added NO new import.
+
+The real physical MiniPC boot, the physical SSD `GENERIC_READ` path, and the
+36-case matrix have **NOT** been run. Stops here for owner final physical
+authorization.

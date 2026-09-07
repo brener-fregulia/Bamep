@@ -14,6 +14,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::matrix::CHUNK_SIZES_MIB;
 use crate::result::CaseResult;
 use crate::MIB;
@@ -56,7 +58,8 @@ pub fn mad(xs: &[f64]) -> f64 {
 }
 
 /// Which throughput series a paired ratio is computed over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Series {
     /// Boundary B — end-to-end verified transfer throughput.
     VerifiedTransfer,
@@ -65,7 +68,7 @@ pub enum Series {
 }
 
 /// Per-chunk-size summary over the 8 measured cases (verified + bulk-stream).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SizeSummary {
     pub chunk_size_mib: u64,
     pub n: usize,
@@ -86,7 +89,7 @@ pub struct SizeSummary {
 }
 
 /// One adjacent-size paired comparison (e.g. 8 -> 16 MiB) for one [`Series`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PairedRatio {
     pub series: Series,
     pub smaller_mib: u64,
@@ -103,7 +106,7 @@ pub struct PairedRatio {
 }
 
 /// The complete measured-only analysis.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Analysis {
     pub sizes: Vec<SizeSummary>,
     pub paired: Vec<PairedRatio>,
