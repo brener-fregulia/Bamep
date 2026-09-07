@@ -57,8 +57,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 mod stream;
 use stream::{
-    run_stream_pass, ChunkReader, DataPlane, PassOutcome, ProgressTick, PutStatus, ResumeStatus,
-    StreamError, StreamEvent, StreamState,
+    run_stream_pass, ChunkReader, DataPlane, Gate4Checkpoint, PassOutcome, ProgressTick, PutStatus,
+    ResumeStatus, StreamError, StreamEvent, StreamState,
 };
 
 const PROBE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -224,6 +224,13 @@ struct Args {
     seal_timeout_secs: u64,
     skew_floor_ms: i64,
     skew_ceil_ms: i64,
+    /// Issue #61 CP7A Gate-4 Subtest A LAB-ONLY deterministic fault-injection
+    /// checkpoint. `0` = disabled (every non-Subtest-A run). `N > 0`: once `N`
+    /// chunks are durably held, read/hash the next missing chunk into `pending`
+    /// and, BEFORE its PUT, perform exactly ONE bodyless `discover_resume` on
+    /// which the harness delivers the single real `401`. NOT production Agent
+    /// behaviour; NOT a recommendation for normal capture sequencing.
+    gate4_checkpoint_after_held: u64,
 }
 fn parse_args() -> Args {
     let mut a = Args {
@@ -238,6 +245,7 @@ fn parse_args() -> Args {
         seal_timeout_secs: SEAL_TIMEOUT_SECS_DEFAULT,
         skew_floor_ms: SKEW_FLOOR_MS_DEFAULT,
         skew_ceil_ms: SKEW_CEIL_MS_DEFAULT,
+        gate4_checkpoint_after_held: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -273,6 +281,23 @@ fn parse_args() -> Args {
             }
             "--skew-ceil-ms" => {
                 a.skew_ceil_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.skew_ceil_ms)
+            }
+            // Issue #61 CP7A Gate-4 Subtest A LAB-ONLY. Strict: a present-but-
+            // unparseable value is a configuration error, NOT a silent fall back
+            // to disabled (a silent 8 -> 0 would resurrect the 8 MiB-body
+            // transport race the checkpoint exists to remove).
+            "--gate4-auth-denial-checkpoint-after-held" => {
+                let raw = it.next().unwrap_or_default();
+                match raw.parse::<u64>() {
+                    Ok(n) => a.gate4_checkpoint_after_held = n,
+                    Err(_) => {
+                        eprintln!(
+                            "cp7a-probe: FATAL: --gate4-auth-denial-checkpoint-after-held \
+                             must be a non-negative integer (got {raw:?})"
+                        );
+                        std::process::exit(exit::BAD_ARGS);
+                    }
+                }
             }
             _ => {}
         }
@@ -467,6 +492,9 @@ where
 /// CP7A exit codes.
 mod exit {
     pub const PASS: i32 = 0;
+    /// Malformed command-line arguments (e.g. a non-integer Gate-4 checkpoint
+    /// threshold) — fail before any network or device access.
+    pub const BAD_ARGS: i32 = 2;
     pub const ENUMERATION: i32 = 61;
     pub const COORD: i32 = 62;
     pub const WSS_AUTH: i32 = 63;
@@ -483,6 +511,34 @@ mod exit {
 }
 
 async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
+    // ---- 0. Gate-4 Subtest A checkpoint config validation (BEFORE any
+    // network or device access). When enabled, the threshold must leave a
+    // "next missing chunk" to prepare — i.e. be strictly below chunk_count.
+    if args.gate4_checkpoint_after_held > 0 {
+        let chunk_count = args.prefix_bytes.div_ceil(args.chunk_size);
+        if args.gate4_checkpoint_after_held >= chunk_count {
+            log.emit(
+                "error",
+                "cp7a.gate4_checkpoint.bad_config",
+                &[
+                    ("after_held", V::U(args.gate4_checkpoint_after_held)),
+                    ("chunk_count", V::U(chunk_count)),
+                    ("note", s("checkpoint threshold must be < chunk_count (no next pending chunk otherwise)")),
+                ],
+            );
+            return exit::BAD_ARGS;
+        }
+        log.emit(
+            "info",
+            "cp7a.gate4_checkpoint.configured",
+            &[
+                ("after_held", V::U(args.gate4_checkpoint_after_held)),
+                ("chunk_count", V::U(chunk_count)),
+                ("note", s("Issue #61 CP7A Spike ONLY — deterministic LAB fault-injection checkpoint; NOT production Agent behaviour")),
+            ],
+        );
+    }
+
     // ---- 1. fresh source epoch -----------------------------------------
     let epoch_src = sources::enumerate();
     let obs_id = epoch_src.observation_id.clone();
@@ -902,6 +958,14 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
         chunk_size,
     };
 
+    // Gate-4 Subtest A LAB-ONLY deterministic checkpoint (disabled at 0).
+    // Fires at most once and survives every `run_stream_pass` re-entry.
+    let mut gate4_checkpoint = if args.gate4_checkpoint_after_held > 0 {
+        Gate4Checkpoint::after_held(args.gate4_checkpoint_after_held)
+    } else {
+        Gate4Checkpoint::disabled()
+    };
+
     let mut suspensions = 0u32;
     loop {
         let mut last_logged_chunks = 0u64;
@@ -974,10 +1038,43 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
                     ("detail", s(detail)),
                 ],
             ),
+            StreamEvent::Gate4CheckpointBegin {
+                after_held,
+                held_chunks,
+                pending_chunk_index,
+            } => log.emit(
+                "warn",
+                "cp7a.gate4_checkpoint.begin",
+                &[
+                    ("after_held", V::U(after_held)),
+                    ("held_chunks", V::U(held_chunks)),
+                    ("pending_chunk_index", V::U(pending_chunk_index)),
+                    ("note", s("Issue #61 CP7A Spike ONLY — deterministic LAB fault-injection checkpoint; NOT production Agent behaviour")),
+                ],
+            ),
+            StreamEvent::Gate4CheckpointAuthDenied { pending_chunk_index } => log.emit(
+                "warn",
+                "cp7a.gate4_checkpoint.auth_denied",
+                &[("pending_chunk_index", V::U(pending_chunk_index))],
+            ),
+            StreamEvent::Gate4CheckpointUnexpected { outcome } => log.emit(
+                "error",
+                "cp7a.gate4_checkpoint.unexpected",
+                &[
+                    ("outcome", s(outcome)),
+                    ("note", s("Gate-4 checkpoint expected a bodyless AuthDenied — failing closed, pending chunk NOT uploaded")),
+                ],
+            ),
         };
-        let outcome =
-            run_stream_pass(&mut state, &reader, &mut dp, &mut on_progress, &mut on_lifecycle)
-                .await;
+        let outcome = run_stream_pass(
+            &mut state,
+            &reader,
+            &mut dp,
+            &mut on_progress,
+            &mut on_lifecycle,
+            &mut gate4_checkpoint,
+        )
+        .await;
         match outcome {
             Ok(PassOutcome::Complete) => {
                 log.emit(
@@ -1423,6 +1520,7 @@ async fn main() {
             ("chunk_size", V::U(args.chunk_size)),
             ("seal_timeout_secs", V::U(args.seal_timeout_secs)),
             ("skew_gate_ms", s(format!("[{}, {}]", args.skew_floor_ms, args.skew_ceil_ms))),
+            ("gate4_checkpoint_after_held", V::U(args.gate4_checkpoint_after_held)),
         ],
     );
 

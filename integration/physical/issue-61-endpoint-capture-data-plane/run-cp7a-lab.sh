@@ -55,7 +55,9 @@
 #
 # Fault mode (exactly one; the launcher passes BOTH thresholds explicitly and
 # fails closed if both are > 0):
-#   DEFAULT — Gate-4 Subtest A, one deterministic auth-denial episode:
+#   DEFAULT — Gate-4 Subtest A, ONE deterministic authorization denial on the
+#   probe's bodyless pre-PUT resume checkpoint (the probe is staged with a
+#   matching --gate4-auth-denial-checkpoint-after-held):
 #     CP7A_AUTH_DENY_AFTER_HELD (8)   CP7A_INTERRUPT_AFTER_HELD (0)
 #   Transport-outage experiment (previous ~400 ms listener restart):
 #     CP7A_AUTH_DENY_AFTER_HELD=0 CP7A_INTERRUPT_AFTER_HELD=8 ./run-cp7a-lab.sh
@@ -93,15 +95,34 @@ CP7A_SEAL_TIMEOUT_SECS=120
 # Fault mode for THIS run (explicit — the launcher never relies on
 # inherited implicit env state). Exactly ONE fault may be armed.
 #
-#   Gate-4 Subtest A (DEFAULT) — one deterministic auth-denial episode:
+#   Gate-4 Subtest A (DEFAULT) — one deterministic authorization denial,
+#   delivered on the probe's LAB-ONLY bodyless pre-PUT resume checkpoint
+#   (the probe is staged with a matching --gate4-auth-denial-checkpoint-
+#   after-held so the single 401 lands with no request body in flight):
 #       CP7A_AUTH_DENY_AFTER_HELD=8   CP7A_INTERRUPT_AFTER_HELD=0
 #   Transport-outage experiment (the previous ~400 ms listener restart):
 #       CP7A_AUTH_DENY_AFTER_HELD=0   CP7A_INTERRUPT_AFTER_HELD=8
 #   No fault:
 #       both 0
 # ---------------------------------------------------------------------
-CP7A_AUTH_DENY_AFTER_HELD="${CP7A_AUTH_DENY_AFTER_HELD:-8}"
-CP7A_INTERRUPT_AFTER_HELD="${CP7A_INTERRUPT_AFTER_HELD:-0}"
+# Only an UNSET var takes the default; an explicitly-empty value reaches the
+# validator (and fails closed).
+CP7A_AUTH_DENY_AFTER_HELD="${CP7A_AUTH_DENY_AFTER_HELD-8}"
+CP7A_INTERRUPT_AFTER_HELD="${CP7A_INTERRUPT_AFTER_HELD-0}"
+
+# Fail closed (before ANY service start or network mutation) on a threshold
+# that is not a non-negative decimal integer: "", "foo", "8x", "-1", "1.5".
+require_nonnegative_int() {
+    case "$2" in
+        '' | *[!0-9]*)
+            echo "FATAL: $1 must be a non-negative decimal integer (got '$2')." >&2
+            exit 1
+            ;;
+    esac
+}
+require_nonnegative_int CP7A_AUTH_DENY_AFTER_HELD "${CP7A_AUTH_DENY_AFTER_HELD}"
+require_nonnegative_int CP7A_INTERRUPT_AFTER_HELD "${CP7A_INTERRUPT_AFTER_HELD}"
+
 FAULT_MODE="none"
 if [ "${CP7A_AUTH_DENY_AFTER_HELD}" -gt 0 ] && [ "${CP7A_INTERRUPT_AFTER_HELD}" -gt 0 ]; then
     echo "FATAL: CP7A_AUTH_DENY_AFTER_HELD and CP7A_INTERRUPT_AFTER_HELD are both > 0." >&2
@@ -112,6 +133,30 @@ elif [ "${CP7A_AUTH_DENY_AFTER_HELD}" -gt 0 ]; then
 elif [ "${CP7A_INTERRUPT_AFTER_HELD}" -gt 0 ]; then
     FAULT_MODE="listener_restart"
 fi
+
+# The probe's Gate-4 pre-PUT bodyless resume checkpoint threshold is, by
+# construction, ALWAYS the harness auth-denial threshold: the single real 401
+# is delivered on that checkpoint. Fail closed if the mode and the two
+# thresholds could ever disagree.
+PROBE_GATE4_CHECKPOINT_AFTER_HELD="${CP7A_AUTH_DENY_AFTER_HELD}"
+case "${FAULT_MODE}" in
+    auth_denial)
+        if [ "${PROBE_GATE4_CHECKPOINT_AFTER_HELD}" != "${CP7A_AUTH_DENY_AFTER_HELD}" ] \
+           || [ "${PROBE_GATE4_CHECKPOINT_AFTER_HELD}" -le 0 ]; then
+            echo "FATAL: auth_denial mode needs a positive Gate-4 checkpoint threshold" \
+                 "equal to CP7A_AUTH_DENY_AFTER_HELD (got probe=${PROBE_GATE4_CHECKPOINT_AFTER_HELD}," \
+                 "harness=${CP7A_AUTH_DENY_AFTER_HELD})." >&2
+            exit 1
+        fi
+        ;;
+    *)
+        if [ "${PROBE_GATE4_CHECKPOINT_AFTER_HELD}" -ne 0 ]; then
+            echo "FATAL: ${FAULT_MODE} mode requires the Gate-4 checkpoint disabled" \
+                 "(probe threshold must be 0, got ${PROBE_GATE4_CHECKPOINT_AFTER_HELD})." >&2
+            exit 1
+        fi
+        ;;
+esac
 
 PHASE9D_DIR="/var/tmp/bamep-issue53-phase9d-winpe-completion"
 PHASE9D_HTTP="${PHASE9D_DIR}/http"
@@ -332,10 +377,11 @@ log "evidence directory: ${EVID}"
     echo "ports             http=${PORT_HTTP} smb=${PORT_SMB} sink=${PORT_SINK} wss=${PORT_WSS} coord=${PORT_COORD} dp=${PORT_DP}"
     echo "cp7a_prefix_bytes ${CP7A_PREFIX_BYTES}"
     echo "fault_mode        ${FAULT_MODE}"
-    echo "cp7_auth_deny_after_held  ${CP7A_AUTH_DENY_AFTER_HELD}"
-    echo "cp7_interrupt_after_held  ${CP7A_INTERRUPT_AFTER_HELD}"
+    echo "cp7_auth_deny_after_held         ${CP7A_AUTH_DENY_AFTER_HELD}"
+    echo "probe_gate4_checkpoint_after_held ${PROBE_GATE4_CHECKPOINT_AFTER_HELD}"
+    echo "cp7_interrupt_after_held         ${CP7A_INTERRUPT_AFTER_HELD}"
 } > "${EVID}/resolved-paths.txt"
-log "FAULT MODE: ${FAULT_MODE}  (auth_deny_after_held=${CP7A_AUTH_DENY_AFTER_HELD}, interrupt_after_held=${CP7A_INTERRUPT_AFTER_HELD})"
+log "FAULT MODE: ${FAULT_MODE}  (auth_deny_after_held=${CP7A_AUTH_DENY_AFTER_HELD}, probe_gate4_checkpoint_after_held=${PROBE_GATE4_CHECKPOINT_AFTER_HELD}, interrupt_after_held=${CP7A_INTERRUPT_AFTER_HELD})"
 
 # ---------------------------------------------------------------------
 # 3. cleanup / supervision trap  (installed BEFORE any mutation)
@@ -552,6 +598,8 @@ cat > "${RUN_CMD}" <<EOF
 rem  Bamep Issue #61 CP7A — staged by run-cp7a-lab.sh (${RUN_ID})
 rem  LAB-ONLY. Bounded prefix ${CP7A_PREFIX_BYTES} bytes / 257 chunks. GENERIC_READ only.
 rem  Does NOT start automatically — the operator runs this by hand inside WinPE.
+rem  --gate4-auth-denial-checkpoint-after-held is LAB-ONLY Spike fault
+rem  injection (Issue #61 CP7A Gate-4 Subtest A). 0 = disabled.
 X:\\cp7a-probe.exe ^
   --wss ${LAB_IP}:${PORT_WSS} ^
   --coord ${LAB_IP}:${PORT_COORD} ^
@@ -559,7 +607,8 @@ X:\\cp7a-probe.exe ^
   --pin ${FINGERPRINT} ^
   --auth-credential-file X:\\cp7a.cred ^
   --prefix-bytes ${CP7A_PREFIX_BYTES} ^
-  --seal-timeout-secs ${CP7A_SEAL_TIMEOUT_SECS}
+  --seal-timeout-secs ${CP7A_SEAL_TIMEOUT_SECS} ^
+  --gate4-auth-denial-checkpoint-after-held ${PROBE_GATE4_CHECKPOINT_AFTER_HELD}
 set "CP7A_EXITCODE=%ERRORLEVEL%"
 echo.
 echo CP7A_EXITCODE=%CP7A_EXITCODE%
@@ -620,6 +669,8 @@ gate "cp7a.cred present and mode 600"          bash -c "[ \"\$(stat -c '%a' '${C
 gate "Phase 9d boot assets present"            bash -c "[ -f '${PHASE9D_HTTP}/wimboot' ] && [ -f '${PHASE9D_HTTP}/boot.wim' ] && [ -f '${PHASE9D_HTTP}/BCD' ] && [ -f '${PHASE9D_HTTP}/boot.sdi' ]"
 gate "staged CP7A probe present"               bash -c "[ -f '${STAGED_PROBE_EXE}' ]"
 gate "staged run-cp7a.cmd carries this fingerprint" grep -qF "${FINGERPRINT}" "${RUN_CMD}"
+gate "staged run-cp7a.cmd carries the Gate-4 checkpoint threshold ${PROBE_GATE4_CHECKPOINT_AFTER_HELD}" \
+    grep -qF -- "--gate4-auth-denial-checkpoint-after-held ${PROBE_GATE4_CHECKPOINT_AFTER_HELD}" "${RUN_CMD}"
 gate "cp7-harness fault_mode == ${FAULT_MODE}" \
     grep -qF "\"event\":\"fault.mode\",\"mode\":\"${FAULT_MODE}\"" "${HARNESS_LOG}"
 
@@ -635,11 +686,12 @@ done
     echo "gate_fail    ${gate_fail}"
     echo
     echo "FAULT MODE         ${FAULT_MODE}"
-    echo "  auth_deny_after_held  ${CP7A_AUTH_DENY_AFTER_HELD}"
-    echo "  interrupt_after_held  ${CP7A_INTERRUPT_AFTER_HELD}"
+    echo "  auth_deny_after_held              ${CP7A_AUTH_DENY_AFTER_HELD}"
+    echo "  probe_gate4_checkpoint_after_held ${PROBE_GATE4_CHECKPOINT_AFTER_HELD}"
+    echo "  interrupt_after_held             ${CP7A_INTERRUPT_AFTER_HELD}"
     case "${FAULT_MODE}" in
-      auth_denial)     echo "  => ONE deterministic auth-denial episode (2 real backend 401s: chunk-PUT masked as transport transient + bodyless resume delivered as AuthDenied) after >= ${CP7A_AUTH_DENY_AFTER_HELD} held chunks. Listener restart is NOT active." ;;
-      listener_restart) echo "  => ~400 ms data-plane listener restart after >= ${CP7A_INTERRUPT_AFTER_HELD} held chunks. Auth-denial is NOT active." ;;
+      auth_denial)     echo "  => ONE deterministic authorization denial. Once >= ${CP7A_AUTH_DENY_AFTER_HELD} chunks are held the probe reads+hashes the next chunk into its pending buffer and, BEFORE its PUT, performs one bodyless discover_resume; the single real backend 401 lands there (no request body in flight -> no transport race). Listener restart is NOT active." ;;
+      listener_restart) echo "  => ~400 ms data-plane listener restart after >= ${CP7A_INTERRUPT_AFTER_HELD} held chunks. Auth-denial / Gate-4 checkpoint are NOT active." ;;
       none)            echo "  => no fault injected this run." ;;
     esac
     echo

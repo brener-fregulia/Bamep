@@ -311,13 +311,14 @@ a complete `\\.\PhysicalDrive0` capture, **NOT** walkthrough D, **NOT** Outcome 
 most once and enters the rolling full-Artifact SHA-256 exactly once; retries
 reuse the same buffered bytes (invariant + host invariant tests in
 `probe7/src/stream.rs`, plus mutation-based sensitivity verification). One
-controlled **data-plane-only** Worker-listener interruption is auto-fired by the
-harness once ~`CP7_INTERRUPT_AFTER_HELD` chunks are durably held (WSS /
-PostgreSQL / storage-root / durable chunk files / Agent process all preserved);
-the probe re-acquires a fresh grant, re-runs resume discovery, reconciles held
-identities from memory, and continues. Then it seals (`chunk_count = 257`, the
-rolling digest), the Worker independently reconstructs and verifies, the Artifact
-reaches durable `Verified`, and the probe sends
+controlled fault is auto-armed by the harness per run — either the
+**data-plane-only** Worker-listener restart or the Gate-4 Subtest A
+authorization denial (see below), never both — once ~`threshold` chunks are
+durably held (WSS / PostgreSQL / storage-root / durable chunk files / Agent
+process all preserved); the probe re-acquires a fresh grant, re-runs resume
+discovery, reconciles held identities from memory, and continues. Then it seals
+(`chunk_count = 257`, the rolling digest), the Worker independently reconstructs
+and verifies, the Artifact reaches durable `Verified`, and the probe sends
 `ActionResult{Succeeded, TRANSFER_VERIFIED}` — which the harness-wired
 `TransferTerminalEvidenceService` consumes to drive the Job to a durable terminal
 state.
@@ -338,7 +339,7 @@ recorded as finding **N1**, never fabricated as `TRANSFER_VERIFIED` or
 
 ```bash
 # host: invariant tests + host-loopback vertical + WinPE cross-build
-cd probe7 && cargo test                              # host invariant + episode tests; 2 heavy tests are #[ignore]
+cd probe7 && cargo test                              # host invariant + Gate-4 checkpoint tests; 2 heavy tests are #[ignore]
 cargo test --release -- --ignored e_full_bounded     # the exact 2,148,532,224-byte digest + exactly-once
 cd ../harness && cargo build --release --bin cp7-harness
 export PATH="$HOME/.local/bin:$PATH" XWIN_ACCEPT_LICENSE=1
@@ -358,26 +359,30 @@ are armed):
 
 - **Subtest A — `auth_denial` (launcher default).** A Spike-local decorator over
   the real `bamep_server::ports::TransferAuthorizationRepository` Port produces
-  one deterministic **authorization-denial episode** for the run's own Transfer,
-  once `>= CP7_AUTH_DENY_AFTER_HELD` chunks are durably held. The episode is
-  exactly **two** consecutive `Ok(None)` returns — the Port's existing
-  contractual value — each flowing through the unchanged real
+  **one** deterministic authorization denial for the run's own Transfer: the
+  first eligible `load_authorization_state` call at/above
+  `CP7_AUTH_DENY_AFTER_HELD` held chunks returns the Port's existing contractual
+  `Ok(None)`, flowing through the unchanged real
   `authorize_request → WorkerAuthorizationOutcome::Denied →
   AuthorizationDecision::denied → HTTP 401 {"error":{"code":"AUTHORIZATION_DENIED"}}`
-  chain. **Denial #1** lands on the first qualifying chunk-PUT authorize; because
-  the Worker authorizes *before* draining the ~8 MiB request body (unchanged
-  production behaviour), the 401 is emitted mid-upload and the client observes a
-  **transport `Transient`** (`cp7a.stream.put_transient`, `local_attempt=1`), not
-  `AuthDenied`. **Denial #2** lands on the probe's bodyless post-transient
-  `discover_resume` authorize — a `GET` with no body delivers the 401 cleanly →
-  `ResumeStatus::AuthDenied` → **`SuspendedNeedsAuthorization`**. The probe then
-  requests a fresh grant, re-enters `run_stream_pass` with the **same
-  `StreamState`**, resume discovery reconciles the held chunks, the buffered
-  `pending` chunk is re-`PUT` with **no source re-read and no rolling-hash
-  double-update**, and the transfer verifies normally with `suspensions == 1`.
-  This intentionally exercises the recovery state machine; it is **NOT** a
-  transport-outage simulation. No `crates/**` change; Worker authorization
-  ordering is untouched.
+  chain. To make that denial land **deterministically** — with no ~8 MiB
+  request body in flight and therefore no transport race — the probe is staged
+  with a matching `--gate4-auth-denial-checkpoint-after-held N`: once `N` chunks
+  are durably held it reads + hashes the next chunk into its `pending` buffer
+  and then, **before that chunk's PUT**, performs exactly **one bodyless
+  `discover_resume`** checkpoint. A `GET`-shaped resume carries no body, so the
+  single real `401` is delivered cleanly → `ResumeStatus::AuthDenied` →
+  **`SuspendedNeedsAuthorization`**. The probe requests a fresh grant, re-enters
+  `run_stream_pass` with the **same `StreamState`**, entry resume discovery
+  reconciles the `N` held chunks, the buffered `pending` chunk is `PUT` with
+  **no source re-read and no rolling-hash double-update**, and the transfer
+  verifies normally with `suspensions == 1`. The checkpoint fires exactly once
+  and does not re-fire after reauthorization; a checkpoint resume that is *not*
+  `AuthDenied` fails closed (the pending chunk is never uploaded). This is
+  **LAB-ONLY Spike fault injection** — **NOT** production Agent recovery
+  behaviour, **NOT** a recommendation for normal capture-protocol sequencing,
+  and **NOT** a transport-outage simulation. No `crates/**` change; Worker
+  authorization ordering is untouched.
 - **Subtest B — `listener_restart`** (`CP7A_AUTH_DENY_AFTER_HELD=0
   CP7A_INTERRUPT_AFTER_HELD=8`). The original ~400 ms data-plane listener
   restart. A later separate validation will exercise a real transport/link
@@ -401,7 +406,8 @@ issue-61-endpoint-capture-data-plane/
 │           ├── cp6-harness.rs    CP6 harness (FROZEN) — one chunk PUT + idempotent retry
 │           └── cp7-harness.rs    CP7A harness: CP6 boundaries + TransferTerminalEvidenceService +
 │                                 mandatory --storage-root + Server-UTC coord response +
-│                                 auto data-plane-only interruption + issue-credential + final-state SQL
+│                                 one of two mutually-exclusive data-plane fault modes
+│                                 (auth_denial default / listener_restart) + issue-credential + final-state SQL
 ├── probe/                         CP4 + CP5 (WinPE-native, sync, no bamep-simulator)
 │   ├── Cargo.toml
 │   ├── Cargo.lock
@@ -424,10 +430,10 @@ issue-61-endpoint-capture-data-plane/
     ├── build.rs
     └── src/
         ├── main.rs               CLI + clock pre-flight + async Agent session + single-pass stream +
-        │                         interruption/resume + seal (A/B/C/D) + terminal ActionResult
+        │                         interruption/resume + Gate-4 LAB checkpoint + seal (A/B/C/D) + ActionResult
         ├── resolver.rs           byte-identical copy of probe6/src/resolver.rs
         ├── sources.rs            ~copy of probe6/src/sources.rs (non-Windows stub = position-keyed pattern)
-        └── stream.rs             the single-pass streaming INVARIANT + retry-safe loop + host invariant tests
+        └── stream.rs             single-pass streaming INVARIANT + retry-safe loop + Gate-4 pre-PUT checkpoint + host tests
 ```
 
 `probe/`, `probe6/`, and `probe7/` each keep a standalone `resolver.rs` /

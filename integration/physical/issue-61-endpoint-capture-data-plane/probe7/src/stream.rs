@@ -123,6 +123,65 @@ pub enum StreamEvent {
     /// A transport-level resume failure inside the bounded local-retry
     /// envelope (observability only).
     ResumeTransient { local_attempt: u32, detail: String },
+    /// Gate-4 Subtest A LAB-ONLY: the deterministic pre-PUT bodyless resume
+    /// checkpoint is about to fire (exactly once per probe process). At this
+    /// point `pending_chunk_index` has been read and folded into the rolling
+    /// hash exactly once and is buffered in `pending`, but has NOT been PUT.
+    Gate4CheckpointBegin {
+        after_held: u64,
+        held_chunks: u64,
+        pending_chunk_index: u64,
+    },
+    /// The Gate-4 checkpoint's bodyless `discover_resume` returned the expected
+    /// generic `401` — the suspension boundary is now exercised deterministically.
+    Gate4CheckpointAuthDenied { pending_chunk_index: u64 },
+    /// FAIL-CLOSED: the Gate-4 checkpoint's `discover_resume` returned something
+    /// other than `AuthDenied`, so the subtest was NOT exercised as designed.
+    /// The pass returns `StreamError::Fatal` and never PUTs the pending chunk.
+    Gate4CheckpointUnexpected { outcome: &'static str },
+}
+
+/// Gate-4 Subtest A LAB-ONLY deterministic fault-injection checkpoint.
+///
+/// Issue #61 CP7A Spike ONLY. This is NOT production Agent recovery behaviour
+/// and NOT a recommendation for normal capture-protocol sequencing: a real
+/// Agent never performs a gratuitous bodyless resume-discovery in the middle of
+/// a healthy streaming pass. It exists purely to make the
+/// `suspend → fresh grant → resume → continue` state machine reachable
+/// deterministically, with no dependency on transport scheduling.
+///
+/// When `after_held > 0`: once `>= after_held` chunks are durably held, the
+/// NEXT missing chunk is read + hashed + buffered in `pending` and then, BEFORE
+/// its PUT, exactly ONE bodyless `discover_resume` is performed. The harness
+/// injects the single real authorization `401` on that request. The checkpoint
+/// fires at most once and survives `run_stream_pass` re-entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gate4Checkpoint {
+    after_held: u64,
+    consumed: bool,
+}
+
+impl Gate4Checkpoint {
+    /// `0` — the checkpoint never fires (every non-Subtest-A run).
+    pub fn disabled() -> Self {
+        Self { after_held: 0, consumed: false }
+    }
+
+    /// Fire one pre-PUT bodyless resume checkpoint once `>= n` chunks are held.
+    pub fn after_held(n: u64) -> Self {
+        Self { after_held: n, consumed: false }
+    }
+
+    /// Returns `true` exactly once — when enabled, not yet consumed, and the
+    /// durable held count has reached the threshold. Marks itself consumed so a
+    /// post-reauthorization re-entry never fires it again.
+    fn arm_before_put(&mut self, held_count: u64) -> bool {
+        if self.after_held == 0 || self.consumed || held_count < self.after_held {
+            return false;
+        }
+        self.consumed = true;
+        true
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -322,6 +381,7 @@ pub async fn run_stream_pass<R, D>(
     dp: &mut D,
     progress: &mut impl FnMut(ProgressTick),
     lifecycle: &mut impl FnMut(StreamEvent),
+    checkpoint: &mut Gate4Checkpoint,
 ) -> Result<PassOutcome, StreamError>
 where
     R: ChunkReader,
@@ -388,6 +448,52 @@ where
             .digest_wire
             .clone();
 
+        // Gate-4 Subtest A — LAB-ONLY deterministic pre-PUT bodyless resume
+        // checkpoint. `index` is now read + hashed + buffered in `pending` but
+        // NOT yet PUT. Exactly one bodyless `discover_resume` (no request body,
+        // so no transport race); the harness delivers its single real `401`
+        // here. Any other outcome fails closed — the pending chunk is NOT PUT.
+        if checkpoint.arm_before_put(state.held_count()) {
+            lifecycle(StreamEvent::Gate4CheckpointBegin {
+                after_held: checkpoint.after_held,
+                held_chunks: state.held_count(),
+                pending_chunk_index: index,
+            });
+            lifecycle(StreamEvent::ResumeBegin);
+            let held_now = state.held_count();
+            match dp.discover_resume().await {
+                ResumeStatus::AuthDenied => {
+                    lifecycle(StreamEvent::ResumeResult {
+                        outcome: "auth_denied",
+                        held_chunks: 0,
+                        sealed: false,
+                    });
+                    lifecycle(StreamEvent::Gate4CheckpointAuthDenied {
+                        pending_chunk_index: index,
+                    });
+                    return Ok(PassOutcome::SuspendedNeedsAuthorization);
+                }
+                other => {
+                    let (outcome, detail): (&'static str, String) = match other {
+                        ResumeStatus::Ok(_) => ("approved", String::new()),
+                        ResumeStatus::Transient(d) => ("transient", format!(": {d}")),
+                        ResumeStatus::Fatal(m) => ("fatal", format!(": {m}")),
+                        ResumeStatus::AuthDenied => unreachable!(),
+                    };
+                    lifecycle(StreamEvent::ResumeResult {
+                        outcome,
+                        held_chunks: 0,
+                        sealed: false,
+                    });
+                    lifecycle(StreamEvent::Gate4CheckpointUnexpected { outcome });
+                    return Err(StreamError::Fatal(format!(
+                        "Gate-4 Subtest A pre-PUT checkpoint (held={held_now}, pending chunk \
+                         {index}) expected a bodyless AuthDenied, got {outcome}{detail}"
+                    )));
+                }
+            }
+        }
+
         let mut local: u32 = 0;
         'retry: loop {
             match dp.put_chunk(index, &digest_wire, &bytes).await {
@@ -424,8 +530,9 @@ where
                     }
                     tokio::time::sleep(LOCAL_BACKOFF).await;
                     // The uncertain PUT may have landed durably — reconcile.
-                    // A denied bodyless resume here is exactly how the Gate-4
-                    // auth-denial episode reaches the outer suspend path.
+                    // A denied bodyless resume here still routes to the outer
+                    // suspend path (small-body denials / future cases); Gate-4
+                    // Subtest A instead uses the explicit pre-PUT checkpoint.
                     lifecycle(StreamEvent::ResumeBegin);
                     match dp.discover_resume().await {
                         ResumeStatus::Ok(held) => {
@@ -577,8 +684,9 @@ mod tests {
         /// First N resume calls -> Transient.
         transient_resume_first_n: u32,
         /// The Nth resume call (1-based) -> AuthDenied, fired at most once.
-        /// Models the Gate-4 auth-denial episode's denial #2 landing on the
-        /// probe's bodyless post-transient discover_resume.
+        /// Models the single Gate-4 Subtest A `401` landing on the probe's
+        /// explicit bodyless pre-PUT resume checkpoint (also covers small-body
+        /// / post-transient denials).
         authdenied_resume_at_call: Option<u32>,
     }
     impl FakeDataPlane {
@@ -664,17 +772,36 @@ mod tests {
     }
 
     /// Same as [`drive`] but records every [`StreamEvent`] across all
-    /// re-entries, for the Gate-4 subtest A lifecycle-evidence tests.
+    /// re-entries. Gate-4 checkpoint disabled.
     async fn drive_collecting(
         state: &mut StreamState,
         reader: &FakeReader,
         dp: &mut FakeDataPlane,
         events: &mut Vec<StreamEvent>,
     ) -> Result<u32, StreamError> {
+        drive_collecting_cp(state, reader, dp, events, &mut Gate4Checkpoint::disabled()).await
+    }
+
+    /// [`drive_collecting`] with an explicit [`Gate4Checkpoint`] threaded
+    /// through every re-entry (Subtest A lifecycle-evidence tests).
+    async fn drive_collecting_cp(
+        state: &mut StreamState,
+        reader: &FakeReader,
+        dp: &mut FakeDataPlane,
+        events: &mut Vec<StreamEvent>,
+        checkpoint: &mut Gate4Checkpoint,
+    ) -> Result<u32, StreamError> {
         let mut suspensions = 0u32;
         for _ in 0..40 {
-            let outcome =
-                run_stream_pass(state, reader, dp, &mut |_t| {}, &mut |e| events.push(e)).await?;
+            let outcome = run_stream_pass(
+                state,
+                reader,
+                dp,
+                &mut |_t| {},
+                &mut |e| events.push(e),
+                checkpoint,
+            )
+            .await?;
             match outcome {
                 PassOutcome::Complete => return Ok(suspensions),
                 // "obtain a fresh grant" / "wait for Worker recovery" — the
@@ -835,98 +962,105 @@ mod tests {
     }
 
     // =================================================================
-    // Gate-4 Subtest A — deterministic one-shot AuthDenied on the CURRENT
-    // chunk's PUT, then suspend -> resume -> continue with the SAME state.
-    // Makes the suspension boundary itself explicit (not relying only on
-    // the broad `a_exactly_once_...` test).
+    // Gate-4 Subtest A — the deterministic LAB-ONLY pre-PUT bodyless resume
+    // checkpoint. `held == N` chunks, the next chunk read+hashed into `pending`
+    // but NOT PUT, one bodyless `discover_resume` -> single real 401 ->
+    // `SuspendedNeedsAuthorization`. No transport race, no scheduler dependency.
     // =================================================================
 
-    /// The REVISED Gate-4 Subtest A shape: a chunk PUT that the auth-denial
-    /// episode's denial #1 turns into a transport `Transient` (8 MiB body
-    /// in-flight when the Worker rejects), then the probe's bodyless
-    /// post-transient resume gets denial #2 as a clean `AuthDenied`, which is
-    /// what actually reaches the outer suspend path. Manual pass-by-pass so
-    /// the suspension boundary is asserted directly.
+    /// Pass-by-pass so the suspension boundary is asserted directly: chunks
+    /// 0..N-1 PUT normally, then the checkpoint fires before PUT(N), the bodyless
+    /// resume returns `AuthDenied`, and re-entry resumes and completes with the
+    /// SAME `StreamState` (pending buffer reused, no re-read, no re-hash).
     #[tokio::test]
-    async fn authdenial_episode_transient_put_then_authdenied_resume_suspends() {
-        const K: u64 = 8;
+    async fn gate4_checkpoint_pre_put_bodyless_resume_suspends_then_resumes() {
+        const N: u64 = 8;
         let total = 12 * CS;
         let reader = FakeReader::new();
         let mut dp = FakeDataPlane::new();
-        dp.transient_put_budget.insert(K, 1); // denial #1: PUT(K) fails once at transport
-        dp.authdenied_resume_at_call = Some(2); // denial #2: post-transient resume (call #2)
+        // entry resume = call #1 (Ok); checkpoint bodyless resume = call #2 (401).
+        dp.authdenied_resume_at_call = Some(2);
         let mut state = StreamState::new(total, CS).unwrap();
+        let mut cp = Gate4Checkpoint::after_held(N);
 
-        // ---- pass 1: 0..K accepted; PUT(K) transient; resume auth_denied ----
+        // ---- pass 1: PUT 0..N-1; checkpoint before PUT(N) -> AuthDenied ----
         let mut ev1 = Vec::new();
-        let out1 =
-            run_stream_pass(&mut state, &reader, &mut dp, &mut |_t| {}, &mut |e| ev1.push(e))
-                .await
-                .unwrap();
+        let out1 = run_stream_pass(
+            &mut state,
+            &reader,
+            &mut dp,
+            &mut |_t| {},
+            &mut |e| ev1.push(e),
+            &mut cp,
+        )
+        .await
+        .unwrap();
         assert_eq!(out1, PassOutcome::SuspendedNeedsAuthorization);
-        assert_eq!(reader.read_count(K), 1, "chunk K read once before suspension");
-        assert_eq!(state.pending_index(), Some(K), "denied chunk is the pending buffer");
-        assert!(!state.is_held(K), "denied chunk is NOT durably held");
-        assert_eq!(state.held_count(), K, "chunks 0..K held after pass 1");
+        assert_eq!(state.held_count(), N, "chunks 0..N-1 durably held after pass 1");
+        assert_eq!(state.pending_index(), Some(N), "chunk N is the buffered pending chunk");
+        assert!(!state.is_held(N), "chunk N is NOT durably held");
+        assert_eq!(reader.read_count(N), 1, "pending chunk read exactly once");
+        assert_eq!(dp.put_calls_for(N), 0, "pending chunk NOT PUT before the checkpoint");
         assert_eq!(
             ev1.iter()
-                .filter(|e| matches!(e, StreamEvent::PutTransient { .. }))
+                .filter(|e| matches!(e, StreamEvent::Gate4CheckpointBegin { .. }))
                 .count(),
             1,
-            "exactly one PutTransient for the denied chunk; got {ev1:?}"
+            "checkpoint begin fired exactly once; got {ev1:?}"
         );
         assert!(
-            ev1.contains(&StreamEvent::PutTransient {
-                chunk_index: K,
-                local_attempt: 1,
-                detail: "injected".into(),
+            ev1.contains(&StreamEvent::Gate4CheckpointBegin {
+                after_held: N,
+                held_chunks: N,
+                pending_chunk_index: N,
             }),
-            "PutTransient{{K, attempt 1}}; got {ev1:?}"
+            "checkpoint begin carries held=N, pending=N; got {ev1:?}"
         );
         assert!(
-            ev1.contains(&StreamEvent::ResumeResult {
-                outcome: "auth_denied",
-                held_chunks: 0,
-                sealed: false,
-            }),
-            "the post-transient resume must surface auth_denied; got {ev1:?}"
+            ev1.contains(&StreamEvent::Gate4CheckpointAuthDenied { pending_chunk_index: N }),
+            "checkpoint delivered the expected AuthDenied; got {ev1:?}"
+        );
+        assert!(
+            !ev1.iter().any(|e| matches!(e, StreamEvent::PutTransient { .. })),
+            "Subtest A has NO transport race; got {ev1:?}"
         );
         assert!(
             !ev1.iter().any(|e| matches!(e, StreamEvent::PutAuthDenied { .. })),
-            "the PUT itself is a transport transient here, not PutAuthDenied"
+            "Subtest A has NO PUT auth-denied; got {ev1:?}"
         );
 
-        // ---- pass 2: recovery — resume approved, reconcile, continue ----
+        // ---- pass 2: recovery — entry resume approved, reconcile, continue ----
         let mut ev2 = Vec::new();
-        let out2 =
-            run_stream_pass(&mut state, &reader, &mut dp, &mut |_t| {}, &mut |e| ev2.push(e))
-                .await
-                .unwrap();
+        let out2 = run_stream_pass(
+            &mut state,
+            &reader,
+            &mut dp,
+            &mut |_t| {},
+            &mut |e| ev2.push(e),
+            &mut cp,
+        )
+        .await
+        .unwrap();
         assert_eq!(out2, PassOutcome::Complete);
-        assert_eq!(ev2.first(), Some(&StreamEvent::ResumeBegin), "recovery begins with resume");
         assert!(
-            ev2.contains(&StreamEvent::ResumeResult {
-                outcome: "approved",
-                held_chunks: K,
-                sealed: false,
-            }),
-            "recovery resume reports the K already-held chunks; got {ev2:?}"
+            !ev2.iter().any(|e| matches!(e, StreamEvent::Gate4CheckpointBegin { .. })),
+            "checkpoint does NOT fire again after reauthorization; got {ev2:?}"
         );
         assert!(
             ev2.contains(&StreamEvent::ResumeReconciled {
-                held_count: K,
-                pending_chunk_index: Some(K),
+                held_count: N,
+                pending_chunk_index: Some(N),
                 pending_already_held: false,
             }),
-            "recovery reconcile: pending chunk K still missing; got {ev2:?}"
+            "recovery reconcile: pending chunk N still missing; got {ev2:?}"
         );
 
         // ---- invariants ----
         assert!(state.all_uploaded());
         for i in 0..12 {
-            assert_eq!(reader.read_count(i), 1, "chunk {i} read once across the suspension");
+            assert_eq!(reader.read_count(i), 1, "chunk {i} read exactly once across the suspension");
         }
-        assert_eq!(dp.put_calls_for(K), 2, "chunk K: one transient PUT + one accepted PUT");
+        assert_eq!(dp.put_calls_for(N), 1, "pending chunk N PUT exactly once, after recovery");
         assert_eq!(
             state.finish_digest().unwrap(),
             reference_digest(total),
@@ -934,20 +1068,92 @@ mod tests {
         );
     }
 
-    /// The `drive`-loop form, asserting the aggregate lifecycle facts a
-    /// physical Gate-4 run must show.
+    /// FAIL-CLOSED: when the explicit checkpoint's bodyless resume returns
+    /// anything other than `AuthDenied`, the pass errors and never PUTs the
+    /// pending chunk.
     #[tokio::test]
-    async fn authdenial_episode_emits_lifecycle_facts() {
-        const K: u64 = 8;
+    async fn gate4_checkpoint_unexpected_result_fails_closed() {
+        const N: u64 = 8;
+        let total = 12 * CS;
+        let reader = FakeReader::new();
+        let mut dp = FakeDataPlane::new(); // no injected denial -> checkpoint resume returns Ok
+        let mut state = StreamState::new(total, CS).unwrap();
+        let mut cp = Gate4Checkpoint::after_held(N);
+
+        let mut events = Vec::new();
+        let out = run_stream_pass(
+            &mut state,
+            &reader,
+            &mut dp,
+            &mut |_t| {},
+            &mut |e| events.push(e),
+            &mut cp,
+        )
+        .await;
+
+        match out {
+            Err(StreamError::Fatal(m)) => {
+                assert!(m.contains("checkpoint"), "message names the checkpoint: {m}");
+                assert!(m.contains("AuthDenied"), "message states the expectation: {m}");
+                assert!(m.contains("approved"), "message states what was seen: {m}");
+            }
+            other => panic!("expected a fail-closed Fatal, got {other:?}"),
+        }
+        assert!(
+            events.contains(&StreamEvent::Gate4CheckpointUnexpected { outcome: "approved" }),
+            "the fail-closed event is emitted; got {events:?}"
+        );
+        assert_eq!(dp.put_calls_for(N), 0, "pending chunk must NOT be PUT after a failed checkpoint");
+        assert!(!state.is_held(N));
+    }
+
+    /// A disabled checkpoint (`after_held == 0`, every non-Subtest-A run) is a
+    /// pure no-op: no event, normal completion.
+    #[tokio::test]
+    async fn gate4_checkpoint_disabled_is_a_noop() {
+        let total = 10 * CS + 5;
+        let reader = FakeReader::new();
+        let mut dp = FakeDataPlane::new();
+        let mut state = StreamState::new(total, CS).unwrap();
+        let mut cp = Gate4Checkpoint::disabled();
+
+        let mut events = Vec::new();
+        let out = run_stream_pass(
+            &mut state,
+            &reader,
+            &mut dp,
+            &mut |_t| {},
+            &mut |e| events.push(e),
+            &mut cp,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, PassOutcome::Complete);
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            StreamEvent::Gate4CheckpointBegin { .. }
+                | StreamEvent::Gate4CheckpointAuthDenied { .. }
+                | StreamEvent::Gate4CheckpointUnexpected { .. }
+        )));
+        assert!(state.all_uploaded());
+        assert_eq!(state.finish_digest().unwrap(), reference_digest(total));
+    }
+
+    /// The `drive`-loop form, asserting the aggregate lifecycle facts a
+    /// physical Gate-4 Subtest A run must show.
+    #[tokio::test]
+    async fn gate4_checkpoint_emits_lifecycle_facts() {
+        const N: u64 = 8;
         let total = 10 * CS + 777;
         let reader = FakeReader::new();
         let mut dp = FakeDataPlane::new();
-        dp.transient_put_budget.insert(K, 1);
         dp.authdenied_resume_at_call = Some(2);
         let mut state = StreamState::new(total, CS).unwrap();
+        let mut cp = Gate4Checkpoint::after_held(N);
 
         let mut events = Vec::new();
-        let suspensions = drive_collecting(&mut state, &reader, &mut dp, &mut events)
+        let suspensions = drive_collecting_cp(&mut state, &reader, &mut dp, &mut events, &mut cp)
             .await
             .unwrap();
 
@@ -955,25 +1161,25 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, StreamEvent::PutTransient { chunk_index, .. } if *chunk_index == K))
+                .filter(|e| matches!(e, StreamEvent::Gate4CheckpointBegin { .. }))
                 .count(),
             1,
-            "exactly one PutTransient on the denied chunk"
+            "exactly one checkpoint begin"
         );
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(
-                    e,
-                    StreamEvent::ResumeResult { outcome: "auth_denied", .. }
-                ))
+                .filter(|e| matches!(e, StreamEvent::Gate4CheckpointAuthDenied { .. }))
                 .count(),
             1,
-            "exactly one auth_denied resume result"
+            "exactly one checkpoint auth_denied"
         );
         assert!(
-            !events.iter().any(|e| matches!(e, StreamEvent::PutAuthDenied { .. })),
-            "Subtest A normally contains ZERO PutAuthDenied events"
+            !events.iter().any(|e| matches!(
+                e,
+                StreamEvent::PutTransient { .. } | StreamEvent::PutAuthDenied { .. }
+            )),
+            "Subtest A contains ZERO PutTransient and ZERO PutAuthDenied; got {events:?}"
         );
         let reconciled: Vec<_> = events
             .iter()
@@ -988,8 +1194,8 @@ mod tests {
             .collect();
         assert!(reconciled.contains(&(0, None, false)), "entry reconcile; got {reconciled:?}");
         assert!(
-            reconciled.contains(&(K, Some(K), false)),
-            "recovery reconcile with pending K missing; got {reconciled:?}"
+            reconciled.contains(&(N, Some(N), false)),
+            "recovery reconcile with pending N missing; got {reconciled:?}"
         );
         assert!(state.all_uploaded());
         assert_eq!(state.finish_digest().unwrap(), reference_digest(total));
@@ -1019,12 +1225,12 @@ mod tests {
         assert_eq!(state.finish_digest().unwrap(), reference_digest(total));
     }
 
-    // ---- E (full, AuthDenial episode) — the exact bounded extent with the
-    // two-step episode around the threshold. Heavy; `#[ignore]` by default:
-    // `cargo test --release -- --ignored e_full_bounded_authdenied`.
+    // ---- E (full, Gate-4 checkpoint) — the exact bounded extent with the
+    // deterministic pre-PUT checkpoint at held == 8. Heavy; `#[ignore]` by
+    // default: `cargo test --release -- --ignored e_full_bounded_gate4`.
     #[tokio::test]
     #[ignore]
-    async fn e_full_bounded_authdenied_episode_around_threshold() {
+    async fn e_full_bounded_gate4_checkpoint_around_threshold() {
         let total: u64 = 2_148_532_224;
         let cs: u64 = 8_388_608;
         let mut state = StreamState::new(total, cs).unwrap();
@@ -1032,11 +1238,12 @@ mod tests {
 
         let reader = FakeReader::new();
         let mut dp = FakeDataPlane::new();
-        dp.transient_put_budget.insert(8, 1); // denial #1 -> transport transient
-        dp.authdenied_resume_at_call = Some(2); // denial #2 -> auth_denied resume
+        // entry resume = call #1 (Ok); checkpoint bodyless resume = call #2 (401).
+        dp.authdenied_resume_at_call = Some(2);
+        let mut cp = Gate4Checkpoint::after_held(8);
 
         let mut events = Vec::new();
-        let suspensions = drive_collecting(&mut state, &reader, &mut dp, &mut events)
+        let suspensions = drive_collecting_cp(&mut state, &reader, &mut dp, &mut events, &mut cp)
             .await
             .unwrap();
 
@@ -1046,21 +1253,30 @@ mod tests {
         for i in 0..257 {
             assert_eq!(reader.read_count(i), 1, "chunk {i} read exactly once");
         }
+        assert_eq!(state.expected_len(256), 1_048_576, "final chunk is exactly 1 MiB");
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, StreamEvent::PutTransient { chunk_index: 8, .. }))
+                .filter(|e| matches!(e, StreamEvent::Gate4CheckpointBegin { .. }))
                 .count(),
             1
         );
+        assert!(events.contains(&StreamEvent::Gate4CheckpointBegin {
+            after_held: 8,
+            held_chunks: 8,
+            pending_chunk_index: 8,
+        }));
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, StreamEvent::ResumeResult { outcome: "auth_denied", .. }))
+                .filter(|e| matches!(e, StreamEvent::Gate4CheckpointAuthDenied { .. }))
                 .count(),
             1
         );
-        assert!(!events.iter().any(|e| matches!(e, StreamEvent::PutAuthDenied { .. })));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            StreamEvent::PutTransient { .. } | StreamEvent::PutAuthDenied { .. }
+        )));
         assert!(events.contains(&StreamEvent::ResumeReconciled {
             held_count: 8,
             pending_chunk_index: Some(8),

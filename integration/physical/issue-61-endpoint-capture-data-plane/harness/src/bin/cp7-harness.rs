@@ -97,8 +97,22 @@ fn data_plane_port() -> u16 {
 fn coord_port() -> u16 {
     cfg("CP7_COORD_PORT", "9106").parse().unwrap()
 }
+/// A `CP7_*_AFTER_HELD` threshold env var: unset -> `default`; set -> must be a
+/// non-negative decimal integer or the harness fails closed (never
+/// `parse().unwrap_or(...)`).
+fn env_nonneg_i64(key: &str, default: i64) -> i64 {
+    match std::env::var(key) {
+        Err(_) => default,
+        Ok(v) => match v.parse::<i64>() {
+            Ok(n) if n >= 0 => n,
+            _ => die(format!(
+                "{key} must be a non-negative decimal integer (got {v:?})"
+            )),
+        },
+    }
+}
 fn interrupt_after_held() -> i64 {
-    cfg("CP7_INTERRUPT_AFTER_HELD", "8").parse().unwrap_or(8)
+    env_nonneg_i64("CP7_INTERRUPT_AFTER_HELD", 8)
 }
 fn prefix_bytes() -> u64 {
     cfg("CP7_PREFIX_BYTES", &PREFIX_BYTES_DEFAULT.to_string())
@@ -226,53 +240,51 @@ fn fs_free_bytes(p: &Path) -> Result<u64, String> {
 }
 
 // =====================================================================
-// Issue #61 CP7A Gate-4 Subtest A — one deterministic AUTHORIZATION-DENIAL
-// EPISODE for the target Transfer.
+// Issue #61 CP7A Gate-4 Subtest A — ONE deterministic AUTHORIZATION DENIAL
+// for the target Transfer.
 //
-// THROWAWAY Spike fault. It resolves EXACTLY TWO consecutive
-// `TransferAuthorizationRepository::load_authorization_state` calls for the
-// target Transfer to the Port's existing contractual `Ok(None)`, once the
-// target Artifact has >= N durably held chunks. Each flows UNCHANGED through
-// the real production chain:
+// THROWAWAY Spike fault. It resolves the FIRST eligible
+// `TransferAuthorizationRepository::load_authorization_state` call for the
+// target Transfer — once the authoritative durable snapshot shows
+// `>= threshold` held chunks — to the Port's existing contractual `Ok(None)`.
+// It flows UNCHANGED through the real production chain:
 //
 //   TransferAuthorizationService::authorize_request  (returns Ok(None))
 //     -> WorkerAuthorizationOutcome::Denied
 //     -> Worker control-plane AuthorizationDecision::denied
-//     -> Worker ChunkAuthorization::Denied / ResumeDiscovery::Denied
+//     -> Worker ResumeDiscovery::Denied
 //     -> existing HTTP 401  {"error":{"code":"AUTHORIZATION_DENIED"}}
 //
-// Why two denials, not one:
-//   * Denial #1 lands on the first qualifying chunk-PUT authorize. The Worker
-//     authorizes BEFORE reading the body (unchanged production behaviour), so
-//     the real 401 is emitted while Hyper is still writing the ~8 MiB chunk
-//     body; the client observes a transport failure -> `PutStatus::Transient`
-//     (NOT `AuthDenied`). The probe's stream loop then performs its existing
-//     post-transient `discover_resume()`.
-//   * Denial #2 lands on that bodyless resume-discovery authorize. A `GET`
-//     with no body delivers the real generic 401 cleanly ->
-//     `ResumeStatus::AuthDenied` -> `SuspendedNeedsAuthorization`.
+// Why exactly ONE denial (the rejected two-denial episode is gone):
+//   The probe now guarantees the first eligible authorization load after the
+//   held count reaches `threshold` is its explicit LAB-ONLY *bodyless pre-PUT
+//   resume checkpoint* (`--gate4-auth-denial-checkpoint-after-held N`). A
+//   `GET`-shaped resume-discovery carries no request body, so the real generic
+//   401 is delivered cleanly -> `ResumeStatus::AuthDenied` ->
+//   `SuspendedNeedsAuthorization`. There is no ~8 MiB chunk-PUT body in flight,
+//   so there is NO transport race and NO dependency on scheduler timing: the
+//   chunk PUT that would race is never issued before the denial.
 //
-// After denial #2 the episode is permanently consumed; every later load
-// delegates to the real Postgres repository (including the probe's re-grant
-// `issue()` load). No fake HTTP shim, no reverse proxy, no new production
-// status, no production fault-injection seam. This is intentionally NOT a
-// transport-outage simulation.
+// After the single denial the episode is permanently consumed; every later
+// load delegates to the real Postgres repository (including the probe's
+// re-grant `issue()` load and the re-entry resume discovery). No fake HTTP
+// shim, no reverse proxy, no new production status, no production
+// fault-injection seam. This is intentionally NOT a transport-outage
+// simulation.
 // =====================================================================
 
 /// Pure, DB-free episode state machine: the single linearisation point that
-/// decides which target `load_authorization_state` calls consume the two deny
-/// slots. Deliberately tiny — no SQL knowledge, no reuse ambitions.
+/// decides which target `load_authorization_state` call consumes the one deny
+/// slot. Deliberately tiny — no SQL knowledge, no reuse ambitions.
 struct AuthDenialEpisode {
     state: std::sync::Mutex<EpisodeState>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum EpisodeState {
-    /// No qualifying target call yet consumed a slot.
+    /// No qualifying target call has consumed the deny slot yet.
     Waiting,
-    /// Denial #1 consumed; the NEXT target call consumes denial #2.
-    DenySecond,
-    /// Both slots consumed — permanent pass-through.
+    /// The single denial has been delivered — permanent pass-through.
     Consumed,
 }
 
@@ -283,34 +295,26 @@ impl AuthDenialEpisode {
         }
     }
 
-    /// True once BOTH deny slots are consumed and the episode is inert.
+    /// True once the deny slot is consumed and the episode is inert.
     fn is_consumed(&self) -> bool {
         *self.state.lock().unwrap() == EpisodeState::Consumed
     }
 
-    /// Returns `Some(1)` / `Some(2)` for the (at most) two callers that
-    /// consume the deny slots, `None` otherwise. Slot #1 requires
-    /// `is_target && threshold > 0 && held >= threshold`; slot #2 fires on the
-    /// very next target call (the body of the qualifying chunk PUT has already
-    /// been rejected, so the durable held count is irrelevant for slot #2).
-    /// Concurrent callers serialise on the mutex, so the slots are handed out
-    /// exactly once each — never one, never three.
-    fn try_consume(&self, is_target: bool, held: i64, threshold: i64) -> Option<u8> {
+    /// Returns `true` for the single caller that consumes the deny slot,
+    /// `false` otherwise. Requires `is_target && threshold > 0 && held >=
+    /// threshold`. Concurrent callers serialise on the mutex, so the slot is
+    /// handed out exactly once — never zero when eligible, never twice.
+    fn try_consume(&self, is_target: bool, held: i64, threshold: i64) -> bool {
         if !is_target || threshold <= 0 {
-            return None;
+            return false;
         }
         let mut st = self.state.lock().unwrap();
         match *st {
             EpisodeState::Waiting if held >= threshold => {
-                *st = EpisodeState::DenySecond;
-                Some(1)
-            }
-            EpisodeState::Waiting => None, // target call, but not yet at threshold
-            EpisodeState::DenySecond => {
                 *st = EpisodeState::Consumed;
-                Some(2)
+                true
             }
-            EpisodeState::Consumed => None,
+            _ => false,
         }
     }
 }
@@ -342,7 +346,7 @@ impl FaultMode {
 }
 
 fn auth_deny_after_held() -> i64 {
-    cfg("CP7_AUTH_DENY_AFTER_HELD", "0").parse().unwrap_or(0)
+    env_nonneg_i64("CP7_AUTH_DENY_AFTER_HELD", 0)
 }
 
 /// Resolve the single active fault mode. Fails closed if two faults are armed
@@ -362,19 +366,92 @@ fn resolve_fault_mode(interrupt_after: i64, auth_deny_after: i64) -> FaultMode {
 
 /// Spike-local decorator over the real `TransferAuthorizationRepository` Port.
 ///
+/// It calls the real inner Port **exactly once** per invocation and never
+/// touches PostgreSQL itself: the durably-held count comes from
+/// `AuthorizationDurableState::held_chunk_indices` in the same locked
+/// authorization-state snapshot the inner Port already returned. The inner
+/// `RepositoryError` is propagated verbatim (no `unwrap_or(0)`).
+///
 /// Pass-through in every case except: fault mode is `auth_denial`, the target
 /// lineage is known, the call is for the target Transfer, the episode is not
-/// yet consumed, and (for slot #1) the target Artifact has >= `threshold`
-/// durably held chunks. Exactly two consecutive qualifying target calls return
-/// the Port's contractual `Ok(None)`. Every other call (including the probe's
-/// post-episode re-grant `issue()` load) delegates to the real Postgres
-/// repository.
+/// yet consumed, the inner Port returned `Some(state)`, and that snapshot's
+/// held-chunk count is >= `threshold`. Exactly ONE qualifying target call
+/// returns the Port's contractual `Ok(None)`.
 struct AuthDenialEpisodeRepo {
     inner: Arc<dyn bamep_server::ports::TransferAuthorizationRepository>,
-    pool: PgPool,
     threshold: i64,
     target: Arc<std::sync::OnceLock<FaultTarget>>,
     episode: AuthDenialEpisode,
+}
+
+/// The pure per-call verdict — no async, no SQL, no domain types.
+#[derive(Debug, PartialEq, Eq)]
+enum EpisodeVerdict {
+    PassThrough,
+    Deny,
+}
+
+impl AuthDenialEpisodeRepo {
+    /// Whether this call is a fault-eligible target call (fault armed, episode
+    /// not yet consumed, target lineage known and matching).
+    fn is_eligible_target(&self, transfer_id: bamep_domain::TransferId) -> bool {
+        self.threshold > 0
+            && !self.episode.is_consumed()
+            && self
+                .target
+                .get()
+                .is_some_and(|t| transfer_id.0 == t.transfer_id)
+    }
+
+    /// Pure decision. `held` is `Some(count)` only when the inner Port returned
+    /// `Some(state)`; `None` (inner returned `None`) never consumes the slot.
+    fn decide(&self, eligible: bool, held: Option<usize>) -> EpisodeVerdict {
+        let Some(held) = held.filter(|_| eligible) else {
+            return EpisodeVerdict::PassThrough;
+        };
+        if self.episode.try_consume(true, held as i64, self.threshold) {
+            EpisodeVerdict::Deny
+        } else {
+            EpisodeVerdict::PassThrough
+        }
+    }
+
+    /// Emit the single-denial episode facts. Arming and consumption now happen
+    /// on the same call, so all three markers are emitted together. Only facts
+    /// this layer actually has — the Port receives `transfer_id` alone, NEVER a
+    /// fabricated operation / HTTP method / chunk index. Probe log correlation
+    /// proves the denied operation was the Gate-4 bodyless pre-PUT checkpoint.
+    fn emit_denial(&self, held: usize) {
+        let Some(t) = self.target.get() else { return };
+        let tid = t.transfer_id.to_string();
+        let aid = t.artifact_id.to_string();
+        ev(
+            "fault.episode_armed",
+            &[
+                ("transfer_id", tid.clone()),
+                ("artifact_id", aid.clone()),
+                ("held_chunks", held.to_string()),
+                ("threshold", self.threshold.to_string()),
+                ("deny_count", "1".to_string()),
+            ],
+        );
+        ev(
+            "fault.denied",
+            &[
+                ("transfer_id", tid.clone()),
+                ("artifact_id", aid.clone()),
+                ("held_chunks", held.to_string()),
+            ],
+        );
+        ev(
+            "fault.episode_consumed",
+            &[
+                ("transfer_id", tid),
+                ("artifact_id", aid),
+                ("denied_total", "1".to_string()),
+            ],
+        );
+    }
 }
 
 #[async_trait::async_trait]
@@ -386,66 +463,21 @@ impl bamep_server::ports::TransferAuthorizationRepository for AuthDenialEpisodeR
         Option<bamep_server::ports::AuthorizationDurableState>,
         bamep_server::ports::RepositoryError,
     > {
-        // (1) fault disabled / episode fully consumed -> transparent pass-through.
-        if self.threshold > 0 && !self.episode.is_consumed() {
-            // (2) target not yet known -> pass-through.
-            if let Some(t) = self.target.get() {
-                // (3) another transfer -> pass-through.
-                if transfer_id.0 == t.transfer_id {
-                    // (4) durable held-count for the target Artifact (gates slot #1).
-                    let held: i64 = sqlx::query_scalar(
-                        "SELECT count(*) FROM chunk_identities WHERE artifact_id=$1 AND held",
-                    )
-                    .bind(t.artifact_id)
-                    .fetch_one(&self.pool)
-                    .await
-                    .unwrap_or(0);
-                    // (5) ask the pure episode state machine.
-                    if let Some(ordinal) = self.episode.try_consume(true, held, self.threshold) {
-                        // (6) emit only facts this layer actually has — the Port
-                        // receives transfer_id alone, NEVER a fabricated
-                        // operation/HTTP method/chunk_index. Which operation each
-                        // denial hit is proven by probe/log correlation.
-                        let tid = t.transfer_id.to_string();
-                        let aid = t.artifact_id.to_string();
-                        if ordinal == 1 {
-                            ev(
-                                "fault.episode_armed",
-                                &[
-                                    ("transfer_id", tid.clone()),
-                                    ("artifact_id", aid.clone()),
-                                    ("held_chunks", held.to_string()),
-                                    ("threshold", self.threshold.to_string()),
-                                    ("deny_count", "2".to_string()),
-                                ],
-                            );
-                        }
-                        ev(
-                            "fault.denied",
-                            &[
-                                ("transfer_id", tid.clone()),
-                                ("artifact_id", aid.clone()),
-                                ("held_chunks", held.to_string()),
-                                ("denial_ordinal", ordinal.to_string()),
-                            ],
-                        );
-                        if ordinal == 2 {
-                            ev(
-                                "fault.episode_consumed",
-                                &[
-                                    ("transfer_id", tid),
-                                    ("artifact_id", aid),
-                                    ("denied_total", "2".to_string()),
-                                ],
-                            );
-                        }
-                        return Ok(None);
-                    }
-                }
+        // Real inner Port, exactly once. `?` propagates its RepositoryError
+        // verbatim — a failed load must NEVER be seen as held == 0.
+        let loaded = self.inner.load_authorization_state(transfer_id).await?;
+
+        let eligible = self.is_eligible_target(transfer_id);
+        // The authoritative durably-held set from the SAME snapshot.
+        let held = loaded.as_ref().map(|s| s.held_chunk_indices.len());
+
+        match self.decide(eligible, held) {
+            EpisodeVerdict::Deny => {
+                self.emit_denial(held.unwrap_or(0));
+                Ok(None)
             }
+            EpisodeVerdict::PassThrough => Ok(loaded),
         }
-        // (7) every non-faulted call: the real Postgres repository.
-        self.inner.load_authorization_state(transfer_id).await
     }
 }
 
@@ -702,15 +734,15 @@ async fn main() {
     let data_plane_base_url = format!("https://{lab_ip}:{dp_port}");
     // The real Postgres authorization-state Port, optionally wrapped by the
     // Gate-4 Subtest A auth-denial-episode decorator. It returns the Port's
-    // existing contractual `Ok(None)` for exactly two consecutive target
-    // loads; every other call — including the probe's post-episode re-grant
-    // `issue()` load — delegates to the real repository. Production semantics
-    // unchanged.
+    // existing contractual `Ok(None)` for exactly ONE target load (the first
+    // eligible one at/above the held threshold — which the probe guarantees is
+    // its bodyless pre-PUT resume checkpoint); every other call — including the
+    // probe's post-episode re-grant `issue()` load — delegates to the real
+    // repository. Production semantics unchanged.
     let auth_state_repo: Arc<dyn bamep_server::ports::TransferAuthorizationRepository> =
         match fault_mode {
             FaultMode::AuthDenial => Arc::new(AuthDenialEpisodeRepo {
                 inner: Arc::new(PostgresTransferAuthorizationRepository::new(pool.clone())),
-                pool: pool.clone(),
                 threshold: fault_threshold,
                 target: Arc::clone(&fault_target),
                 episode: AuthDenialEpisode::new(),
@@ -1288,7 +1320,7 @@ async fn handle_conn(
 // =====================================================================
 // Issue #61 CP7A Gate-4 Subtest A — host unit tests for the pure
 // authorization-denial EPISODE state machine. No SQL, no PgPool, no network:
-// only the deterministic two-slot transition is exercised here.
+// only the deterministic single-denial transition is exercised here.
 // =====================================================================
 #[cfg(test)]
 mod fault_gate_tests {
@@ -1299,86 +1331,68 @@ mod fault_gate_tests {
     #[test]
     fn below_threshold_consumes_no_slot() {
         let e = AuthDenialEpisode::new();
-        assert_eq!(e.try_consume(true, 0, 8), None);
-        assert_eq!(e.try_consume(true, 7, 8), None);
+        assert!(!e.try_consume(true, 0, 8));
+        assert!(!e.try_consume(true, 7, 8));
         assert!(!e.is_consumed());
         // reaching threshold later still works
-        assert_eq!(e.try_consume(true, 8, 8), Some(1));
+        assert!(e.try_consume(true, 8, 8));
     }
 
     #[test]
-    fn target_at_threshold_hands_out_slots_one_then_two_then_delegates() {
+    fn target_at_threshold_hands_out_one_denial_then_delegates() {
         let e = AuthDenialEpisode::new();
-        assert_eq!(e.try_consume(true, 8, 8), Some(1), "first qualifying call -> denial #1");
-        assert!(!e.is_consumed(), "episode not done after denial #1");
-        assert_eq!(e.try_consume(true, 8, 8), Some(2), "next target call -> denial #2");
-        assert!(e.is_consumed(), "episode consumed after denial #2");
-        assert_eq!(e.try_consume(true, 8, 8), None, "third+ delegates");
-        assert_eq!(e.try_consume(true, 999, 8), None);
-    }
-
-    #[test]
-    fn slot_two_does_not_recheck_held_count() {
-        // The chunk PUT body was already rejected before denial #2, so the
-        // durable held count is irrelevant for slot #2.
-        let e = AuthDenialEpisode::new();
-        assert_eq!(e.try_consume(true, 8, 8), Some(1));
-        assert_eq!(e.try_consume(true, 0, 8), Some(2), "denial #2 fires regardless of held");
+        assert!(e.try_consume(true, 8, 8), "first qualifying call -> the denial");
+        assert!(e.is_consumed(), "episode consumed after the single denial");
+        assert!(!e.try_consume(true, 8, 8), "second+ target call delegates");
+        assert!(!e.try_consume(true, 999, 8));
     }
 
     #[test]
     fn non_target_calls_consume_no_slot() {
         let e = AuthDenialEpisode::new();
-        assert_eq!(e.try_consume(false, 8, 8), None);
-        assert_eq!(e.try_consume(false, 999, 8), None);
+        assert!(!e.try_consume(false, 8, 8));
+        assert!(!e.try_consume(false, 999, 8));
         assert!(!e.is_consumed());
-        // the real target calls still get both slots afterwards
-        assert_eq!(e.try_consume(true, 8, 8), Some(1));
-        assert_eq!(e.try_consume(true, 8, 8), Some(2));
+        // the real target call still gets the slot afterwards
+        assert!(e.try_consume(true, 8, 8));
+        assert!(!e.try_consume(true, 8, 8));
     }
 
     #[test]
     fn target_calls_below_threshold_consume_no_slot() {
         let e = AuthDenialEpisode::new();
-        assert_eq!(e.try_consume(true, 7, 8), None);
-        assert_eq!(e.try_consume(true, 5, 8), None);
+        assert!(!e.try_consume(true, 7, 8));
+        assert!(!e.try_consume(true, 5, 8));
         assert!(!e.is_consumed());
-        assert_eq!(e.try_consume(true, 8, 8), Some(1));
+        assert!(e.try_consume(true, 8, 8));
     }
 
     #[test]
     fn disabled_threshold_consumes_no_slot() {
         let e = AuthDenialEpisode::new();
-        assert_eq!(e.try_consume(true, 8, 0), None);
-        assert_eq!(e.try_consume(true, 8, -1), None);
+        assert!(!e.try_consume(true, 8, 0));
+        assert!(!e.try_consume(true, 8, -1));
         assert!(!e.is_consumed());
     }
 
     #[test]
-    fn concurrent_qualifying_callers_win_exactly_two_slots() {
+    fn concurrent_qualifying_callers_win_exactly_one_slot() {
         let e = Arc::new(AuthDenialEpisode::new());
-        let ones = Arc::new(AtomicUsize::new(0));
-        let twos = Arc::new(AtomicUsize::new(0));
+        let wins = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
         for _ in 0..64 {
             let e = Arc::clone(&e);
-            let (ones, twos) = (Arc::clone(&ones), Arc::clone(&twos));
-            handles.push(std::thread::spawn(move || match e.try_consume(true, 8, 8) {
-                Some(1) => {
-                    ones.fetch_add(1, Ordering::SeqCst);
+            let wins = Arc::clone(&wins);
+            handles.push(std::thread::spawn(move || {
+                if e.try_consume(true, 8, 8) {
+                    wins.fetch_add(1, Ordering::SeqCst);
                 }
-                Some(2) => {
-                    twos.fetch_add(1, Ordering::SeqCst);
-                }
-                Some(_) => unreachable!("only ordinals 1 and 2 exist"),
-                None => {}
             }));
         }
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(ones.load(Ordering::SeqCst), 1, "exactly one denial #1");
-        assert_eq!(twos.load(Ordering::SeqCst), 1, "exactly one denial #2");
+        assert_eq!(wins.load(Ordering::SeqCst), 1, "exactly one caller wins the deny slot");
         assert!(e.is_consumed());
     }
 
@@ -1388,5 +1402,182 @@ mod fault_gate_tests {
         assert_eq!(super::resolve_fault_mode(8, 0), FaultMode::ListenerRestart);
         assert_eq!(super::resolve_fault_mode(0, 8), FaultMode::AuthDenial);
         // (8, 8) would `die()` (process exit) — not exercised here.
+    }
+
+    #[test]
+    fn env_nonneg_i64_accepts_nonnegative_ints_and_falls_back_when_unset() {
+        // SAFETY: single-threaded test, no other thread reads these vars.
+        let k = "CP7_TEST_NONNEG_XYZ";
+        std::env::remove_var(k);
+        assert_eq!(super::env_nonneg_i64(k, 7), 7, "unset -> default");
+        std::env::set_var(k, "0");
+        assert_eq!(super::env_nonneg_i64(k, 7), 0);
+        std::env::set_var(k, "123");
+        assert_eq!(super::env_nonneg_i64(k, 7), 123);
+        std::env::remove_var(k);
+        // Invalid values (foo / 8x / -1 / 1.5 / "") would `die()` (process exit)
+        // — verified via the launcher's Bash validator instead of here.
+    }
+}
+
+// =====================================================================
+// Issue #61 CP7A Gate-4 Subtest A — the SQL-free decorator over the real
+// `TransferAuthorizationRepository` Port. The `Some(state)` denial paths are
+// covered by the pure `AuthDenialEpisodeRepo::decide` (the full
+// `AuthorizationDurableState` is impractical to reconstruct off a real DB);
+// the async shell's inner-`?` propagation and no-arm-on-`None` are covered
+// with a tiny fake inner; end-to-end wiring against a real
+// `AuthorizationDurableState` is covered by the host-loopback.
+// =====================================================================
+#[cfg(test)]
+mod decorator_tests {
+    use super::{AuthDenialEpisode, AuthDenialEpisodeRepo, EpisodeVerdict, FaultTarget};
+    use bamep_server::ports::{
+        AuthorizationDurableState, RepositoryError, TransferAuthorizationRepository,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
+    use uuid::Uuid;
+
+    /// Very small fake inner Port. Only the two shapes the decorator's async
+    /// shell can exercise without a full `AuthorizationDurableState`:
+    /// a `RepositoryError`, or `Ok(None)`. Counts its calls so we can prove
+    /// the decorator invokes it exactly once.
+    struct FakeInner {
+        err: bool,
+        calls: AtomicUsize,
+    }
+    impl FakeInner {
+        fn erroring() -> Self {
+            Self { err: true, calls: AtomicUsize::new(0) }
+        }
+        fn none() -> Self {
+            Self { err: false, calls: AtomicUsize::new(0) }
+        }
+    }
+    #[async_trait::async_trait]
+    impl TransferAuthorizationRepository for FakeInner {
+        async fn load_authorization_state(
+            &self,
+            _transfer_id: bamep_domain::TransferId,
+        ) -> Result<Option<AuthorizationDurableState>, RepositoryError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.err {
+                Err(RepositoryError::Backend("simulated inner failure".into()))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    fn repo(inner: Arc<FakeInner>, threshold: i64, target: Option<FaultTarget>) -> AuthDenialEpisodeRepo {
+        let t = Arc::new(OnceLock::new());
+        if let Some(ft) = target {
+            let _ = t.set(ft);
+        }
+        AuthDenialEpisodeRepo {
+            inner,
+            threshold,
+            target: t,
+            episode: AuthDenialEpisode::new(),
+        }
+    }
+    fn tid(u: Uuid) -> bamep_domain::TransferId {
+        bamep_domain::TransferId(u)
+    }
+
+    // ---- A — inner RepositoryError is propagated verbatim, no arming ----
+    #[tokio::test]
+    async fn inner_error_is_propagated_and_never_arms_the_episode() {
+        let target_tx = Uuid::new_v4();
+        let inner = Arc::new(FakeInner::erroring());
+        let d = repo(Arc::clone(&inner), 8, Some(FaultTarget { transfer_id: target_tx, artifact_id: Uuid::new_v4() }));
+
+        let out = d.load_authorization_state(tid(target_tx)).await;
+        match out {
+            Err(RepositoryError::Backend(m)) => assert_eq!(m, "simulated inner failure"),
+            other => panic!("expected the inner Backend error, got {other:?}"),
+        }
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1, "inner called exactly once");
+        assert!(!d.episode.is_consumed());
+        // the episode is still `Waiting` — a real target call would win the slot
+        assert_eq!(d.decide(true, Some(8)), EpisodeVerdict::Deny);
+    }
+
+    // ---- B — inner None passes through, no arming ----
+    #[tokio::test]
+    async fn inner_none_passes_through_and_never_arms_the_episode() {
+        let target_tx = Uuid::new_v4();
+        let inner = Arc::new(FakeInner::none());
+        let d = repo(Arc::clone(&inner), 8, Some(FaultTarget { transfer_id: target_tx, artifact_id: Uuid::new_v4() }));
+
+        assert!(d.load_authorization_state(tid(target_tx)).await.unwrap().is_none());
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert!(!d.episode.is_consumed());
+        assert_eq!(d.decide(true, Some(8)), EpisodeVerdict::Deny, "still Waiting after an inner None");
+    }
+
+    // ---- G — a non-target transfer never consumes a slot ----
+    #[tokio::test]
+    async fn unrelated_transfer_never_consumes_a_slot() {
+        let target_tx = Uuid::new_v4();
+        let other_tx = Uuid::new_v4();
+        let inner = Arc::new(FakeInner::none());
+        let d = repo(Arc::clone(&inner), 8, Some(FaultTarget { transfer_id: target_tx, artifact_id: Uuid::new_v4() }));
+
+        assert!(!d.is_eligible_target(tid(other_tx)));
+        assert!(d.load_authorization_state(tid(other_tx)).await.unwrap().is_none());
+        assert!(!d.episode.is_consumed());
+        assert_eq!(d.decide(true, Some(8)), EpisodeVerdict::Deny, "the target call still wins the slot");
+    }
+
+    // ---- fault disabled / target unset -> always pass-through ----
+    #[tokio::test]
+    async fn disabled_or_unset_target_is_transparent() {
+        let target_tx = Uuid::new_v4();
+        // threshold 0
+        let d0 = repo(Arc::new(FakeInner::none()), 0, Some(FaultTarget { transfer_id: target_tx, artifact_id: Uuid::new_v4() }));
+        assert!(!d0.is_eligible_target(tid(target_tx)));
+        // target unset
+        let d1 = repo(Arc::new(FakeInner::none()), 8, None);
+        assert!(!d1.is_eligible_target(tid(target_tx)));
+    }
+
+    // ---- C/D/F — the pure decision over the held-count from the same
+    // authorization-state snapshot ----
+    #[test]
+    fn decide_below_threshold_passes_through() {
+        let target_tx = Uuid::new_v4();
+        let d = repo(Arc::new(FakeInner::none()), 8, Some(FaultTarget { transfer_id: target_tx, artifact_id: Uuid::new_v4() }));
+        assert_eq!(d.decide(true, Some(7)), EpisodeVerdict::PassThrough); // C
+        assert_eq!(d.decide(true, Some(0)), EpisodeVerdict::PassThrough);
+        assert!(!d.episode.is_consumed());
+    }
+
+    #[test]
+    fn decide_hands_out_one_denial_then_delegates() {
+        let target_tx = Uuid::new_v4();
+        let d = repo(Arc::new(FakeInner::none()), 8, Some(FaultTarget { transfer_id: target_tx, artifact_id: Uuid::new_v4() }));
+        assert_eq!(d.decide(true, Some(8)), EpisodeVerdict::Deny); // D — first eligible call at threshold
+        assert!(d.episode.is_consumed());
+        assert_eq!(d.decide(true, Some(8)), EpisodeVerdict::PassThrough); // F — every later call delegates
+        assert_eq!(d.decide(true, Some(999)), EpisodeVerdict::PassThrough);
+    }
+
+    #[test]
+    fn decide_none_held_never_denies() {
+        let target_tx = Uuid::new_v4();
+        let d = repo(Arc::new(FakeInner::none()), 8, Some(FaultTarget { transfer_id: target_tx, artifact_id: Uuid::new_v4() }));
+        // inner returned None -> held is None -> never a slot even when eligible
+        assert_eq!(d.decide(true, None), EpisodeVerdict::PassThrough);
+        assert!(!d.episode.is_consumed());
+    }
+
+    #[test]
+    fn decide_ineligible_never_denies() {
+        let target_tx = Uuid::new_v4();
+        let d = repo(Arc::new(FakeInner::none()), 8, Some(FaultTarget { transfer_id: target_tx, artifact_id: Uuid::new_v4() }));
+        assert_eq!(d.decide(false, Some(999)), EpisodeVerdict::PassThrough);
+        assert!(!d.episode.is_consumed());
     }
 }
