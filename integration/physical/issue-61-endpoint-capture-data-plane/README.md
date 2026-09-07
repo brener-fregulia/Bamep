@@ -16,7 +16,9 @@ to the closed Issue #60 harness (`../issue-60-winpe-agent-slice/`), which is
   reference path (`bamep_simulator::DataPlaneTransferAgent` / `DataPlaneClient`).
   It is **not** `bamep.m2.endpoint-capture-transfer` and must not be reported
   as the M2 product action.
-- Attempt-by-attempt evidence and the A/B/C/D classification live on Issue #61.
+- The final Issue #61 classification is **Outcome B** (see "CP7A physical
+  result — PASSED" and "Issue #61 final classification — Outcome B" below).
+  Attempt-by-attempt evidence lives on Issue #61.
 
 ## CP2 — what `harness/` proves
 
@@ -287,9 +289,9 @@ RUSTFLAGS="-C target-feature=+crt-static" cargo xwin build --release --target x8
 
 ## CP7A — bounded-prefix physical data-plane pressure (`harness/src/bin/cp7-harness.rs` + `probe7/`)
 
-**Status: built + host-verified; not yet physically run.** Owner-approved for the
-bounded pressure stage only. CP7B full-device scale characterization is **not**
-authorized.
+**Status: physically run and PASSED** — run `cp7a-lab-20260906T222258`, Gate-4a /
+Subtest A (`auth_denial`). Owner-approved for the bounded pressure stage only.
+CP7B full-device scale characterization is **not** authorized.
 
 CP7A does **not** continue the CP6 Transfer. `probe7` mints a **fresh** source
 epoch (fresh random `source_observation_id` + `agent_source_id`s, held only in
@@ -298,7 +300,7 @@ lineage in `bamep_physint_spike`. The CP6 lineage, its held chunk 0, and
 `runtime-cp6/` are never touched. The action remains
 `bamep.m1.data-plane-transfer`; **no RF-2 / RF-6 / RF-7 production
 source-authority layer is implemented** — its absence is the exact recorded
-blocker and the expected final Issue #61 classification is **Outcome B**.
+blocker and the confirmed final Issue #61 classification is **Outcome B**.
 
 Bounded extent: **2,148,532,224 bytes** (`2 GiB + 1 MiB`) at an 8 MiB chunk
 size → **257 chunks** = 256 × 8,388,608 B + one final **1,048,576 B** chunk.
@@ -346,18 +348,86 @@ export PATH="$HOME/.local/bin:$PATH" XWIN_ACCEPT_LICENSE=1
 cd ../probe7 && RUSTFLAGS="-C target-feature=+crt-static" cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
 
+### CP7A physical result — PASSED
+
+CP7A ran on the physical MiniPC (`cp7a-lab-20260906T222258`, Gate-4a / Subtest A
+`auth_denial`) and **passed**:
+
+- bounded extent **2,148,532,224 B** = **257 chunks** (256 × 8,388,608 B + one
+  final 1,048,576 B), read from the CP4-resolved disposable SSD with
+  `CreateFileW` requesting **`GENERIC_READ` only** — no source write, no
+  format/partition/repair/restore, no mount, no CP7B, no full-device claim;
+- real physical bytes crossed the real sender-constrained Worker HTTPS data
+  plane; chunks became durably held; the manifest sealed at `chunk_count = 257`;
+- **Gate-4a checkpoint** at `held = 8`: the probe read + buffered the pending
+  chunk (`pending_chunk_index = 8`) and issued exactly one bodyless
+  `discover_resume`; the harness fault decorator produced exactly **one**
+  authorization denial (`held_chunks = 8`, `threshold = 8`, `deny_count = 1`,
+  `denied_total = 1`);
+- the probe **suspended once** (`suspension_count = 1`,
+  `reason = authorization_denied`), requested a **fresh grant**, re-entered the
+  stream with the same `StreamState`, and resume discovery reconciled
+  `held = 8` / `pending = 8` / `pending_already_held = false` — the pending
+  chunk was uploaded with **no second physical source read**;
+- stream completed `held_chunks = 257`, `device_read_count = 257`; zero
+  `cp7a.stream.put_transient`, zero `cp7a.stream.put_auth_denied`, zero
+  `gate4_checkpoint.unexpected`;
+- rolling full-Artifact SHA-256
+  `g3G5p7YUFRfjTicWcEa_U9gkA22uWB_OQfiaqeVlNmA`
+  (`total_bytes_hashed = 2148532224`, `chunk_count = 257`);
+- the Worker independently reconstructed and verified; durable **Artifact
+  `Verified`** (`artifact_id 785f0891-7584-46a0-ac3f-f2cf8179432f`); the probe
+  sent `ActionResult{Succeeded, TRANSFER_VERIFIED}`; the harness drove **Job /
+  JobStep / Attempt = `Succeeded`** with `manifest_sealed = true`; WinPE wrapper
+  `CP7A_EXITCODE = 0`; final probe verdict `cp7a_pass = true`.
+
+This PASS is a **bounded-prefix M1 pressure Artifact** exercised through
+`bamep.m1.data-plane-transfer`. It is **NOT** a complete `\\.\PhysicalDrive0`
+capture, **NOT** walkthrough D, **NOT** Outcome A, and **NOT** production
+`bamep.m2.endpoint-capture-transfer`. Gate-4a proves the Spike
+suspend → fresh-grant → resume state machine under a deterministic authorization
+denial; it does **not** prove generic real-world network-outage recovery.
+
+Raw run logs stay under `evidence/cp7a-lab-20260906T222258/` (git-ignored lab
+evidence, never committed); only the concise durable facts above belong here.
+
+### Issue #61 final classification — Outcome B
+
+**Outcome B — physical source read works; the product-action / Application seam
+blocks honest transfer.** Every lower layer is now physically proven: stock
+WinPE source resolution and `GENERIC_READ` reads, real bytes across the
+sender-constrained Worker HTTPS data plane, durable chunks, manifest seal,
+Worker full-Artifact reconstruction/verification, durable `Artifact::Verified`,
+terminal `TRANSFER_VERIFIED`, and one suspension → fresh authorization → resume
+cycle. All complete-Artifact pressure still runs through
+`bamep.m1.data-plane-transfer`, because the repository has **no** honest
+production M2 seam: RF-2 `SourceReference` authority/freshness enforcement, RF-5
+structured immutable `SourceProvenance` binding, RF-6 authoritative atomic
+endpoint-capture target creation with server-side freshness checks + final
+pre-dispatch revalidation, and RF-7 `bamep.m2.endpoint-capture-transfer`
+dispatch/action handling (with the matching Agent-side `SOURCE_REFERENCE_STALE`
+check before source read) are all absent. CP3 showed today's M1-shaped creation
+path mechanically accepts a stale tuple as opaque provenance — evidence of the
+missing M2 seam, not an M1 bug. The Issue's conditional full-source walkthrough D
+is therefore not honestly reachable inside this Spike, and a larger fixture
+capture would only add scale through the already-proven lower layer without
+answering the outstanding M2 authority question.
+
 ### CP7A Gate-4 subtests — proving the interruption-recovery state machine
 
-The single `data-plane-only` interruption above proved end-to-end verification
-but did **not** exercise the Agent-side
-`suspend → fresh grant → resume discovery → continue` recovery path: physical
-run 2's PCAP showed the ~400 ms Worker-listener restart is absorbed by the WinPE
-TCP stack (one SYN retransmit) before it reaches the probe's application layer.
-The recovery machinery is therefore proven separately, in two subtests split by
-the launcher's fault mode (exactly one per run; the harness fails closed if both
-are armed):
+The single `data-plane-only` interruption in physical run 2 proved end-to-end
+verification but did **not** exercise the Agent-side
+`suspend → fresh grant → resume discovery → continue` recovery path: its PCAP
+showed the ~400 ms Worker-listener restart is absorbed by the WinPE TCP stack
+(one SYN retransmit) before it reaches the probe's application layer. The
+recovery machinery is proven separately, in two subtests split by the launcher's
+fault mode (exactly one per run; the harness fails closed if both are armed).
+**Subtest A is the mode physically run and PASSED at Gate-4a**
+(`cp7a-lab-20260906T222258`, above); Subtest B remains a later separate
+validation:
 
-- **Subtest A — `auth_denial` (launcher default).** A Spike-local decorator over
+- **Subtest A — `auth_denial` (launcher default; physically run + PASSED at
+  Gate-4a, `cp7a-lab-20260906T222258`).** A Spike-local decorator over
   the real `bamep_server::ports::TransferAuthorizationRepository` Port produces
   **one** deterministic authorization denial for the run's own Transfer: the
   first eligible `load_authorization_state` call at/above
