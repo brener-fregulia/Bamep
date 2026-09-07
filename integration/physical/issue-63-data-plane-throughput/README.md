@@ -337,11 +337,23 @@ export RUSTFLAGS="-C target-feature=+crt-static"
 
 ### Non-physical validation performed
 
+- **Physical attempt 1 aborted at the bootstrap → runner argv contract** (before
+  any network wait, `next_case`, probe launch, source access or Transfer): the
+  WinPE bootstrap passed `--run-id` to the runner, which `parse_matrix_args`
+  does not accept ⇒ `BAD_ARGS` exit 2; and a literal `(no retry)` inside the
+  bootstrap's `if/else` block broke cmd.exe parsing (`. was unexpected at this
+  time.`). Both fixed in `bamep-i63-stage3-bootstrap.cmd.template`; a new
+  `run-stage3-checks.sh` step now renders the bootstrap and runs its exact
+  generated runner argv against the host binary.
 - `stage3/run-stage3-checks.sh` — **STAGE3_CHECKS_PASS**: stage2-engine (53
-  tests) + coordinator (25 tests incl. 3 new `matrix_net` line-protocol tests) +
-  stage2-probe (14) + winpe-runner (23 incl. 7 matrix-loop tests) + stage3-harness
-  release build + `issue-credential` arg guard + `bash -n` all scripts + the
-  launcher `PHYSICAL MATRIX NOT ARMED` banner.
+  tests) + coordinator (25 tests incl. 3 `matrix_net` line-protocol tests) +
+  stage2-probe (14) + winpe-runner (23 incl. 7 matrix-loop tests) + **the
+  generated-bootstrap → runner argv contract** (renders the template with the
+  same `@TOKEN@` set, extracts the `bamep-i63-runner.exe …` invocation, runs
+  that exact 28-arg argv against the host runner → `STAGE3_MATRIX_RUNNER_ARMED`,
+  NOT `BAD_ARGS`, reaches the deliberately unreachable network boundary and exits
+  `20`) + stage3-harness release build + `issue-credential` arg guard + `bash -n`
+  all scripts + the launcher `PHYSICAL MATRIX NOT ARMED` banner.
 - `stage3-harness` composes against **real PostgreSQL** (`db.connected_and_migrated`),
   real WSS (`wss.listening`), real Worker control plane (`worker.ipc_available`),
   real Worker HTTPS (`worker.https_listening`); stable 64-hex leaf fingerprint.

@@ -19,7 +19,10 @@ echo [bamep-i63] Stage 3 bootstrap: running wpeinit (network + PnP init)...
 wpeinit
 >> "%EV%" echo {"event":"winpe.wpeinit_complete","origin":"bootstrap","run_id":"@RUN_ID@","bootstrap_local_ts":"%DATE% %TIME%"}
 echo [bamep-i63] launching the Stage 3 matrix runner (ARMED)...
-X:\Windows\System32\bamep-i63-runner.exe --matrix --arm --run-id @RUN_ID@ --matrix-coord @LAB_IP@:@MATRIX_PORT@ --coord @LAB_IP@:@COORD_PORT@ --wss @LAB_IP@:@WSS_PORT@ --sink @LAB_IP@:@SINK_PORT@ --pin @PIN@ --probe X:\Windows\System32\bamep-i63-stage2-probe.exe --enroll-credential-file X:\Windows\System32\bamep-i63-enroll.cred --runtime-credential-file X:\bamep-i63-runtime.cred --select-model-substr "@MODEL_SUBSTR@" --skew-floor-ms @SKEW_FLOOR_MS@ --skew-ceil-ms @SKEW_CEIL_MS@ --net-wait-secs @NET_WAIT_SECS@ --seal-timeout-secs @SEAL_TIMEOUT_SECS@
+rem  run_id is NOT passed to the runner: it receives the authoritative run_id on
+rem  every typed Case from the matrix coordinator. The run_id token stays in the
+rem  evidence lines above only.
+X:\Windows\System32\bamep-i63-runner.exe --matrix --arm --matrix-coord @LAB_IP@:@MATRIX_PORT@ --coord @LAB_IP@:@COORD_PORT@ --wss @LAB_IP@:@WSS_PORT@ --sink @LAB_IP@:@SINK_PORT@ --pin @PIN@ --probe X:\Windows\System32\bamep-i63-stage2-probe.exe --enroll-credential-file X:\Windows\System32\bamep-i63-enroll.cred --runtime-credential-file X:\bamep-i63-runtime.cred --select-model-substr "@MODEL_SUBSTR@" --skew-floor-ms @SKEW_FLOOR_MS@ --skew-ceil-ms @SKEW_CEIL_MS@ --net-wait-secs @NET_WAIT_SECS@ --seal-timeout-secs @SEAL_TIMEOUT_SECS@
 set "RC=%ERRORLEVEL%"
 echo.
 echo BAMEP_I63_STAGE3_RUNNER_EXITCODE=%RC%
@@ -27,7 +30,7 @@ if "%RC%"=="0" (
   echo [bamep-i63] Stage 3 matrix runner reported STAGE3_MATRIX_RUNNER_DONE. Watch the Fedora
   echo            coordinator for STAGE3_MATRIX_TERMINAL marker=matrix_pass, then power the MiniPC off.
 ) else (
-  echo [bamep-i63] Stage 3 matrix runner exited rc=%RC%. The matrix STOPPED (no retry). See the
+  echo [bamep-i63] Stage 3 matrix runner exited rc=%RC%. The matrix STOPPED; no retry. See the
   echo            probe lines above and the Fedora coordinator output. This CMD stays open.
 )
 endlocal
