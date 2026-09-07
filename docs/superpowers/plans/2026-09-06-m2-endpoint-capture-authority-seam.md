@@ -349,12 +349,16 @@ Run RED: `cargo test -p bamep-server --test endpoint_capture_creation capture_ -
 
 - [ ] Add `provenance_shape_rejects_partial_or_mixed_columns`; assert database constraint failures leave no extra rows. Retain Task 2's `legacy_creation_rejects_m2_context` regression. Use direct SQL only for constraint-negative data in the disposable database, not to simulate an accepted capture operation. Run RED with `cargo test -p bamep-server --test endpoint_capture_creation -- --nocapture`; the missing representation constraint supplies a database assertion failure. The legacy guard from Task 2 may already pass: retain that regression without manufacturing a failure. Rerun the complete suite for GREEN after the schema/transaction implementation below.
 
+- [ ] **RED — exact M2 source-id persistence.** Add adapter-local PostgreSQL tests `m2_source_agent_id_round_trips_nul_and_unicode` and `m2_source_agent_id_rejects_invalid_persisted_utf8` in `crates/server/src/adapters/postgres/transfer_repository.rs`. Use the existing disposable TestDatabase harness and transaction-local insertion helper to persist a Domain context whose otherwise valid source id is `"source-\u{0000}-α-id"` (Rust string syntax). Reload through both provenance readers and assert string equality and byte equality with the original. Exercise this as a provenance-storage fixture, independently of InventoryReport ingestion; do not claim RF-2 target acceptance from fixture insertion. For the negative read case, inject non-empty invalid UTF-8 bytes such as `[0xff]` into a disposable persisted fixture and require `RepositoryError`, never replacement characters or fallback to M1. Retain the SQL empty-value constraint test.
+
+Run RED before the BYTEA mapping: `cargo test -p bamep-server --lib m2_source_agent_id -- --nocapture`. Rerun the identical command for GREEN after the mapping below, then `cargo test -p bamep-server --test transfer_repository --test endpoint_capture_creation` for regression.
+
 - [ ] **GREEN — schema and transaction implementation.** In `transfers`, make legacy `source_provenance` nullable and add:
 
 ```sql
 source_inventory_revision_id UUID,
 source_observation_id BYTEA,
-source_agent_id TEXT,
+source_agent_id BYTEA,
 CONSTRAINT transfer_provenance_shape CHECK (
   (source_provenance IS NOT NULL AND source_inventory_revision_id IS NULL
     AND source_observation_id IS NULL AND source_agent_id IS NULL)
@@ -370,6 +374,8 @@ FOREIGN KEY (endpoint_id, source_inventory_revision_id)
 No fabricated M1 description for M2, no source-state lifecycle column, no provenance FK to the **current** pointer. Historical inventory FK preserves ownership without making continued provenance validity depend on currency. No backfill/upgrade claim for disposable pre-baseline databases.
 
 Both `load_locked_facts` and `load_locked_transfer_and_artifact` must use one adapter-local provenance mapper: legacy text alone -> M1; complete tuple alone -> validated M2; incomplete/invalid combinations -> RepositoryError. No JSON sniffing or fallback. All binding/manifest/Artifact update SQL leaves provenance untouched.
+
+For M2 `source_agent_id`, write `agent_source_id.as_str().as_bytes()` exactly to BYTEA. On read, load the bytes, require valid UTF-8 with `String::from_utf8`, then require non-empty through `AgentSourceId::new`; reconstruct the exact string without trimming, normalization, or lossy conversion. Invalid UTF-8 or an empty persisted value is persisted-data corruption and returns `RepositoryError`. Domain remains `AgentSourceId(String)` and the wire remains a JSON UTF-8 string, including embedded NUL. `source_observation_id` remains BYTEA containing exactly 32 raw bytes; M1 descriptive TEXT is unchanged.
 
 Extract transaction-local insertion helpers from existing methods without changing M1 behavior:
 
@@ -471,7 +477,7 @@ pub(super) fn endpoint_capture_action_parameters(
 ) -> serde_json::Map<String, serde_json::Value>;
 ```
 
-- [ ] **RED.** Add `dispatch_capture_sends_exact_rf7_action`, `capture_dispatch_preserves_send_once_and_failure_semantics`, and `capture_dispatch_refuses_wrong_correlation` to the new Application submodule's tests. Use a recording `AgentDispatchPort` as in existing `mod.rs::tests` outbound tests; this fake proves only message construction/send discipline, not database commitment.
+- [ ] **RED.** Add `dispatch_capture_sends_exact_rf7_action` and `capture_dispatch_preserves_send_once_and_failure_semantics` to the new Application submodule's tests. Use a recording `AgentDispatchPort` as in existing `mod.rs::tests` outbound tests; this fake proves only message construction/send discipline, not database commitment.
 
 ```rust
 let sent = transport.last_dispatch().unwrap();
@@ -490,7 +496,7 @@ assert_eq!(serde_json::Value::Object(sent.body.parameters), serde_json::json!({
 }));
 ```
 
-Build test Transfer/Attempt with exact matching Endpoint, step, and bound Attempt. Negative correlation cases: other Endpoint, other step, unbound/different Attempt; return NotDispatchable and record zero sends/registrations. Test non-Dispatched Attempt; duplicate call after success; duplicate after send failure; reservation retained on uncertain send. Do not change expectations of existing M1 tests, whose fixture arguments were not previously correlation-gated.
+Consume the already-coherent committed Transfer/Attempt context: `evaluate_transfer_dispatch` checks exact Job/JobStep/Endpoint/Transfer correlation before minting the Attempt and binds the Transfer to that Attempt in the committed outcome. Preserve the existing `AttemptState::Dispatched` guard, `AttemptId -> ReservationId` register-before-send handoff, and send-once behavior. Test the existing non-Dispatched guard, duplicate call after success, duplicate after send failure, and reservation retention on uncertain send. Do not introduce an M2-only correlation rejection or reservation-release lifecycle: an early rejection before registration would leave the already-acquired reservation outside the existing ownership path. M1 behavior remains unchanged.
 
 RED: `cargo test -p bamep-server --lib endpoint_capture::tests -- --nocapture`.
 
@@ -498,7 +504,7 @@ RED: `cargo test -p bamep-server --lib endpoint_capture::tests -- --nocapture`.
 
 Run RED: `cargo test -p bamep-server --test endpoint_capture_dispatch committed_capture_reconstructs_rf7_from_durable_provenance -- --exact --nocapture`; the existing outbound method still constructs M1. After the implementation below, run the identical command for GREEN and the full `endpoint_capture_dispatch` suite for regression.
 
-- [ ] **GREEN.** In `ActionDispatchService::dispatch_transfer`, match the durable provenance variant. M1 keeps its constants and untouched five-field `transfer_action_parameters`. M2 checks Endpoint/step/Attempt correlation, uses M2 constants and a new builder that extends those five shared values with exactly `source_reference` from typed immutable provenance. Both call the existing `dispatch_message`; no second transport, new action identity, arbitrary parameter map, or Server-side resend loop.
+- [ ] **GREEN.** In `ActionDispatchService::dispatch_transfer`, match the durable provenance variant. M1 keeps its constants and untouched five-field `transfer_action_parameters`. M2 consumes that committed context and uses M2 constants and a new builder that extends those five shared values with exactly `source_reference` from typed immutable provenance. Both call the existing `dispatch_message`; no second transport, new action identity, arbitrary parameter map, or Server-side resend loop.
 
 ```rust
 // M2 builder body, reusing the existing parent's five-value mapper:
