@@ -1,0 +1,45 @@
+# Issue #63 Stage 1 — WinPE-native runner (THROWAWAY Spike artifact).
+#
+# LAB-ONLY. NOT the Bamep Agent, NOT crates/agent, NOT the bamepd composition
+# root, NOT a production Agent architecture. It proves ONLY the Stage-1
+# automation primitives:
+#   WinPE auto-start (injected via wimboot into X:\Windows\System32, the
+#   Phase-9d boot.wim is NOT modified) -> wait for network -> reach the Fedora
+#   coordinator -> obtain the Server's current UTC -> align the WinPE SYSTEM
+#   clock with SetSystemTime (UTC) -> read it back -> re-check the skew against
+#   a strict bound -> report READY.
+#
+# It opens NO \\.\PhysicalDrive* handle, issues NO IOCTL, performs NO transfer
+# and touches NO disk beyond a local X:\ NDJSON evidence file. Minimal deps:
+# std TCP + serde_json + windows-sys time APIs (all in the #60/#61-proven stock
+# WinPE DLL set: kernel32 / ntdll / ws2_32 / advapi32 / bcrypt). Standalone
+# workspace so it never joins the main Bamep workspace.
+[package]
+name = "bamep-i63-stage1-runner"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[workspace]
+
+[[bin]]
+name = "bamep-i63-runner"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

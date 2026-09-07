@@ -1,0 +1,31 @@
+@echo off
+rem  Bamep Issue #63 Stage 1 — WinPE auto-start bootstrap. THROWAWAY LAB ONLY.
+rem
+rem  Injected into X:\Windows\System32 by the DERIVED Issue-63 autoexec.ipxe via
+rem  wimboot's boot-time file overlay. The Phase-9d boot.wim / BCD / boot.sdi are
+rem  NOT modified. Stage 1 opens NO disk handle and performs NO transfer.
+rem
+rem  It writes winpe.booted BEFORE wpeinit and winpe.wpeinit_complete AFTER, to a
+rem  LOCAL X:\ evidence file (no network needed). The runner FORWARDS those two
+rem  lines verbatim; it never synthesises them. %DATE%/%TIME% are the pre-clock-
+rem  alignment local wall clock, recorded only for order/provenance.
+rem
+rem  winpeshl.ini launches:  cmd.exe /k X:\Windows\System32\bamep-i63-bootstrap.cmd
+rem  so this window stays open after the runner exits.
+setlocal
+set "EV=X:\bamep-i63-events.ndjson"
+> "%EV%" echo {"event":"winpe.booted","origin":"bootstrap","run_id":"@RUN_ID@","bootstrap_local_ts":"%DATE% %TIME%"}
+echo [bamep-i63] Stage 1 bootstrap: running wpeinit (network + PnP init)...
+wpeinit
+>> "%EV%" echo {"event":"winpe.wpeinit_complete","origin":"bootstrap","run_id":"@RUN_ID@","bootstrap_local_ts":"%DATE% %TIME%"}
+echo [bamep-i63] launching the Stage 1 runner...
+X:\Windows\System32\bamep-i63-runner.exe --run-id @RUN_ID@ --mode physical --coord @LAB_IP@:@COORD_PORT@ --sink @LAB_IP@:@SINK_PORT@ --bootstrap-events "%EV%" --skew-floor-ms @SKEW_FLOOR_MS@ --skew-ceil-ms @SKEW_CEIL_MS@ --net-wait-secs @NET_WAIT_SECS@
+set "RC=%ERRORLEVEL%"
+echo.
+echo BAMEP_I63_STAGE1_EXITCODE=%RC%
+if "%RC%"=="0" (
+  echo [bamep-i63] Stage 1 runner reached READY. Watch the Fedora coordinator for the physical PASS line, then power the MiniPC off.
+) else (
+  echo [bamep-i63] Stage 1 FAILED rc=%RC%. See the runner lines above and the Fedora coordinator output. This CMD stays open.
+)
+endlocal

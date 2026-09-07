@@ -1,0 +1,32 @@
+# Issue #63 Stage 1 — Fedora-side lab coordinator (THROWAWAY Spike plumbing).
+#
+# NOT the Bamep control plane. NO TLS, NO authentication, NO database, NO Worker,
+# NO transfer. Two plain-TCP listeners on the isolated #53 lab link only:
+#   * coord — request/response: hands the WinPE runner the Server's current UTC
+#   * sink  — ingest: receives the runner's cumulative NDJSON event snapshot
+# and drives a small, unit-tested Stage-1 state machine to a deterministic
+# PASS/FAIL. Standalone workspace so it never joins the main Bamep workspace.
+[package]
+name = "bamep-i63-stage1-coordinator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bamep-i63-stage1-coordinator"
+path = "src/main.rs"
+
+[lib]
+name = "bamep_i63_stage1_coordinator"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
