@@ -29,6 +29,7 @@ boundaries are not the Web API.
 Administrative API v1 defines:
 
 - minimum current-state reads for a future Presentation implementation;
+- a minimum Endpoint collection read for the current small fleet;
 - Endpoint and Job representations, including nested JobStep/Attempt state;
 - progress/reconciliation and Transfer/Artifact summaries;
 - stable cross-boundary identifiers;
@@ -41,7 +42,8 @@ It is intentionally not a future-complete management API.
 
 This contract does not define Web UI, administrative authentication/users/RBAC, Job creation or
 cancellation, enrollment approval, destructive or other Web-originated writes, workflow editing,
-browser push/change notifications, list/search/filter/pagination APIs, persistence schema,
+browser push/change notifications, collection reads beyond the minimum Endpoint collection,
+search/filter/sort queries, pagination/cursors, persistence schema,
 Agent Protocol/data-plane mechanics, external ERP APIs, or public third-party compatibility
 guarantees.
 
@@ -79,6 +81,9 @@ Identifier ownership and persistence correlation remain defined by
 
 Administrative API v1 defines exactly these minimum reads:
 
+- `GET /api/admin/v1/endpoints`
+  - successful collection read → HTTP `200` with the Endpoint collection representation;
+  - an empty fleet → HTTP `200` with `{"endpoints": []}`, never HTTP `404`.
 - `GET /api/admin/v1/endpoints/{endpoint_id}`
   - existing Endpoint → HTTP `200` with the Endpoint representation;
   - nonexistent Endpoint → HTTP `404`.
@@ -91,6 +96,27 @@ snapshot, and Transfer/Artifact summary when applicable. Separate JobStep/Attemp
 not part of this minimum contract.
 
 ## Resource representations
+
+### Endpoint collection
+
+The response is a JSON object with one required `endpoints` array. Each item is the Endpoint
+representation below, with the same fields and semantics as the detail read. No collection
+metadata is defined.
+
+An empty collection is:
+
+```json
+{
+  "endpoints": []
+}
+```
+
+The collection enumerates existing Endpoints, including their authoritative identity states;
+it does not synthesize resources for absent or deleted Endpoints or a separate retired-resource
+model. Ordering is semantically unspecified. This small-fleet read has no pagination, cursor,
+filter, search, or sort query contract.
+
+The existing v1 unknown-field rule applies to the collection envelope and its Endpoint items.
 
 ### Endpoint
 
@@ -107,6 +133,15 @@ Expose:
 
 `agent_presence` is independent of credential state. A `CredentialActive` Endpoint may be
 `Disconnected`; the API must not derive one dimension from the other.
+
+Collection and detail reads preserve `endpoint_id`, identity state, credential state,
+`agent_presence`, hardware confidence, and current-inventory presence/reference as separate
+facts. Returned `endpoint_id` values are the real opaque Administrative API Endpoint identifiers;
+`LAB-*` identifiers are Presentation fixtures only and define no API identity semantics.
+
+Web composes operator-facing presentation from these facts. The API defines no aggregate
+`ready`, `situation`, `health`, or `availability` state and no durable Endpoint naming/alias
+concept such as `display_name`, `asset_tag`, or hostname authority.
 
 Endpoint semantics are owned by `m0-endpoint-identity-lifecycle.md`; inventory durability is owned
 by `m0-persistence-observability-and-domain-events.md`. Richer inventory content is deferred until
@@ -166,7 +201,8 @@ capture-consistency semantics are owned by `m0-data-plane-and-storage-contracts.
 
 ## Representation semantics
 
-- **Absent resource:** HTTP `404`; no synthetic empty Domain state.
+- **Absent detail resource:** HTTP `404`; no synthetic empty Domain state.
+- **Empty Endpoint collection:** HTTP `200` with an empty `endpoints` array.
 - **Optional absent field:** omitted from JSON, never `null`.
 - **Pending:** use the owning Domain state; no parallel Web-only "not started" state.
 - **Failed/rejected:** expose the owning state and applicable `failure_reason`; do not collapse them
@@ -184,7 +220,8 @@ Future work not defined by this minimum read contract:
 - production administrative authentication/authorization;
 - Web-originated command/write semantics;
 - richer inventory reads;
-- list/filter/pagination and broader HTTP conventions;
+- collection reads beyond the minimum Endpoint collection, search/filter/sort queries,
+  pagination/cursors, and broader HTTP conventions;
 - browser update-notification mechanism;
 - generation format for opaque Domain identifiers;
 - mechanism used by the Server to derive `agent_presence`.
@@ -194,12 +231,19 @@ Future work not defined by this minimum read contract:
 Implementation requires at least:
 
 - serialization coverage for every representation/state above;
+- Endpoint collection envelope/item serialization, including an empty fleet returning `200`
+  with an empty `endpoints` array;
+- multiple Endpoints preserving independent identity, credential, presence, hardware-confidence,
+  and current-inventory presence/reference facts;
+- collection `endpoint_id` values remaining opaque strings, without Presentation fixture-id
+  semantics or a Server-authoritative situation/readiness summary;
 - RFC 3339 timestamps and opaque identifiers;
 - omitted-vs-`null` optional-field behavior;
-- unknown-field forward compatibility where applicable;
+- unknown-field forward compatibility, including the collection envelope and Endpoint items;
 - credential state and `agent_presence` proven independent;
 - absent progress represented as omitted;
-- Endpoint/Job reads returning `200` for existing and `404` for nonexistent resources;
+- unchanged Endpoint/Job detail reads returning `200` for existing and `404` for nonexistent
+  resources, with Endpoint detail fields/semantics consistent with collection items;
 - correct Job nesting of JobStep, Attempt, progress, and Transfer/Artifact summaries;
 - `AwaitingReconciliation`, `Indeterminate`, and every `failure_reason` represented without
   collapsing/substitution;
