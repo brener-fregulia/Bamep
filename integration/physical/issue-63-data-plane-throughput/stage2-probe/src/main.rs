@@ -32,9 +32,12 @@ mod safety;
 mod sources;
 mod stream;
 
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Mutex;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bamep_agent_protocol::{
@@ -57,8 +60,9 @@ use sources::Counters;
 use tokio_tungstenite::tungstenite::Message;
 
 use stream::{
-    run_stream_pass, run_stream_pass_prep_ahead, ChunkReader, DataPlane, PassOutcome, ProgressTick,
-    PutStatus, ResumeStatus, StreamError, StreamEvent, StreamState,
+    run_stream_pass, run_stream_pass_prep_ahead, run_stream_pass_window8, ChunkReader, DataPlane,
+    PassOutcome, ProgressTick, PutStatus, ResumeStatus, StreamError, StreamEvent, StreamState,
+    WindowedPutLauncher,
 };
 
 const PROBE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -205,23 +209,31 @@ fn flush_sink(log: &Log, sink: &str) {
 
 /// Issue #63 Stage 4 — which single-pass streaming algorithm the probe runs.
 /// `Serial` is the already-proven Stage-3 default; `PrepAhead2` is the
-/// throwaway depth-2 prep-ahead pipeline (`run_stream_pass_prep_ahead`).
+/// throwaway depth-2 prep-ahead pipeline (`run_stream_pass_prep_ahead`);
+/// `PrepAheadWindow8` is the window_8 solution candidate: the SAME prep-ahead
+/// source pipeline + up to 8 concurrent chunk PUTs, per-PUT Worker durability
+/// semantics unchanged (`run_stream_pass_window8`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamMode {
     Serial,
     PrepAhead2,
+    PrepAheadWindow8,
 }
 impl StreamMode {
     fn wire(self) -> &'static str {
         match self {
             StreamMode::Serial => "serial",
             StreamMode::PrepAhead2 => "prep_ahead_2",
+            StreamMode::PrepAheadWindow8 => "prep_ahead_window_8",
         }
     }
     fn parse(s: &str) -> Option<Self> {
         match s {
             "serial" => Some(StreamMode::Serial),
             "prep_ahead_2" | "prep-ahead-2" => Some(StreamMode::PrepAhead2),
+            "prep_ahead_window_8" | "prep-ahead-window-8" | "window_8" => {
+                Some(StreamMode::PrepAheadWindow8)
+            }
             _ => None,
         }
     }
@@ -297,7 +309,7 @@ fn parse_args() -> Args {
                 match StreamMode::parse(&raw) {
                     Some(m) => a.mode = m,
                     None => {
-                        eprintln!("bad --mode {raw:?} (want: serial | prep_ahead_2)");
+                        eprintln!("bad --mode {raw:?} (want: serial | prep_ahead_2 | prep_ahead_window_8)");
                         std::process::exit(exit::BAD_ARGS);
                     }
                 }
@@ -452,6 +464,84 @@ impl DataPlane for RealDataPlane {
             }
             Err(e) => PutStatus::Transient(format!("{e}")),
         }
+    }
+}
+
+// ---- window_8 candidate: bounded-concurrent-PUT launcher ------------------
+
+/// The `stream::WindowedPutLauncher` for the real Worker HTTPS data plane.
+/// Borrows `auth` ONLY to synchronously mint each PUT's proof on the
+/// foreground (`AgentTransferAuthorization::create_proof_now` takes `&self`,
+/// so this is safe without any interior synchronization); the returned future
+/// captures only owned, immutable copies (`token`, `transfer_uuid`, the
+/// already-minted `proof`, `base_url`, the `Copy` `fingerprint`) — never
+/// `auth` itself — so the future's `'static` bound holds despite `auth` being
+/// borrowed. Keeps the SAME fresh-TCP/TLS-per-request semantics `DataPlaneClient`
+/// already uses; `DataPlaneClient` is not `Clone`, and per the Spike's
+/// authorization a fresh per-PUT client is an acceptable candidate simplification
+/// (persistent-connection pooling is not a variable of this candidate).
+struct RealWindowLauncher<'a> {
+    auth: &'a AgentTransferAuthorization,
+    transfer_uuid: uuid::Uuid,
+    base_url: String,
+    fingerprint: ServerCertFingerprint,
+    request_timeout: Duration,
+    /// Foreground-only (proof minting is synchronous and sequential) —
+    /// a plain accumulator is safe.
+    proof_ns: std::cell::Cell<u128>,
+    /// Written concurrently from multiple in-flight PUT futures — needs a
+    /// real atomic. Nanoseconds fit comfortably in a `u64`.
+    put_ack_ns: Arc<AtomicU64>,
+}
+impl WindowedPutLauncher for RealWindowLauncher<'_> {
+    fn start_put(
+        &mut self,
+        index: u64,
+        digest_wire: String,
+        bytes: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = PutStatus> + Send>> {
+        let t_proof = Instant::now();
+        let proof = match self
+            .auth
+            .create_proof_now(TransferOperation::ChunkUpload, Some(index))
+        {
+            Ok(p) => p,
+            Err(e) => return Box::pin(async move { PutStatus::Fatal(format!("chunk proof: {e}")) }),
+        };
+        self.proof_ns.set(self.proof_ns.get() + t_proof.elapsed().as_nanos());
+
+        let token = self.auth.token().to_string();
+        let transfer_uuid = self.transfer_uuid;
+        let base_url = self.base_url.clone();
+        let fingerprint = self.fingerprint;
+        let request_timeout = self.request_timeout;
+        let put_ack_ns = Arc::clone(&self.put_ack_ns);
+
+        Box::pin(async move {
+            let client = match DataPlaneClient::connect(&base_url, fingerprint) {
+                Ok(c) => c.with_request_timeout(request_timeout),
+                Err(e) => return PutStatus::Fatal(format!("window_8: connect: {e}")),
+            };
+            let t_put = Instant::now();
+            let outcome = client
+                .put_chunk(&token, transfer_uuid, index, &digest_wire, &proof, bytes)
+                .await;
+            put_ack_ns.fetch_add(t_put.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            match outcome {
+                Ok(PutChunkOutcome::Accepted { .. }) => PutStatus::Accepted,
+                Ok(PutChunkOutcome::AlreadyHeld { .. }) => PutStatus::AlreadyHeld,
+                Ok(PutChunkOutcome::DigestMismatch) => PutStatus::DigestMismatch,
+                Ok(PutChunkOutcome::ChunkIdentityConflict) => PutStatus::IdentityConflict,
+                Ok(PutChunkOutcome::TransferNotContinuable) => PutStatus::NotContinuable,
+                Ok(PutChunkOutcome::ChunkTooLarge) => PutStatus::Fatal("413 CHUNK_TOO_LARGE".into()),
+                Ok(PutChunkOutcome::AuthorizationDenied) => PutStatus::AuthDenied,
+                Ok(PutChunkOutcome::Malformed) => PutStatus::Fatal("400 MALFORMED_REQUEST".into()),
+                Ok(PutChunkOutcome::Unexpected { status }) => {
+                    PutStatus::Fatal(format!("unexpected PUT status {status}"))
+                }
+                Err(e) => PutStatus::Transient(format!("{e}")),
+            }
+        })
     }
 }
 
@@ -1161,6 +1251,47 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
                 )
                 .await
             }
+            StreamMode::PrepAheadWindow8 => {
+                // Resume is fetched HERE (not inside the driver) so the
+                // driver can immutably borrow `dp.auth` for the whole pass —
+                // see `RealWindowLauncher`'s doc comment for why that borrow
+                // is `'static`-safe despite the concurrent PUT futures.
+                let resume = dp.discover_resume().await;
+                let locator = resolved.local_locator.clone();
+                let factory = move || -> Result<DeviceReader, String> {
+                    let mut c = Counters::default();
+                    let src = sources::RawReadSource::open(&locator, &mut c)?;
+                    Ok(DeviceReader {
+                        src,
+                        counters: std::cell::RefCell::new(c),
+                    })
+                };
+                let mut launcher = RealWindowLauncher {
+                    auth: &dp.auth,
+                    transfer_uuid,
+                    base_url: base_url.clone(),
+                    fingerprint,
+                    request_timeout: Duration::from_secs(args.seal_timeout_secs),
+                    proof_ns: std::cell::Cell::new(0),
+                    put_ack_ns: Arc::new(AtomicU64::new(0)),
+                };
+                let result = run_stream_pass_window8(
+                    &mut state,
+                    factory,
+                    resume,
+                    &mut launcher,
+                    &mut on_progress,
+                    &mut on_lifecycle,
+                )
+                .await;
+                // Fold the launcher's aggregates into `dp`'s — both are Cell
+                // `.set`/`.get` (shared access), so this needs no mutable
+                // borrow of `dp` and does not conflict with `launcher.auth`.
+                dp.proof_ns.set(dp.proof_ns.get() + launcher.proof_ns.get());
+                dp.put_ack_ns
+                    .set(dp.put_ack_ns.get() + launcher.put_ack_ns.load(Ordering::Relaxed) as u128);
+                result
+            }
         };
         resume_ms_total += t_resume.elapsed().as_secs_f64() * 1000.0;
 
@@ -1171,10 +1302,12 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
                 }
                 let device_read_count = match args.mode {
                     StreamMode::Serial => reader.counters.borrow().data_read_count,
-                    // In prep-ahead the producer thread owns the reads; the
-                    // foreground `reader` is unused. The producer's read log is
-                    // the authoritative per-pass read count.
-                    StreamMode::PrepAhead2 => state.producer_read_log().len() as u64,
+                    // In prep-ahead / window_8 the producer thread owns the
+                    // reads; the foreground `reader` is unused. The producer's
+                    // read log is the authoritative per-pass read count.
+                    StreamMode::PrepAhead2 | StreamMode::PrepAheadWindow8 => {
+                        state.producer_read_log().len() as u64
+                    }
                 };
                 log.emit(
                     "info",
@@ -1188,6 +1321,21 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
                         )),
                     ],
                 );
+                if args.mode == StreamMode::PrepAheadWindow8 {
+                    // Raw evidence only (not part of the engine's parsed
+                    // schema): the exact PUT start/completion order proof.
+                    log.emit(
+                        "info",
+                        "probe.window8.put_order_evidence",
+                        &[
+                            ("put_window", V::U(state.put_window())),
+                            ("peak_puts_in_flight", V::U(state.peak_puts_in_flight())),
+                            ("put_starts_ascending", V::B(state.put_starts_ascending())),
+                            ("put_start_order", s(format!("{:?}", state.put_start_order()))),
+                            ("put_completion_order", s(format!("{:?}", state.put_completion_order()))),
+                        ],
+                    );
+                }
                 break 'outer;
             }
             Ok(_) => {
@@ -1266,13 +1414,18 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
             let ns_ms = |n: u128| (n as f64 / 1_000_000.0) as i64;
             let device_read_count = match args.mode {
                 StreamMode::Serial => reader.counters.borrow().data_read_count,
-                StreamMode::PrepAhead2 => state.producer_read_log().len() as u64,
+                StreamMode::PrepAhead2 | StreamMode::PrepAheadWindow8 => {
+                    state.producer_read_log().len() as u64
+                }
             };
             emit_full_result(
                 log, args, state.chunk_count(), transfer_uuid, artifact_uuid,
                 &safety_verdict_token, &clock_verdict,
                 bulk_stream_wall_ms, verified_transfer_wall_ms, resume_ms_total, seal_d2_ms,
-                device_read_count, state.prepared_peak(), "Verified", case_status,
+                device_read_count, state.prepared_peak(),
+                state.put_window(), state.put_started_count(), state.put_completed_count(),
+                state.peak_puts_in_flight(), state.put_starts_ascending(),
+                "Verified", case_status,
                 &[
                     ("read_ms", ns_ms(ts.read_ns)),
                     ("chunk_sha_ms", ns_ms(ts.chunk_sha_ns)),
@@ -1328,6 +1481,13 @@ fn emit_full_result(
     seal_d2_ms: f64,
     device_read_count: u64,
     prepared_buffer_peak: u64,
+    // window_8 candidate fields — 0/false for serial / prep_ahead_2 (the
+    // engine's `S4CaseResult` serde-defaults them identically).
+    put_window: u64,
+    put_started_count: u64,
+    put_completed_count: u64,
+    peak_puts_in_flight: u64,
+    put_starts_ascending: bool,
     final_artifact_status: &str,
     case_status: &str,
     extra_ms: &[(&str, i64)],
@@ -1348,6 +1508,11 @@ fn emit_full_result(
         ("chunk_count", V::U(chunk_count)),
         ("device_read_count", V::U(device_read_count)),
         ("prepared_buffer_peak", V::U(prepared_buffer_peak)),
+        ("put_window", V::U(put_window)),
+        ("put_started_count", V::U(put_started_count)),
+        ("put_completed_count", V::U(put_completed_count)),
+        ("peak_puts_in_flight", V::U(peak_puts_in_flight)),
+        ("put_starts_ascending", V::B(put_starts_ascending)),
         ("transfer_id", s(transfer_uuid.to_string())),
         ("artifact_id", s(artifact_uuid.to_string())),
         ("source_safety_verdict", s(safety_verdict)),

@@ -5,19 +5,24 @@
 # read, NO 10-case transfer matrix, NO MiniPC power-on. Nothing here arms
 # anything (the launcher's `--arm` is NOT passed).
 #
-#   1. stage2-engine    — unit tests (incl. the stage4 module) + release build
-#   2. coordinator      — all tests; --stage4-selftest; --stage4 (no --arm) NOT ARMED
-#   3. stage2-probe      — host tests (incl. prep-ahead pipeline RED/GREEN) + --self-check
+#   1. stage2-engine    — unit tests (incl. the stage4 + window_8 plan/analysis) + release build
+#   2. coordinator      — all tests; --stage4-selftest; --window8-selftest; --stage4 (no --arm) NOT ARMED
+#   3. stage2-probe      — host tests (incl. prep-ahead + window_8 RED/GREEN) + --self-check
 #   4. winpe-runner      — Stage-1/3 regression + --stage4 NOT ARMED + --stage4 --arm
-#                          fails closed without a valid --pin + stage4 loop unit tests
+#                          fails closed without a valid --pin + stage4 loop unit tests (incl. window_8 mode)
 #   5. Worker PUT timing hook — `cargo test -p bamep-worker` (env-gated hook inert;
-#                          the staging sub-timings fire only with i63_active)
+#                          the staging sub-timings fire only with i63_active); the
+#                          out-of-order commit/seal contract check
+#                          (`chunks_committed_in_strictly_descending_order_still_seal_verified`)
 #   6. generated stage4 bootstrap -> runner argv contract (the exact @TOKEN@
 #                          substituted invocation MUST parse, reach the network
-#                          boundary, and NEVER exit BAD_ARGS)
+#                          boundary, and NEVER exit BAD_ARGS) — window_8 reuses this
+#                          SAME bootstrap unchanged (only the coordinator's own
+#                          `--window8` flag differs; the runner forwards `mode`
+#                          from the coordinator's case JSON generically)
 #   7. stage3-harness    — release build + `--stage4` requires `--worker-timing-file`
 #   8. bash -n on the Stage-4 shell scripts + derive `--stage 4` dry checks +
-#                          launcher NOT ARMED banner
+#                          launcher NOT ARMED banner (both `--stage4` and `--window8`)
 #
 # WinPE cross-build + PE-import inspection is a separate manual step (needs
 # cargo-xwin); see README.md.
@@ -29,16 +34,17 @@ REPO_ROOT="$(cd "${root}/../../.." && pwd)"
 step() { printf '\n=== %s ===\n' "$1"; }
 fail() { printf '\nSTAGE4_CHECKS_FAIL: %s\n' "$1"; exit 1; }
 
-step "1/8 stage2-engine (incl. stage4 module)"
+step "1/8 stage2-engine (incl. stage4 + window_8 module)"
 ( cd stage2-engine && cargo test --quiet && cargo clippy --quiet --all-targets -- -D warnings \
   && cargo build --release --quiet ) || fail "stage2-engine"
 
-step "2/8 coordinator (stage4_net + selftest + NOT ARMED)"
+step "2/8 coordinator (stage4_net + selftest + window8-selftest + NOT ARMED)"
 ( cd coordinator && cargo test --quiet ) || fail "coordinator tests"
 ( cd coordinator && cargo run --quiet -- --stage4-selftest | tail -1 | grep -q STAGE4_SELFTEST_PASS ) || fail "stage4-selftest"
+( cd coordinator && cargo run --quiet -- --window8-selftest | tail -1 | grep -q WINDOW8_SELFTEST_PASS ) || fail "window8-selftest"
 ( cd coordinator && cargo run --quiet -- --stage4 | grep -q 'STAGE4 NOT ARMED' ) || fail "--stage4 not-armed banner"
 
-step "3/8 stage2-probe (host; prep-ahead pipeline RED/GREEN + synthetic S-vs-P smoke)"
+step "3/8 stage2-probe (host; prep-ahead + window_8 pipeline RED/GREEN + synthetic S-vs-P smoke)"
 ( cd stage2-probe && cargo test --quiet ) || fail "probe tests"
 ( cd stage2-probe && cargo run --quiet -- --self-check | grep -q PROBE_SELF_CHECK_PASS ) || fail "probe self-check"
 ( cd stage2-probe && cargo run --quiet -- --pipeline-check | grep -q PROBE_PIPELINE_CHECK_PASS ) || fail "probe pipeline-check (serial vs prep-ahead digest parity)"
@@ -53,6 +59,11 @@ step "5/8 Worker PUT timing hook (env-gated; bamep-worker tests)"
 I63T_OUT="$( cd "${REPO_ROOT}" && cargo test -p bamep-worker --quiet i63_stage_timing 2>&1 || true )"
 printf '%s\n' "${I63T_OUT}" | grep -qE 'test result: ok\. 1 passed' || fail "i63 stage timing test did not pass"
 grep -q 'BAMEP_I63_WORKER_PUT_TIMING' "${REPO_ROOT}/crates/worker/src/data_plane/i63_timing.rs" || fail "worker hook env var not present"
+# window_8 CONTRACT / ORDERING CHECK: independently addressed chunk PUTs may
+# durably complete/commit out of order before seal (m0-data-plane-and-storage-
+# contracts.md "Full-Artifact byte reconstruction").
+W8ORD_OUT="$( cd "${REPO_ROOT}" && cargo test -p bamep-worker --test data_plane_transfer --quiet chunks_committed_in_strictly_descending_order 2>&1 || true )"
+printf '%s\n' "${W8ORD_OUT}" | grep -qE 'test result: ok\. 1 passed' || fail "window_8 out-of-order commit/seal contract check did not pass"
 # The hook must be inert with the env var UNSET: no NDJSON sink is written.
 I63T_INERT="$(mktemp -d)"
 ( cd "${REPO_ROOT}" && env -u BAMEP_I63_WORKER_PUT_TIMING cargo test -p bamep-worker --quiet valid_body_finalizes 2>&1 || true ) >/dev/null
@@ -111,6 +122,7 @@ done
 [ -f stage3/winpeshl-stage4.ini ] || fail "stage3/winpeshl-stage4.ini missing"
 [ -f stage3/bamep-i63-stage4-bootstrap.cmd.template ] || fail "stage4 bootstrap template missing"
 ( stage4/run-stage4-lab.sh | grep -q 'STAGE4 NOT ARMED' ) || fail "launcher (no args) must print STAGE4 NOT ARMED"
+( stage4/run-stage4-lab.sh --window8 | grep -q 'STAGE4 NOT ARMED' ) || fail "launcher --window8 (no --arm) must print STAGE4 NOT ARMED"
 command -v shellcheck >/dev/null 2>&1 && { shellcheck -S warning stage4/*.sh || fail "shellcheck"; } || printf 'shellcheck not installed — skipped\n'
 
 printf '\nSTAGE4_CHECKS_PASS  (root=%s)\n' "$root"

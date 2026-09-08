@@ -44,7 +44,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use bamep_i63_stage2_engine::stage4::{
-    analyse_s4, analyse_worker_decomp, S4Mode, S4Plan, S4CaseResult, WorkerDecomp, WorkerPutRecord,
+    analyse_s4, analyse_w8, analyse_worker_decomp, S4Mode, S4Plan, S4CaseResult, WorkerDecomp,
+    WorkerPutRecord,
 };
 
 const DRAIN_SECS: u64 = 5;
@@ -58,6 +59,10 @@ pub struct Cfg {
     /// The env-gated Worker PUT timing NDJSON file (`BAMEP_I63_WORKER_PUT_TIMING`).
     /// Read best-effort at terminal; absence/shortfall => `stage4_invalid`.
     pub worker_timing_file: Option<PathBuf>,
+    /// Issue #63 window_8 candidate: serve the 5-case P-vs-W plan
+    /// (`S4Plan::build_window8`) instead of the 10-case S-vs-P plan, and write
+    /// the P-vs-W analysis at terminal. Same wire protocol, same markers.
+    pub window8: bool,
 }
 
 pub fn parse_cfg() -> Cfg {
@@ -67,10 +72,12 @@ pub fn parse_cfg() -> Cfg {
     let mut run_id = "i63s4".to_string();
     let mut verdict_file: Option<String> = None;
     let mut worker_timing_file: Option<PathBuf> = None;
+    let mut window8 = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--stage4" | "--arm" => {}
+            "--window8" => window8 = true,
             "--matrix-addr" => matrix_addr = it.next().unwrap_or(matrix_addr),
             "--sink-addr" => sink_addr = it.next().unwrap_or(sink_addr),
             "--evidence-dir" => {
@@ -92,6 +99,7 @@ pub fn parse_cfg() -> Cfg {
         run_id,
         verdict_file,
         worker_timing_file,
+        window8,
     }
 }
 
@@ -125,6 +133,7 @@ struct State {
     run_id: String,
     verdict_file: Option<String>,
     worker_timing_file: Option<PathBuf>,
+    window8: bool,
     events_written: u64,
 }
 
@@ -144,12 +153,6 @@ impl State {
         self.append("coordinator-events.ndjson", &line.to_string());
     }
 
-    fn measured_case_count(&self) -> usize {
-        self.plan.measured().count()
-    }
-    fn chunk_count(&self) -> u64 {
-        self.plan.cases.first().map(|c| c.expected_chunk_count).unwrap_or(0)
-    }
 }
 
 /// Read + parse the Worker PUT timing NDJSON (best effort).
@@ -175,35 +178,33 @@ fn read_worker_records(path: &Option<PathBuf>) -> Vec<WorkerPutRecord> {
 }
 
 /// The Worker decomposition, split by mode via the case results' transfer_ids.
+/// Returns `(overall, per_mode)` where `per_mode` carries one entry per mode
+/// that appears in the MEASURED results (record count + decomposition).
 fn worker_decomp(
     results: &[S4CaseResult],
     records: &[WorkerPutRecord],
-) -> (WorkerDecomp, WorkerDecomp, WorkerDecomp, usize, usize) {
+) -> (WorkerDecomp, Vec<(S4Mode, usize, WorkerDecomp)>) {
     let mode_of = |tid: &str| -> Option<S4Mode> {
         results
             .iter()
             .find(|r| r.is_measured() && r.transfer_id.as_deref() == Some(tid))
             .map(|r| r.mode)
     };
-    let mut serial = Vec::new();
-    let mut prep = Vec::new();
+    let mut by_mode: Vec<(S4Mode, Vec<WorkerPutRecord>)> = Vec::new();
+    let mut overall = Vec::new();
     for rec in records {
-        match mode_of(&rec.transfer_id) {
-            Some(S4Mode::Serial) => serial.push(rec.clone()),
-            Some(S4Mode::PrepAhead2) => prep.push(rec.clone()),
-            None => {}
+        let Some(mode) = mode_of(&rec.transfer_id) else { continue };
+        overall.push(rec.clone());
+        match by_mode.iter_mut().find(|(m, _)| *m == mode) {
+            Some((_, v)) => v.push(rec.clone()),
+            None => by_mode.push((mode, vec![rec.clone()])),
         }
     }
-    let (ns, np) = (serial.len(), prep.len());
-    let mut overall = serial.clone();
-    overall.extend(prep.clone());
-    (
-        analyse_worker_decomp(&overall),
-        analyse_worker_decomp(&serial),
-        analyse_worker_decomp(&prep),
-        ns,
-        np,
-    )
+    let per_mode = by_mode
+        .into_iter()
+        .map(|(m, v)| (m, v.len(), analyse_worker_decomp(&v)))
+        .collect();
+    (analyse_worker_decomp(&overall), per_mode)
 }
 
 fn spawn_drain_then_exit(marker: &'static str, verdict_file: Option<String>) {
@@ -225,13 +226,27 @@ fn maybe_go_terminal(st: &mut State) {
     st.terminal_spawned = true;
     st.done = true;
 
-    let s_vs_p = analyse_s4(&st.results);
     let records = read_worker_records(&st.worker_timing_file);
-    let (overall, serial_d, prep_d, n_serial, n_prep) = worker_decomp(&st.results, &records);
+    let (overall, per_mode) = worker_decomp(&st.results, &records);
 
-    // Q2 needs Worker timing covering every measured PUT of BOTH modes.
-    let expect_per_mode = (st.measured_case_count() / 2) as u64 * st.chunk_count();
-    let worker_ok = n_serial as u64 >= expect_per_mode && n_prep as u64 >= expect_per_mode;
+    // The Worker timing must cover every measured PUT of EVERY planned mode.
+    let mut expected_modes: Vec<(S4Mode, u64)> = Vec::new();
+    for c in st.plan.measured() {
+        match expected_modes.iter_mut().find(|(m, _)| *m == c.mode) {
+            Some((_, n)) => *n += c.expected_chunk_count,
+            None => expected_modes.push((c.mode, c.expected_chunk_count)),
+        }
+    }
+    let records_for = |mode: S4Mode| -> u64 {
+        per_mode
+            .iter()
+            .find(|(m, _, _)| *m == mode)
+            .map(|(_, n, _)| *n as u64)
+            .unwrap_or(0)
+    };
+    let worker_ok = expected_modes
+        .iter()
+        .all(|(mode, expect)| records_for(*mode) >= *expect);
 
     let all_completed = st.halt.is_none() && st.completed == st.plan.cases.len();
     let marker: &'static str = if !all_completed {
@@ -242,25 +257,50 @@ fn maybe_go_terminal(st: &mut State) {
         "stage4_pass"
     };
 
-    let analysis = json!({
-        "run_id": st.run_id,
-        "verdict": marker,
-        "completed": st.completed,
-        "total_cases": st.plan.cases.len(),
-        "halt": st.halt,
-        "s_vs_p": s_vs_p,
-        "worker_decomposition": {
-            "records_serial": n_serial,
-            "records_prep_ahead": n_prep,
-            "expected_per_mode": expect_per_mode,
-            "covers_measured_puts": worker_ok,
-            "overall": overall,
-            "serial": serial_d,
-            "prep_ahead": prep_d,
-        },
-        "q1": "compare median prep_ahead bulk MiB/s vs median serial; paired P/S ratios (n=4, no significance)",
-        "q2": "see worker_decomposition; body_pump_ms & staging_worker_ms OVERLAP",
+    let decomp_by_mode: Vec<Value> = per_mode
+        .iter()
+        .map(|(m, n, d)| json!({ "mode": m.wire(), "records": n, "decomposition": d }))
+        .collect();
+    let coverage: Vec<Value> = expected_modes
+        .iter()
+        .map(|(m, expect)| {
+            json!({ "mode": m.wire(), "expected": expect, "records": records_for(*m) })
+        })
+        .collect();
+    let worker_decomposition = json!({
+        "coverage": coverage,
+        "covers_measured_puts": worker_ok,
+        "overall": overall,
+        "by_mode": decomp_by_mode,
     });
+
+    let analysis = if st.window8 {
+        let p_vs_w = analyse_w8(&st.results);
+        json!({
+            "run_id": st.run_id,
+            "candidate": "prep_ahead_window_8",
+            "verdict": marker,
+            "completed": st.completed,
+            "total_cases": st.plan.cases.len(),
+            "halt": st.halt,
+            "p_vs_w": p_vs_w,
+            "worker_decomposition": worker_decomposition,
+            "question": "does window_8 break the per-chunk PUT throughput ceiling? W decomposition intervals OVERLAP ACROSS PUTs — never sum per-PUT times against wall-clock",
+        })
+    } else {
+        let s_vs_p = analyse_s4(&st.results);
+        json!({
+            "run_id": st.run_id,
+            "verdict": marker,
+            "completed": st.completed,
+            "total_cases": st.plan.cases.len(),
+            "halt": st.halt,
+            "s_vs_p": s_vs_p,
+            "worker_decomposition": worker_decomposition,
+            "q1": "compare median prep_ahead bulk MiB/s vs median serial; paired P/S ratios (n=4, no significance)",
+            "q2": "see worker_decomposition; body_pump_ms & staging_worker_ms OVERLAP",
+        })
+    };
     let _ = std::fs::write(
         st.evidence_dir.join("analysis.json"),
         serde_json::to_string_pretty(&analysis).unwrap_or_else(|_| "{}".into()),
@@ -480,14 +520,20 @@ pub fn run(cfg: Cfg) -> ! {
         std::process::exit(1);
     });
 
-    let plan = S4Plan::build(&cfg.run_id).unwrap_or_else(|e| {
+    let plan = if cfg.window8 {
+        S4Plan::build_window8(&cfg.run_id)
+    } else {
+        S4Plan::build(&cfg.run_id)
+    }
+    .unwrap_or_else(|e| {
         eprintln!("STAGE4_START_FAIL plan_arithmetic={e:?}");
         std::process::exit(1);
     });
     println!(
-        "STAGE4_ARMED run_id={} cases={} matrix={} sink={}",
+        "STAGE4_ARMED run_id={} cases={} plan={} matrix={} sink={}",
         cfg.run_id,
         plan.cases.len(),
+        if cfg.window8 { "window8_p_vs_w" } else { "stage4_s_vs_p" },
         cfg.matrix_addr,
         cfg.sink_addr
     );
@@ -514,6 +560,7 @@ pub fn run(cfg: Cfg) -> ! {
         run_id: cfg.run_id.clone(),
         verdict_file: cfg.verdict_file.clone(),
         worker_timing_file: cfg.worker_timing_file.clone(),
+        window8: cfg.window8,
         events_written: 0,
     }));
     {
@@ -550,9 +597,14 @@ pub fn run(cfg: Cfg) -> ! {
 mod tests {
     use super::*;
 
-    fn state_for(dir: &std::path::Path) -> Arc<Mutex<State>> {
+    fn state_with_plan(dir: &std::path::Path, window8: bool) -> Arc<Mutex<State>> {
+        let plan = if window8 {
+            S4Plan::build_window8("i63w8-net-test").unwrap()
+        } else {
+            S4Plan::build("i63s4-net-test").unwrap()
+        };
         Arc::new(Mutex::new(State {
-            plan: S4Plan::build("i63s4-net-test").unwrap(),
+            plan,
             next_index: 0,
             current: None,
             results: Vec::new(),
@@ -564,11 +616,17 @@ mod tests {
             run_id: "i63s4-net-test".into(),
             verdict_file: None,
             worker_timing_file: None,
+            window8,
             events_written: 0,
         }))
     }
 
+    fn state_for(dir: &std::path::Path) -> Arc<Mutex<State>> {
+        state_with_plan(dir, false)
+    }
+
     fn ok_result_json(case: &Value) -> Value {
+        let window = case["mode"] == "prep_ahead_window_8";
         json!({
             "run_id": case["run_id"], "case_id": case["case_id"], "mode": case["mode"],
             "phase": case["phase"], "cycle": case["cycle"], "slot": case["slot"],
@@ -576,11 +634,17 @@ mod tests {
             "chunk_count": case["expected_chunk_count"],
             "transfer_id": format!("t-{}", case["case_id"].as_str().unwrap()),
             "artifact_id": "a",
-            "bulk_stream_wall_ms": 52000.0, "verified_transfer_wall_ms": 58000.0,
+            "bulk_stream_wall_ms": if window { 21000.0 } else { 52000.0 },
+            "verified_transfer_wall_ms": if window { 27000.0 } else { 58000.0 },
             "resume_ms": 3.0, "seal_d2_ms": 5000.0, "read_ms": 5700.0, "chunk_sha_ms": 5400.0,
             "rolling_sha_ms": 6100.0, "proof_ms": 6.0, "put_ack_ms": 33000.0,
-            "prepared_buffer_peak": if case["mode"] == "prep_ahead_2" { 2 } else { 0 },
+            "prepared_buffer_peak": if case["mode"] == "prep_ahead_2" { 2 } else if window { 9 } else { 0 },
             "device_read_count": 32,
+            "put_window": if window { 8 } else { 0 },
+            "put_started_count": if window { 32 } else { 0 },
+            "put_completed_count": if window { 32 } else { 0 },
+            "peak_puts_in_flight": if window { 8 } else { 0 },
+            "put_starts_ascending": window,
             "final_artifact_status": "Verified", "case_status": "completed",
         })
     }
@@ -612,6 +676,45 @@ mod tests {
             handled += 1;
         }
         assert_eq!(handled, 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn window8_5_case_walkthrough_reaches_matrix_completed_with_pw_wp_order() {
+        let dir = std::env::temp_dir().join(format!("i63w8net-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = state_with_plan(&dir, true);
+        let mut modes: Vec<String> = Vec::new();
+        loop {
+            let r = handle_request(&st, r#"{"op":"next_case"}"#);
+            let v: Value = serde_json::from_str(&r).unwrap();
+            if let Some(mc) = v.get("matrix_completed") {
+                assert_eq!(mc["completed"].as_u64().unwrap(), 5);
+                break;
+            }
+            let case = v.get("case").expect("a case").clone();
+            modes.push(case["mode"].as_str().unwrap().to_string());
+            let cid = case["case_id"].as_str().unwrap();
+            for op in ["case_ready", "case_started"] {
+                let resp = handle_request(&st, &json!({ "op": op, "case_id": cid }).to_string());
+                assert_eq!(serde_json::from_str::<Value>(&resp).unwrap()["ack"], json!(true));
+            }
+            let done = handle_request(
+                &st,
+                &json!({ "op": "case_completed", "case_id": cid, "result": ok_result_json(&case) }).to_string(),
+            );
+            assert_eq!(serde_json::from_str::<Value>(&done).unwrap()["ack"], json!(true));
+        }
+        assert_eq!(
+            modes,
+            vec![
+                "prep_ahead_window_8", // warm-up
+                "prep_ahead_2",
+                "prep_ahead_window_8",
+                "prep_ahead_window_8",
+                "prep_ahead_2",
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

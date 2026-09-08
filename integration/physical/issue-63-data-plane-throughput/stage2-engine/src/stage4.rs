@@ -43,6 +43,17 @@ pub const S4_TOTAL_CASES: usize = 10;
 /// Raw Artifact payload the Stage-4 matrix writes and preserves (10 x 2 GiB).
 pub const S4_PAYLOAD_BYTES: u64 = S4_TOTAL_CASES as u64 * EXTENT_BYTES;
 
+// ---- Issue #63 window_8 solution candidate (P vs W micro-plan) --------------
+
+/// The hard-coded bounded PUT window of the `prep_ahead_window_8` candidate.
+pub const W8_PUT_WINDOW: u64 = 8;
+/// Measured window_8 cycles (each cycle = one P + one W transfer).
+pub const W8_MEASURED_CYCLES: u8 = 2;
+/// 1 warm-up (W) + 4 measured.
+pub const W8_TOTAL_CASES: usize = 5;
+/// Raw Artifact payload the window_8 plan writes and preserves (5 x 2 GiB).
+pub const W8_PAYLOAD_BYTES: u64 = W8_TOTAL_CASES as u64 * EXTENT_BYTES;
+
 /// Which single-pass streaming algorithm a case runs. The serde representation
 /// is EXACTLY the `--mode` token the probe accepts (`wire()`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +64,11 @@ pub enum S4Mode {
     /// The throwaway depth-2 prep-ahead pipeline (`run_stream_pass_prep_ahead`).
     #[serde(rename = "prep_ahead_2")]
     PrepAhead2,
+    /// The throwaway window_8 candidate: prep-ahead source pipeline + up to 8
+    /// concurrent chunk PUTs, per-PUT Worker durability semantics UNCHANGED
+    /// (`run_stream_pass_window8`).
+    #[serde(rename = "prep_ahead_window_8")]
+    PrepAheadWindow8,
 }
 
 impl S4Mode {
@@ -61,12 +77,16 @@ impl S4Mode {
         match self {
             S4Mode::Serial => "serial",
             S4Mode::PrepAhead2 => "prep_ahead_2",
+            S4Mode::PrepAheadWindow8 => "prep_ahead_window_8",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "serial" => Some(S4Mode::Serial),
             "prep_ahead_2" | "prep-ahead-2" => Some(S4Mode::PrepAhead2),
+            "prep_ahead_window_8" | "prep-ahead-window-8" | "window_8" => {
+                Some(S4Mode::PrepAheadWindow8)
+            }
             _ => None,
         }
     }
@@ -150,6 +170,61 @@ impl S4Plan {
         })
     }
 
+    /// Build the canonical window_8 candidate plan for `run_id`:
+    ///
+    /// ```text
+    /// warm-up (excluded):  W
+    /// measured cycle 1:    P, W
+    /// measured cycle 2:    W, P
+    /// ```
+    ///
+    /// => 1 warm-up + 4 measured; `n = 2` per measured mode. P = the Stage-4
+    /// `prep_ahead_2` reference (one PUT in flight); W = `prep_ahead_window_8`.
+    /// Deliberately SMALL — a solution candidate, not another matrix.
+    pub fn build_window8(run_id: &str) -> Result<Self, ArithmeticError> {
+        let expected_chunk_count = expected_chunk_count(EXTENT_BYTES, S4_CHUNK_SIZE_BYTES)?;
+        let mk = |case_id: String, phase, mode, cycle, slot| S4Case {
+            run_id: run_id.to_string(),
+            case_id,
+            phase,
+            mode,
+            cycle,
+            slot,
+            chunk_size_bytes: S4_CHUNK_SIZE_BYTES,
+            extent_bytes: EXTENT_BYTES,
+            expected_chunk_count,
+        };
+        let mut cases = Vec::with_capacity(W8_TOTAL_CASES);
+        cases.push(mk(
+            format!("{run_id}/warmup/{}", S4Mode::PrepAheadWindow8.wire()),
+            Phase::Warmup,
+            S4Mode::PrepAheadWindow8,
+            None,
+            None,
+        ));
+        for cycle in 1..=W8_MEASURED_CYCLES {
+            let order = if cycle % 2 == 1 {
+                [S4Mode::PrepAhead2, S4Mode::PrepAheadWindow8]
+            } else {
+                [S4Mode::PrepAheadWindow8, S4Mode::PrepAhead2]
+            };
+            for (slot_idx, &mode) in order.iter().enumerate() {
+                let slot = slot_idx as u8 + 1;
+                cases.push(mk(
+                    format!("{run_id}/c{cycle}/s{slot}/{}", mode.wire()),
+                    Phase::Measured,
+                    mode,
+                    Some(cycle),
+                    Some(slot),
+                ));
+            }
+        }
+        Ok(Self {
+            run_id: run_id.to_string(),
+            cases,
+        })
+    }
+
     pub fn warmups(&self) -> impl Iterator<Item = &S4Case> {
         self.cases.iter().filter(|c| c.phase == Phase::Warmup)
     }
@@ -190,10 +265,29 @@ pub struct S4CaseResult {
     /// OVERLAPS local preparation and MUST NOT be compared to the wall as if it
     /// were exclusive of prep.
     pub put_ack_ms: f64,
-    /// Proof the depth-2 buffer bound held: `0` (serial) or `2` (prep-ahead);
-    /// never `> 2`.
+    /// Proof the live payload-buffer bound held: `0` (serial), `2` (prep-ahead
+    /// depth 2), or `<= 9` (window_8: <= 8 unacknowledged PUT payloads + <= 1
+    /// producer/current chunk).
     pub prepared_buffer_peak: u64,
     pub device_read_count: u64,
+
+    // ---- window_8 candidate fields (serde-defaulted so Stage-3/4 result
+    // lines, which predate them, still parse; 0/false for non-window modes) ----
+    /// The bounded PUT window (8 for `prep_ahead_window_8`; 0 otherwise).
+    #[serde(default)]
+    pub put_window: u64,
+    #[serde(default)]
+    pub put_started_count: u64,
+    #[serde(default)]
+    pub put_completed_count: u64,
+    /// The maximum simultaneously-unacknowledged PUT count the window manager
+    /// observed (an upper bound on true network concurrency; MUST be `<= 8`).
+    #[serde(default)]
+    pub peak_puts_in_flight: u64,
+    /// `true` iff the probe verified every PUT was STARTED in strictly
+    /// ascending chunk-index order.
+    #[serde(default)]
+    pub put_starts_ascending: bool,
 
     pub final_artifact_status: String,
     /// `completed` | `failed:*` | `contaminated`.
@@ -214,6 +308,13 @@ impl S4CaseResult {
     /// End-to-end verified throughput, MiB/s.
     pub fn verified_mib_s(&self) -> f64 {
         rate(self.extent_bytes, self.verified_transfer_wall_ms)
+    }
+    /// `bulk` throughput in DECIMAL MB/s (the product-target unit).
+    pub fn bulk_mb_s(&self) -> f64 {
+        if self.bulk_stream_wall_ms <= 0.0 {
+            return 0.0;
+        }
+        (self.extent_bytes as f64 / 1_000_000.0) / (self.bulk_stream_wall_ms / 1000.0)
     }
     /// The serial-style component sum (prep + PUT/ACK) — a DERIVED diagnostic,
     /// not an authoritative protocol metric. In prep-ahead the real wall is
@@ -380,6 +481,122 @@ pub fn analyse_s4(results: &[S4CaseResult]) -> S4Analysis {
         paired,
         excluded_unverified,
         significance_claim: "none (n=4 per mode; paired ratios only)",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// window_8 P-vs-W analysis (measured, verified-only)
+// ---------------------------------------------------------------------------
+
+/// The within-cycle paired W/P ratios for one series (`> 1.0` => window_8 was
+/// faster that cycle).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct W8PairedRatio {
+    pub series: S4Series,
+    pub raw_ratios: Vec<f64>,
+    pub median_ratio: f64,
+    pub cycles_favouring_window8: usize,
+}
+
+/// The complete measured-only P-vs-W analysis. `n = 2` per mode; NO
+/// significance claim — this classifies a single solution candidate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct W8Analysis {
+    pub prep_ahead: Option<S4ModeSummary>,
+    pub window8: Option<S4ModeSummary>,
+    /// Paired W/P ratios per shared cycle, both series.
+    pub paired: Vec<W8PairedRatio>,
+    pub put_window: u64,
+    /// Median window_8 bulk throughput in DECIMAL MB/s (product-target unit).
+    pub window8_median_bulk_mb_s: f64,
+    /// Median window_8 bulk wall for the 2 GiB extent, ms.
+    pub window8_median_bulk_wall_ms: f64,
+    /// Max `peak_puts_in_flight` over the measured verified window_8 cases.
+    pub max_peak_puts_in_flight: u64,
+    /// `true` iff every measured verified window_8 case reported ascending PUT
+    /// starts AND `peak_puts_in_flight` in `2..=8` AND `prepared_buffer_peak <= 9`.
+    pub window_invariants_held: bool,
+    pub excluded_unverified: Vec<String>,
+    pub significance_claim: &'static str,
+}
+
+/// Build the measured-only P-vs-W analysis from every window_8-plan case result.
+pub fn analyse_w8(results: &[S4CaseResult]) -> W8Analysis {
+    let mut excluded_unverified = Vec::new();
+    let mut by_cycle: Vec<(u8, &S4CaseResult)> = Vec::new();
+    for r in results.iter().filter(|r| r.is_measured()) {
+        if !r.is_completed_and_verified() {
+            excluded_unverified.push(r.case_id.clone());
+            continue;
+        }
+        if let Some(cycle) = r.cycle {
+            by_cycle.push((cycle, r));
+        }
+    }
+
+    let prep_ahead = mode_summary(S4Mode::PrepAhead2, &by_cycle);
+    let window8 = mode_summary(S4Mode::PrepAheadWindow8, &by_cycle);
+
+    let mut paired = Vec::new();
+    for series in [S4Series::BulkStream, S4Series::VerifiedTransfer] {
+        let mut raw = Vec::new();
+        for cycle in 1..=W8_MEASURED_CYCLES {
+            let p = by_cycle
+                .iter()
+                .find(|(c, r)| *c == cycle && r.mode == S4Mode::PrepAhead2)
+                .map(|(_, r)| *r);
+            let w = by_cycle
+                .iter()
+                .find(|(c, r)| *c == cycle && r.mode == S4Mode::PrepAheadWindow8)
+                .map(|(_, r)| *r);
+            let (Some(p), Some(w)) = (p, w) else { continue };
+            let (pt, wt) = match series {
+                S4Series::BulkStream => (p.bulk_mib_s(), w.bulk_mib_s()),
+                S4Series::VerifiedTransfer => (p.verified_mib_s(), w.verified_mib_s()),
+            };
+            if pt > 0.0 {
+                raw.push(wt / pt);
+            }
+        }
+        if raw.is_empty() {
+            continue;
+        }
+        paired.push(W8PairedRatio {
+            series,
+            median_ratio: median(raw.clone()),
+            cycles_favouring_window8: raw.iter().filter(|r| **r > 1.0).count(),
+            raw_ratios: raw,
+        });
+    }
+
+    let w_cases: Vec<&S4CaseResult> = by_cycle
+        .iter()
+        .filter(|(_, r)| r.mode == S4Mode::PrepAheadWindow8)
+        .map(|(_, r)| *r)
+        .collect();
+    let window_invariants_held = !w_cases.is_empty()
+        && w_cases.iter().all(|r| {
+            r.put_starts_ascending
+                && r.put_window == W8_PUT_WINDOW
+                && (2..=W8_PUT_WINDOW).contains(&r.peak_puts_in_flight)
+                && r.prepared_buffer_peak <= W8_PUT_WINDOW + 1
+                && r.put_started_count == r.chunk_count
+                && r.put_completed_count == r.chunk_count
+        });
+
+    W8Analysis {
+        prep_ahead,
+        window8,
+        paired,
+        put_window: W8_PUT_WINDOW,
+        window8_median_bulk_mb_s: median(w_cases.iter().map(|r| r.bulk_mb_s()).collect()),
+        window8_median_bulk_wall_ms: median(
+            w_cases.iter().map(|r| r.bulk_stream_wall_ms).collect(),
+        ),
+        max_peak_puts_in_flight: w_cases.iter().map(|r| r.peak_puts_in_flight).max().unwrap_or(0),
+        window_invariants_held,
+        excluded_unverified,
+        significance_claim: "none (n=2 per mode; paired ratios only; solution-candidate check)",
     }
 }
 
@@ -566,10 +783,127 @@ mod tests {
     fn s4mode_wire_round_trips_and_matches_probe_tokens() {
         assert_eq!(S4Mode::Serial.wire(), "serial");
         assert_eq!(S4Mode::PrepAhead2.wire(), "prep_ahead_2");
+        assert_eq!(S4Mode::PrepAheadWindow8.wire(), "prep_ahead_window_8");
         assert_eq!(S4Mode::parse("serial"), Some(S4Mode::Serial));
         assert_eq!(S4Mode::parse("prep_ahead_2"), Some(S4Mode::PrepAhead2));
         assert_eq!(S4Mode::parse("prep-ahead-2"), Some(S4Mode::PrepAhead2));
+        assert_eq!(
+            S4Mode::parse("prep_ahead_window_8"),
+            Some(S4Mode::PrepAheadWindow8)
+        );
+        assert_eq!(S4Mode::parse("window_8"), Some(S4Mode::PrepAheadWindow8));
         assert_eq!(S4Mode::parse("nonsense"), None);
+    }
+
+    // ---- window_8 candidate plan + analysis --------------------------------
+
+    #[test]
+    fn window8_plan_is_5_cases_w_warmup_then_pw_wp() {
+        let p = S4Plan::build_window8("i63w8-t").unwrap();
+        assert_eq!(p.cases.len(), W8_TOTAL_CASES);
+        assert_eq!(p.warmups().count(), 1);
+        assert_eq!(p.measured().count(), 4);
+        let w: Vec<S4Mode> = p.warmups().map(|c| c.mode).collect();
+        assert_eq!(w, vec![S4Mode::PrepAheadWindow8]);
+        let rows: Vec<Vec<S4Mode>> = (1..=2)
+            .map(|cy| {
+                p.measured()
+                    .filter(|c| c.cycle == Some(cy))
+                    .map(|c| c.mode)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                vec![S4Mode::PrepAhead2, S4Mode::PrepAheadWindow8],
+                vec![S4Mode::PrepAheadWindow8, S4Mode::PrepAhead2],
+            ]
+        );
+        for c in &p.cases {
+            assert_eq!(c.chunk_size_bytes, 64 * MIB);
+            assert_eq!(c.expected_chunk_count, 32);
+        }
+        let ids: std::collections::BTreeSet<&str> =
+            p.cases.iter().map(|c| c.case_id.as_str()).collect();
+        assert_eq!(ids.len(), 5);
+    }
+
+    fn w8_full_set() -> Vec<S4CaseResult> {
+        let mut v = Vec::new();
+        let mut w = result(0, 0, S4Mode::PrepAheadWindow8, 22_000.0, 28_000.0);
+        w.phase = Phase::Warmup;
+        w.cycle = None;
+        w.slot = None;
+        w.case_id = "r/warmup/prep_ahead_window_8".into();
+        v.push(w);
+        for cycle in 1..=2u8 {
+            v.push(result(cycle, 1, S4Mode::PrepAhead2, 66_000.0, 72_000.0));
+            v.push(result(cycle, 2, S4Mode::PrepAheadWindow8, 21_000.0, 27_000.0));
+        }
+        v
+    }
+
+    #[test]
+    fn w8_analysis_pairs_w_over_p_and_reports_target_units() {
+        let a = analyse_w8(&w8_full_set());
+        assert!(a.excluded_unverified.is_empty());
+        let p = a.prep_ahead.unwrap();
+        let w = a.window8.unwrap();
+        assert_eq!((p.n, w.n), (2, 2));
+        assert!(w.median_bulk_mib_s > p.median_bulk_mib_s);
+        assert_eq!(a.paired.len(), 2);
+        for pr in &a.paired {
+            assert_eq!(pr.raw_ratios.len(), 2);
+            assert!(pr.median_ratio > 2.0);
+            assert_eq!(pr.cycles_favouring_window8, 2);
+        }
+        // 2 GiB / 21 s ~= 102.26 MB/s decimal.
+        assert!((a.window8_median_bulk_mb_s - 2_147_483_648.0 / 1e6 / 21.0).abs() < 0.5);
+        assert_eq!(a.window8_median_bulk_wall_ms, 21_000.0);
+        assert_eq!(a.put_window, 8);
+        assert_eq!(a.max_peak_puts_in_flight, 8);
+        assert!(a.window_invariants_held);
+    }
+
+    #[test]
+    fn w8_analysis_flags_broken_window_invariants_and_unverified_cases() {
+        let mut set = w8_full_set();
+        // a window case that never reached >1 in flight breaks the invariant
+        set[2].peak_puts_in_flight = 1;
+        let a = analyse_w8(&set);
+        assert!(!a.window_invariants_held);
+
+        let mut set2 = w8_full_set();
+        set2[4].final_artifact_status = "Failed".into();
+        set2[4].case_status = "failed:artifact_verification".into();
+        let a2 = analyse_w8(&set2);
+        assert_eq!(a2.excluded_unverified, vec![set2[4].case_id.clone()]);
+        // the cycle missing its W case contributes no ratio
+        assert!(a2.paired.iter().all(|pr| pr.raw_ratios.len() == 1));
+    }
+
+    #[test]
+    fn s4_case_result_without_window_fields_defaults_them() {
+        // A Stage-4-era line (no window fields) must still parse.
+        let line = r#"{"run_id":"i63s4-x","case_id":"i63s4-x/c2/s1/prep_ahead_2","mode":"prep_ahead_2","phase":"measured","cycle":2,"slot":1,"chunk_size_bytes":67108864,"extent_bytes":2147483648,"chunk_count":32,"transfer_id":"t","artifact_id":"a","bulk_stream_wall_ms":40000.0,"verified_transfer_wall_ms":46000.0,"resume_ms":3.0,"seal_d2_ms":5000.0,"read_ms":5700.0,"chunk_sha_ms":5400.0,"rolling_sha_ms":6100.0,"proof_ms":6.0,"put_ack_ms":33000.0,"prepared_buffer_peak":2,"device_read_count":32,"final_artifact_status":"Verified","case_status":"completed"}"#;
+        let r: S4CaseResult = serde_json::from_str(line).unwrap();
+        assert_eq!(r.put_window, 0);
+        assert_eq!(r.peak_puts_in_flight, 0);
+        assert!(!r.put_starts_ascending);
+    }
+
+    #[test]
+    fn s4_case_result_parses_the_window8_runner_shape() {
+        // EXACTLY the object the runner's `build_s4_case_result` emits for a
+        // window_8 case (cross-crate contract).
+        let line = r#"{"run_id":"i63w8-x","case_id":"i63w8-x/c1/s2/prep_ahead_window_8","mode":"prep_ahead_window_8","phase":"measured","cycle":1,"slot":2,"chunk_size_bytes":67108864,"extent_bytes":2147483648,"chunk_count":32,"transfer_id":"t","artifact_id":"a","bulk_stream_wall_ms":21000.0,"verified_transfer_wall_ms":27000.0,"resume_ms":3.0,"seal_d2_ms":5000.0,"read_ms":5700.0,"chunk_sha_ms":5400.0,"rolling_sha_ms":6100.0,"proof_ms":6.0,"put_ack_ms":90000.0,"prepared_buffer_peak":9,"device_read_count":32,"put_window":8,"put_started_count":32,"put_completed_count":32,"peak_puts_in_flight":8,"put_starts_ascending":true,"final_artifact_status":"Verified","case_status":"completed"}"#;
+        let r: S4CaseResult = serde_json::from_str(line).unwrap();
+        assert_eq!(r.mode, S4Mode::PrepAheadWindow8);
+        assert_eq!(r.put_window, 8);
+        assert_eq!(r.peak_puts_in_flight, 8);
+        assert!(r.put_starts_ascending);
+        assert!(r.is_completed_and_verified());
     }
 
     fn result(cycle: u8, slot: u8, mode: S4Mode, bulk_ms: f64, verified_ms: f64) -> S4CaseResult {
@@ -594,8 +928,17 @@ mod tests {
             rolling_sha_ms: 6_100.0,
             proof_ms: 6.0,
             put_ack_ms: 33_000.0,
-            prepared_buffer_peak: if mode == S4Mode::PrepAhead2 { 2 } else { 0 },
+            prepared_buffer_peak: match mode {
+                S4Mode::PrepAhead2 => 2,
+                S4Mode::PrepAheadWindow8 => 9,
+                S4Mode::Serial => 0,
+            },
             device_read_count: 32,
+            put_window: if mode == S4Mode::PrepAheadWindow8 { 8 } else { 0 },
+            put_started_count: if mode == S4Mode::PrepAheadWindow8 { 32 } else { 0 },
+            put_completed_count: if mode == S4Mode::PrepAheadWindow8 { 32 } else { 0 },
+            peak_puts_in_flight: if mode == S4Mode::PrepAheadWindow8 { 8 } else { 0 },
+            put_starts_ascending: mode == S4Mode::PrepAheadWindow8,
             final_artifact_status: "Verified".into(),
             case_status: "completed".into(),
         }

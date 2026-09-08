@@ -758,7 +758,7 @@ pub fn parse_s4_case(json: &str) -> Result<S4PlannedCase, String> {
             .ok_or_else(|| format!("s4 case missing u64 field {k}"))
     };
     let mode = get_str("mode")?;
-    if mode != "serial" && mode != "prep_ahead_2" {
+    if mode != "serial" && mode != "prep_ahead_2" && mode != "prep_ahead_window_8" {
         return Err(format!("s4 case has unknown mode {mode:?}"));
     }
     Ok(S4PlannedCase {
@@ -868,6 +868,15 @@ pub fn build_s4_case_result(case: &S4PlannedCase, pr: Option<&Value>, probe_exit
         "put_ack_ms": put_ack_ms,
         "prepared_buffer_peak": prepared_peak,
         "device_read_count": device_reads,
+        // window_8 candidate fields — 0/false for serial / prep_ahead_2 (the
+        // engine's `S4CaseResult` serde-defaults them the same way).
+        "put_window": pr.map(|v| u64f(v, "put_window")).unwrap_or(0),
+        "put_started_count": pr.map(|v| u64f(v, "put_started_count")).unwrap_or(0),
+        "put_completed_count": pr.map(|v| u64f(v, "put_completed_count")).unwrap_or(0),
+        "peak_puts_in_flight": pr.map(|v| u64f(v, "peak_puts_in_flight")).unwrap_or(0),
+        "put_starts_ascending": pr
+            .and_then(|v| v.get("put_starts_ascending").and_then(|x| x.as_bool()))
+            .unwrap_or(false),
         "final_artifact_status": artifact_status,
         "case_status": case_status,
     })
@@ -1165,10 +1174,55 @@ mod tests {
             "extent_bytes", "chunk_count", "transfer_id", "artifact_id", "bulk_stream_wall_ms",
             "verified_transfer_wall_ms", "resume_ms", "seal_d2_ms", "read_ms", "chunk_sha_ms",
             "rolling_sha_ms", "proof_ms", "put_ack_ms", "prepared_buffer_peak", "device_read_count",
-            "final_artifact_status", "case_status",
+            "put_window", "put_started_count", "put_completed_count", "peak_puts_in_flight",
+            "put_starts_ascending", "final_artifact_status", "case_status",
         ] {
             assert!(r.get(k).is_some(), "missing S4CaseResult field {k}");
         }
+        // non-window modes carry the defaulted window fields
+        assert_eq!(r["put_window"], 0);
+        assert_eq!(r["put_starts_ascending"], false);
+    }
+
+    // ---- window_8 candidate --------------------------------------------
+
+    const W8_CASE: &str = r#"{
+        "run_id":"i63w8-x","case_id":"i63w8-x/c1/s2/prep_ahead_window_8","phase":"measured",
+        "mode":"prep_ahead_window_8","cycle":1,"slot":2,
+        "chunk_size_bytes":67108864,"extent_bytes":2147483648,"expected_chunk_count":32
+    }"#;
+
+    #[test]
+    fn parse_s4_case_accepts_the_window8_mode() {
+        let c = parse_s4_case(W8_CASE).unwrap();
+        assert_eq!(c.mode, "prep_ahead_window_8");
+        let argv = s4_probe_argv(&cfg(), &c, "X:\\rt.cred");
+        let pos = |k: &str| argv.iter().position(|a| a == k).map(|i| argv[i + 1].clone());
+        assert_eq!(pos("--mode").as_deref(), Some("prep_ahead_window_8"));
+    }
+
+    #[test]
+    fn build_s4_case_result_forwards_the_window8_fields() {
+        let c = parse_s4_case(W8_CASE).unwrap();
+        let pr: Value = serde_json::from_str(
+            r#"{"event":"probe.case_result","mode":"prep_ahead_window_8","chunk_count":32,
+                "bulk_stream_wall_ms":21000,"verified_transfer_wall_ms":27000,"resume_ms":3,
+                "seal_d2_ms":5000,"read_ms":5700,"chunk_sha_ms":5400,"rolling_sha_ms":6100,
+                "proof_ms":6,"put_ack_ms":90000,"prepared_buffer_peak":9,"device_read_count":32,
+                "put_window":8,"put_started_count":32,"put_completed_count":32,
+                "peak_puts_in_flight":8,"put_starts_ascending":true,
+                "transfer_id":"t","artifact_id":"a","final_artifact_status":"Verified",
+                "case_status":"completed"}"#,
+        )
+        .unwrap();
+        let r = build_s4_case_result(&c, Some(&pr), 0);
+        assert_eq!(r["mode"], "prep_ahead_window_8");
+        assert_eq!(r["put_window"], 8);
+        assert_eq!(r["put_started_count"], 32);
+        assert_eq!(r["put_completed_count"], 32);
+        assert_eq!(r["peak_puts_in_flight"], 8);
+        assert_eq!(r["put_starts_ascending"], true);
+        assert_eq!(r["prepared_buffer_peak"], 9);
     }
 
     #[test]

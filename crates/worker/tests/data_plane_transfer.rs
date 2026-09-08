@@ -1147,6 +1147,188 @@ async fn concurrent_uploads_for_distinct_chunks_each_finalize_and_commit() {
     }
 }
 
+/// Issue #63 window_8 CONTRACT / ORDERING CHECK: deliberately answers every
+/// chunk's `AuthorizationDecision` and `ChunkAcceptanceDecision` in
+/// DESCENDING `chunk_index` order (the highest index finalizes/durably
+/// commits FIRST, the lowest LAST) — the durable-acceptance completion order
+/// is the exact REVERSE of ascending, proving independently addressed
+/// non-overlapping chunk PUTs may complete/commit out of order before seal:
+///
+/// * every chunk is still `201 Accepted` regardless of completion order;
+/// * every chunk's finalized bytes on disk are exactly its own declared
+///   bytes at its own `chunk_index` path (D1 identity is positional, not
+///   arrival-ordered);
+/// * `seal` — which reconstructs strictly ASCENDING regardless of commit
+///   order (`m0-data-plane-and-storage-contracts.md` "Full-Artifact byte
+///   reconstruction": "each chunk contributes its bytes at one fixed
+///   position regardless of transfer order") — still reaches
+///   `Artifact::Verified`.
+///
+/// This is the empirical basis (together with `bamepd`'s
+/// `commit_chunk_acceptance`, which carries no chunk-index ordering
+/// precondition — see `crates/server/src/application/mod.rs`) for arming the
+/// window_8 candidate's bounded-concurrent-PUT design.
+#[tokio::test]
+async fn chunks_committed_in_strictly_descending_order_still_seal_verified() {
+    let harness = Harness::start().await;
+    let mut peer = harness.fake_bamepd().await;
+    let transfer_id = Uuid::new_v4();
+    const CHUNK_SIZE: u32 = 4096;
+
+    // 4 chunks: the first 3 exactly `CHUNK_SIZE` (non-final), the last short
+    // (`m0-...` "every chunk except the last has size == chunk_size").
+    let chunks: Vec<Vec<u8>> = vec![
+        vec![1u8; CHUNK_SIZE as usize],
+        vec![2u8; CHUNK_SIZE as usize],
+        vec![3u8; CHUNK_SIZE as usize],
+        vec![4u8; 777],
+    ];
+    let n = chunks.len() as u64;
+
+    let completion_order: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requests: Vec<_> = chunks
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            let addr = harness.server_addr;
+            let leaf = harness.leaf_der.clone();
+            let digest = sha256_b64(payload);
+            let headers = put_headers(&digest);
+            let payload = payload.clone();
+            let completion_order = Arc::clone(&completion_order);
+            tokio::spawn(async move {
+                let response = https_put(
+                    addr,
+                    &chunk_path(transfer_id, index as u64),
+                    &borrow(&headers),
+                    payload,
+                    &leaf,
+                )
+                .await;
+                completion_order.lock().unwrap().push(index as u64);
+                (index as u64, response)
+            })
+        })
+        .collect();
+
+    // Phase 1: drain all 4 AuthorizationQuery messages, then answer them in
+    // DESCENDING chunk_index order.
+    let mut queries = Vec::new();
+    for _ in 0..n {
+        match peer.recv().await {
+            WorkerProtocolMessage::AuthorizationQuery(q) => queries.push(q),
+            other => panic!("phase 1: got {other:?}"),
+        }
+    }
+    queries.sort_by_key(|q| std::cmp::Reverse(q.body.chunk_index));
+    assert_eq!(
+        queries.iter().map(|q| q.body.chunk_index).collect::<Vec<_>>(),
+        (0..n).rev().collect::<Vec<_>>(),
+        "sanity: exactly one AuthorizationQuery per chunk_index"
+    );
+    for q in &queries {
+        peer.send(WorkerProtocolMessage::AuthorizationDecision(
+            AuthorizationDecisionMessage::approved(
+                q.envelope.message_id,
+                WireDigestAlgorithm::Sha256,
+                CHUNK_SIZE,
+                format!("handle-{}", q.body.chunk_index),
+                None,
+            ),
+        ))
+        .await;
+    }
+
+    // Phase 2: same drain-then-answer-descending discipline for the
+    // ChunkAcceptanceRequest (the actual DURABLE commit step) — this is what
+    // makes chunk 3 durably commit (and its HTTP 201 return) BEFORE chunk 0.
+    let mut acceptances = Vec::new();
+    for _ in 0..n {
+        match peer.recv().await {
+            WorkerProtocolMessage::ChunkAcceptanceRequest(r) => acceptances.push(r),
+            other => panic!("phase 2: got {other:?}"),
+        }
+    }
+    acceptances.sort_by_key(|r| std::cmp::Reverse(r.body.chunk_index));
+    assert_eq!(
+        acceptances.iter().map(|r| r.body.chunk_index).collect::<Vec<_>>(),
+        (0..n).rev().collect::<Vec<_>>(),
+    );
+    for r in &acceptances {
+        peer.send(WorkerProtocolMessage::ChunkAcceptanceDecision(
+            ChunkAcceptanceDecisionMessage::committed(r.envelope.message_id),
+        ))
+        .await;
+    }
+
+    for request in requests {
+        let (index, response) = timeout(TEST_TIMEOUT, request).await.unwrap().unwrap();
+        assert_eq!(response.status, StatusCode::CREATED, "chunk {index}: must accept regardless of commit order");
+        assert_eq!(
+            std::fs::read(harness.finalized_chunk_path(transfer_id, index)).unwrap(),
+            chunks[index as usize],
+            "chunk {index}: D1 identity is positional (by chunk_index), not arrival-ordered"
+        );
+    }
+    let observed = completion_order.lock().unwrap().clone();
+    assert_ne!(
+        observed,
+        (0..n).collect::<Vec<_>>(),
+        "completion order must NOT be ascending — the whole point of this check"
+    );
+    assert_eq!(
+        observed[0], 3,
+        "chunk 3 (answered first, in descending order) must be the FIRST to durably complete"
+    );
+
+    // seal: reconstruction is strictly ASCENDING regardless of commit order.
+    let full: Vec<u8> = chunks.concat();
+    let artifact_digest = sha256_b64(&full);
+    let body = json!({ "chunk_count": n, "artifact_digest": artifact_digest }).to_string();
+    let seal_request = tokio::spawn({
+        let addr = harness.server_addr;
+        let leaf = harness.leaf_der.clone();
+        async move {
+            https_post(addr, &seal_path(transfer_id), &seal_headers(), body.into_bytes(), &leaf).await
+        }
+    });
+
+    let seal = match peer.recv().await {
+        WorkerProtocolMessage::ManifestSealRequest(r) => r,
+        other => panic!("expected ManifestSealRequest, got {other:?}"),
+    };
+    assert_eq!(seal.body.chunk_count, n);
+    let facts = sealed_facts(n, CHUNK_SIZE, &artifact_digest);
+    peer.send(WorkerProtocolMessage::ManifestSealDecision(
+        ManifestSealDecisionMessage::sealed(seal.envelope.message_id, facts),
+    ))
+    .await;
+
+    let report = match peer.recv().await {
+        WorkerProtocolMessage::ArtifactVerificationReport(r) => r,
+        other => panic!("expected ArtifactVerificationReport, got {other:?}"),
+    };
+    assert_eq!(
+        report.body.computed_artifact_digest, artifact_digest,
+        "D2 reconstruction (ascending, positional) matches regardless of commit order"
+    );
+    peer.send(WorkerProtocolMessage::ArtifactVerificationAck(
+        ArtifactVerificationAckMessage::committed(
+            report.envelope.message_id,
+            WireArtifactStatus::Verified,
+        ),
+    ))
+    .await;
+
+    let response = timeout(TEST_TIMEOUT, seal_request).await.unwrap().unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(
+        response.body.get("artifact_status").and_then(|v| v.as_str()),
+        Some("Verified"),
+        "out-of-order durable commit must still reach Artifact::Verified"
+    );
+}
+
 // =====================================================================
 // seal — Verified / Failed / conflicts
 // =====================================================================

@@ -5,11 +5,16 @@
 # management, NOT the Bamep firewall/network/boot design.
 #
 # =====================================================================
-# THE PHYSICAL 10-CASE MICRO-MATRIX IS ARMED ONLY BEHIND  --arm.
+# THE PHYSICAL MICRO-MATRIX IS ARMED ONLY BEHIND  --arm.
 # Without --arm this prints "STAGE4 NOT ARMED" and exits 0.
 # Even WITH --arm the supervisor first runs every host-side preflight and only
 # then prints READY_FOR_STAGE4_MINIPC_POWER_ON. It NEVER powers the MiniPC and
 # NEVER starts a physical source read or a transfer.
+#
+# --window8 additionally selects the Issue #63 window_8 SOLUTION CANDIDATE:
+# the same lab (harness/derive/coordinator binary), but a 5-case P-vs-W plan
+# (prep_ahead_2 vs prep_ahead_window_8, put_window=8) instead of the 10-case
+# S-vs-P plan, printing READY_FOR_WINDOW8_MINIPC_POWER_ON instead.
 # =====================================================================
 #
 # One foreground supervisor that owns every background service the Stage-4
@@ -77,12 +82,24 @@ RUNNER_EXE="${I63_DIR}/winpe-runner/target/x86_64-pc-windows-msvc/release/bamep-
 PROBE_EXE="${I63_DIR}/stage2-probe/target/x86_64-pc-windows-msvc/release/bamep-i63-stage2-probe.exe"
 DERIVE="${I63_DIR}/stage3/derive-stage3-runtime.sh"
 
-STORAGE_ROOT="${I63_STORAGE_ROOT:-${I63_DIR}/stage3-harness/runtime-stage4/chunkstore}"
 DB_NAME="bamep_physint_spike"
 
-# 10 x 2 GiB preserved payload + margin.
-MATRIX_PAYLOAD_BYTES=$((10 * 2147483648))     # 21474836480 = 20 GiB
-MIN_FREE_BYTES=$((30 * 1024 * 1024 * 1024))   # 32212254720 = 30 GiB
+# Issue #63 window_8 candidate: `--window8` swaps the Stage-4 10-case S-vs-P
+# plan for the 5-case P-vs-W solution-candidate plan (1 warm-up W + 4 measured
+# P/W). Same harness, same coordinator binary, same bootstrap/runner argv
+# shape — only the coordinator's own `--window8` flag and the run/storage
+# bookkeeping below differ.
+WINDOW8=0
+
+STORAGE_ROOT_STAGE4="${I63_DIR}/stage3-harness/runtime-stage4/chunkstore"
+STORAGE_ROOT_WINDOW8="${I63_DIR}/stage3-harness/runtime-stage4/chunkstore-window8"
+
+# Stage-4: 10 x 2 GiB preserved payload + margin.
+MATRIX_PAYLOAD_BYTES_STAGE4=$((10 * 2147483648))     # 21474836480 = 20 GiB
+MIN_FREE_BYTES_STAGE4=$((30 * 1024 * 1024 * 1024))   # 32212254720 = 30 GiB
+# window_8: 5 x 2 GiB preserved payload + margin.
+MATRIX_PAYLOAD_BYTES_WINDOW8=$((5 * 2147483648))     # 10737418240 = 10 GiB
+MIN_FREE_BYTES_WINDOW8=$((20 * 1024 * 1024 * 1024))  # 21474836480 = 20 GiB
 
 PINNED_HTTP_WIMBOOT="5f067ccdc4d084d5bf77b6c853bd0f8402dfc2b4cd1b103d358993ae97fae8e3"
 PINNED_HTTP_BCD="c0fd865ab0a1329d333ee6d3ab48c3030851a193a939d8b382522d40c81eea41"
@@ -94,10 +111,9 @@ PINNED_TFTP_IPXE="b1e67c3e4a1e8708ddfd0079ad4505e3a02245acb55ee9a95437ab3c507be8
 
 PROVEN_DLLS="api-ms-win-core-synch-l1-2-0.dll kernel32.dll ntdll.dll ws2_32.dll advapi32.dll bcrypt.dll bcryptprimitives.dll"
 
-RUN_ID="i63s4-$(date +%Y%m%dT%H%M%S)"
-EVID="${I63_DIR}/evidence/${RUN_ID}"
-MATRIX_EVID="${EVID}/matrix"
-WORKER_TIMING_FILE="${MATRIX_EVID}/worker-put-timing.ndjson"
+# RUN_ID / EVID / MATRIX_EVID / WORKER_TIMING_FILE / STORAGE_ROOT /
+# MATRIX_PAYLOAD_BYTES / MIN_FREE_BYTES are resolved AFTER argv parsing below
+# (they depend on WINDOW8).
 SENTINEL=""
 MATRIX_VERDICT=""
 WATCHDOG_ABORT=""
@@ -210,6 +226,7 @@ PREFLIGHT_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --arm) ARMED=1; shift ;;
+    --window8) WINDOW8=1; shift ;;
     --preflight|--dry-run) PREFLIGHT_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
@@ -220,11 +237,28 @@ if [ "${ARMED}" -eq 0 ] && [ "${PREFLIGHT_ONLY}" -eq 0 ]; then
   echo "STAGE4 NOT ARMED"
   echo
   echo "run-stage4-lab.sh needs an explicit --arm to start the physical services."
-  echo "  ./run-stage4-lab.sh --preflight        # read-only host checks, no services"
-  echo "  ./run-stage4-lab.sh --arm --preflight  # armed interface, host checks only, still no boot"
-  echo "  ./run-stage4-lab.sh --arm              # bring the lab up; prints READY_FOR_STAGE4_MINIPC_POWER_ON"
+  echo "  ./run-stage4-lab.sh --preflight                    # read-only host checks (Stage-4 S-vs-P), no services"
+  echo "  ./run-stage4-lab.sh --arm --preflight              # armed interface, host checks only, still no boot"
+  echo "  ./run-stage4-lab.sh --arm                          # bring up the Stage-4 S-vs-P (10-case) lab"
+  echo "  ./run-stage4-lab.sh --window8 --arm --preflight    # window_8 candidate (5-case), host checks only"
+  echo "  ./run-stage4-lab.sh --window8 --arm                # bring up the window_8 P-vs-W (5-case) lab"
   exit 0
 fi
+
+if [ "${WINDOW8}" -eq 1 ]; then
+  RUN_ID="i63w8-$(date +%Y%m%dT%H%M%S)"
+  STORAGE_ROOT="${I63_STORAGE_ROOT:-${STORAGE_ROOT_WINDOW8}}"
+  MATRIX_PAYLOAD_BYTES="${MATRIX_PAYLOAD_BYTES_WINDOW8}"
+  MIN_FREE_BYTES="${MIN_FREE_BYTES_WINDOW8}"
+else
+  RUN_ID="i63s4-$(date +%Y%m%dT%H%M%S)"
+  STORAGE_ROOT="${I63_STORAGE_ROOT:-${STORAGE_ROOT_STAGE4}}"
+  MATRIX_PAYLOAD_BYTES="${MATRIX_PAYLOAD_BYTES_STAGE4}"
+  MIN_FREE_BYTES="${MIN_FREE_BYTES_STAGE4}"
+fi
+EVID="${I63_DIR}/evidence/${RUN_ID}"
+MATRIX_EVID="${EVID}/matrix"
+WORKER_TIMING_FILE="${MATRIX_EVID}/worker-put-timing.ndjson"
 
 # ---------------------------------------------------------------------
 # 1. PREFLIGHT — read-only.
@@ -265,7 +299,17 @@ log "[preflight] deterministic Stage-4 10-case plan + S/P analysis shape"
 "${COORD_BIN}" --stage4 2>&1 | grep -q 'STAGE4 NOT ARMED' || die "coordinator --stage4 (no --arm) must print STAGE4 NOT ARMED"
 log "  ok: 10-case plan (2 warm-up + 8 measured, 64 MiB, 32 chunks/2048 MiB); n=4 per mode"
 
-log "[preflight] Worker storage root + free space (>= 30 GiB for 10 preserved 2 GiB Artifacts)"
+log "[preflight] deterministic window_8 5-case plan + P-vs-W analysis shape"
+( cd "${I63_DIR}/coordinator" && "${COORD_BIN}" --window8-selftest 2>&1 | tail -2 ) | tee -a "${LAUNCHER_LOG}" >&2
+"${COORD_BIN}" --window8-selftest 2>&1 | grep -q '^WINDOW8_SELFTEST_PASS' || die "coordinator --window8-selftest FAILED"
+log "  ok: 5-case plan (1 warm-up W + 4 measured, 64 MiB, put_window=8); n=2 per mode"
+
+if [ "${WINDOW8}" -eq 1 ]; then
+  MIN_FREE_GIB=$((MIN_FREE_BYTES / 1024 / 1024 / 1024))
+  log "[preflight] Worker storage root + free space (>= ${MIN_FREE_GIB} GiB for 5 preserved 2 GiB Artifacts)"
+else
+  log "[preflight] Worker storage root + free space (>= 30 GiB for 10 preserved 2 GiB Artifacts)"
+fi
 mkdir -p "${STORAGE_ROOT}"
 case "${STORAGE_ROOT}" in
   *runtime-cp6*|*runtime-cp7a*) die "storage root must not resolve under an Issue #61 runtime-cp* tree" ;;
@@ -534,9 +578,15 @@ register_child "dnsmasq" "$!" 1
 await "dnsmasq udp/67 (DHCP)" 40 udp_up 67 || die "dnsmasq did not bind udp/67 — see ${EVID}/dnsmasq.log"
 await "dnsmasq udp/69 (TFTP)" 20 udp_up 69 || die "dnsmasq did not bind udp/69 — see ${EVID}/dnsmasq.log"
 
-log "[coordinator] bamep-i63-stage1-coordinator --stage4 --arm (typed 10-case authority + probe sink)"
+COORD_EXTRA_ARGS=()
+if [ "${WINDOW8}" -eq 1 ]; then
+  COORD_EXTRA_ARGS+=("--window8")
+  log "[coordinator] bamep-i63-stage1-coordinator --stage4 --arm --window8 (typed 5-case P-vs-W authority + probe sink)"
+else
+  log "[coordinator] bamep-i63-stage1-coordinator --stage4 --arm (typed 10-case S-vs-P authority + probe sink)"
+fi
 rm -f "${MATRIX_VERDICT}"
-"${COORD_BIN}" --stage4 --arm --matrix-addr "${LAB_IP}:${PORT_MATRIX}" --sink-addr "${LAB_IP}:${PORT_SINK}" \
+"${COORD_BIN}" --stage4 --arm "${COORD_EXTRA_ARGS[@]}" --matrix-addr "${LAB_IP}:${PORT_MATRIX}" --sink-addr "${LAB_IP}:${PORT_SINK}" \
   --evidence-dir "${MATRIX_EVID}" --run-id "${RUN_ID}" --verdict-file "${MATRIX_VERDICT}" \
   --worker-timing-file "${WORKER_TIMING_FILE}" > "${EVID}/coordinator.log" 2>&1 &
 register_child "stage4-coordinator" "$!" 0
@@ -590,7 +640,8 @@ gate "autoexec injects enroll.cred"         grep -qF "/bamep-i63-enroll.cred bam
 gate "autoexec: boot.wim initrd is last"    bash -c "[ \"\$(grep '^initrd ' '${AX}' | tail -1)\" = \"initrd http://${LAB_IP}:${PORT_HTTP}/boot.wim boot.wim\" ]"
 gate "bootstrap.cmd launches runner --stage4 --arm" grep -qF -- '--stage4 --arm' "${DERIVE_OUT}/http/bamep-i63-stage4-bootstrap.cmd"
 gate "bootstrap.cmd carries this fingerprint"       grep -qF "${FINGERPRINT}" "${DERIVE_OUT}/http/bamep-i63-stage4-bootstrap.cmd"
-gate "matrix-plan.json written (10 cases)"   bash -c "[ -f '${MATRIX_EVID}/matrix-plan.json' ] && [ \"\$(grep -c '\"case_id\"' '${MATRIX_EVID}/matrix-plan.json')\" -ge 10 ]"
+EXPECT_CASES=10; [ "${WINDOW8}" -eq 1 ] && EXPECT_CASES=5
+gate "matrix-plan.json written (${EXPECT_CASES} cases)"   bash -c "[ -f '${MATRIX_EVID}/matrix-plan.json' ] && [ \"\$(grep -c '\"case_id\"' '${MATRIX_EVID}/matrix-plan.json')\" -ge ${EXPECT_CASES} ]"
 
 for i in "${!CHILD_PID[@]}"; do
   gate "child alive: ${CHILD_DESC[$i]} (pid ${CHILD_PID[$i]})" proc_alive "${CHILD_PID[$i]}"
@@ -638,6 +689,53 @@ log "health watchdog running (pid ${WATCHDOG_PID})"
 # ---------------------------------------------------------------------
 # 10. READY
 # ---------------------------------------------------------------------
+if [ "${WINDOW8}" -eq 1 ]; then
+cat <<EOF | tee -a "${LAUNCHER_LOG}"
+
+==================================================
+READY_FOR_WINDOW8_MINIPC_POWER_ON   (${RUN_ID})
+==================================================
+DHCP/TFTP      : READY   (dnsmasq, derived Issue-63 conf, ${LAB_IFACE})
+WinPE HTTP     : READY   (${LAB_IP}:${PORT_HTTP}  ${DERIVE_OUT}/http)
+Stage-4 harness: READY   real Postgres(${DB_NAME}) + WSS ${LAB_IP}:${PORT_WSS} + Worker HTTPS ${LAB_IP}:${PORT_DP} + coord ${LAB_IP}:${PORT_COORD}
+                 Worker PUT timing sink -> ${WORKER_TIMING_FILE}
+window_8 coord : READY   ARMED   (typed 5-case P-vs-W authority ${LAB_IP}:${PORT_MATRIX}  +  probe sink ${LAB_IP}:${PORT_SINK})
+Phase-9d       : byte-identical before/after derive (7/7 pinned)
+Storage root   : ${STORAGE_ROOT}   free=${FREE_BYTES} bytes  (>= 20 GiB gate; 10 GiB payload preserved)
+Clock method   : SetSystemTime (UTC); strict skew window [${SKEW_FLOOR_MS}, ${SKEW_CEIL_MS}] ms; aligned OUTSIDE every measured wall
+
+window_8 candidate plan (fixed):
+  chunk size  64 MiB ONLY   ->   32 chunks over 2048 MiB (no partial final chunk)
+  extent      2,147,483,648 bytes (2048 MiB) per case
+  put_window  8   (bounded PUT window; up to 8 concurrent chunk PUTs; per-PUT Worker durability UNCHANGED)
+  warm-up (excluded): W        measured cycles: (P,W) (W,P)  => 1 + 4 = 5 transfers
+  ONE WinPE boot, NO reboot between cases, NO deliberate fault injection
+  P = prep_ahead_2 (Stage-4 reference, 1 PUT in flight)   W = prep_ahead_window_8 (this candidate)
+
+Failure policy: window_8 is a CLEAN FAST PATH candidate — NOT a production recovery proposal. ANY
+  transport failure / auth denial / retry / resume / AlreadyHeld / digest mismatch / identity
+  conflict / cancellation anomaly / missing Worker timing / non-Verified Artifact -> the case is
+  FAILED or CONTAMINATED, the coordinator stops handing out cases, all completed evidence is
+  preserved, and the matrix terminates NON-ZERO. NO "retry until green". Outstanding PUT tasks are
+  drained (aborted + joined) on any failure so nothing continues in the background.
+  A 5/5 run with MISSING Worker PUT timing evidence terminates stage4_invalid (Q2 unanswerable).
+
+Evidence: ${EVID}
+  launcher.log  harness.log  http.log  dnsmasq.log  coordinator.log  derive.log  fingerprint.txt
+  matrix/{matrix-plan.json, case-results.ndjson, coordinator-events.ndjson, probe-evidence.ndjson,
+          worker-put-timing.ndjson, analysis.json}
+  derived-runtime/{phase9d-hashes-*.txt, derived-manifest.txt}   matrix.verdict
+
+Owner action (ONLY this):
+  1. (done) launcher running / sudo password entered.
+  2. Power ON the MiniPC. It DHCP-leases in 192.168.99.50-100 and PXE-boots.
+  3. Press a key ONCE at wimboot's "Press any key to continue booting..." prompt.
+  4. Type NOTHING in WinPE. winpeshl.ini auto-runs bootstrap -> wpeinit -> runner --stage4 --arm,
+     which drives all 5 cases (prep-ahead + window_8) and reports each to the window_8 coordinator.
+Watch this terminal for  STAGE4_MATRIX_TERMINAL marker=stage4_pass  (or stage4_fail / stage4_invalid). Ctrl-C to tear down.
+==================================================
+EOF
+else
 cat <<EOF | tee -a "${LAUNCHER_LOG}"
 
 ==================================================
@@ -680,6 +778,7 @@ Owner action (ONLY this):
 Watch this terminal for  STAGE4_MATRIX_TERMINAL marker=stage4_pass  (or stage4_fail / stage4_invalid). Ctrl-C to tear down.
 ==================================================
 EOF
+fi
 
 # ---------------------------------------------------------------------
 # 11. foreground supervise — stream the coordinator log

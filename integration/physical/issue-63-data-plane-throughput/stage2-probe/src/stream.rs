@@ -22,6 +22,8 @@
 //!     digest fails closed.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -133,6 +135,20 @@ pub struct StreamState {
     chunk_size: u64,
     chunk_count: u64,
     timings: PassTimings,
+    // ---- Issue #63 window_8 candidate bookkeeping. All zero/empty unless
+    // `run_stream_pass_window8` ran. ----
+    /// The bounded PUT window (8) — `0` for serial / prep-ahead passes.
+    put_window: u64,
+    put_started_count: u64,
+    put_completed_count: u64,
+    /// Max simultaneously-unacknowledged PUT count (upper bound on true
+    /// network concurrency; structurally `<= PUT_WINDOW`).
+    peak_puts_in_flight: u64,
+    /// The exact chunk-index order PUTs were STARTED in (must be ascending).
+    put_start_order: Vec<u64>,
+    /// The exact chunk-index order PUT outcomes were observed in (MAY differ
+    /// from the start order — completions are unordered by design).
+    put_completion_order: Vec<u64>,
     // ---- Issue #63 Stage 4 prep-ahead (depth-2) bookkeeping. Untouched by the
     // serial `run_stream_pass`. ----
     /// The largest LIVE bulk-buffer depth actually observed during the
@@ -174,10 +190,42 @@ impl StreamState {
             chunk_size,
             chunk_count,
             timings: PassTimings::default(),
+            put_window: 0,
+            put_started_count: 0,
+            put_completed_count: 0,
+            peak_puts_in_flight: 0,
+            put_start_order: Vec::new(),
+            put_completion_order: Vec::new(),
             prepared_peak: 0,
             finalized_digest: None,
             producer_read_log: Vec::new(),
         })
+    }
+
+    // ---- window_8 observability (0/empty unless the window pass ran) ----
+    pub fn put_window(&self) -> u64 {
+        self.put_window
+    }
+    pub fn put_started_count(&self) -> u64 {
+        self.put_started_count
+    }
+    pub fn put_completed_count(&self) -> u64 {
+        self.put_completed_count
+    }
+    pub fn peak_puts_in_flight(&self) -> u64 {
+        self.peak_puts_in_flight
+    }
+    pub fn put_start_order(&self) -> &[u64] {
+        &self.put_start_order
+    }
+    pub fn put_completion_order(&self) -> &[u64] {
+        &self.put_completion_order
+    }
+    /// `true` iff every PUT was started in strictly ascending chunk-index
+    /// order (trivially `false` before the window pass ran).
+    pub fn put_starts_ascending(&self) -> bool {
+        !self.put_start_order.is_empty()
+            && self.put_start_order.windows(2).all(|w| w[0] < w[1])
     }
 
     pub fn chunk_count(&self) -> u64 {
@@ -962,6 +1010,364 @@ where
     Ok(PassOutcome::Complete)
 }
 
+// =====================================================================
+// Issue #63 window_8 — the prep-ahead + bounded-concurrent-PUT candidate
+// (throwaway Spike).
+//
+// SOURCE side is the UNCHANGED Stage-4 producer (`run_producer`): one
+// dedicated thread owning its own GENERIC_READ handle + the rolling
+// full-Artifact SHA-256; chunks prepared strictly ascending, each read exactly
+// once; at most ONE outstanding `Prepare` at a time. NETWORK side is new: up
+// to `PUT_WINDOW` (8) chunk PUTs concurrently in flight as independent tokio
+// tasks, STARTED in ascending chunk-index order, completions accepted in ANY
+// order. Each PUT's owned `Vec<u8>` payload is MOVED into its task (no 64 MiB
+// clone); the exact prepared bytes+digest are retained by that task until its
+// outcome is known. Completion order cannot affect the Artifact digest — the
+// producer thread alone owns the rolling hasher, in index order.
+//
+// Worker durability semantics are UNCHANGED: every individual PUT still runs
+// the full authorize -> stage -> validate -> finalize(fsync+placement+fsync)
+// -> commit_chunk -> only-then-Accepted path; window_8 merely lets up to 8
+// such independently durable PUTs overlap. Contract basis: the m0 data-plane
+// Specification's reconstruction rule ("each chunk contributes its bytes at
+// one fixed position regardless of transfer order") and
+// `commit_chunk_acceptance` (no ordering precondition; per-transfer locked
+// first-writer commit).
+//
+// CLEAN-FAST-PATH FAILURE POLICY (NOT a production recovery proposal): ANY
+// non-Accepted PUT outcome (transient, 401, AlreadyHeld, digest/identity
+// conflict, ...) terminates the pass — no retry-to-green. Outstanding PUT
+// tasks are aborted and joined before returning, so no background request
+// object outlives a failed case. Authoritative serial resume behaviour is
+// untouched.
+//
+// Memory model: <= PUT_WINDOW unacknowledged payloads + <= 1 producer/current
+// chunk => live payload depth <= PUT_WINDOW + 1 (~576 MiB at 64 MiB chunks).
+// =====================================================================
+
+/// The hard-coded window_8 bounded PUT window. Deliberately NOT configurable.
+pub const PUT_WINDOW: u64 = 8;
+
+/// Spike-only owned-payload PUT launcher for the window_8 path. `start_put` is
+/// invoked on the foreground task in strictly ascending `index` order; the
+/// implementation must synchronously prepare all immutable request material
+/// (e.g. mint the per-request proof — see [`AgentTransferAuthorization::create_proof_now`],
+/// which is `&self` and safe to call repeatedly from the foreground) and
+/// return a future that performs the PUT and resolves to its outcome. The
+/// payload `Vec<u8>` is MOVED in — the launcher must not clone it.
+///
+/// The returned future is spawned as EXACTLY ONE task by the driver
+/// (`run_stream_pass_window8`), which is what makes `JoinSet::abort_all`
+/// actually cancel the real PUT: the launcher must NOT itself spawn a second,
+/// independent task (e.g. via `tokio::spawn`) and hand back a `JoinHandle` to
+/// it — a `JoinHandle`'s underlying task keeps running even if its handle is
+/// aborted from the wrong place, which would leave a PUT running in the
+/// background after a case is declared failed.
+pub trait WindowedPutLauncher {
+    fn start_put(
+        &mut self,
+        index: u64,
+        digest_wire: String,
+        bytes: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = PutStatus> + Send>>;
+}
+
+/// One re-entrant window_8 pass over the bounded source. `resume` is the
+/// pre-fetched resume-discovery outcome (fetched by the caller so the launcher
+/// may immutably borrow the same authorization material). Clean fast path
+/// only: a non-empty resume fails closed, any non-`Accepted` PUT outcome
+/// terminates the pass, and all outstanding PUT tasks are aborted + joined on
+/// every exit path.
+pub async fn run_stream_pass_window8<R, F, L>(
+    state: &mut StreamState,
+    reader_factory: F,
+    resume: ResumeStatus,
+    launcher: &mut L,
+    progress: &mut impl FnMut(ProgressTick),
+    lifecycle: &mut impl FnMut(StreamEvent),
+) -> Result<PassOutcome, StreamError>
+where
+    R: ChunkReader + 'static,
+    F: FnOnce() -> Result<R, String> + Send + 'static,
+    L: WindowedPutLauncher,
+{
+    lifecycle(StreamEvent::ResumeBegin);
+    match resume {
+        ResumeStatus::Ok(held) => {
+            lifecycle(StreamEvent::ResumeResult {
+                outcome: "approved",
+                held_chunks: held.len() as u64,
+                sealed: false,
+            });
+            if !held.is_empty() {
+                return Err(StreamError::Fatal(format!(
+                    "window_8: unexpected non-empty resume ({} held)",
+                    held.len()
+                )));
+            }
+            lifecycle(StreamEvent::ResumeReconciled {
+                held_count: 0,
+                pending_chunk_index: None,
+                pending_already_held: false,
+            });
+        }
+        ResumeStatus::AuthDenied => {
+            lifecycle(StreamEvent::ResumeResult {
+                outcome: "auth_denied",
+                held_chunks: 0,
+                sealed: false,
+            });
+            return Ok(PassOutcome::SuspendedNeedsAuthorization);
+        }
+        ResumeStatus::Transient(detail) => {
+            lifecycle(StreamEvent::ResumeResult {
+                outcome: "transient",
+                held_chunks: 0,
+                sealed: false,
+            });
+            lifecycle(StreamEvent::ResumeTransient { local_attempt: 0, detail });
+            return Ok(PassOutcome::SuspendedDataPlaneUnreachable);
+        }
+        ResumeStatus::Fatal(m) => {
+            lifecycle(StreamEvent::ResumeResult {
+                outcome: "fatal",
+                held_chunks: 0,
+                sealed: false,
+            });
+            return Err(StreamError::Fatal(m));
+        }
+    }
+
+    let chunk_count = state.chunk_count;
+    let chunk_size = state.chunk_size;
+    let total_len = state.total_len;
+    state.put_window = PUT_WINDOW;
+
+    let (ctrl_tx, ctrl_rx) = sync_channel::<Ctrl>(1);
+    let (out_tx, out_rx) = sync_channel::<PrepMsg>(1);
+    let producer = std::thread::Builder::new()
+        .name("i63-w8-producer".into())
+        .spawn(move || {
+            run_producer(reader_factory, chunk_size, total_len, chunk_count, ctrl_rx, out_tx)
+        })
+        .map_err(|e| StreamError::Fatal(format!("spawn window_8 producer thread: {e}")))?;
+
+    /// How the drive loop terminated (single cleanup path, like prep-ahead).
+    enum Term {
+        Complete,
+        SuspendAuth,
+        SuspendUnreachable,
+        VerifyFail(u64),
+        Fatal(String),
+    }
+
+    // In-flight PUT tasks. `window.len()` counts unreaped tasks, so the true
+    // network in-flight count is `<= window.len() <= PUT_WINDOW` at all times.
+    let mut window: tokio::task::JoinSet<(u64, PutStatus)> = tokio::task::JoinSet::new();
+    let mut next_index: u64 = 0;
+    // Live 64 MiB payload buffers: in-flight tasks + (producer reading /
+    // prepared / foreground-held current). Peak MUST stay <= PUT_WINDOW + 1.
+    fn track_payload_peak(state: &mut StreamState, window_len: u64, extra: u64) {
+        state.prepared_peak = state.prepared_peak.max(window_len + extra);
+    }
+
+    // Classify one completed PUT. Returns Some(Term) to stop the pass.
+    fn classify(
+        state: &mut StreamState,
+        index: u64,
+        status: PutStatus,
+        progress: &mut impl FnMut(ProgressTick),
+        lifecycle: &mut impl FnMut(StreamEvent),
+    ) -> Option<Term> {
+        state.put_completed_count += 1;
+        state.put_completion_order.push(index);
+        match status {
+            PutStatus::Accepted => {
+                state.mark_held(index);
+                progress(ProgressTick {
+                    held_bytes: state.durably_held_bytes(),
+                    held_chunks: state.held_count(),
+                });
+                None
+            }
+            // Clean fast path: an AlreadyHeld on a first-and-only PUT is a
+            // duplicate/resume anomaly — contamination, never silently green.
+            PutStatus::AlreadyHeld => Some(Term::Fatal(format!(
+                "window_8: unexpected AlreadyHeld for chunk {index} on the clean path"
+            ))),
+            PutStatus::DigestMismatch | PutStatus::IdentityConflict => {
+                Some(Term::VerifyFail(index))
+            }
+            PutStatus::NotContinuable => Some(Term::Fatal(format!(
+                "chunk {index}: 409 TRANSFER_NOT_CONTINUABLE"
+            ))),
+            PutStatus::Fatal(m) => Some(Term::Fatal(m)),
+            PutStatus::AuthDenied => {
+                lifecycle(StreamEvent::PutAuthDenied { chunk_index: index });
+                Some(Term::SuspendAuth)
+            }
+            PutStatus::Transient(detail) => {
+                // NO local retry in window_8 — any transient contaminates the
+                // case and terminates the pass.
+                lifecycle(StreamEvent::PutTransient {
+                    chunk_index: index,
+                    local_attempt: 1,
+                    detail,
+                });
+                Some(Term::SuspendUnreachable)
+            }
+        }
+    }
+
+    let term: Term = 'drive: loop {
+        if next_index < chunk_count && (window.len() as u64) < PUT_WINDOW {
+            // Capacity + chunks remain: ask the producer for exactly one next
+            // chunk. Its read+hash overlaps the in-flight PUT tasks.
+            if ctrl_tx.send(Ctrl::Prepare(next_index)).is_err() {
+                let msg = match out_rx.recv() {
+                    Ok(PrepMsg::Err(e)) => e,
+                    _ => "window_8: producer exited before accepting a request".to_string(),
+                };
+                break 'drive Term::Fatal(msg);
+            }
+            track_payload_peak(state, window.len() as u64, 1);
+            // Blocking recv on the driving thread is the same throwaway idiom
+            // prep-ahead uses: the spawned PUT tasks progress on the runtime's
+            // other worker threads, and the wait is bounded by one chunk read.
+            let prepared = match out_rx.recv() {
+                Ok(PrepMsg::Chunk(c)) => c,
+                Ok(PrepMsg::Err(e)) => break 'drive Term::Fatal(e),
+                Ok(_) => break 'drive Term::Fatal("window_8: expected PreparedChunk".into()),
+                Err(_) => break 'drive Term::Fatal("window_8: producer hung up mid-pass".into()),
+            };
+            if prepared.index != next_index {
+                break 'drive Term::Fatal(format!(
+                    "window_8: producer returned chunk {} (expected {next_index})",
+                    prepared.index
+                ));
+            }
+            // Launch the PUT: the owned payload Vec MOVES into the future the
+            // launcher builds, which `window.spawn` turns into EXACTLY ONE
+            // real task (so `abort_all` below can actually cancel it — see
+            // `WindowedPutLauncher`'s contract).
+            let idx = prepared.index;
+            state.put_start_order.push(idx);
+            state.put_started_count += 1;
+            let fut = launcher.start_put(idx, prepared.digest_wire, prepared.bytes);
+            window.spawn(async move { (idx, fut.await) });
+            next_index += 1;
+            // `window.len()` counts unreaped tasks — an upper bound on true
+            // network in-flight, and the value the <= PUT_WINDOW gate enforces.
+            state.peak_puts_in_flight = state.peak_puts_in_flight.max(window.len() as u64);
+            track_payload_peak(state, window.len() as u64, 0);
+            // Opportunistically reap already-finished PUTs (non-blocking) so
+            // failures stop the pass promptly and the window stays honest.
+            while let Some(done) = window.try_join_next() {
+                let (idx, status) = match done {
+                    Ok(pair) => pair,
+                    Err(e) => break 'drive Term::Fatal(format!("window_8: task join: {e}")),
+                };
+                if let Some(t) = classify(state, idx, status, progress, lifecycle) {
+                    break 'drive t;
+                }
+            }
+            continue;
+        }
+        // Window full, or no chunks left to start: wait for one completion.
+        match window.join_next().await {
+            Some(Ok((idx, status))) => {
+                if let Some(t) = classify(state, idx, status, progress, lifecycle) {
+                    break 'drive t;
+                }
+            }
+            Some(Err(e)) => break 'drive Term::Fatal(format!("window_8: task join: {e}")),
+            None => break 'drive Term::Complete, // window empty and all started
+        }
+    };
+
+    // ---- single cleanup path: no PUT task may outlive the pass ----
+    window.abort_all();
+    while window.join_next().await.is_some() {}
+
+    let mut final_data: Option<(String, PassTimings, Vec<u64>)> = None;
+    let mut late_err: Option<String> = None;
+    if matches!(term, Term::Complete) {
+        let _ = ctrl_tx.send(Ctrl::Finish);
+        loop {
+            match out_rx.recv() {
+                Ok(PrepMsg::Final { rolling_digest, timings, read_log }) => {
+                    final_data = Some((rolling_digest, timings, read_log));
+                    break;
+                }
+                Ok(PrepMsg::Chunk(_)) => continue,
+                Ok(PrepMsg::Err(e)) => {
+                    late_err = Some(e);
+                    break;
+                }
+                Err(_) => {
+                    late_err = Some("window_8: producer hung up before final".into());
+                    break;
+                }
+            }
+        }
+    }
+    drop(ctrl_tx);
+    let _ = producer.join();
+
+    match term {
+        Term::SuspendAuth => return Ok(PassOutcome::SuspendedNeedsAuthorization),
+        Term::SuspendUnreachable => return Ok(PassOutcome::SuspendedDataPlaneUnreachable),
+        Term::VerifyFail(idx) => return Err(StreamError::ChunkVerificationFailed { index: idx }),
+        Term::Fatal(m) => return Err(StreamError::Fatal(m)),
+        Term::Complete => {}
+    }
+    if let Some(e) = late_err {
+        return Err(StreamError::Fatal(e));
+    }
+    let (rolling_digest, timings, read_log) = final_data
+        .ok_or_else(|| StreamError::Fatal("window_8: no producer final message".into()))?;
+
+    // INTEGRITY: source read exactly once, ascending; PUTs started ascending,
+    // each logical chunk submitted exactly once; window + payload bounds held.
+    let expected: Vec<u64> = (0..chunk_count).collect();
+    if read_log != expected {
+        return Err(StreamError::Fatal(format!(
+            "window_8: producer read log is not 0..{chunk_count} exactly once ascending"
+        )));
+    }
+    if state.put_start_order != expected {
+        return Err(StreamError::Fatal(format!(
+            "window_8: PUT start order is not 0..{chunk_count} exactly once ascending"
+        )));
+    }
+    if state.peak_puts_in_flight > PUT_WINDOW {
+        return Err(StreamError::Fatal(format!(
+            "window_8: peak in-flight {} exceeded the {PUT_WINDOW} window",
+            state.peak_puts_in_flight
+        )));
+    }
+    if state.prepared_peak > PUT_WINDOW + 1 {
+        return Err(StreamError::Fatal(format!(
+            "window_8: live payload depth {} exceeded {} (window + producer/current)",
+            state.prepared_peak,
+            PUT_WINDOW + 1
+        )));
+    }
+    state.timings = timings;
+    state.finalized_digest = Some(rolling_digest);
+    state.producer_read_log = read_log;
+    state.hashed_through = chunk_count;
+
+    if !state.all_uploaded() {
+        return Err(StreamError::Fatal(format!(
+            "window_8 pass ended with {}/{} chunks held",
+            state.held.len(),
+            chunk_count
+        )));
+    }
+    Ok(PassOutcome::Complete)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1447,5 +1853,392 @@ mod tests {
             other => panic!("expected Fatal, got {other:?}"),
         }
         assert!(!state.all_uploaded());
+    }
+
+    // =================================================================
+    // Issue #63 window_8 candidate — prep-ahead source + bounded (<= 8)
+    // concurrent chunk PUTs, per-PUT Worker durability semantics unchanged.
+    // =================================================================
+
+    /// Records the pointer of each source-produced chunk buffer, keyed by
+    /// index — used to prove the owned payload is MOVED (never cloned) all
+    /// the way from `ObservedReader::read_chunk` into the launcher's task.
+    #[derive(Clone)]
+    struct PtrTrackingReader {
+        inner: ObservedReader,
+        ptr_by_index: Arc<Mutex<BTreeMap<u64, usize>>>,
+    }
+    impl ChunkReader for PtrTrackingReader {
+        fn read_chunk(&self, index: u64, offset: u64, len: u64) -> Result<Vec<u8>, String> {
+            let bytes = self.inner.read_chunk(index, offset, len)?;
+            self.ptr_by_index.lock().unwrap().insert(index, bytes.as_ptr() as usize);
+            Ok(bytes)
+        }
+    }
+
+    /// In-flight tracking shared between a launcher and its spawned tasks.
+    /// `enter()` increments on creation and the returned guard decrements on
+    /// `Drop` — including when tokio cancels (aborts) the task mid-`.await`,
+    /// which drops the future's pinned locals. So `in_flight.load() == 0`
+    /// after a pass returns proves every spawned PUT task actually terminated
+    /// (naturally or via `abort_all`), never left running in the background.
+    #[derive(Clone)]
+    struct FlightTracker {
+        in_flight: Arc<AtomicU64>,
+        max_in_flight: Arc<AtomicU64>,
+    }
+    impl FlightTracker {
+        fn new() -> Self {
+            Self { in_flight: Arc::new(AtomicU64::new(0)), max_in_flight: Arc::new(AtomicU64::new(0)) }
+        }
+        fn enter(&self) -> FlightGuard {
+            let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(n, Ordering::SeqCst);
+            FlightGuard { in_flight: self.in_flight.clone() }
+        }
+    }
+    struct FlightGuard {
+        in_flight: Arc<AtomicU64>,
+    }
+    impl Drop for FlightGuard {
+        fn drop(&mut self) {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A [`WindowedPutLauncher`] whose PUTs complete after a per-index delay
+    /// (so the test controls completion order independently of start order),
+    /// records the pointer of the bytes it actually receives (proving no
+    /// clone happened on the way in), and can be told to fire exactly one
+    /// `AuthDenied` / `Transient` outcome for a chosen index.
+    #[derive(Clone)]
+    struct WindowFakeLauncher {
+        held: Arc<Mutex<BTreeMap<u64, String>>>,
+        tracker: FlightTracker,
+        launcher_ptr_by_index: Arc<Mutex<BTreeMap<u64, usize>>>,
+        completion_order: Arc<Mutex<Vec<u64>>>,
+        delay_ms: Arc<dyn Fn(u64) -> u64 + Send + Sync>,
+        authdenied_once: Arc<Mutex<BTreeSet<u64>>>,
+        fired_authdenied: Arc<Mutex<BTreeSet<u64>>>,
+        transient_once: Arc<Mutex<BTreeSet<u64>>>,
+        fired_transient: Arc<Mutex<BTreeSet<u64>>>,
+    }
+    impl WindowFakeLauncher {
+        fn new(delay_ms: impl Fn(u64) -> u64 + Send + Sync + 'static) -> Self {
+            Self {
+                held: Arc::new(Mutex::new(BTreeMap::new())),
+                tracker: FlightTracker::new(),
+                launcher_ptr_by_index: Arc::new(Mutex::new(BTreeMap::new())),
+                completion_order: Arc::new(Mutex::new(Vec::new())),
+                delay_ms: Arc::new(delay_ms),
+                authdenied_once: Arc::new(Mutex::new(BTreeSet::new())),
+                fired_authdenied: Arc::new(Mutex::new(BTreeSet::new())),
+                transient_once: Arc::new(Mutex::new(BTreeSet::new())),
+                fired_transient: Arc::new(Mutex::new(BTreeSet::new())),
+            }
+        }
+        fn max_in_flight(&self) -> u64 {
+            self.tracker.max_in_flight.load(Ordering::SeqCst)
+        }
+        fn in_flight_now(&self) -> u64 {
+            self.tracker.in_flight.load(Ordering::SeqCst)
+        }
+        fn completion_order(&self) -> Vec<u64> {
+            self.completion_order.lock().unwrap().clone()
+        }
+    }
+    impl WindowedPutLauncher for WindowFakeLauncher {
+        fn start_put(
+            &mut self,
+            index: u64,
+            digest_wire: String,
+            bytes: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = PutStatus> + Send>> {
+            self.launcher_ptr_by_index
+                .lock()
+                .unwrap()
+                .insert(index, bytes.as_ptr() as usize);
+            let held = self.held.clone();
+            let tracker = self.tracker.clone();
+            let completion_order = self.completion_order.clone();
+            let delay_ms = (self.delay_ms)(index);
+            let fire_authdenied = self.authdenied_once.lock().unwrap().contains(&index)
+                && self.fired_authdenied.lock().unwrap().insert(index);
+            let fire_transient = self.transient_once.lock().unwrap().contains(&index)
+                && self.fired_transient.lock().unwrap().insert(index);
+            // NOT `tokio::spawn` here — a plain future. `window.spawn` in the
+            // driver turns this into the ONE real task, so aborting it there
+            // actually cancels this body (including dropping `_guard` — the
+            // requirement this test module exists to prove).
+            Box::pin(async move {
+                let _guard = tracker.enter();
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                completion_order.lock().unwrap().push(index);
+                if fire_authdenied {
+                    return PutStatus::AuthDenied;
+                }
+                if fire_transient {
+                    return PutStatus::Transient("injected".into());
+                }
+                if crate::sha256_wire(&bytes) != digest_wire {
+                    return PutStatus::DigestMismatch;
+                }
+                held.lock().unwrap().insert(index, digest_wire);
+                PutStatus::Accepted
+            })
+        }
+    }
+
+    fn w8_factory(reader: &PtrTrackingReader) -> impl FnOnce() -> Result<PtrTrackingReader, String> + Send + 'static {
+        let r = reader.clone();
+        move || Ok(r)
+    }
+
+    fn w8_reader(ptr_by_index: &Arc<Mutex<BTreeMap<u64, usize>>>) -> (ObservedReader, PtrTrackingReader) {
+        let inner = ObservedReader::new();
+        let tracked = PtrTrackingReader { inner: inner.clone(), ptr_by_index: ptr_by_index.clone() };
+        (inner, tracked)
+    }
+
+    /// GREEN: window_8 reaches strictly more than 1 and at most 8 PUTs
+    /// simultaneously in flight (requirement: max network in-flight <= 8, and
+    /// this candidate must actually reach > 1 physically).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn window8_reaches_more_than_one_and_at_most_eight_puts_in_flight() {
+        let n = 16u64;
+        let total = n * SMALL;
+        let ptrs = Arc::new(Mutex::new(BTreeMap::new()));
+        let (_inner, reader) = w8_reader(&ptrs);
+        let mut state = StreamState::new(total, SMALL).unwrap();
+        let mut launcher = WindowFakeLauncher::new(|_i| 40);
+
+        let out = run_stream_pass_window8(
+            &mut state,
+            w8_factory(&reader),
+            ResumeStatus::Ok(vec![]),
+            &mut launcher,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, PassOutcome::Complete);
+        assert!(launcher.max_in_flight() > 1, "must actually reach concurrency > 1");
+        assert!(launcher.max_in_flight() <= PUT_WINDOW, "must never exceed the window");
+        // `state.peak_puts_in_flight()` is an upper bound (unreaped JoinSet
+        // length can lag real completions) — it must dominate the real
+        // observed concurrency and still respect the window cap.
+        assert!(state.peak_puts_in_flight() >= launcher.max_in_flight());
+        assert!(state.peak_puts_in_flight() <= PUT_WINDOW);
+        assert_eq!(launcher.in_flight_now(), 0, "no PUT task left running after the pass");
+        assert_eq!(state.finish_digest().unwrap(), reference_digest(total));
+    }
+
+    /// PUT starts are strictly ascending regardless of window depth.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn window8_put_starts_are_strictly_ascending() {
+        let n = 20u64;
+        let total = n * SMALL;
+        let ptrs = Arc::new(Mutex::new(BTreeMap::new()));
+        let (_inner, reader) = w8_reader(&ptrs);
+        let mut state = StreamState::new(total, SMALL).unwrap();
+        let mut launcher = WindowFakeLauncher::new(|_i| 5);
+
+        run_stream_pass_window8(
+            &mut state,
+            w8_factory(&reader),
+            ResumeStatus::Ok(vec![]),
+            &mut launcher,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.put_start_order(), &(0..n).collect::<Vec<_>>()[..]);
+        assert!(state.put_starts_ascending());
+        assert_eq!(state.put_started_count(), n);
+        assert_eq!(state.put_completed_count(), n);
+        assert_eq!(state.put_window(), PUT_WINDOW);
+    }
+
+    /// Completions MAY land out of order (a later-started chunk given a
+    /// SHORTER delay finishes first); the rolling Artifact digest is still
+    /// bit-identical to the serial reference because the producer thread
+    /// alone owns the hasher, in ascending index order — completion order
+    /// never touches it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn window8_completions_out_of_order_still_yield_the_serial_digest() {
+        let n = 10u64;
+        let total = n * SMALL;
+        let ptrs = Arc::new(Mutex::new(BTreeMap::new()));
+        let (_inner, reader) = w8_reader(&ptrs);
+        let mut state = StreamState::new(total, SMALL).unwrap();
+        // chunk 0 is deliberately the SLOWEST PUT; later chunks finish first.
+        let mut launcher = WindowFakeLauncher::new(|i| if i == 0 { 120 } else { 5 });
+
+        let out = run_stream_pass_window8(
+            &mut state,
+            w8_factory(&reader),
+            ResumeStatus::Ok(vec![]),
+            &mut launcher,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, PassOutcome::Complete);
+        let completion = launcher.completion_order();
+        assert_ne!(
+            completion.first(),
+            Some(&0),
+            "chunk 0 must NOT be the first completion despite being the first PUT started"
+        );
+        assert_eq!(state.put_start_order(), &(0..n).collect::<Vec<_>>()[..], "starts stay ascending");
+        // completion order is a permutation of every chunk index exactly once.
+        let mut sorted = completion.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..n).collect::<Vec<_>>());
+        assert_eq!(
+            state.finish_digest().unwrap(),
+            reference_digest(total),
+            "out-of-order completion must not perturb the rolling Artifact digest"
+        );
+    }
+
+    /// The owned 64 MiB payload is MOVED end-to-end (source read -> prepared
+    /// channel -> drive loop -> launcher task): the pointer the reader
+    /// produced is byte-identical to the pointer the launcher's task actually
+    /// received, for every chunk. No clone occurred on the hot path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn window8_owned_put_path_never_clones_the_chunk_buffer() {
+        let n = 12u64;
+        let total = n * SMALL;
+        let ptrs = Arc::new(Mutex::new(BTreeMap::new()));
+        let (_inner, reader) = w8_reader(&ptrs);
+        let mut state = StreamState::new(total, SMALL).unwrap();
+        let mut launcher = WindowFakeLauncher::new(|_i| 3);
+
+        run_stream_pass_window8(
+            &mut state,
+            w8_factory(&reader),
+            ResumeStatus::Ok(vec![]),
+            &mut launcher,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+        let produced = ptrs.lock().unwrap().clone();
+        let received = launcher.launcher_ptr_by_index.lock().unwrap().clone();
+        assert_eq!(produced.len(), n as usize);
+        assert_eq!(received.len(), n as usize);
+        for i in 0..n {
+            assert_eq!(
+                produced.get(&i),
+                received.get(&i),
+                "chunk {i}: launcher received a DIFFERENT allocation than the source produced (a clone happened)"
+            );
+        }
+    }
+
+    /// CLEAN-FAST-PATH FAILURE POLICY: an unexpected 401 on one PUT suspends
+    /// the whole pass (contamination), no retry-to-green, and every other
+    /// outstanding PUT task is drained (aborted + joined) before returning —
+    /// none is left running in the background, and the pass never reaches
+    /// `Complete` (so the caller never seals).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn window8_auth_denied_suspends_drains_outstanding_tasks_no_seal() {
+        let n = 16u64;
+        let total = n * SMALL;
+        let ptrs = Arc::new(Mutex::new(BTreeMap::new()));
+        let (_inner, reader) = w8_reader(&ptrs);
+        let mut state = StreamState::new(total, SMALL).unwrap();
+        // Long delay on every PUT so several are genuinely in flight when
+        // chunk 3's 401 lands; chunk 3 itself resolves quickly.
+        let mut launcher = WindowFakeLauncher::new(|i| if i == 3 { 5 } else { 200 });
+        launcher.authdenied_once.lock().unwrap().insert(3);
+
+        let mut events = Vec::new();
+        let out = run_stream_pass_window8(
+            &mut state,
+            w8_factory(&reader),
+            ResumeStatus::Ok(vec![]),
+            &mut launcher,
+            &mut |_| {},
+            &mut |e| events.push(e),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, PassOutcome::SuspendedNeedsAuthorization);
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::PutAuthDenied { chunk_index: 3 })),
+            "the 401 was surfaced as a contamination signal, not hidden"
+        );
+        assert!(!state.all_uploaded(), "the pass did not complete — no seal is possible");
+        assert!(state.finish_digest().is_none(), "no Artifact digest is available on a suspended pass");
+        assert_eq!(
+            launcher.in_flight_now(),
+            0,
+            "every outstanding PUT task must be drained before the pass returns"
+        );
+    }
+
+    /// A non-empty resume is rejected fail-closed (window_8 is a clean fast
+    /// path only, mirroring the prep-ahead depth-2 contract).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn window8_unexpected_non_empty_resume_fails_closed() {
+        let total = 4 * SMALL;
+        let ptrs = Arc::new(Mutex::new(BTreeMap::new()));
+        let (_inner, reader) = w8_reader(&ptrs);
+        let mut state = StreamState::new(total, SMALL).unwrap();
+        let mut launcher = WindowFakeLauncher::new(|_i| 1);
+        let resume = ResumeStatus::Ok(vec![(0, "x".to_string())]);
+        let res = run_stream_pass_window8(
+            &mut state,
+            w8_factory(&reader),
+            resume,
+            &mut launcher,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .await;
+        match res {
+            Err(StreamError::Fatal(m)) => assert!(m.contains("non-empty resume")),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
+
+    /// The live payload-buffer bound never exceeds `PUT_WINDOW + 1` (<= 8
+    /// unacknowledged PUT payloads + <= 1 producer/current chunk).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn window8_payload_buffer_peak_stays_within_window_plus_one() {
+        let n = 24u64;
+        let total = n * SMALL;
+        let ptrs = Arc::new(Mutex::new(BTreeMap::new()));
+        let (_inner, reader) = w8_reader(&ptrs);
+        let mut state = StreamState::new(total, SMALL).unwrap();
+        let mut launcher = WindowFakeLauncher::new(|_i| 15);
+
+        run_stream_pass_window8(
+            &mut state,
+            w8_factory(&reader),
+            ResumeStatus::Ok(vec![]),
+            &mut launcher,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            state.prepared_peak() <= PUT_WINDOW + 1,
+            "live payload depth {} exceeded window+1",
+            state.prepared_peak()
+        );
     }
 }

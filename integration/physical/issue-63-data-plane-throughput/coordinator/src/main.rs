@@ -113,6 +113,7 @@ fn stage2_subcommand() -> Option<i32> {
     match std::env::args().nth(1).as_deref() {
         Some("--matrix-selftest") => Some(matrix_selftest()),
         Some("--stage4-selftest") => Some(stage4_selftest()),
+        Some("--window8-selftest") => Some(window8_selftest()),
         Some("--stage4") => {
             // Issue #63 Stage 4: `--stage4 --arm ...` runs the ARMED networked
             // 64 MiB serial-vs-prep-ahead micro-matrix authority (the Stage-4
@@ -290,6 +291,11 @@ fn stage4_selftest() -> i32 {
                 put_ack_ms: 33_000.0,
                 prepared_buffer_peak: if c.mode == S4Mode::PrepAhead2 { 2 } else { 0 },
                 device_read_count: 32,
+                put_window: 0,
+                put_started_count: 0,
+                put_completed_count: 0,
+                peak_puts_in_flight: 0,
+                put_starts_ascending: false,
                 final_artifact_status: "Verified".into(),
                 case_status: "completed".into(),
             }
@@ -314,6 +320,94 @@ fn stage4_selftest() -> i32 {
         0
     } else {
         eprintln!("stage4-selftest: expected serial_n=4 prep_ahead_n=4 paired=2 excluded=0");
+        1
+    }
+}
+
+/// In-memory: build the deterministic Issue #63 window_8 5-case plan, run
+/// `analyse_w8` over stub Verified results, and assert the P-vs-W shape +
+/// window invariants. NO socket, NO transfer, NO device.
+fn window8_selftest() -> i32 {
+    use bamep_i63_stage2_engine::stage4::{
+        analyse_w8, S4CaseResult, S4Mode, S4Plan, W8_PUT_WINDOW, W8_TOTAL_CASES,
+    };
+    let plan = match S4Plan::build_window8("i63w8-selftest") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("window8-selftest: plan did not build: {e:?}");
+            return 1;
+        }
+    };
+    if plan.cases.len() != W8_TOTAL_CASES || plan.warmups().count() != 1 || plan.measured().count() != 4 {
+        eprintln!("window8-selftest: plan shape wrong");
+        return 1;
+    }
+    let results: Vec<S4CaseResult> = plan
+        .cases
+        .iter()
+        .map(|c| {
+            let window = c.mode == S4Mode::PrepAheadWindow8;
+            // window_8 deterministically faster in the stub.
+            let (b, v) = if window { (21_000.0, 27_000.0) } else { (66_000.0, 72_000.0) };
+            S4CaseResult {
+                run_id: c.run_id.clone(),
+                case_id: c.case_id.clone(),
+                mode: c.mode,
+                phase: c.phase,
+                cycle: c.cycle,
+                slot: c.slot,
+                chunk_size_bytes: c.chunk_size_bytes,
+                extent_bytes: c.extent_bytes,
+                chunk_count: c.expected_chunk_count,
+                transfer_id: Some(format!("stub-t-{}", c.case_id)),
+                artifact_id: Some("stub-a".into()),
+                bulk_stream_wall_ms: b,
+                verified_transfer_wall_ms: v,
+                resume_ms: 3.0,
+                seal_d2_ms: 5_000.0,
+                read_ms: 5_700.0,
+                chunk_sha_ms: 5_400.0,
+                rolling_sha_ms: 6_100.0,
+                proof_ms: 6.0,
+                put_ack_ms: if window { 90_000.0 } else { 33_000.0 },
+                prepared_buffer_peak: if window { 9 } else { 2 },
+                device_read_count: 32,
+                put_window: if window { W8_PUT_WINDOW } else { 0 },
+                put_started_count: if window { 32 } else { 0 },
+                put_completed_count: if window { 32 } else { 0 },
+                peak_puts_in_flight: if window { 8 } else { 0 },
+                put_starts_ascending: window,
+                final_artifact_status: "Verified".into(),
+                case_status: "completed".into(),
+            }
+        })
+        .collect();
+    let a = analyse_w8(&results);
+    let (Some(p), Some(w)) = (a.prep_ahead.as_ref(), a.window8.as_ref()) else {
+        eprintln!("window8-selftest: missing a mode summary");
+        return 1;
+    };
+    println!(
+        "WINDOW8_SELFTEST plan=5 warmups=1 measured=4 chunk=64MiB chunks=32 put_window={} \
+         prep_ahead_n={} window8_n={} paired_series={} invariants_held={} excluded={}",
+        a.put_window,
+        p.n,
+        w.n,
+        a.paired.len(),
+        a.window_invariants_held,
+        a.excluded_unverified.len()
+    );
+    if p.n == 2
+        && w.n == 2
+        && a.paired.len() == 2
+        && a.window_invariants_held
+        && a.excluded_unverified.is_empty()
+        && a.window8_median_bulk_mb_s > 100.0
+    {
+        println!("WINDOW8_SELFTEST_PASS");
+        0
+    } else {
+        eprintln!("window8-selftest: expected prep_n=2 window_n=2 paired=2 invariants=held excluded=0");
         1
     }
 }
