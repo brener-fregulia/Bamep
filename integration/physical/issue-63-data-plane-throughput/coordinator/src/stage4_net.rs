@@ -63,6 +63,7 @@ pub struct Cfg {
     /// (`S4Plan::build_window8`) instead of the 10-case S-vs-P plan, and write
     /// the P-vs-W analysis at terminal. Same wire protocol, same markers.
     pub window8: bool,
+    pub batch8: bool,
 }
 
 pub fn parse_cfg() -> Cfg {
@@ -73,11 +74,13 @@ pub fn parse_cfg() -> Cfg {
     let mut verdict_file: Option<String> = None;
     let mut worker_timing_file: Option<PathBuf> = None;
     let mut window8 = false;
+    let mut batch8 = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--stage4" | "--arm" => {}
             "--window8" => window8 = true,
+            "--batch8" => batch8 = true,
             "--matrix-addr" => matrix_addr = it.next().unwrap_or(matrix_addr),
             "--sink-addr" => sink_addr = it.next().unwrap_or(sink_addr),
             "--evidence-dir" => {
@@ -100,6 +103,7 @@ pub fn parse_cfg() -> Cfg {
         verdict_file,
         worker_timing_file,
         window8,
+        batch8,
     }
 }
 
@@ -134,6 +138,7 @@ struct State {
     verdict_file: Option<String>,
     worker_timing_file: Option<PathBuf>,
     window8: bool,
+    batch8: bool,
     events_written: u64,
 }
 
@@ -274,7 +279,9 @@ fn maybe_go_terminal(st: &mut State) {
         "by_mode": decomp_by_mode,
     });
 
-    let analysis = if st.window8 {
+    let mut analysis = if st.batch8 {
+        batch8_analysis(st, &records, worker_decomposition, marker)
+    } else if st.window8 {
         let p_vs_w = analyse_w8(&st.results);
         json!({
             "run_id": st.run_id,
@@ -301,6 +308,11 @@ fn maybe_go_terminal(st: &mut State) {
             "q2": "see worker_decomposition; body_pump_ms & staging_worker_ms OVERLAP",
         })
     };
+    let marker = if st.batch8 && marker == "stage4_pass"
+        && analysis["contamination"].as_array().is_some_and(|c| !c.is_empty()) {
+        analysis["verdict"] = json!("stage4_invalid");
+        "stage4_invalid"
+    } else { marker };
     let _ = std::fs::write(
         st.evidence_dir.join("analysis.json"),
         serde_json::to_string_pretty(&analysis).unwrap_or_else(|_| "{}".into()),
@@ -310,6 +322,65 @@ fn maybe_go_terminal(st: &mut State) {
         json!({ "marker": marker, "completed": st.completed, "worker_ok": worker_ok }),
     );
     spawn_drain_then_exit(marker, st.verdict_file.clone());
+}
+
+fn batch8_analysis(st: &State, records: &[WorkerPutRecord], worker: Value, marker: &str) -> Value {
+    use bamep_i63_stage2_engine::analysis::median;
+    let measured: Vec<_> = st.results.iter().filter(|r| r.is_measured()).collect();
+    let batches: Vec<Value> = std::fs::read_to_string(st.evidence_dir.join("worker-batch-timing.ndjson"))
+        .unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let mut contamination = Vec::new();
+    if marker != "stage4_pass" { contamination.push(format!("terminal:{marker}")); }
+    if let Some(h) = &st.halt { contamination.push(h.clone()); }
+    for r in &st.results {
+        if !r.is_completed_and_verified() || r.device_read_count != 32 || r.put_window != 8
+            || r.put_started_count != 32 || r.put_completed_count != 32 || !r.put_starts_ascending
+            || r.peak_puts_in_flight <= 1 || r.peak_puts_in_flight > 8 || r.prepared_buffer_peak > 9 {
+            contamination.push(format!("case_invariant:{}", r.case_id));
+        }
+    }
+    if batches.len() != 16 || st.results.iter().any(|r| (0..4).any(|n| batches.iter().filter(|b|
+        b["transfer_id"].as_str() == r.transfer_id.as_deref() && b["batch_number"] == n
+        && b["first_chunk_index"] == n*8 && b["last_chunk_index"] == n*8+7
+        && b["member_count"] == 8 && b["outcome"] == "durable").count() != 1)) {
+        contamination.push("batch_timing_missing_or_failed".into());
+    }
+    let raw_puts: Vec<Value> = st.worker_timing_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    if st.worker_timing_file.is_some() && (raw_puts.len() != 128 || st.results.iter().any(|r|
+        (0..32).any(|n| raw_puts.iter().filter(|p| p["transfer_id"].as_str() == r.transfer_id.as_deref()
+            && p["chunk_index"] == n && p["outcome"] == "accepted").count() != 1))) {
+        contamination.push("put_timing_duplicate_missing_or_failed".into());
+    }
+    let errors = records.iter().filter(|r| r.outcome.contains("control_error")).count();
+    if errors > 0 { contamination.push("control_error".into()); }
+    let mib = median(measured.iter().map(|r| r.bulk_mib_s()).collect());
+    let mb = median(measured.iter().map(|r| r.bulk_mb_s()).collect());
+    let classification = if !contamination.is_empty() || measured.len() != 3 { "D — NO USEFUL SOLUTION" }
+        else if mb >= 100.0 { "A — TARGET MET" } else if mib >= 80.0 { "B — MAJOR IMPROVEMENT" }
+        else if mib >= 60.0 { "C — MATERIAL BUT INSUFFICIENT" } else { "D — NO USEFUL SOLUTION" };
+    let distributions: Vec<Value> = ["file_sync_sum_ns", "dir_fsync_ns", "batch_finalize_total_ns"].into_iter().map(|key| {
+        let mut samples: Vec<f64> = batches.iter().filter(|b| measured.iter().any(|r| r.transfer_id.as_deref() == b["transfer_id"].as_str()))
+            .filter_map(|b| b[key].as_u64()).map(|n| n as f64 / 1e6).collect();
+        samples.sort_by(f64::total_cmp);
+        json!({"name":key,"n":samples.len(),"median_ms":median(samples.clone()),"samples_ms":samples})
+    }).collect();
+    let root = st.evidence_dir.parent().unwrap_or(&st.evidence_dir);
+    json!({"run_id":st.run_id,"candidate":"prep_ahead_window_8_batch_8", "verdict":marker,"classification":classification,
+        "base_git_head":std::fs::read_to_string(root.join("repo-head.txt")).unwrap_or_default().trim(),
+        "worktree_status":std::fs::read_to_string(root.join("repo-status.txt")).unwrap_or_default(),
+        "case_outcomes":st.plan.cases.iter().map(|c|json!({"case_id":c.case_id,"result":st.results.iter().find(|r|r.case_id==c.case_id),"outcome":st.results.iter().find(|r|r.case_id==c.case_id).map(|r|r.case_status.as_str()).unwrap_or("not_completed")})).collect::<Vec<_>>(),
+        "measured_bulk_walls_ms":measured.iter().map(|r|r.bulk_stream_wall_ms).collect::<Vec<_>>(),
+        "measured_verified_walls_ms":measured.iter().map(|r|r.verified_transfer_wall_ms).collect::<Vec<_>>(),
+        "candidate_median_mib_s":mib,"candidate_median_decimal_mb_s":mb,
+        "median_2gib_bulk_seconds":median(measured.iter().map(|r|r.bulk_stream_wall_ms/1000.0).collect()),
+        "ratio_vs_stage4_prep_ahead_2":mib/30.7199,"historical_baseline_run":"i63s4-20260907T214609",
+        "peak_put_concurrency":st.results.iter().map(|r|r.peak_puts_in_flight).max(),
+        "prepared_payload_buffer_peak":st.results.iter().map(|r|r.prepared_buffer_peak).max(),
+        "source_read_counts":st.results.iter().map(|r|r.device_read_count).collect::<Vec<_>>(),
+        "worker_decomposition":worker,"batch_distributions":distributions,"control_error_count":errors,
+        "artifact_verified":measured.iter().filter(|r|r.final_artifact_status=="Verified").count(),
+        "contamination":contamination,"note":"Intervals overlap across PUTs; do not add them. Descriptive comparison only; no significance claim."})
 }
 
 fn write_plan(st: &State) {
@@ -520,7 +591,9 @@ pub fn run(cfg: Cfg) -> ! {
         std::process::exit(1);
     });
 
-    let plan = if cfg.window8 {
+    let plan = if cfg.batch8 {
+        S4Plan::build_batch8(&cfg.run_id)
+    } else if cfg.window8 {
         S4Plan::build_window8(&cfg.run_id)
     } else {
         S4Plan::build(&cfg.run_id)
@@ -533,7 +606,7 @@ pub fn run(cfg: Cfg) -> ! {
         "STAGE4_ARMED run_id={} cases={} plan={} matrix={} sink={}",
         cfg.run_id,
         plan.cases.len(),
-        if cfg.window8 { "window8_p_vs_w" } else { "stage4_s_vs_p" },
+        if cfg.batch8 { "prep_ahead_window_8_batch_8" } else if cfg.window8 { "window8_p_vs_w" } else { "stage4_s_vs_p" },
         cfg.matrix_addr,
         cfg.sink_addr
     );
@@ -561,6 +634,7 @@ pub fn run(cfg: Cfg) -> ! {
         verdict_file: cfg.verdict_file.clone(),
         worker_timing_file: cfg.worker_timing_file.clone(),
         window8: cfg.window8,
+        batch8: cfg.batch8,
         events_written: 0,
     }));
     {
@@ -617,6 +691,7 @@ mod tests {
             verdict_file: None,
             worker_timing_file: None,
             window8,
+            batch8: false,
             events_written: 0,
         }))
     }
@@ -626,7 +701,7 @@ mod tests {
     }
 
     fn ok_result_json(case: &Value) -> Value {
-        let window = case["mode"] == "prep_ahead_window_8";
+        let window = case["mode"] == "prep_ahead_window_8" || case["mode"] == "prep_ahead_window_8_batch_8";
         json!({
             "run_id": case["run_id"], "case_id": case["case_id"], "mode": case["mode"],
             "phase": case["phase"], "cycle": case["cycle"], "slot": case["slot"],
@@ -647,6 +722,29 @@ mod tests {
             "put_starts_ascending": window,
             "final_artifact_status": "Verified", "case_status": "completed",
         })
+    }
+
+    #[test]
+    fn batch8_analysis_requires_exact_durable_batch_coverage() {
+        let dir = std::env::temp_dir().join(format!("i63b8-analysis-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = state_for(&dir);
+        let mut st = state.lock().unwrap();
+        st.batch8 = true;
+        st.plan = S4Plan::build_batch8("b8test").unwrap();
+        st.results = st.plan.cases.iter().map(|c| serde_json::from_value(ok_result_json(&serde_json::to_value(c).unwrap())).unwrap()).collect();
+        let mut batches = Vec::new();
+        for r in &st.results { for n in 0..4 { batches.push(json!({"transfer_id":r.transfer_id,"batch_number":n,"first_chunk_index":n*8,"last_chunk_index":n*8+7,"member_count":8,"outcome":"durable","file_sync_sum_ns":1000,"dir_fsync_ns":1000,"batch_finalize_total_ns":2000})); } }
+        let write = |b: &Vec<Value>| std::fs::write(dir.join("worker-batch-timing.ndjson"),b.iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        write(&batches);
+        let good = batch8_analysis(&st,&[],json!({}),"stage4_pass");
+        assert_eq!(good["classification"], "A — TARGET MET");
+        assert_eq!(good["case_outcomes"].as_array().unwrap().len(),4);
+        assert_eq!(good["measured_bulk_walls_ms"].as_array().unwrap().len(),3);
+        batches[1] = batches[0].clone();
+        write(&batches);
+        assert_eq!(batch8_analysis(&st,&[],json!({}),"stage4_pass")["classification"],"D — NO USEFUL SOLUTION");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

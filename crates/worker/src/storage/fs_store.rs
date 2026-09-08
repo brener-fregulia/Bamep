@@ -263,6 +263,120 @@ pub struct StagingChunk {
     poisoned: bool,
 }
 
+/// Issue #63 throwaway batch_8 measurements. Intervals overlap the PUT wall.
+#[derive(Default)]
+pub(crate) struct I63BatchTiming {
+    pub file_sync_sum_ns: u128,
+    pub placement_sum_ns: u128,
+    pub dir_fsync_ns: u128,
+    pub batch_finalize_total_ns: u128,
+    pub directory_barriers: usize,
+    pub file_syncs: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static I63_SYNC_EVENTS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    static I63_DIR_GATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn i63_test_directory_gate(gate: impl FnOnce() + 'static) {
+    I63_DIR_GATE.with(|slot| *slot.borrow_mut() = Some(Box::new(gate)));
+}
+
+/// Issue #63 only: verified per-chunk files, serial file sync, one directory
+/// barrier. Failure preserves installed final names; this is not a transaction.
+pub(crate) fn finalize_i63_batch(
+    mut members: Vec<(StagingChunk, Sha256Digest, u64)>,
+    timing: &mut I63BatchTiming,
+) -> Result<(), StorageError> {
+    let started = std::time::Instant::now();
+    let result = (|| {
+        let invalid = || StorageError::Io {
+            context: "Issue #63 batch_8 invalid verified staging group".into(),
+            source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
+        };
+        if members.len() != 8 {
+            return Err(invalid());
+        }
+        members.sort_by_key(|(s, _, _)| s.chunk_index);
+        let first = &members[0].0;
+        let transfer = first.transfer_id;
+        let directory = first.chunks_dir.clone();
+        let first_index = first.chunk_index;
+        let expected_size = first.max_size;
+        if !first_index.is_multiple_of(8) || first_index >= 32 {
+            return Err(invalid());
+        }
+        for (offset, (s, digest, size)) in members.iter().enumerate() {
+            if s.transfer_id != transfer
+                || s.chunks_dir != directory
+                || s.chunk_index != first_index + offset as u64
+                || s.poisoned
+                || s.file.is_none()
+                || s.written == 0
+                || s.written != *size
+                || s.written != s.max_size
+                || s.max_size != expected_size
+                || s.digest() != *digest
+            {
+                return Err(invalid());
+            }
+        }
+        for (s, _, _) in &mut members {
+            let mark = std::time::Instant::now();
+            let file = s.file.as_mut().ok_or_else(invalid)?;
+            #[cfg(test)]
+            I63_SYNC_EVENTS.with(|events| events.borrow_mut().push("file_begin"));
+            let sync = file.flush().and_then(|()| file.sync_all());
+            #[cfg(test)]
+            I63_SYNC_EVENTS.with(|events| events.borrow_mut().push("file_end"));
+            timing.file_sync_sum_ns += mark.elapsed().as_nanos();
+            timing.file_syncs += 1;
+            sync.map_err(|source| StorageError::FinalizationSync {
+                context: "Issue #63 batch_8 serial staging sync".into(),
+                source,
+            })?;
+        }
+        for (s, _, _) in &mut members {
+            s.file = None;
+        }
+        for (s, _, _) in &members {
+            let mark = std::time::Instant::now();
+            let placed = place_no_replace(&s.staging_path, &s.final_path);
+            timing.placement_sum_ns += mark.elapsed().as_nanos();
+            if matches!(placed?, Placement::DestinationExists) {
+                return Err(StorageError::FinalizedChunkConflict {
+                    transfer_id: s.transfer_id,
+                    chunk_index: s.chunk_index,
+                });
+            }
+        }
+        let mark = std::time::Instant::now();
+        timing.directory_barriers += 1;
+        #[cfg(test)]
+        I63_DIR_GATE.with(|slot| {
+            if let Some(gate) = slot.borrow_mut().take() {
+                gate();
+            }
+        });
+        #[cfg(test)]
+        I63_SYNC_EVENTS.with(|events| events.borrow_mut().push("directory_begin"));
+        let synced = fsync_dir(&directory);
+        #[cfg(test)]
+        I63_SYNC_EVENTS.with(|events| events.borrow_mut().push("directory_end"));
+        timing.dir_fsync_ns = mark.elapsed().as_nanos();
+        synced?;
+        for (s, _, _) in &members {
+            let _ = fs::remove_file(&s.staging_path);
+        }
+        Ok(())
+    })();
+    timing.batch_finalize_total_ns = started.elapsed().as_nanos();
+    result
+}
+
 impl StagingChunk {
     pub fn transfer_id(&self) -> Uuid {
         self.transfer_id

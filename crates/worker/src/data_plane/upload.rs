@@ -95,12 +95,23 @@ pub(super) async fn stage_chunk_body(
     body: Body,
     i63_active: bool,
 ) -> (StageOutcome, StageTiming) {
+    stage_chunk_body_with_batch(store, request, body, i63_active, None).await
+}
+
+pub(super) async fn stage_chunk_body_with_batch(
+    store: FilesystemChunkStore,
+    request: StageRequest,
+    body: Body,
+    i63_active: bool,
+    batch: Option<std::sync::Arc<super::i63_batch::Coordinator>>,
+) -> (StageOutcome, StageTiming) {
     let (tx, rx) = mpsc::channel::<PumpMessage>(FRAME_CHANNEL_CAPACITY);
 
     // The staging worker runs concurrently with the body pump below; time both
     // from here — the two intervals OVERLAP and are labelled as such.
     let worker_mark = i63_mark(i63_active);
-    let worker = tokio::task::spawn_blocking(move || stage_worker(store, request, rx, i63_active));
+    let worker =
+        tokio::task::spawn_blocking(move || stage_worker(store, request, rx, i63_active, batch));
 
     let pump_mark = i63_mark(i63_active);
     let mut body = body;
@@ -149,6 +160,7 @@ fn stage_worker(
     request: StageRequest,
     mut rx: mpsc::Receiver<PumpMessage>,
     i63_active: bool,
+    batch: Option<std::sync::Arc<super::i63_batch::Coordinator>>,
 ) -> (StageOutcome, StageTiming) {
     let StageRequest {
         transfer_id,
@@ -217,6 +229,24 @@ fn stage_worker(
     };
 
     let m = i63_mark(i63_active);
+    if let Some(batch) = batch {
+        t.batch_number = Some(chunk_index / 8);
+        let wait = Instant::now();
+        let ok = size == chunk_size && batch.submit(staging);
+        t.batch_wait_ns = wait.elapsed().as_nanos();
+        t.finalize_ns = i63_since(m);
+        return (
+            if ok {
+                StageOutcome::Finalized {
+                    size,
+                    digest: computed,
+                }
+            } else {
+                StageOutcome::StorageUnavailable
+            },
+            t,
+        );
+    }
     let finalized = staging.finalize();
     t.finalize_ns = i63_since(m);
     let outcome = match finalized {
@@ -246,6 +276,37 @@ mod tests {
 
     fn digest_b64(bytes: &[u8]) -> String {
         URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_digest_invalid_member_fails_waiters_without_publication() {
+        let root = TempRoot::new();
+        let transfer = Uuid::new_v4();
+        let batch = std::sync::Arc::new(super::super::i63_batch::Coordinator::new(
+            std::time::Duration::from_secs(2),
+        ));
+        let mut tasks = Vec::new();
+        for index in 0..8 {
+            let store = root.store();
+            let batch = batch.clone();
+            tasks.push(tokio::spawn(async move {
+                let _guard = batch.request(transfer, index);
+                stage_chunk_body_with_batch(
+                    store,
+                    StageRequest {
+                        transfer_id: transfer, chunk_index: index, chunk_size: 4,
+                        declared_digest: digest_b64(&[if index == 7 { 99 } else { index as u8 }; 4]),
+                    },
+                    Body::from(vec![index as u8; 4]), false, Some(batch),
+                ).await.0
+            }));
+        }
+        for (index, task) in tasks.into_iter().enumerate() {
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), task).await.unwrap().unwrap();
+            if index == 7 { assert!(matches!(outcome, StageOutcome::DigestMismatch)); }
+            else { assert!(matches!(outcome, StageOutcome::StorageUnavailable)); }
+            assert!(!root.final_path(transfer, index as u64).exists());
+        }
     }
 
     struct TempRoot(std::path::PathBuf);

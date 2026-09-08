@@ -218,6 +218,7 @@ enum StreamMode {
     Serial,
     PrepAhead2,
     PrepAheadWindow8,
+    PrepAheadWindow8Batch8,
 }
 impl StreamMode {
     fn wire(self) -> &'static str {
@@ -225,6 +226,7 @@ impl StreamMode {
             StreamMode::Serial => "serial",
             StreamMode::PrepAhead2 => "prep_ahead_2",
             StreamMode::PrepAheadWindow8 => "prep_ahead_window_8",
+            StreamMode::PrepAheadWindow8Batch8 => "prep_ahead_window_8_batch_8",
         }
     }
     fn parse(s: &str) -> Option<Self> {
@@ -234,6 +236,7 @@ impl StreamMode {
             "prep_ahead_window_8" | "prep-ahead-window-8" | "window_8" => {
                 Some(StreamMode::PrepAheadWindow8)
             }
+            "prep_ahead_window_8_batch_8" | "batch_8" => Some(StreamMode::PrepAheadWindow8Batch8),
             _ => None,
         }
     }
@@ -1251,7 +1254,7 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
                 )
                 .await
             }
-            StreamMode::PrepAheadWindow8 => {
+            StreamMode::PrepAheadWindow8 | StreamMode::PrepAheadWindow8Batch8 => {
                 // Resume is fetched HERE (not inside the driver) so the
                 // driver can immutably borrow `dp.auth` for the whole pass —
                 // see `RealWindowLauncher`'s doc comment for why that borrow
@@ -1305,7 +1308,7 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
                     // In prep-ahead / window_8 the producer thread owns the
                     // reads; the foreground `reader` is unused. The producer's
                     // read log is the authoritative per-pass read count.
-                    StreamMode::PrepAhead2 | StreamMode::PrepAheadWindow8 => {
+                    StreamMode::PrepAhead2 | StreamMode::PrepAheadWindow8 | StreamMode::PrepAheadWindow8Batch8 => {
                         state.producer_read_log().len() as u64
                     }
                 };
@@ -1321,7 +1324,7 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
                         )),
                     ],
                 );
-                if args.mode == StreamMode::PrepAheadWindow8 {
+                if matches!(args.mode, StreamMode::PrepAheadWindow8 | StreamMode::PrepAheadWindow8Batch8) {
                     // Raw evidence only (not part of the engine's parsed
                     // schema): the exact PUT start/completion order proof.
                     log.emit(
@@ -1414,7 +1417,7 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
             let ns_ms = |n: u128| (n as f64 / 1_000_000.0) as i64;
             let device_read_count = match args.mode {
                 StreamMode::Serial => reader.counters.borrow().data_read_count,
-                StreamMode::PrepAhead2 | StreamMode::PrepAheadWindow8 => {
+                StreamMode::PrepAhead2 | StreamMode::PrepAheadWindow8 | StreamMode::PrepAheadWindow8Batch8 => {
                     state.producer_read_log().len() as u64
                 }
             };
@@ -1794,4 +1797,12 @@ async fn main() {
     println!("BAMEP_I63_STAGE2_PROBE_EXITCODE={code}");
     let _ = std::io::stdout().flush();
     std::process::exit(code);
+}
+
+#[test]
+fn batch8_mode_keeps_candidate_wire_identity() {
+    let mode = StreamMode::parse("prep_ahead_window_8_batch_8").unwrap();
+    assert_eq!(mode, StreamMode::PrepAheadWindow8Batch8);
+    assert_eq!(mode.wire(), "prep_ahead_window_8_batch_8");
+    assert_eq!(StreamMode::parse("window_8"), Some(StreamMode::PrepAheadWindow8));
 }

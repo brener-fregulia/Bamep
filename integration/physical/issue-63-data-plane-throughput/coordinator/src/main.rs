@@ -114,6 +114,7 @@ fn stage2_subcommand() -> Option<i32> {
         Some("--matrix-selftest") => Some(matrix_selftest()),
         Some("--stage4-selftest") => Some(stage4_selftest()),
         Some("--window8-selftest") => Some(window8_selftest()),
+        Some("--batch8-selftest") => Some(batch8_selftest()),
         Some("--stage4") => {
             // Issue #63 Stage 4: `--stage4 --arm ...` runs the ARMED networked
             // 64 MiB serial-vs-prep-ahead micro-matrix authority (the Stage-4
@@ -627,4 +628,16 @@ fn handle_sink(mut s: TcpStream, shared: &Arc<Mutex<Shared>>) {
         println!("STAGE1_SINK_INGEST peer={peer} fresh_lines={fresh}");
     }
     let _ = std::io::stdout().flush();
+}
+
+fn batch8_selftest() -> i32 {
+    use bamep_i63_stage2_engine::stage4::S4Plan;
+    let p = S4Plan::build_batch8("i63b8-selftest").expect("fixed geometry");
+    if p.cases.len() != 4 || p.warmups().count() != 1 || p.measured().count() != 3
+        || p.cases.iter().enumerate().any(|(i,c)| c.case_id != format!("i63b8-selftest/B{i}")
+            || c.mode.wire() != "prep_ahead_window_8_batch_8" || c.expected_chunk_count != 32) {
+        return 1;
+    }
+    println!("BATCH8_SELFTEST_PASS cases=4 warmup=1 measured=3 chunk_mib=64 extent_mib=2048 put_window=8");
+    0
 }

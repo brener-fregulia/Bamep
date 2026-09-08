@@ -44,6 +44,8 @@ step "2/8 coordinator (stage4_net + selftest + window8-selftest + NOT ARMED)"
 ( cd coordinator && cargo run --quiet -- --window8-selftest | tail -1 | grep -q WINDOW8_SELFTEST_PASS ) || fail "window8-selftest"
 ( cd coordinator && cargo run --quiet -- --stage4 | grep -q 'STAGE4 NOT ARMED' ) || fail "--stage4 not-armed banner"
 
+( cd coordinator && cargo run --quiet -- --batch8-selftest | grep -q BATCH8_SELFTEST_PASS ) || fail "batch8-selftest"
+
 step "3/8 stage2-probe (host; prep-ahead + window_8 pipeline RED/GREEN + synthetic S-vs-P smoke)"
 ( cd stage2-probe && cargo test --quiet ) || fail "probe tests"
 ( cd stage2-probe && cargo run --quiet -- --self-check | grep -q PROBE_SELF_CHECK_PASS ) || fail "probe self-check"
@@ -123,6 +125,7 @@ done
 [ -f stage3/bamep-i63-stage4-bootstrap.cmd.template ] || fail "stage4 bootstrap template missing"
 ( stage4/run-stage4-lab.sh | grep -q 'STAGE4 NOT ARMED' ) || fail "launcher (no args) must print STAGE4 NOT ARMED"
 ( stage4/run-stage4-lab.sh --window8 | grep -q 'STAGE4 NOT ARMED' ) || fail "launcher --window8 (no --arm) must print STAGE4 NOT ARMED"
+( stage4/run-stage4-lab.sh --batch8 | grep -q 'STAGE4 NOT ARMED' ) || fail "launcher --batch8 NOT ARMED"
 command -v shellcheck >/dev/null 2>&1 && { shellcheck -S warning stage4/*.sh || fail "shellcheck"; } || printf 'shellcheck not installed — skipped\n'
 
 printf '\nSTAGE4_CHECKS_PASS  (root=%s)\n' "$root"

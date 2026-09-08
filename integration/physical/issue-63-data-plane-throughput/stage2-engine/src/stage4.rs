@@ -69,6 +69,8 @@ pub enum S4Mode {
     /// (`run_stream_pass_window8`).
     #[serde(rename = "prep_ahead_window_8")]
     PrepAheadWindow8,
+    #[serde(rename = "prep_ahead_window_8_batch_8")]
+    PrepAheadWindow8Batch8,
 }
 
 impl S4Mode {
@@ -78,6 +80,7 @@ impl S4Mode {
             S4Mode::Serial => "serial",
             S4Mode::PrepAhead2 => "prep_ahead_2",
             S4Mode::PrepAheadWindow8 => "prep_ahead_window_8",
+            S4Mode::PrepAheadWindow8Batch8 => "prep_ahead_window_8_batch_8",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -87,6 +90,7 @@ impl S4Mode {
             "prep_ahead_window_8" | "prep-ahead-window-8" | "window_8" => {
                 Some(S4Mode::PrepAheadWindow8)
             }
+            "prep_ahead_window_8_batch_8" | "batch_8" => Some(S4Mode::PrepAheadWindow8Batch8),
             _ => None,
         }
     }
@@ -223,6 +227,17 @@ impl S4Plan {
             run_id: run_id.to_string(),
             cases,
         })
+    }
+
+    pub fn build_batch8(run_id: &str) -> Result<Self, ArithmeticError> {
+        let expected_chunk_count = expected_chunk_count(EXTENT_BYTES, S4_CHUNK_SIZE_BYTES)?;
+        Ok(Self { run_id: run_id.into(), cases: (0..4).map(|i| S4Case {
+            run_id: run_id.into(), case_id: format!("{run_id}/B{i}"),
+            phase: if i == 0 { Phase::Warmup } else { Phase::Measured },
+            mode: S4Mode::PrepAheadWindow8Batch8,
+            cycle: if i == 0 { None } else { Some(i) }, slot: if i == 0 { None } else { Some(1) },
+            chunk_size_bytes: S4_CHUNK_SIZE_BYTES, extent_bytes: EXTENT_BYTES, expected_chunk_count,
+        }).collect() })
     }
 
     pub fn warmups(&self) -> impl Iterator<Item = &S4Case> {
@@ -708,6 +723,18 @@ mod tests {
     }
 
     #[test]
+    fn batch8_plan_has_only_four_fixed_candidate_cases() {
+        let p = S4Plan::build_batch8("i63b8-test").unwrap();
+        assert_eq!(p.cases.len(), 4);
+        assert_eq!(p.warmups().count(), 1);
+        for (i,c) in p.cases.iter().enumerate() {
+            assert_eq!(c.case_id, format!("i63b8-test/B{i}"));
+            assert_eq!(c.mode.wire(), "prep_ahead_window_8_batch_8");
+            assert_eq!((c.chunk_size_bytes,c.extent_bytes,c.expected_chunk_count), (64*MIB,EXTENT_BYTES,32));
+        }
+    }
+
+    #[test]
     fn plan_is_10_cases_2_warmup_8_measured_all_64_mib_32_chunks() {
         let p = plan();
         assert_eq!(p.cases.len(), 10);
@@ -930,7 +957,7 @@ mod tests {
             put_ack_ms: 33_000.0,
             prepared_buffer_peak: match mode {
                 S4Mode::PrepAhead2 => 2,
-                S4Mode::PrepAheadWindow8 => 9,
+                S4Mode::PrepAheadWindow8 | S4Mode::PrepAheadWindow8Batch8 => 9,
                 S4Mode::Serial => 0,
             },
             device_read_count: 32,

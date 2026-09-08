@@ -60,6 +60,9 @@ mod http;
 /// unless `BAMEP_I63_WORKER_PUT_TIMING` is set. See the module doc.
 #[cfg(unix)]
 mod i63_timing;
+
+#[cfg(unix)]
+mod i63_batch;
 #[cfg(unix)]
 mod upload;
 

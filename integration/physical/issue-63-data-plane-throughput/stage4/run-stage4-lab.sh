@@ -90,6 +90,7 @@ DB_NAME="bamep_physint_spike"
 # shape — only the coordinator's own `--window8` flag and the run/storage
 # bookkeeping below differ.
 WINDOW8=0
+BATCH8=0
 
 STORAGE_ROOT_STAGE4="${I63_DIR}/stage3-harness/runtime-stage4/chunkstore"
 STORAGE_ROOT_WINDOW8="${I63_DIR}/stage3-harness/runtime-stage4/chunkstore-window8"
@@ -227,11 +228,14 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --arm) ARMED=1; shift ;;
     --window8) WINDOW8=1; shift ;;
+    --batch8) BATCH8=1; shift ;;
     --preflight|--dry-run) PREFLIGHT_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
+
+[ "${WINDOW8}" -eq 0 ] || [ "${BATCH8}" -eq 0 ] || die "--window8 and --batch8 are mutually exclusive"
 
 if [ "${ARMED}" -eq 0 ] && [ "${PREFLIGHT_ONLY}" -eq 0 ]; then
   echo "STAGE4 NOT ARMED"
@@ -242,10 +246,16 @@ if [ "${ARMED}" -eq 0 ] && [ "${PREFLIGHT_ONLY}" -eq 0 ]; then
   echo "  ./run-stage4-lab.sh --arm                          # bring up the Stage-4 S-vs-P (10-case) lab"
   echo "  ./run-stage4-lab.sh --window8 --arm --preflight    # window_8 candidate (5-case), host checks only"
   echo "  ./run-stage4-lab.sh --window8 --arm                # bring up the window_8 P-vs-W (5-case) lab"
+  echo "  ./run-stage4-lab.sh --batch8 --arm                 # batch_8 candidate-only B0 B1 B2 B3"
   exit 0
 fi
 
-if [ "${WINDOW8}" -eq 1 ]; then
+if [ "${BATCH8}" -eq 1 ]; then
+  RUN_ID="i63b8-$(date +%Y%m%dT%H%M%S)"
+  STORAGE_ROOT="${I63_STORAGE_ROOT:-${I63_DIR}/stage3-harness/runtime-stage4/chunkstore-batch8}"
+  MATRIX_PAYLOAD_BYTES=$((4 * 2147483648))
+  MIN_FREE_BYTES=$((16 * 1024 * 1024 * 1024))
+elif [ "${WINDOW8}" -eq 1 ]; then
   RUN_ID="i63w8-$(date +%Y%m%dT%H%M%S)"
   STORAGE_ROOT="${I63_STORAGE_ROOT:-${STORAGE_ROOT_WINDOW8}}"
   MATRIX_PAYLOAD_BYTES="${MATRIX_PAYLOAD_BYTES_WINDOW8}"
@@ -259,6 +269,7 @@ fi
 EVID="${I63_DIR}/evidence/${RUN_ID}"
 MATRIX_EVID="${EVID}/matrix"
 WORKER_TIMING_FILE="${MATRIX_EVID}/worker-put-timing.ndjson"
+WORKER_BATCH_TIMING_FILE="${MATRIX_EVID}/worker-batch-timing.ndjson"
 
 # ---------------------------------------------------------------------
 # 1. PREFLIGHT — read-only.
@@ -299,6 +310,9 @@ log "[preflight] deterministic Stage-4 10-case plan + S/P analysis shape"
 "${COORD_BIN}" --stage4 2>&1 | grep -q 'STAGE4 NOT ARMED' || die "coordinator --stage4 (no --arm) must print STAGE4 NOT ARMED"
 log "  ok: 10-case plan (2 warm-up + 8 measured, 64 MiB, 32 chunks/2048 MiB); n=4 per mode"
 
+if [ "${BATCH8}" -eq 1 ]; then
+  "${COORD_BIN}" --batch8-selftest | grep -q '^BATCH8_SELFTEST_PASS' || die "coordinator --batch8-selftest FAILED"
+fi
 log "[preflight] deterministic window_8 5-case plan + P-vs-W analysis shape"
 ( cd "${I63_DIR}/coordinator" && "${COORD_BIN}" --window8-selftest 2>&1 | tail -2 ) | tee -a "${LAUNCHER_LOG}" >&2
 "${COORD_BIN}" --window8-selftest 2>&1 | grep -q '^WINDOW8_SELFTEST_PASS' || die "coordinator --window8-selftest FAILED"
@@ -333,6 +347,9 @@ case "$(readlink -f "${MATRIX_EVID}" 2>/dev/null || echo "${MATRIX_EVID}")" in
   "$(readlink -f "${STORAGE_ROOT}" 2>/dev/null || echo "${STORAGE_ROOT}")"*) die "worker timing sink must be OUTSIDE the storage root" ;;
 esac
 log "  ok: ${WORKER_TIMING_FILE}"
+if [ "${BATCH8}" -eq 1 ]; then
+  log "  ok: ${WORKER_BATCH_TIMING_FILE}"
+fi
 
 log "[preflight] PostgreSQL reachable / ${DB_NAME} present (read-only check; never created/migrated here)"
 if db_reachable; then
@@ -396,6 +413,8 @@ WATCHDOG_ABORT="${EVID}/.watchdog-abort"
 CRED_TMP="${EVID}/.enroll.cred"
 DERIVE_OUT="${EVID}/derived-runtime"
 : > "${WORKER_TIMING_FILE}"
+if [ "${BATCH8}" -eq 1 ]; then : > "${WORKER_BATCH_TIMING_FILE}"; fi
+git -C "${REPO_ROOT}" status --porcelain > "${EVID}/repo-status.txt"
 log "evidence directory: ${EVID}"
 git -C "${REPO_ROOT}" rev-parse HEAD > "${EVID}/repo-head.txt" 2>/dev/null || echo unknown > "${EVID}/repo-head.txt"
 {
@@ -508,7 +527,11 @@ fi
 hr
 log "STARTING #61-SHAPED HARNESS (--stage4: real Postgres + WSS + Worker HTTPS + PUT timing sink)"
 HARNESS_LOG="${EVID}/harness.log"
-env I63_LAB_IP="${LAB_IP}" I63_WSS_PORT="${PORT_WSS}" I63_COORD_PORT="${PORT_COORD}" I63_DP_PORT="${PORT_DP}" \
+BATCH_ENV=()
+if [ "${BATCH8}" -eq 1 ]; then
+  BATCH_ENV+=("BAMEP_I63_WORKER_BATCH_FINALIZE=8" "BAMEP_I63_WORKER_BATCH_TIMING=${WORKER_BATCH_TIMING_FILE}")
+fi
+env "${BATCH_ENV[@]}" I63_LAB_IP="${LAB_IP}" I63_WSS_PORT="${PORT_WSS}" I63_COORD_PORT="${PORT_COORD}" I63_DP_PORT="${PORT_DP}" \
     "${HARNESS_BIN}" --stage4 --storage-root "${STORAGE_ROOT}" --worker-timing-file "${WORKER_TIMING_FILE}" \
     > "${HARNESS_LOG}" 2>&1 &
 register_child "stage4-harness" "$!" 0
@@ -579,7 +602,10 @@ await "dnsmasq udp/67 (DHCP)" 40 udp_up 67 || die "dnsmasq did not bind udp/67 �
 await "dnsmasq udp/69 (TFTP)" 20 udp_up 69 || die "dnsmasq did not bind udp/69 — see ${EVID}/dnsmasq.log"
 
 COORD_EXTRA_ARGS=()
-if [ "${WINDOW8}" -eq 1 ]; then
+if [ "${BATCH8}" -eq 1 ]; then
+  COORD_EXTRA_ARGS+=("--batch8")
+  log "[coordinator] batch_8 candidate-only B0 B1 B2 B3"
+elif [ "${WINDOW8}" -eq 1 ]; then
   COORD_EXTRA_ARGS+=("--window8")
   log "[coordinator] bamep-i63-stage1-coordinator --stage4 --arm --window8 (typed 5-case P-vs-W authority + probe sink)"
 else
@@ -640,8 +666,10 @@ gate "autoexec injects enroll.cred"         grep -qF "/bamep-i63-enroll.cred bam
 gate "autoexec: boot.wim initrd is last"    bash -c "[ \"\$(grep '^initrd ' '${AX}' | tail -1)\" = \"initrd http://${LAB_IP}:${PORT_HTTP}/boot.wim boot.wim\" ]"
 gate "bootstrap.cmd launches runner --stage4 --arm" grep -qF -- '--stage4 --arm' "${DERIVE_OUT}/http/bamep-i63-stage4-bootstrap.cmd"
 gate "bootstrap.cmd carries this fingerprint"       grep -qF "${FINGERPRINT}" "${DERIVE_OUT}/http/bamep-i63-stage4-bootstrap.cmd"
-EXPECT_CASES=10; [ "${WINDOW8}" -eq 1 ] && EXPECT_CASES=5
-gate "matrix-plan.json written (${EXPECT_CASES} cases)"   bash -c "[ -f '${MATRIX_EVID}/matrix-plan.json' ] && [ \"\$(grep -c '\"case_id\"' '${MATRIX_EVID}/matrix-plan.json')\" -ge ${EXPECT_CASES} ]"
+EXPECT_CASES=10
+[ "${WINDOW8}" -eq 1 ] && EXPECT_CASES=5
+[ "${BATCH8}" -eq 1 ] && EXPECT_CASES=4
+gate "matrix-plan.json written (${EXPECT_CASES} cases)"   bash -c "[ -f '${MATRIX_EVID}/matrix-plan.json' ] && [ \"\$(grep -c '\"case_id\"' '${MATRIX_EVID}/matrix-plan.json')\" -eq ${EXPECT_CASES} ]"
 
 for i in "${!CHILD_PID[@]}"; do
   gate "child alive: ${CHILD_DESC[$i]} (pid ${CHILD_PID[$i]})" proc_alive "${CHILD_PID[$i]}"
@@ -689,7 +717,19 @@ log "health watchdog running (pid ${WATCHDOG_PID})"
 # ---------------------------------------------------------------------
 # 10. READY
 # ---------------------------------------------------------------------
-if [ "${WINDOW8}" -eq 1 ]; then
+if [ "${BATCH8}" -eq 1 ]; then
+cat <<EOF | tee -a "${LAUNCHER_LOG}"
+READY_FOR_BATCH8_MINIPC_POWER_ON   (${RUN_ID})
+Candidate: prep_ahead_window_8_batch_8, Agent PUT window 8, Worker durability batch 8.
+Fixed geometry: 64 MiB chunks / 2 GiB extent / 32 chunks. Four transfers / 8 GiB.
+B0 warmup (excluded), B1 B2 B3 measured; fresh Transfer / Artifact every case.
+Clean fast path only: any failure or contamination stops the case; no retries.
+Worker timing: ${WORKER_TIMING_FILE}
+Batch timing: ${WORKER_BATCH_TIMING_FILE}
+Evidence: ${MATRIX_EVID}/analysis.json
+Power the MiniPC, press one wimboot key, type nothing else.
+EOF
+elif [ "${WINDOW8}" -eq 1 ]; then
 cat <<EOF | tee -a "${LAUNCHER_LOG}"
 
 ==================================================
@@ -788,8 +828,16 @@ fi
     printf '%s\n' "${line}"
     case "${line}" in
       STAGE4_MATRIX_TERMINAL*marker=stage4_pass*)
+        if [ "${BATCH8}" -eq 1 ]; then
+          printf '\nBATCH8 CASES PASS — 4/4 Verified; review target classification in %s/matrix/analysis.json\n' "${EVID}"
+          continue
+        fi
         printf '\n############################################\n# STAGE 4 PASS — 10/10 verified + Worker PUT timing captured — review analysis.json\n# %s\n############################################\n' "${EVID}" ;;
       STAGE4_MATRIX_TERMINAL*marker=stage4_invalid*)
+        if [ "${BATCH8}" -eq 1 ]; then
+          printf '\nBATCH8 INVALID — missing, failed or contaminated evidence; inspect %s/matrix/analysis.json\n' "${EVID}"
+          continue
+        fi
         printf '\n????????????????????????????????????????????\n? STAGE 4 INVALID — 10/10 completed but Worker PUT timing evidence missing/short (Q2 unanswerable)\n? %s\n????????????????????????????????????????????\n' "${EVID}" ;;
       STAGE4_MATRIX_TERMINAL*marker=stage4_fail*)
         printf '\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n! STAGE 4 FAILED — stopped, evidence preserved\n! %s\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n' "${EVID}" ;;

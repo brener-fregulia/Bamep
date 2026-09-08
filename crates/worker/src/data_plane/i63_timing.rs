@@ -67,6 +67,8 @@ pub(super) struct StageTiming {
     /// `StagingChunk::finalize()` — flush + fsync(file) + no-replace placement
     /// + fsync(dir). The durability boundary.
     pub finalize_ns: u128,
+    pub batch_number: Option<u64>,
+    pub batch_wait_ns: u128,
 }
 
 /// A stopwatch for one chunk PUT handler invocation. Inert unless the sink env
@@ -146,7 +148,7 @@ impl PutTimer {
                 r#""commit_chunk_ns":{cc},"#,
                 r#""overlapping":{{"body_pump_ns":{bp},"staging_worker_ns":{sw}}},"#,
                 r#""begin_stage_ns":{bs},"write_sum_ns":{ws},"digest_ns":{dg},"#,
-                r#""finalize_ns":{fz}}}"#,
+                r#""finalize_ns":{fz}{batch}}}"#,
             ),
             ts = ts_ms,
             tid = a.transfer_id.hyphenated(),
@@ -163,6 +165,14 @@ impl PutTimer {
             ws = a.stage.write_sum_ns,
             dg = a.stage.digest_ns,
             fz = a.stage.finalize_ns,
+            batch = a
+                .stage
+                .batch_number
+                .map(|number| format!(
+                    ",\"batch_number\":{number},\"batch_wait_ns\":{}",
+                    a.stage.batch_wait_ns
+                ))
+                .unwrap_or_default(),
         );
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)

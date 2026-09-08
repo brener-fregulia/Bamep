@@ -162,6 +162,10 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Self {
+        Self::start_with_control_timeout(Duration::from_millis(800)).await
+    }
+
+    async fn start_with_control_timeout(control_timeout: Duration) -> Self {
         let identity = TestIdentity::generate();
         let leaf_der = identity.leaf_der.clone();
         let tls = build_server_config(
@@ -180,7 +184,7 @@ impl Harness {
         let (control, driver) = worker_control(
             socket_path,
             Duration::from_millis(20),
-            Duration::from_millis(800),
+            control_timeout,
             Uuid::new_v4(),
         );
         let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1849,4 +1853,196 @@ async fn wrong_methods_and_unknown_shapes_are_405_and_404() {
         response.body,
         json!({ "error": { "code": "UNKNOWN_ROUTE" } })
     );
+}
+
+/// Isolated child process: the experimental environment cannot affect the
+/// existing normal-path tests running concurrently in this integration binary.
+#[test]
+fn i63_batch8_https_durability_and_individual_commit_gates() {
+    const CHILD: &str = "BAMEP_I63_BATCH_HTTP_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "i63_batch8_https_durability_and_individual_commit_gates",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("BAMEP_I63_WORKER_BATCH_FINALIZE", "8")
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated batch HTTP proof failed");
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let harness = Harness::start_with_control_timeout(Duration::from_secs(8)).await;
+            let mut peer = harness.fake_bamepd().await;
+            let transfer_id = Uuid::new_v4();
+            const SIZE: usize = 64 * 1024 * 1024;
+            let payload = Bytes::from(vec![73; SIZE]);
+            let digest = sha256_b64(&payload);
+            let mut requests = Vec::new();
+            for index in 0..8 {
+                let addr = harness.server_addr;
+                let leaf = harness.leaf_der.clone();
+                let headers = put_headers(&digest);
+                let body = payload.clone();
+                requests.push(tokio::spawn(async move {
+                    let mut sender = connect(addr, &leaf).await;
+                    let mut builder = Request::builder().method("PUT").uri(format!(
+                        "https://bamep-worker-e2b-test.local{}",
+                        chunk_path(transfer_id, index)
+                    ));
+                    for (name, value) in headers {
+                        builder = builder.header(name, value);
+                    }
+                    timeout(
+                        Duration::from_secs(90),
+                        sender.send_request(builder.body(box_body(Full::new(body))).unwrap()),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status()
+                }));
+                let query = match peer.recv().await {
+                    WorkerProtocolMessage::AuthorizationQuery(q) => q,
+                    other => panic!("commit before full batch: {other:?}"),
+                };
+                assert_eq!(query.body.chunk_index, index);
+                if index == 7 {
+                    // Wait for all seven actual bodies, not a timing assumption.
+                    let staging = harness
+                        .finalized_chunk_path(transfer_id, 0)
+                        .parent()
+                        .unwrap()
+                        .join(".staging");
+                    timeout(Duration::from_secs(60), async {
+                        loop {
+                            assert!(
+                                (0..7).all(|i| !harness
+                                    .finalized_chunk_path(transfer_id, i)
+                                    .exists()),
+                                "seven members must not finalize before batch is full"
+                            );
+                            let complete = std::fs::read_dir(&staging)
+                                .map(|entries| {
+                                    entries
+                                        .filter_map(Result::ok)
+                                        .filter(|e| {
+                                            e.metadata().is_ok_and(|m| m.len() == SIZE as u64)
+                                        })
+                                        .count()
+                                })
+                                .unwrap_or(0);
+                            if complete == 7 {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("seven bodies staged");
+                    assert!(
+                        requests.iter().all(|r| !r.is_finished()),
+                        "no early HTTP success"
+                    );
+                    assert!(
+                        (0..8).all(|i| !harness.finalized_chunk_path(transfer_id, i).exists()),
+                        "seven members must not be independently finalized"
+                    );
+                    assert!(
+                        timeout(
+                            Duration::from_millis(100),
+                            bamep_worker_protocol::receive(&mut peer.stream)
+                        )
+                        .await
+                        .is_err(),
+                        "no commit before eighth member enters durability batch"
+                    );
+                }
+                peer.send(WorkerProtocolMessage::AuthorizationDecision(
+                    AuthorizationDecisionMessage::approved(
+                        query.envelope.message_id,
+                        WireDigestAlgorithm::Sha256,
+                        SIZE as u32,
+                        format!("batch-ticket-{index}"),
+                        None,
+                    ),
+                ))
+                .await;
+            }
+            let mut acceptances = Vec::new();
+            for _ in 0..8 {
+                let request = timeout(
+                    Duration::from_secs(60),
+                    bamep_worker_protocol::receive(&mut peer.stream),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                match request {
+                    WorkerProtocolMessage::ChunkAcceptanceRequest(r) => {
+                        assert!(
+                            (0..8).all(|i| harness.finalized_chunk_path(transfer_id, i).exists()),
+                            "every batch final name precedes the first commit"
+                        );
+                        acceptances.push(r);
+                    }
+                    other => panic!("expected individual commit: {other:?}"),
+                }
+            }
+            assert!(
+                requests.iter().all(|r| !r.is_finished()),
+                "durable bytes alone cannot ACK"
+            );
+            // Hold all but one control response. Each HTTP handler must wait for
+            // its own durable commit, even after every batch file is durable.
+            acceptances.sort_by_key(|r| r.body.chunk_index);
+            for request in acceptances {
+                let index = request.body.chunk_index as usize;
+                assert_eq!(request.body.digest, digest);
+                assert_eq!(request.body.size, SIZE as u32);
+                let decision = if index == 7 {
+                    ChunkAcceptanceDecisionMessage::rejected(
+                        request.envelope.message_id,
+                        ChunkAcceptanceRejectionReason::TransferNotContinuable,
+                    )
+                } else {
+                    ChunkAcceptanceDecisionMessage::committed(request.envelope.message_id)
+                };
+                peer.send(WorkerProtocolMessage::ChunkAcceptanceDecision(decision))
+                    .await;
+                let status = timeout(TEST_TIMEOUT, &mut requests[index])
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    status,
+                    if index == 7 {
+                        StatusCode::CONFLICT
+                    } else {
+                        StatusCode::CREATED
+                    }
+                );
+                assert!(
+                    requests.iter().skip(index + 1).all(|r| !r.is_finished()),
+                    "other requests require their own commit result"
+                );
+            }
+            // Fresh store startup plus exact bytes proves restart-readable final
+            // names. This does not claim power-cut validation on physical media.
+            let _fresh = FilesystemChunkStore::initialize(&harness.storage_dir.0).unwrap();
+            for index in 0..8 {
+                let bytes =
+                    std::fs::read(harness.finalized_chunk_path(transfer_id, index)).unwrap();
+                assert_eq!(bytes.as_slice(), payload.as_ref());
+                assert_eq!(sha256_b64(&bytes), digest);
+            }
+        });
 }

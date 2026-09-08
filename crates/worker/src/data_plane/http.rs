@@ -62,6 +62,8 @@ struct DataPlaneState {
     /// Unix-only; the data plane there is a compile-only stub).
     #[cfg_attr(not(unix), allow(dead_code))]
     chunk_store: FilesystemChunkStore,
+    #[cfg(unix)]
+    i63_batch: Option<std::sync::Arc<super::i63_batch::Coordinator>>,
 }
 
 /// Builds the exact `/api/data/v1/` router. Every path outside the three
@@ -71,6 +73,8 @@ pub fn router(control: WorkerControlHandle, chunk_store: FilesystemChunkStore) -
     let state = DataPlaneState {
         control,
         chunk_store,
+        #[cfg(unix)]
+        i63_batch: super::i63_batch::Coordinator::from_env(),
     };
 
     #[cfg_attr(not(unix), allow(unused_mut))]
@@ -237,6 +241,18 @@ async fn chunk_upload(
     };
     // ISSUE #63 STAGE 4 — inert unless `BAMEP_I63_WORKER_PUT_TIMING` is set.
     let mut i63 = super::i63_timing::PutTimer::start(transfer_id, chunk_index);
+    let mut batch_guard = state
+        .i63_batch
+        .as_ref()
+        .map(|b| b.request(transfer_id, chunk_index));
+    if state
+        .i63_batch
+        .as_ref()
+        .is_some_and(|b| b.failed(transfer_id))
+    {
+        i63.finish("batch_contaminated", None);
+        return authorization_denied();
+    }
     let Ok(proof) = parse_common(&headers) else {
         return malformed_request();
     };
@@ -277,6 +293,16 @@ async fn chunk_upload(
         }
     };
 
+    if state.i63_batch.is_some()
+        && (approved.chunk_size != 64 * 1024 * 1024 || approved.expected_chunk_digest.is_some())
+    {
+        eprintln!(
+            "Issue #63 batch_8: requires fresh 64 MiB chunks, indices 0..31; case contaminated"
+        );
+        i63.finish("batch_geometry_or_resume_rejected", None);
+        return authorization_denied();
+    }
+
     // Exhaustive: a future digest algorithm must not silently hash as SHA-256.
     match approved.digest_algorithm {
         bamep_worker_protocol::WireDigestAlgorithm::Sha256 => {}
@@ -298,18 +324,24 @@ async fn chunk_upload(
 
     // ---- stream into D1, hash, validate, finalize (steps 4-5) ----
     let i63_m = i63.active().then(Instant::now);
-    let (staged, stage_timing) = upload::stage_chunk_body(
-        state.chunk_store.clone(),
-        upload::StageRequest {
-            transfer_id,
-            chunk_index,
-            chunk_size: approved.chunk_size,
-            declared_digest,
-        },
-        body,
-        i63.active(),
-    )
-    .await;
+    let request = upload::StageRequest {
+        transfer_id,
+        chunk_index,
+        chunk_size: approved.chunk_size,
+        declared_digest,
+    };
+    let (staged, stage_timing) = if let Some(batch) = &state.i63_batch {
+        upload::stage_chunk_body_with_batch(
+            state.chunk_store.clone(),
+            request,
+            body,
+            i63.active(),
+            Some(batch.clone()),
+        )
+        .await
+    } else {
+        upload::stage_chunk_body(state.chunk_store.clone(), request, body, i63.active()).await
+    };
     i63.set_stage(
         i63_m.map(|m| m.elapsed().as_nanos()).unwrap_or(0),
         stage_timing,
@@ -351,10 +383,17 @@ async fn chunk_upload(
     }
     match commit_result {
         Ok(ChunkAcceptance::Committed) => {
+            if let Some(guard) = &mut batch_guard {
+                guard.committed();
+            }
             i63.finish("accepted", Some(verified_size));
             chunk_accepted(chunk_index)
         }
         Ok(ChunkAcceptance::AlreadyCommitted) => {
+            if batch_guard.is_some() {
+                i63.finish("batch_unexpected_already_committed", Some(verified_size));
+                return authorization_denied();
+            }
             i63.finish("already_held", Some(verified_size));
             chunk_already_held(chunk_index)
         }
@@ -403,6 +442,15 @@ async fn seal_manifest(
     let Some((chunk_count, artifact_digest)) = read_seal_body(body).await else {
         return malformed_request();
     };
+
+    if state
+        .i63_batch
+        .as_ref()
+        .is_some_and(|b| chunk_count != 32 || b.failed(transfer_id))
+    {
+        eprintln!("Issue #63 batch_8: seal requires clean 32-chunk geometry");
+        return authorization_denied();
+    }
 
     let input = ManifestSealInput {
         token: proof.token,

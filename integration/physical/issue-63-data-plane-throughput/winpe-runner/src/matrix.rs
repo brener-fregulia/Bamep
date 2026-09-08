@@ -758,7 +758,7 @@ pub fn parse_s4_case(json: &str) -> Result<S4PlannedCase, String> {
             .ok_or_else(|| format!("s4 case missing u64 field {k}"))
     };
     let mode = get_str("mode")?;
-    if mode != "serial" && mode != "prep_ahead_2" && mode != "prep_ahead_window_8" {
+    if mode != "serial" && mode != "prep_ahead_2" && mode != "prep_ahead_window_8" && mode != "prep_ahead_window_8_batch_8" {
         return Err(format!("s4 case has unknown mode {mode:?}"));
     }
     Ok(S4PlannedCase {
@@ -1191,6 +1191,15 @@ mod tests {
         "mode":"prep_ahead_window_8","cycle":1,"slot":2,
         "chunk_size_bytes":67108864,"extent_bytes":2147483648,"expected_chunk_count":32
     }"#;
+
+    #[test]
+    fn batch8_mode_is_forwarded_without_changing_window_pipeline_arguments() {
+        let c = parse_s4_case(&W8_CASE.replace("prep_ahead_window_8", "prep_ahead_window_8_batch_8")).unwrap();
+        let argv = s4_probe_argv(&cfg(), &c, "X:\\rt.cred");
+        let i = argv.iter().position(|a| a == "--mode").unwrap();
+        assert_eq!(argv[i+1], "prep_ahead_window_8_batch_8");
+        assert_eq!(c.chunk_size_bytes, 67108864);
+    }
 
     #[test]
     fn parse_s4_case_accepts_the_window8_mode() {

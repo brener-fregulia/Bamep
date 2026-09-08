@@ -170,6 +170,12 @@ mod fs_store;
 pub use fs_store::{ChunkStore, FilesystemChunkStore, StagingChunk, StoredChunkReader};
 
 #[cfg(unix)]
+pub(crate) use fs_store::{finalize_i63_batch, I63BatchTiming};
+
+#[cfg(all(unix, test))]
+pub(crate) use fs_store::i63_test_directory_gate;
+
+#[cfg(unix)]
 mod full_artifact;
 
 #[cfg(unix)]

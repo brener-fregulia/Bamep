@@ -10,6 +10,102 @@ use std::sync::{Arc, Barrier};
 
 use super::*;
 
+#[test]
+fn i63_batch8_installs_exact_bytes_surviving_store_restart() {
+    I63_SYNC_EVENTS.with(|events| events.borrow_mut().clear());
+    let tree = TempTree::new();
+    let store = FilesystemChunkStore::initialize(tree.root()).unwrap();
+    let transfer = Uuid::new_v4();
+    let mut members = Vec::new();
+    for index in 0..8 {
+        let bytes = vec![index as u8; 1024];
+        let mut staged = store.begin_stage(transfer, index, 1024).unwrap();
+        staged.write(&bytes).unwrap();
+        let digest = staged.digest();
+        members.push((staged, digest, 1024));
+    }
+    let mut timing = I63BatchTiming::default();
+    finalize_i63_batch(members, &mut timing).unwrap();
+    drop(store);
+    let fresh = FilesystemChunkStore::initialize(tree.root()).unwrap();
+    for index in 0..8 {
+        let mut reader = fresh.open_final(transfer, index).unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, vec![index as u8; 1024]);
+    }
+    assert_eq!(timing.directory_barriers, 1);
+    assert_eq!(timing.file_syncs, 8);
+    I63_SYNC_EVENTS.with(|events| {
+        assert_eq!(
+            *events.borrow(),
+            [
+                "file_begin",
+                "file_end",
+                "file_begin",
+                "file_end",
+                "file_begin",
+                "file_end",
+                "file_begin",
+                "file_end",
+                "file_begin",
+                "file_end",
+                "file_begin",
+                "file_end",
+                "file_begin",
+                "file_end",
+                "file_begin",
+                "file_end",
+                "directory_begin",
+                "directory_end",
+            ]
+        );
+    });
+}
+
+#[test]
+fn i63_batch8_rejects_invalid_groups_before_any_sync_or_publication() {
+    for defect in 0..9 {
+        let tree = TempTree::new();
+        let store = FilesystemChunkStore::initialize(tree.root()).unwrap();
+        let transfer = Uuid::new_v4();
+        let mut members = Vec::new();
+        for index in 0..8 {
+            let mut staged = store.begin_stage(transfer, index, 4).unwrap();
+            staged.write(&[index as u8; 4]).unwrap();
+            members.push((
+                staged,
+                Sha256Digest::from_raw(Sha256::digest([index as u8; 4]).into()),
+                4,
+            ));
+        }
+        match defect {
+            0 => {
+                members.pop();
+            }
+            1 => members[7].0.transfer_id = Uuid::new_v4(),
+            2 => members[7].0.chunks_dir = tree.base.clone(),
+            3 => members[7].0.chunk_index = 6,
+            4 => members[7].0.poisoned = true,
+            5 => members[7].0.written = 0,
+            6 => members[7].1 = members[0].1,
+            7 => members[7].2 = 3,
+            8 => members[7].0.file = None,
+            _ => unreachable!(),
+        }
+        let mut timing = I63BatchTiming::default();
+        assert!(
+            finalize_i63_batch(members, &mut timing).is_err(),
+            "defect {defect}"
+        );
+        assert_eq!(timing.file_syncs, 0);
+        assert_eq!(timing.directory_barriers, 0);
+        for index in 0..8 {
+            assert!(!final_path_for(&tree.root(), transfer, index).exists());
+        }
+    }
+}
+
 /// Isolated temporary storage tree, removed on drop. Mirrors the manual
 /// temp-dir + `Drop` pattern already used by this crate's TLS-identity and
 /// reconnect tests (no `tempfile` dependency introduced).
