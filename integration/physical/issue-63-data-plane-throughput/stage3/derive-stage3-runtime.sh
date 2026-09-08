@@ -51,6 +51,11 @@ HTTP_PORT="8080"; MATRIX_PORT="9210"; COORD_PORT="9206"; WSS_PORT="8443"; SINK_P
 SKEW_FLOOR_MS="-2000"; SKEW_CEIL_MS="2000"; NET_WAIT_SECS="180"; SEAL_TIMEOUT_SECS="300"
 MODEL_SUBSTR="256GB"
 RUN_ID="i63s3"; IFACE="enp8s0"
+# --stage 3 => the 36-case chunk-size matrix (runner `--matrix --arm`).
+# --stage 4 => the Issue #63 Stage-4 64 MiB serial-vs-prep-ahead micro-matrix
+#              (runner `--stage4 --arm`). ONLY the injected bootstrap .cmd and
+#              the runner arm token differ; the Phase-9d lineage is identical.
+STAGE="3"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 die() { echo "derive-stage3: FATAL: $*" >&2; exit 1; }
@@ -74,6 +79,7 @@ while [ $# -gt 0 ]; do
     --seal-timeout-secs) SEAL_TIMEOUT_SECS="$2"; shift 2 ;;
     --model-substr) MODEL_SUBSTR="$2"; shift 2 ;;
     --run-id) RUN_ID="$2"; shift 2 ;;
+    --stage) STAGE="$2"; shift 2 ;;
     --iface) IFACE="$2"; shift 2 ;;
     -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -92,6 +98,17 @@ done
 [ -d "${PHASE9D_DIR}" ] || die "Phase-9d runtime not found at ${PHASE9D_DIR}"
 [ -e "${OUT}" ] && die "refusing to overwrite existing ${OUT} — pass a fresh --out path"
 
+case "${STAGE}" in
+  3) BOOT_CMD_NAME="bamep-i63-stage3-bootstrap.cmd"; RUNNER_ARM_TOKEN="--matrix --arm"
+     WINPESHL_SRC="${SCRIPT_DIR}/winpeshl.ini" ;;
+  4) BOOT_CMD_NAME="bamep-i63-stage4-bootstrap.cmd"; RUNNER_ARM_TOKEN="--stage4 --arm"
+     WINPESHL_SRC="${SCRIPT_DIR}/winpeshl-stage4.ini" ;;
+  *) die "--stage must be 3 or 4 (got ${STAGE})" ;;
+esac
+BOOT_TPL="${SCRIPT_DIR}/${BOOT_CMD_NAME}.template"
+[ -f "${BOOT_TPL}" ] || die "bootstrap template not found: ${BOOT_TPL}"
+[ -f "${WINPESHL_SRC}" ] || die "winpeshl source not found: ${WINPESHL_SRC}"
+
 hash_of() { sha256sum "$1" | awk '{print $1}'; }
 
 # 1. verify every Phase-9d source asset against the pinned hash (BEFORE)
@@ -104,7 +121,7 @@ for rel in "${!PIN[@]}"; do
   [ "${got}" = "${PIN[$rel]}" ] || die "Phase-9d asset ${rel} hash ${got} != pinned — refusing to derive"
   printf '%s  %s\n' "${got}" "${rel}"
 done | sort > "${BEFORE}"
-echo "derive-stage3: Phase-9d source assets verified against pinned hashes (7 files)"
+echo "derive-stage${STAGE}: Phase-9d source assets verified against pinned hashes (7 files)"
 
 # 2. build the derived tree
 mkdir -p "${OUT}/tftp/ipxeboot/x86_64-sb" "${OUT}/http"
@@ -120,13 +137,13 @@ ln -s "${PHASE9D_DIR}/http/boot.wim" "${OUT}/http/boot.wim"
 #     boot.wim LAST. wimboot pause kept (the one intentional operator keypress).
 cat > "${OUT}/tftp/ipxeboot/x86_64-sb/autoexec.ipxe" <<EOF
 #!ipxe
-echo Bamep Issue 63 Stage 3 (derived from Phase 9d - boot.wim/BCD/boot.sdi unmodified)
+echo Bamep Issue 63 Stage ${STAGE} (derived from Phase 9d - boot.wim/BCD/boot.sdi unmodified)
 show efi/SecureBoot
 kernel http://${LAB_IP}:${HTTP_PORT}/wimboot pause
 initrd http://${LAB_IP}:${HTTP_PORT}/BCD BCD
 initrd http://${LAB_IP}:${HTTP_PORT}/boot.sdi boot.sdi
 initrd http://${LAB_IP}:${HTTP_PORT}/winpeshl.ini winpeshl.ini
-initrd http://${LAB_IP}:${HTTP_PORT}/bamep-i63-stage3-bootstrap.cmd bamep-i63-stage3-bootstrap.cmd
+initrd http://${LAB_IP}:${HTTP_PORT}/${BOOT_CMD_NAME} ${BOOT_CMD_NAME}
 initrd http://${LAB_IP}:${HTTP_PORT}/bamep-i63-runner.exe bamep-i63-runner.exe
 initrd http://${LAB_IP}:${HTTP_PORT}/bamep-i63-stage2-probe.exe bamep-i63-stage2-probe.exe
 initrd http://${LAB_IP}:${HTTP_PORT}/bamep-i63-enroll.cred bamep-i63-enroll.cred
@@ -136,7 +153,7 @@ boot
 EOF
 
 # 2d. injected System32 payload
-install -m 0644 "${SCRIPT_DIR}/winpeshl.ini" "${OUT}/http/winpeshl.ini"
+install -m 0644 "${WINPESHL_SRC}" "${OUT}/http/winpeshl.ini"
 sed -e "s|@RUN_ID@|${RUN_ID}|g" \
     -e "s|@LAB_IP@|${LAB_IP}|g" \
     -e "s|@MATRIX_PORT@|${MATRIX_PORT}|g" \
@@ -149,11 +166,11 @@ sed -e "s|@RUN_ID@|${RUN_ID}|g" \
     -e "s|@SKEW_CEIL_MS@|${SKEW_CEIL_MS}|g" \
     -e "s|@NET_WAIT_SECS@|${NET_WAIT_SECS}|g" \
     -e "s|@SEAL_TIMEOUT_SECS@|${SEAL_TIMEOUT_SECS}|g" \
-    "${SCRIPT_DIR}/bamep-i63-stage3-bootstrap.cmd.template" > "${OUT}/http/bamep-i63-stage3-bootstrap.cmd"
-chmod 0644 "${OUT}/http/bamep-i63-stage3-bootstrap.cmd"
-grep -qE '@[A-Z_]+@' "${OUT}/http/bamep-i63-stage3-bootstrap.cmd" && die "unsubstituted @TOKEN@ left in bootstrap.cmd"
-grep -qF -- '--matrix --arm' "${OUT}/http/bamep-i63-stage3-bootstrap.cmd" || die "bootstrap.cmd does not launch the runner with --matrix --arm"
-grep -qF -- "${PIN_HEX}" "${OUT}/http/bamep-i63-stage3-bootstrap.cmd" || die "bootstrap.cmd does not carry the pin"
+    "${BOOT_TPL}" > "${OUT}/http/${BOOT_CMD_NAME}"
+chmod 0644 "${OUT}/http/${BOOT_CMD_NAME}"
+grep -qE '@[A-Z_]+@' "${OUT}/http/${BOOT_CMD_NAME}" && die "unsubstituted @TOKEN@ left in bootstrap.cmd"
+grep -qF -- "${RUNNER_ARM_TOKEN}" "${OUT}/http/${BOOT_CMD_NAME}" || die "bootstrap.cmd does not launch the runner with ${RUNNER_ARM_TOKEN}"
+grep -qF -- "${PIN_HEX}" "${OUT}/http/${BOOT_CMD_NAME}" || die "bootstrap.cmd does not carry the pin"
 install -m 0644 "${RUNNER_EXE}" "${OUT}/http/bamep-i63-runner.exe"
 install -m 0644 "${PROBE_EXE}"  "${OUT}/http/bamep-i63-stage2-probe.exe"
 install -m 0600 "${ENROLL_CRED}" "${OUT}/http/bamep-i63-enroll.cred"
@@ -225,7 +242,7 @@ echo "derive-stage3: secret sweep OK (only the single mode-600 first-contact cre
 # 6. structural checks on the derived autoexec
 AX="${OUT}/tftp/ipxeboot/x86_64-sb/autoexec.ipxe"
 for inj in "winpeshl.ini winpeshl.ini" \
-           "bamep-i63-stage3-bootstrap.cmd bamep-i63-stage3-bootstrap.cmd" \
+           "${BOOT_CMD_NAME} ${BOOT_CMD_NAME}" \
            "bamep-i63-runner.exe bamep-i63-runner.exe" \
            "bamep-i63-stage2-probe.exe bamep-i63-stage2-probe.exe" \
            "bamep-i63-enroll.cred bamep-i63-enroll.cred"; do
@@ -247,7 +264,7 @@ echo "derive-stage3: derived autoexec.ipxe structurally OK (5 injections, boot.w
   echo "## authored / substituted / copied (independent bytes; credential hash NOT listed):"
   sha256sum "${AX}" \
             "${OUT}/http/winpeshl.ini" \
-            "${OUT}/http/bamep-i63-stage3-bootstrap.cmd" \
+            "${OUT}/http/${BOOT_CMD_NAME}" \
             "${OUT}/http/bamep-i63-runner.exe" \
             "${OUT}/http/bamep-i63-stage2-probe.exe" \
             "${OUT}/tftp/ipxe.efi" \

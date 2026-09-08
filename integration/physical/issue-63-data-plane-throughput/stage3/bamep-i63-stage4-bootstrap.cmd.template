@@ -1,0 +1,37 @@
+@echo off
+rem  Bamep Issue #63 Stage 4 — WinPE auto-start bootstrap. THROWAWAY LAB ONLY.
+rem
+rem  Injected into X:\Windows\System32 by the DERIVED Issue-63 autoexec.ipxe via
+rem  wimboot's boot-time file overlay. The Phase-9d boot.wim / BCD / boot.sdi are
+rem  NOT modified.
+rem
+rem  It runs wpeinit (network + PnP), then launches the Stage-4 micro-matrix
+rem  runner with `--stage4 --arm` and explicit typed argv. The runner asks the
+rem  Stage-4 coordinator for each of the 10 typed cases (2 warm-up + 8 measured,
+rem  64 MiB only, serial vs prep-ahead depth-2), aligns the WinPE UTC clock
+rem  OUTSIDE the measured wall (the proven Stage-1 SetSystemTime path), and
+rem  launches ONE Issue-63 transfer probe per case (with `--mode serial` or
+rem  `--mode prep_ahead_2`) against the #61-shaped Stage-4 harness. The operator
+rem  types NOTHING in WinPE after the one wimboot keypress.
+setlocal
+set "EV=X:\bamep-i63-events.ndjson"
+> "%EV%" echo {"event":"winpe.booted","origin":"bootstrap","run_id":"@RUN_ID@","bootstrap_local_ts":"%DATE% %TIME%"}
+echo [bamep-i63] Stage 4 bootstrap: running wpeinit (network + PnP init)...
+wpeinit
+>> "%EV%" echo {"event":"winpe.wpeinit_complete","origin":"bootstrap","run_id":"@RUN_ID@","bootstrap_local_ts":"%DATE% %TIME%"}
+echo [bamep-i63] launching the Stage 4 micro-matrix runner (ARMED)...
+rem  run_id is NOT passed to the runner: it receives the authoritative run_id on
+rem  every typed Case from the Stage-4 coordinator. The run_id token stays in the
+rem  evidence lines above only.
+X:\Windows\System32\bamep-i63-runner.exe --stage4 --arm --matrix-coord @LAB_IP@:@MATRIX_PORT@ --coord @LAB_IP@:@COORD_PORT@ --wss @LAB_IP@:@WSS_PORT@ --sink @LAB_IP@:@SINK_PORT@ --pin @PIN@ --probe X:\Windows\System32\bamep-i63-stage2-probe.exe --enroll-credential-file X:\Windows\System32\bamep-i63-enroll.cred --runtime-credential-file X:\bamep-i63-runtime.cred --select-model-substr "@MODEL_SUBSTR@" --skew-floor-ms @SKEW_FLOOR_MS@ --skew-ceil-ms @SKEW_CEIL_MS@ --net-wait-secs @NET_WAIT_SECS@ --seal-timeout-secs @SEAL_TIMEOUT_SECS@
+set "RC=%ERRORLEVEL%"
+echo.
+echo BAMEP_I63_STAGE4_RUNNER_EXITCODE=%RC%
+if "%RC%"=="0" (
+  echo [bamep-i63] Stage 4 runner reported STAGE4_RUNNER_DONE. Watch the Fedora
+  echo            coordinator for STAGE4_MATRIX_TERMINAL marker=stage4_pass, then power the MiniPC off.
+) else (
+  echo [bamep-i63] Stage 4 runner exited rc=%RC%. The matrix STOPPED; no retry. See the
+  echo            probe lines above and the Fedora coordinator output. This CMD stays open.
+)
+endlocal

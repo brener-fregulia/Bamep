@@ -14,12 +14,26 @@
 //! or `Verified`/`Failed` decision; the caller (`http::chunk_upload`) drives
 //! E1 `authorize_chunk` before calling in and E1 `commit_chunk` after.
 
+use std::time::Instant;
+
 use axum::body::{Body, Bytes};
 use http_body_util::BodyExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use super::i63_timing::StageTiming;
 use crate::storage::{ChunkStore, FilesystemChunkStore, StagingChunk, StorageError};
+
+/// Issue #63 Stage 4: `Instant::now()` iff timing is active — otherwise no
+/// clock is read at all.
+#[inline]
+fn i63_mark(active: bool) -> Option<Instant> {
+    active.then(Instant::now)
+}
+#[inline]
+fn i63_since(mark: Option<Instant>) -> u128 {
+    mark.map(|t| t.elapsed().as_nanos()).unwrap_or(0)
+}
 
 /// How many body frames may sit buffered between the async pump and the
 /// blocking staging worker. Small: this only smooths over the boundary
@@ -71,14 +85,24 @@ enum PumpMessage {
 
 /// Streams `body` into a fresh D1 staging file, validates size + digest, and
 /// finalizes into a restart-stable no-replace final iff the bytes are valid.
+///
+/// `i63_active` (Issue #63 Stage 4): when `true`, the returned [`StageTiming`]
+/// is populated; when `false`, no clock is read and it is all zero. The staging
+/// behaviour is byte-for-byte identical either way.
 pub(super) async fn stage_chunk_body(
     store: FilesystemChunkStore,
     request: StageRequest,
     body: Body,
-) -> StageOutcome {
+    i63_active: bool,
+) -> (StageOutcome, StageTiming) {
     let (tx, rx) = mpsc::channel::<PumpMessage>(FRAME_CHANNEL_CAPACITY);
-    let worker = tokio::task::spawn_blocking(move || stage_worker(store, request, rx));
 
+    // The staging worker runs concurrently with the body pump below; time both
+    // from here — the two intervals OVERLAP and are labelled as such.
+    let worker_mark = i63_mark(i63_active);
+    let worker = tokio::task::spawn_blocking(move || stage_worker(store, request, rx, i63_active));
+
+    let pump_mark = i63_mark(i63_active);
     let mut body = body;
     loop {
         match body.frame().await {
@@ -104,20 +128,28 @@ pub(super) async fn stage_chunk_body(
         }
     }
     drop(tx);
+    let body_pump_ns = i63_since(pump_mark);
 
-    match worker.await {
-        Ok(outcome) => outcome,
-        Err(_) => StageOutcome::StorageUnavailable,
-    }
+    let (outcome, mut timing) = match worker.await {
+        Ok(pair) => pair,
+        Err(_) => (StageOutcome::StorageUnavailable, StageTiming::default()),
+    };
+    timing.body_pump_ns = body_pump_ns;
+    timing.staging_worker_ns = i63_since(worker_mark);
+    (outcome, timing)
 }
 
 /// The blocking half: owns the [`StagingChunk`] and never yields it across an
 /// `await`. Returns as soon as the outcome is known.
+///
+/// `i63_active` (Issue #63 Stage 4): gates whether the per-phase `Instant`s are
+/// read. The staging behaviour is identical regardless.
 fn stage_worker(
     store: FilesystemChunkStore,
     request: StageRequest,
     mut rx: mpsc::Receiver<PumpMessage>,
-) -> StageOutcome {
+    i63_active: bool,
+) -> (StageOutcome, StageTiming) {
     let StageRequest {
         transfer_id,
         chunk_index,
@@ -125,27 +157,34 @@ fn stage_worker(
         declared_digest,
     } = request;
 
+    let mut t = StageTiming::default();
+
+    let m = i63_mark(i63_active);
     let mut staging: StagingChunk =
         match store.begin_stage(transfer_id, chunk_index, u64::from(chunk_size)) {
             Ok(staging) => staging,
-            Err(_) => return StageOutcome::StorageUnavailable,
+            Err(_) => return (StageOutcome::StorageUnavailable, t),
         };
+    t.begin_stage_ns = i63_since(m);
 
     while let Some(message) = rx.blocking_recv() {
         match message {
             PumpMessage::Data(bytes) => {
-                if let Err(err) = staging.write(&bytes) {
+                let m = i63_mark(i63_active);
+                let write_result = staging.write(&bytes);
+                t.write_sum_ns += i63_since(m);
+                if let Err(err) = write_result {
                     let outcome = match err {
                         StorageError::Oversize { .. } => StageOutcome::TooLarge,
                         _ => StageOutcome::StorageUnavailable,
                     };
                     staging.discard();
-                    return outcome;
+                    return (outcome, t);
                 }
             }
             PumpMessage::Truncated => {
                 staging.discard();
-                return StageOutcome::StorageUnavailable;
+                return (StageOutcome::StorageUnavailable, t);
             }
         }
     }
@@ -153,17 +192,19 @@ fn stage_worker(
     let size = staging.staged_len();
     if size == 0 {
         staging.discard();
-        return StageOutcome::EmptyBody;
+        return (StageOutcome::EmptyBody, t);
     }
 
     // Both values are canonical base64url-no-pad SHA-256 text and public
     // integrity identities, not secrets — a plain canonical-string compare is
     // the contract's identity test (`m0-...` "Durable chunk acceptance
     // ordering", step 5).
+    let m = i63_mark(i63_active);
     let computed = staging.digest().to_base64url_no_pad();
+    t.digest_ns = i63_since(m);
     if computed != declared_digest {
         staging.discard();
-        return StageOutcome::DigestMismatch;
+        return (StageOutcome::DigestMismatch, t);
     }
 
     let size = match u32::try_from(size) {
@@ -171,11 +212,14 @@ fn stage_worker(
         // Unreachable: `size <= chunk_size <= u32::MAX`. Fail closed anyway.
         Err(_) => {
             staging.discard();
-            return StageOutcome::StorageUnavailable;
+            return (StageOutcome::StorageUnavailable, t);
         }
     };
 
-    match staging.finalize() {
+    let m = i63_mark(i63_active);
+    let finalized = staging.finalize();
+    t.finalize_ns = i63_since(m);
+    let outcome = match finalized {
         Ok(_finalized) => StageOutcome::Finalized {
             size,
             digest: computed,
@@ -183,7 +227,8 @@ fn stage_worker(
         Err(StorageError::FinalizedChunkConflict { .. }) => StageOutcome::LocalIdentityConflict,
         Err(StorageError::EmptyChunk) => StageOutcome::EmptyBody,
         Err(_) => StageOutcome::StorageUnavailable,
-    }
+    };
+    (outcome, t)
 }
 
 #[cfg(test)]
@@ -261,10 +306,11 @@ mod tests {
         let root = TempRoot::new();
         let transfer_id = Uuid::new_v4();
         let payload = vec![9u8; 2048];
-        let outcome = stage_chunk_body(
+        let (outcome, _timing) = stage_chunk_body(
             root.store(),
             request(transfer_id, 4096, digest_b64(&payload)),
             Body::from(payload.clone()),
+            false,
         )
         .await;
         match outcome {
@@ -285,10 +331,11 @@ mod tests {
         let root = TempRoot::new();
         let transfer_id = Uuid::new_v4();
         let body = Body::new(FrameThenError(Some(Bytes::from(vec![1u8; 512]))));
-        let outcome = stage_chunk_body(
+        let (outcome, _timing) = stage_chunk_body(
             root.store(),
             request(transfer_id, 65536, "A".repeat(43)),
             body,
+            false,
         )
         .await;
         assert!(
@@ -301,10 +348,11 @@ mod tests {
     #[tokio::test]
     async fn an_empty_body_is_reported_as_empty() {
         let root = TempRoot::new();
-        let outcome = stage_chunk_body(
+        let (outcome, _timing) = stage_chunk_body(
             root.store(),
             request(Uuid::new_v4(), 4096, digest_b64(&[])),
             Body::empty(),
+            false,
         )
         .await;
         assert!(matches!(outcome, StageOutcome::EmptyBody));
@@ -314,10 +362,11 @@ mod tests {
     async fn a_body_over_chunk_size_is_reported_too_large() {
         let root = TempRoot::new();
         let payload = vec![2u8; 5000];
-        let outcome = stage_chunk_body(
+        let (outcome, _timing) = stage_chunk_body(
             root.store(),
             request(Uuid::new_v4(), 4096, digest_b64(&payload)),
             Body::from(payload),
+            false,
         )
         .await;
         assert!(matches!(outcome, StageOutcome::TooLarge));
@@ -327,14 +376,65 @@ mod tests {
     async fn bytes_that_disagree_with_the_declared_digest_are_a_mismatch() {
         let root = TempRoot::new();
         let transfer_id = Uuid::new_v4();
-        let outcome = stage_chunk_body(
+        let (outcome, _timing) = stage_chunk_body(
             root.store(),
             request(transfer_id, 4096, digest_b64(&[0u8; 100])),
             Body::from(vec![1u8; 100]),
+            false,
         )
         .await;
         assert!(matches!(outcome, StageOutcome::DigestMismatch));
         assert!(!root.final_path(transfer_id, 0).exists());
+    }
+
+    /// ISSUE #63 STAGE 4: with `i63_active = true` the staging composition
+    /// reports its per-phase sub-timings; with `false` it reports all zero and
+    /// the outcome is identical. (The env-gated `PutTimer` / NDJSON sink is a
+    /// separate concern not exercised here.)
+    #[tokio::test]
+    async fn i63_stage_timing_is_populated_only_when_active_and_never_changes_the_outcome() {
+        let root = TempRoot::new();
+        let payload = vec![7u8; 4096];
+
+        let (off_outcome, off_t) = stage_chunk_body(
+            root.store(),
+            request(Uuid::new_v4(), 8192, digest_b64(&payload)),
+            Body::from(payload.clone()),
+            false,
+        )
+        .await;
+        assert!(matches!(off_outcome, StageOutcome::Finalized { .. }));
+        assert_eq!(
+            (
+                off_t.body_pump_ns,
+                off_t.staging_worker_ns,
+                off_t.begin_stage_ns,
+                off_t.write_sum_ns,
+                off_t.digest_ns,
+                off_t.finalize_ns
+            ),
+            (0, 0, 0, 0, 0, 0),
+            "inactive => no clock read"
+        );
+
+        let (on_outcome, on_t) = stage_chunk_body(
+            root.store(),
+            request(Uuid::new_v4(), 8192, digest_b64(&payload)),
+            Body::from(payload.clone()),
+            true,
+        )
+        .await;
+        assert!(matches!(on_outcome, StageOutcome::Finalized { .. }));
+        assert!(on_t.staging_worker_ns > 0, "staging worker wall measured");
+        assert!(on_t.write_sum_ns > 0, "write+hash measured");
+        assert!(on_t.finalize_ns > 0, "finalize/fsync measured");
+        // body_pump and staging_worker overlap: neither is the sum of the other
+        // parts, and staging_worker envelops begin_stage+write+digest+finalize.
+        assert!(
+            on_t.staging_worker_ns
+                >= on_t.begin_stage_ns + on_t.write_sum_ns + on_t.digest_ns + on_t.finalize_ns,
+            "staging_worker_ns envelops its sequential sub-phases"
+        );
     }
 
     // `StageOutcome` deliberately carries no `Debug`; this is test-only.

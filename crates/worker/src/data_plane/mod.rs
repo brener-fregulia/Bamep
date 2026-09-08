@@ -56,6 +56,10 @@
 //! re-drives verification (`m0-...` "Durable chunk acceptance ordering").
 
 mod http;
+/// ISSUE #63 STAGE 4 — throwaway lab-only PUT-boundary timing hook. Inert
+/// unless `BAMEP_I63_WORKER_PUT_TIMING` is set. See the module doc.
+#[cfg(unix)]
+mod i63_timing;
 #[cfg(unix)]
 mod upload;
 

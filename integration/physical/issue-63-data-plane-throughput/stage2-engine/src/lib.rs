@@ -32,6 +32,10 @@ pub mod lifecycle;
 pub mod matrix;
 pub mod result;
 pub mod safety;
+/// Issue #63 **Stage 4** micro-matrix (64 MiB serial vs prep-ahead depth-2) +
+/// paired analysis + Worker PUT decomposition. Separate from the Stage-3
+/// [`matrix`]/[`result`]/[`analysis`] authority; nothing here arms a transfer.
+pub mod stage4;
 
 /// One mebibyte.
 pub const MIB: u64 = 1024 * 1024;

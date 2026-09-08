@@ -243,7 +243,7 @@ fn parse_matrix_args() -> Result<MatrixArgs, String> {
     while let Some(x) = it.next() {
         let mut next = || it.next().ok_or_else(|| format!("{x} needs a value"));
         match x.as_str() {
-            "--matrix" | "--arm" => {}
+            "--matrix" | "--arm" | "--stage4" => {}
             "--matrix-coord" => a.matrix_coord = next()?,
             "--probe" => a.probe_path = next()?,
             "--coord" => a.harness_coord = next()?,
@@ -720,6 +720,343 @@ pub fn run_armed() -> i32 {
     }
 }
 
+// ===================================================================
+// Issue #63 STAGE 4 — 64 MiB serial-vs-prep-ahead micro-matrix loop.
+//
+// Reached ONLY via `bamep-i63-runner --stage4 --arm ...`. Same shape as the
+// Stage-3 loop above, but: the case carries a `mode` (serial | prep_ahead_2)
+// which is forwarded to the probe as `--mode`, the chunk size is always 64 MiB,
+// and the per-case result is the self-contained `S4CaseResult` shape (NOT the
+// Stage-3 `CaseResult`). The runner opens no device and injects no fault.
+// ===================================================================
+
+/// The Stage-4 case fields the runner forwards.
+pub struct S4PlannedCase {
+    pub run_id: String,
+    pub case_id: String,
+    pub phase: String,
+    /// `"serial"` | `"prep_ahead_2"` — passed verbatim to the probe `--mode`.
+    pub mode: String,
+    pub cycle: Option<u64>,
+    pub slot: Option<u64>,
+    pub chunk_size_bytes: u64,
+    pub extent_bytes: u64,
+    pub expected_chunk_count: u64,
+}
+
+pub fn parse_s4_case(json: &str) -> Result<S4PlannedCase, String> {
+    let v: Value = serde_json::from_str(json).map_err(|e| format!("s4 case JSON: {e}"))?;
+    let get_str = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .map(String::from)
+            .ok_or_else(|| format!("s4 case missing string field {k}"))
+    };
+    let get_u64 = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| format!("s4 case missing u64 field {k}"))
+    };
+    let mode = get_str("mode")?;
+    if mode != "serial" && mode != "prep_ahead_2" {
+        return Err(format!("s4 case has unknown mode {mode:?}"));
+    }
+    Ok(S4PlannedCase {
+        run_id: get_str("run_id")?,
+        case_id: get_str("case_id")?,
+        phase: get_str("phase")?,
+        mode,
+        cycle: v.get("cycle").and_then(|x| x.as_u64()),
+        slot: v.get("slot").and_then(|x| x.as_u64()),
+        chunk_size_bytes: get_u64("chunk_size_bytes")?,
+        extent_bytes: get_u64("extent_bytes")?,
+        expected_chunk_count: get_u64("expected_chunk_count")?,
+    })
+}
+
+/// The exact probe argv for a Stage-4 case — `probe_argv` plus `--mode`.
+pub fn s4_probe_argv(
+    cfg: &MatrixRunnerConfig,
+    case: &S4PlannedCase,
+    auth_credential_file: &str,
+) -> Vec<String> {
+    let base = PlannedCase {
+        run_id: case.run_id.clone(),
+        case_id: case.case_id.clone(),
+        phase: case.phase.clone(),
+        cycle: case.cycle,
+        slot: case.slot,
+        chunk_size_bytes: case.chunk_size_bytes,
+        extent_bytes: case.extent_bytes,
+        expected_chunk_count: case.expected_chunk_count,
+    };
+    let mut argv = probe_argv(cfg, &base, auth_credential_file);
+    argv.push("--mode".into());
+    argv.push(case.mode.clone());
+    argv
+}
+
+/// Merge the probe's `probe.case_result` line + the plan case into an
+/// `bamep_i63_stage2_engine::stage4::S4CaseResult`-shaped JSON object.
+pub fn build_s4_case_result(case: &S4PlannedCase, pr: Option<&Value>, probe_exit: i32) -> Value {
+    let (
+        transfer_id,
+        artifact_id,
+        b_wall,
+        v_wall,
+        resume_ms,
+        seal_d2_ms,
+        chunks,
+        read_ms,
+        chunk_sha_ms,
+        rolling_sha_ms,
+        proof_ms,
+        put_ack_ms,
+        prepared_peak,
+        device_reads,
+        artifact_status,
+        case_status,
+    ) = match pr {
+        Some(v) => (
+            v.get("transfer_id").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(String::from),
+            v.get("artifact_id").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(String::from),
+            num(v, "bulk_stream_wall_ms"),
+            num(v, "verified_transfer_wall_ms"),
+            num(v, "resume_ms"),
+            num(v, "seal_d2_ms"),
+            {
+                let c = u64f(v, "chunk_count");
+                if c > 0 { c } else { case.expected_chunk_count }
+            },
+            num(v, "read_ms"),
+            num(v, "chunk_sha_ms"),
+            num(v, "rolling_sha_ms"),
+            num(v, "proof_ms"),
+            num(v, "put_ack_ms"),
+            u64f(v, "prepared_buffer_peak"),
+            u64f(v, "device_read_count"),
+            v.get("final_artifact_status").and_then(|x| x.as_str()).unwrap_or("none").to_string(),
+            v.get("case_status").and_then(|x| x.as_str()).unwrap_or("failed:no_probe_result").to_string(),
+        ),
+        None => (
+            None, None, 0.0, 0.0, 0.0, 0.0, case.expected_chunk_count, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0, 0, "none".into(),
+            format!("failed:no_probe_result(exit={probe_exit})"),
+        ),
+    };
+
+    json!({
+        "run_id": case.run_id,
+        "case_id": case.case_id,
+        "mode": case.mode,
+        "phase": case.phase,
+        "cycle": case.cycle,
+        "slot": case.slot,
+        "chunk_size_bytes": case.chunk_size_bytes,
+        "extent_bytes": case.extent_bytes,
+        "chunk_count": chunks,
+        "transfer_id": transfer_id,
+        "artifact_id": artifact_id,
+        "bulk_stream_wall_ms": b_wall,
+        "verified_transfer_wall_ms": v_wall,
+        "resume_ms": resume_ms,
+        "seal_d2_ms": seal_d2_ms,
+        "read_ms": read_ms,
+        "chunk_sha_ms": chunk_sha_ms,
+        "rolling_sha_ms": rolling_sha_ms,
+        "proof_ms": proof_ms,
+        "put_ack_ms": put_ack_ms,
+        "prepared_buffer_peak": prepared_peak,
+        "device_read_count": device_reads,
+        "final_artifact_status": artifact_status,
+        "case_status": case_status,
+    })
+}
+
+/// `--stage4` (NOT armed): explain + exit 0. No network, no clock change, no
+/// device access, no transfer.
+pub fn run_stage4_not_armed() -> i32 {
+    println!("STAGE4_RUNNER_NOT_ARMED");
+    println!(
+        "bamep-i63-runner --stage4: the Stage-4 micro-matrix loop is present but NOT armed. \
+         Pass `--stage4 --arm ...` (run-stage4-lab.sh does this in the derived WinPE bootstrap \
+         ONLY after host-side preflight). STAGE4 NOT ARMED."
+    );
+    0
+}
+
+/// Entry point for `bamep-i63-runner --stage4 --arm ...`.
+pub fn run_stage4_armed() -> i32 {
+    println!("STAGE4_RUNNER_ARMED");
+    let a = match parse_matrix_args() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("bamep-i63-runner --stage4 --arm: FATAL: {e}");
+            return exit::BAD_ARGS;
+        }
+    };
+    let mut log = Log::new(&a.local_evidence);
+    log.emit(
+        "info",
+        "stage4.runner_start",
+        json!({
+            "clock_backend": clock::BACKEND,
+            "matrix_coord": a.matrix_coord,
+            "harness_coord": a.harness_coord,
+            "harness_wss": a.harness_wss,
+            "probe": a.probe_path,
+            "skew_window_ms": [a.skew_floor_ms, a.skew_ceil_ms],
+        }),
+    );
+
+    if let Err(e) = wait_for_network(&mut log, &a.matrix_coord, a.net_wait_secs) {
+        log.emit("error", "stage4.network_unreachable", json!({ "detail": e }));
+        return exit::NET_NOT_READY;
+    }
+    if let Err(e) = align_clock(&mut log, &a, true) {
+        log.emit("error", "stage4.clock_alignment_failed", json!({ "detail": e }));
+        return exit::CLOCK_FAILED;
+    }
+
+    let cfg = MatrixRunnerConfig {
+        probe_path: a.probe_path.clone(),
+        coord: a.harness_coord.clone(),
+        sink: a.sink.clone(),
+        wss: a.harness_wss.clone(),
+        pin_hex: a.pin_hex.clone(),
+        runtime_credential_out: a.runtime_cred.clone(),
+        select_model_substr: a.select_model_substr.clone(),
+        seal_timeout_secs: a.seal_timeout_secs,
+    };
+
+    let mut case_index = 0usize;
+    loop {
+        let resp = match matrix_rpc(&a.matrix_coord, &json!({ "op": "next_case" })) {
+            Ok(r) => r,
+            Err(e) => {
+                log.emit("error", "stage4.next_case_rpc_failed", json!({ "detail": e }));
+                return exit::COORD_PROTOCOL;
+            }
+        };
+        if let Some(mc) = resp.get("matrix_completed") {
+            let completed = mc.get("completed").and_then(|x| x.as_u64()).unwrap_or(0);
+            log.emit("info", "stage4.matrix_completed", json!({ "completed": completed }));
+            println!("STAGE4_RUNNER_DONE completed={completed}");
+            return exit::DONE;
+        }
+        if let Some(h) = resp.get("halt") {
+            log.emit("error", "stage4.matrix_halted", json!({ "reason": h }));
+            println!("STAGE4_RUNNER_HALTED reason={h}");
+            return exit::MATRIX_HALTED;
+        }
+        let case_json = match resp.get("case") {
+            Some(c) => c.to_string(),
+            None => {
+                log.emit("error", "stage4.next_case_unexpected", json!({ "resp": resp }));
+                return exit::COORD_PROTOCOL;
+            }
+        };
+        let case = match parse_s4_case(&case_json) {
+            Ok(c) => c,
+            Err(e) => {
+                log.emit("error", "stage4.case_parse_failed", json!({ "detail": e }));
+                return exit::COORD_PROTOCOL;
+            }
+        };
+        log.emit(
+            "info",
+            "stage4.case_received",
+            json!({
+                "case_index": case_index, "case_id": case.case_id, "phase": case.phase,
+                "mode": case.mode, "expected_chunk_count": case.expected_chunk_count,
+            }),
+        );
+
+        // clock re-check / re-align OUTSIDE the measured wall
+        if let Err(e) = align_clock(&mut log, &a, false) {
+            log.emit("error", "stage4.clock_recheck_failed", json!({ "detail": e }));
+            let _ = matrix_rpc(&a.matrix_coord, &json!({ "op": "case_ready", "case_id": case.case_id }));
+            let _ = matrix_rpc(
+                &a.matrix_coord,
+                &json!({ "op": "case_failed", "case_id": case.case_id, "reason": format!("clock recheck failed: {e}"), "contaminated": false }),
+            );
+            println!("STAGE4_RUNNER_HALTED reason=clock_recheck_failed");
+            return exit::CLOCK_FAILED;
+        }
+
+        let ready = matrix_rpc(&a.matrix_coord, &json!({ "op": "case_ready", "case_id": case.case_id }));
+        match ready {
+            Ok(r) if r.get("ack") == Some(&Value::Bool(true)) => {}
+            Ok(r) if r.get("halt").is_some() => {
+                log.emit("error", "stage4.case_ready_halt", json!({ "resp": r }));
+                println!("STAGE4_RUNNER_HALTED reason=case_ready");
+                return exit::MATRIX_HALTED;
+            }
+            other => {
+                log.emit("error", "stage4.case_ready_failed", json!({ "resp": format!("{other:?}") }));
+                return exit::COORD_PROTOCOL;
+            }
+        }
+
+        let auth_cred = if case_index == 0 { &a.enroll_cred } else { &a.runtime_cred };
+        let argv = s4_probe_argv(&cfg, &case, auth_cred);
+        let (probe_exit, output) = run_probe(&mut log, &argv);
+        let pr = extract_case_result(&output);
+        let real_exit = extract_probe_exit(&output).unwrap_or(probe_exit);
+        let result = build_s4_case_result(&case, pr.as_ref(), real_exit);
+        let case_status = result["case_status"].as_str().unwrap_or("").to_string();
+        let artifact_status = result["final_artifact_status"].as_str().unwrap_or("").to_string();
+        let verified = real_exit == 0 && case_status == "completed" && artifact_status == "Verified";
+        log.emit(
+            "info",
+            "stage4.probe_observed",
+            json!({
+                "case_id": case.case_id, "mode": case.mode, "probe_exit": real_exit,
+                "case_status": case_status, "final_artifact_status": artifact_status, "verified": verified,
+            }),
+        );
+
+        if verified {
+            let r = matrix_rpc(&a.matrix_coord, &json!({ "op": "case_started", "case_id": case.case_id }));
+            if !matches!(&r, Ok(v) if v.get("ack") == Some(&Value::Bool(true))) {
+                log.emit("error", "stage4.case_started_failed", json!({ "resp": format!("{r:?}") }));
+                return exit::COORD_PROTOCOL;
+            }
+            let done = matrix_rpc(
+                &a.matrix_coord,
+                &json!({ "op": "case_completed", "case_id": case.case_id, "result": result }),
+            );
+            match done {
+                Ok(r) if r.get("ack") == Some(&Value::Bool(true)) => {
+                    log.emit("info", "stage4.case_completed", json!({ "case_id": case.case_id }));
+                    case_index += 1;
+                }
+                Ok(r) if r.get("halt").is_some() => {
+                    log.emit("error", "stage4.case_completed_halt", json!({ "resp": r }));
+                    println!("STAGE4_RUNNER_HALTED reason=case_completed");
+                    return exit::MATRIX_HALTED;
+                }
+                other => {
+                    log.emit("error", "stage4.case_completed_failed", json!({ "resp": format!("{other:?}") }));
+                    return exit::COORD_PROTOCOL;
+                }
+            }
+        } else {
+            let contaminated = case_status == "contaminated";
+            let reason = format!(
+                "probe exit {real_exit}; case_status={case_status}; artifact={artifact_status}"
+            );
+            let _ = matrix_rpc(
+                &a.matrix_coord,
+                &json!({ "op": "case_failed", "case_id": case.case_id, "reason": reason, "contaminated": contaminated, "result": result }),
+            );
+            log.emit("error", "stage4.case_failed", json!({ "case_id": case.case_id, "reason": reason, "contaminated": contaminated }));
+            println!("STAGE4_RUNNER_HALTED reason=case_failed");
+            return exit::MATRIX_HALTED;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,6 +1105,84 @@ mod tests {
     fn parse_case_fails_closed_on_missing_fields() {
         assert!(parse_case(r#"{"run_id":"x"}"#).is_err());
         assert!(parse_case("not json").is_err());
+    }
+
+    // ---- Stage 4 ----------------------------------------------------------
+
+    const S4_CASE: &str = r#"{
+        "run_id":"i63s4-x","case_id":"i63s4-x/c2/s1/prep_ahead_2","phase":"measured",
+        "mode":"prep_ahead_2","cycle":2,"slot":1,
+        "chunk_size_bytes":67108864,"extent_bytes":2147483648,"expected_chunk_count":32
+    }"#;
+
+    #[test]
+    fn parse_s4_case_reads_mode_and_rejects_unknown_mode() {
+        let c = parse_s4_case(S4_CASE).unwrap();
+        assert_eq!(c.mode, "prep_ahead_2");
+        assert_eq!(c.cycle, Some(2));
+        assert_eq!(c.chunk_size_bytes, 67_108_864);
+        assert_eq!(c.expected_chunk_count, 32);
+        let bad = S4_CASE.replace("prep_ahead_2", "turbo");
+        assert!(parse_s4_case(&bad).is_err());
+        assert!(parse_s4_case(r#"{"run_id":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn s4_probe_argv_appends_mode_and_keeps_the_stage3_argv() {
+        let c = parse_s4_case(S4_CASE).unwrap();
+        let argv = s4_probe_argv(&cfg(), &c, "X:\\enroll.cred");
+        let pos = |k: &str| argv.iter().position(|a| a == k).map(|i| argv[i + 1].clone());
+        assert_eq!(pos("--mode").as_deref(), Some("prep_ahead_2"));
+        assert_eq!(pos("--chunk-size").as_deref(), Some("67108864"));
+        assert_eq!(pos("--extent-bytes").as_deref(), Some("2147483648"));
+        assert_eq!(pos("--case-id").as_deref(), Some("i63s4-x/c2/s1/prep_ahead_2"));
+        // exactly one --mode
+        assert_eq!(argv.iter().filter(|a| *a == "--mode").count(), 1);
+    }
+
+    #[test]
+    fn build_s4_case_result_shape_incl_mode_and_prepared_peak() {
+        let c = parse_s4_case(S4_CASE).unwrap();
+        let pr: Value = serde_json::from_str(
+            r#"{"event":"probe.case_result","mode":"prep_ahead_2","chunk_count":32,
+                "bulk_stream_wall_ms":40000,"verified_transfer_wall_ms":46000,"resume_ms":3,
+                "seal_d2_ms":5000,"read_ms":5700,"chunk_sha_ms":5400,"rolling_sha_ms":6100,
+                "proof_ms":6,"put_ack_ms":33000,"prepared_buffer_peak":2,"device_read_count":32,
+                "transfer_id":"t","artifact_id":"a","final_artifact_status":"Verified",
+                "case_status":"completed"}"#,
+        )
+        .unwrap();
+        let r = build_s4_case_result(&c, Some(&pr), 0);
+        assert_eq!(r["mode"], "prep_ahead_2");
+        assert_eq!(r["chunk_count"], 32);
+        assert_eq!(r["prepared_buffer_peak"], 2);
+        assert_eq!(r["final_artifact_status"], "Verified");
+        assert_eq!(r["cycle"], 2);
+        // exact field set the engine's `S4CaseResult` deserialises (asserted
+        // against real deserialisation in the engine's own test suite).
+        for k in [
+            "run_id", "case_id", "mode", "phase", "cycle", "slot", "chunk_size_bytes",
+            "extent_bytes", "chunk_count", "transfer_id", "artifact_id", "bulk_stream_wall_ms",
+            "verified_transfer_wall_ms", "resume_ms", "seal_d2_ms", "read_ms", "chunk_sha_ms",
+            "rolling_sha_ms", "proof_ms", "put_ack_ms", "prepared_buffer_peak", "device_read_count",
+            "final_artifact_status", "case_status",
+        ] {
+            assert!(r.get(k).is_some(), "missing S4CaseResult field {k}");
+        }
+    }
+
+    #[test]
+    fn build_s4_case_result_without_probe_line_is_a_failure_record() {
+        let c = parse_s4_case(S4_CASE).unwrap();
+        let r = build_s4_case_result(&c, None, 70);
+        assert!(r["case_status"].as_str().unwrap().starts_with("failed:no_probe_result"));
+        assert_eq!(r["final_artifact_status"], "none");
+        assert_eq!(r["chunk_count"], 32);
+    }
+
+    #[test]
+    fn stage4_not_armed_returns_zero() {
+        assert_eq!(run_stage4_not_armed(), 0);
     }
 
     #[test]

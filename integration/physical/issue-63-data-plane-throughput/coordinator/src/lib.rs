@@ -3,4 +3,7 @@
 
 pub mod matrix;
 pub mod matrix_net;
+/// Issue #63 Stage 4 — ARMED networked wiring for the 64 MiB serial-vs-prep-ahead
+/// micro-matrix. Reached only via `coordinator --stage4 --arm`.
+pub mod stage4_net;
 pub mod state;

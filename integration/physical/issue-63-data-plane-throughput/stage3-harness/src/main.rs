@@ -65,9 +65,27 @@ const DEFAULT_DB: &str = "bamep_physint_spike";
 /// The Stage-3 matrix pins the transfer chunk size PER CASE (8/16/32/64 MiB); a
 /// coord message without a `chunk_size` falls back to this.
 const CHUNK_SIZE_FALLBACK: u64 = 8 * 1024 * 1024;
-/// 36 preserved 2 GiB Artifacts + margin. The Stage-3 supervisor also runs the
+/// Stage 3: 36 preserved 2 GiB Artifacts + margin. The supervisor also runs the
 /// pure `budget` gate; this is the harness's own fail-closed floor.
-const MIN_FREE_BYTES: u64 = 90 * 1024 * 1024 * 1024;
+const MIN_FREE_BYTES_STAGE3: u64 = 90 * 1024 * 1024 * 1024;
+/// Stage 4 (Issue #63): only 10 preserved 2 GiB Artifacts + margin.
+const MIN_FREE_BYTES_STAGE4: u64 = 30 * 1024 * 1024 * 1024;
+
+/// Issue #63 Stage 4: `--stage4` selects the 64 MiB serial-vs-prep-ahead
+/// micro-matrix. The per-case orchestration, coord protocol, WSS + Worker
+/// composition are IDENTICAL to Stage 3 (the probe alone carries the `--mode`);
+/// only the runtime dir, the disk-budget floor, and the env-gated Worker PUT
+/// timing sink differ.
+fn stage4_mode() -> bool {
+    std::env::args().any(|a| a == "--stage4")
+}
+fn min_free_bytes() -> u64 {
+    if stage4_mode() {
+        MIN_FREE_BYTES_STAGE4
+    } else {
+        MIN_FREE_BYTES_STAGE3
+    }
+}
 
 fn cfg(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -86,9 +104,58 @@ fn coord_port() -> u16 {
 }
 
 fn runtime_dir() -> PathBuf {
-    let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime-stage3");
+    let name = if stage4_mode() {
+        "runtime-stage4"
+    } else {
+        "runtime-stage3"
+    };
+    let d = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
     let _ = std::fs::create_dir_all(&d);
     d
+}
+
+/// First value after `flag` in argv (`--flag <value>`), or `None`.
+fn arg_value(flag: &str) -> Option<String> {
+    let a: Vec<String> = std::env::args().skip(1).collect();
+    a.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+/// Issue #63 Stage 4 — the env-gated Worker PUT timing sink.
+///
+/// `--worker-timing-file <path>` (mandatory in `--stage4` mode): fail closed
+/// BEFORE the Worker starts on a non-writable parent or a path INSIDE the
+/// Worker chunk-store tree, truncate/create the file so its presence is a
+/// signal, then export `BAMEP_I63_WORKER_PUT_TIMING` so the in-process Worker's
+/// (best-effort, never-fsync'd) hook appends one NDJSON record per chunk PUT.
+/// Absent + not `--stage4` ⇒ no-op (Stage-3 behaviour unchanged).
+fn setup_worker_timing_sink(storage_root: &Path) {
+    // The `--stage4` + missing-flag case already failed closed in `main`.
+    let Some(raw) = arg_value("--worker-timing-file") else {
+        return;
+    };
+    let path = PathBuf::from(raw);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .unwrap_or_else(|e| die(format!("--worker-timing-file parent {}: {e}", parent.display())));
+    let parent_canon = parent
+        .canonicalize()
+        .unwrap_or_else(|e| die(format!("--worker-timing-file parent {}: {e}", parent.display())));
+    if parent_canon.starts_with(storage_root) {
+        die(format!(
+            "--worker-timing-file {} must be OUTSIDE the Worker chunk-store tree ({})",
+            path.display(),
+            storage_root.display()
+        ));
+    }
+    std::fs::write(&path, b"")
+        .unwrap_or_else(|e| die(format!("--worker-timing-file {} not writable: {e}", path.display())));
+    let abs = path
+        .canonicalize()
+        .unwrap_or_else(|e| die(format!("--worker-timing-file {}: {e}", path.display())));
+    // Edition 2021: `set_var` is safe. Done in `main` before the Worker task is
+    // spawned, so `i63_timing::sink_path()`'s first read sees it.
+    std::env::set_var("BAMEP_I63_WORKER_PUT_TIMING", &abs);
+    ev("worker.put_timing_sink", &[("path", abs.display().to_string())]);
 }
 
 fn ev(event: &str, kv: &[(&str, String)]) {
@@ -181,17 +248,18 @@ fn resolve_storage_root() -> PathBuf {
     let _ = std::fs::remove_file(&probe);
 
     match fs_free_bytes(&canon) {
-        Ok(free) if free >= MIN_FREE_BYTES => ev(
+        Ok(free) if free >= min_free_bytes() => ev(
             "storage_root.ok",
             &[
                 ("path", canon.display().to_string()),
                 ("free_bytes", free.to_string()),
-                ("min_free_bytes", MIN_FREE_BYTES.to_string()),
+                ("min_free_bytes", min_free_bytes().to_string()),
             ],
         ),
         Ok(free) => die(format!(
-            "--storage-root {} free {free} < required {MIN_FREE_BYTES} for the 36 x 2 GiB matrix",
-            canon.display()
+            "--storage-root {} free {free} < required {} for the preserved matrix payload",
+            canon.display(),
+            min_free_bytes()
         )),
         Err(e) => die(format!(
             "--storage-root {}: cannot determine free space ({e}); refusing to start",
@@ -590,9 +658,22 @@ async fn main() {
         issue_credential(&signal).await;
     }
 
+    // Issue #63 Stage 4: fail closed on a missing `--worker-timing-file` BEFORE
+    // any disk / DB / network work (Q2 needs Worker PUT timing).
+    if stage4_mode() && arg_value("--worker-timing-file").is_none() {
+        die("--stage4 requires --worker-timing-file <path> (Q2 needs Worker PUT timing; \
+             a run without it is an INVALID experiment)");
+    }
+
     let lab_ip = lab_ip();
     let (wss_port, dp_port, coord_port) = (wss_port(), data_plane_port(), coord_port());
     let storage_root = resolve_storage_root();
+    // Issue #63 Stage 4: gate + export the Worker PUT timing sink BEFORE the
+    // Worker task spawns. No-op unless `--worker-timing-file` is given.
+    setup_worker_timing_sink(&storage_root);
+    if stage4_mode() {
+        ev("harness.mode", &[("stage", "stage4".into())]);
+    }
 
     let url = db_url();
     ev("db.connecting", &[("target", redact(&url))]);

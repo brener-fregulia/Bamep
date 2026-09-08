@@ -3,12 +3,14 @@
 #   coordinator/src/**, winpe-runner/src/**, winpe-runner/build.rs,
 #   stage2-engine/src/**, stage2-probe/src/**, stage2-probe/build.rs,
 #   stage2-harness/src/**, stage3-harness/src/**, */Cargo.toml, */Cargo.lock,
-#   stage1/**, stage2/**, stage3/**, README.md, this .gitignore.
+#   stage1/**, stage2/**, stage3/**, stage4/**, README.md, this .gitignore.
 # Everything below is regenerable, runtime, or physical-run output.
 target/
 evidence/
-# Stage-3 harness runtime: persisted self-signed leaf, chunk store, fingerprint.
+# Stage-3 / Stage-4 harness runtime: persisted self-signed leaf, chunk store,
+# fingerprint, Worker PUT timing sink.
 runtime-stage3/
+runtime-stage4/
 *.log
 *.ndjson
 # Generated / cross-built executables (rebuilt from source, staged at run time).

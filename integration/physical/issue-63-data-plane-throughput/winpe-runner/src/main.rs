@@ -694,6 +694,14 @@ fn main() {
         }
         std::process::exit(matrix::run_not_armed());
     }
+    // `--stage4` subcommand — the Issue #63 Stage-4 64 MiB serial-vs-prep-ahead
+    // micro-matrix. `--stage4 --arm` runs the loop; `--stage4` alone is inert.
+    if std::env::args().nth(1).as_deref() == Some("--stage4") {
+        if std::env::args().any(|x| x == "--arm") {
+            std::process::exit(matrix::run_stage4_armed());
+        }
+        std::process::exit(matrix::run_stage4_not_armed());
+    }
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {

@@ -57,8 +57,8 @@ use sources::Counters;
 use tokio_tungstenite::tungstenite::Message;
 
 use stream::{
-    run_stream_pass, ChunkReader, DataPlane, PassOutcome, ProgressTick, PutStatus, ResumeStatus,
-    StreamError, StreamEvent, StreamState,
+    run_stream_pass, run_stream_pass_prep_ahead, ChunkReader, DataPlane, PassOutcome, ProgressTick,
+    PutStatus, ResumeStatus, StreamError, StreamEvent, StreamState,
 };
 
 const PROBE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -203,6 +203,30 @@ fn flush_sink(log: &Log, sink: &str) {
     }
 }
 
+/// Issue #63 Stage 4 — which single-pass streaming algorithm the probe runs.
+/// `Serial` is the already-proven Stage-3 default; `PrepAhead2` is the
+/// throwaway depth-2 prep-ahead pipeline (`run_stream_pass_prep_ahead`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamMode {
+    Serial,
+    PrepAhead2,
+}
+impl StreamMode {
+    fn wire(self) -> &'static str {
+        match self {
+            StreamMode::Serial => "serial",
+            StreamMode::PrepAhead2 => "prep_ahead_2",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "serial" => Some(StreamMode::Serial),
+            "prep_ahead_2" | "prep-ahead-2" => Some(StreamMode::PrepAhead2),
+            _ => None,
+        }
+    }
+}
+
 struct Args {
     sink: String,
     coord: String,
@@ -210,6 +234,9 @@ struct Args {
     pin_hex: String,
     credential_file: String,
     select_model_substr: String,
+    /// Stage-4 stream algorithm. Defaults to `Serial` so every existing
+    /// (Stage-1/2/3) invocation is byte-for-byte unchanged.
+    mode: StreamMode,
     chunk_size: u64,
     extent_bytes: u64,
     seal_timeout_secs: u64,
@@ -234,6 +261,7 @@ fn parse_args() -> Args {
         pin_hex: String::new(),
         credential_file: String::new(),
         select_model_substr: "256GB".into(),
+        mode: StreamMode::Serial,
         chunk_size: CHUNK_SIZE_DEFAULT,
         extent_bytes: EXTENT_BYTES,
         seal_timeout_secs: SEAL_TIMEOUT_SECS_DEFAULT,
@@ -263,6 +291,16 @@ fn parse_args() -> Args {
             }
             "--skew-ceil-ms" => {
                 a.skew_ceil_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.skew_ceil_ms)
+            }
+            "--mode" => {
+                let raw = it.next().unwrap_or_default();
+                match StreamMode::parse(&raw) {
+                    Some(m) => a.mode = m,
+                    None => {
+                        eprintln!("bad --mode {raw:?} (want: serial | prep_ahead_2)");
+                        std::process::exit(exit::BAD_ARGS);
+                    }
+                }
             }
             "--case-id" => a.case_id = it.next().unwrap_or(a.case_id),
             "--run-id" => a.run_id = it.next().unwrap_or(a.run_id),
@@ -624,6 +662,7 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
         &[
             ("run_id", s(&args.run_id)),
             ("case_id", s(&args.case_id)),
+            ("mode", s(args.mode.wire())),
             ("extent_bytes", V::U(args.extent_bytes)),
             ("chunk_size", V::U(args.chunk_size)),
             ("expected_chunk_count", V::U(expected_chunks)),
@@ -1093,7 +1132,36 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
         };
 
         let t_resume = Instant::now();
-        let outcome = run_stream_pass(&mut state, &reader, &mut dp, &mut on_progress, &mut on_lifecycle).await;
+        let outcome = match args.mode {
+            StreamMode::Serial => {
+                run_stream_pass(&mut state, &reader, &mut dp, &mut on_progress, &mut on_lifecycle)
+                    .await
+            }
+            StreamMode::PrepAhead2 => {
+                // The producer thread opens its OWN GENERIC_READ-only handle to
+                // the already-resolved + already-safety-PASSED locator (a fresh
+                // closure per `'outer` iteration; `run_stream_pass_prep_ahead`
+                // takes it `FnOnce`). No handle and no hasher crosses a thread
+                // boundary; no `unsafe`.
+                let locator = resolved.local_locator.clone();
+                let factory = move || -> Result<DeviceReader, String> {
+                    let mut c = Counters::default();
+                    let src = sources::RawReadSource::open(&locator, &mut c)?;
+                    Ok(DeviceReader {
+                        src,
+                        counters: std::cell::RefCell::new(c),
+                    })
+                };
+                run_stream_pass_prep_ahead(
+                    &mut state,
+                    factory,
+                    &mut dp,
+                    &mut on_progress,
+                    &mut on_lifecycle,
+                )
+                .await
+            }
+        };
         resume_ms_total += t_resume.elapsed().as_secs_f64() * 1000.0;
 
         match outcome {
@@ -1101,12 +1169,20 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
                 if let Some(a) = wall_a {
                     bulk_stream_wall_ms = a.elapsed().as_secs_f64() * 1000.0;
                 }
+                let device_read_count = match args.mode {
+                    StreamMode::Serial => reader.counters.borrow().data_read_count,
+                    // In prep-ahead the producer thread owns the reads; the
+                    // foreground `reader` is unused. The producer's read log is
+                    // the authoritative per-pass read count.
+                    StreamMode::PrepAhead2 => state.producer_read_log().len() as u64,
+                };
                 log.emit(
                     "info",
                     "probe.stream.complete",
                     &[
                         ("held_chunks", V::U(state.chunk_count())),
-                        ("device_read_count", V::U(reader.counters.borrow().data_read_count)),
+                        ("device_read_count", V::U(device_read_count)),
+                        ("prepared_buffer_peak", V::U(state.prepared_peak())),
                         ("observed_manifest_chunk_size", V::I(
                             dp.observed_manifest_chunk_size.map(|n| n as i64).unwrap_or(-1),
                         )),
@@ -1188,11 +1264,15 @@ async fn run(log: &Log, args: &Args, counters: &mut Counters) -> i32 {
             };
             let ts = state.timings();
             let ns_ms = |n: u128| (n as f64 / 1_000_000.0) as i64;
+            let device_read_count = match args.mode {
+                StreamMode::Serial => reader.counters.borrow().data_read_count,
+                StreamMode::PrepAhead2 => state.producer_read_log().len() as u64,
+            };
             emit_full_result(
                 log, args, state.chunk_count(), transfer_uuid, artifact_uuid,
                 &safety_verdict_token, &clock_verdict,
                 bulk_stream_wall_ms, verified_transfer_wall_ms, resume_ms_total, seal_d2_ms,
-                reader.counters.borrow().data_read_count, "Verified", case_status,
+                device_read_count, state.prepared_peak(), "Verified", case_status,
                 &[
                     ("read_ms", ns_ms(ts.read_ns)),
                     ("chunk_sha_ms", ns_ms(ts.chunk_sha_ns)),
@@ -1247,6 +1327,7 @@ fn emit_full_result(
     resume_ms: f64,
     seal_d2_ms: f64,
     device_read_count: u64,
+    prepared_buffer_peak: u64,
     final_artifact_status: &str,
     case_status: &str,
     extra_ms: &[(&str, i64)],
@@ -1261,10 +1342,12 @@ fn emit_full_result(
     let mut fields: Vec<(&str, V)> = vec![
         ("run_id", s(&args.run_id)),
         ("case_id", s(&args.case_id)),
+        ("mode", s(args.mode.wire())),
         ("chunk_size_bytes", V::U(args.chunk_size)),
         ("extent_bytes", V::U(args.extent_bytes)),
         ("chunk_count", V::U(chunk_count)),
         ("device_read_count", V::U(device_read_count)),
+        ("prepared_buffer_peak", V::U(prepared_buffer_peak)),
         ("transfer_id", s(transfer_uuid.to_string())),
         ("artifact_id", s(artifact_uuid.to_string())),
         ("source_safety_verdict", s(safety_verdict)),
@@ -1303,6 +1386,7 @@ fn emit_result_line(
         &[
             ("run_id", s(&args.run_id)),
             ("case_id", s(&args.case_id)),
+            ("mode", s(args.mode.wire())),
             ("chunk_size_bytes", V::U(args.chunk_size)),
             ("extent_bytes", V::U(args.extent_bytes)),
             ("chunk_count", V::U(chunk_count)),
@@ -1392,10 +1476,126 @@ fn self_check() -> i32 {
     0
 }
 
+/// `--pipeline-check`: host synthetic SERIAL vs PREP-AHEAD comparison over the
+/// non-Windows stub source + an in-process fake data plane. NO network, NO real
+/// device. Proves: (1) the probe's real `run_stream_pass_prep_ahead` call path
+/// (mode branch → reader factory → dedicated producer thread → `DeviceReader`
+/// second open → `sync_channel`) works; (2) the prep-ahead full-Artifact digest
+/// is bit-identical to serial over the same bounded source; (3) the depth-2
+/// buffer bound holds (`prepared_buffer_peak == 2`); (4) every chunk is read
+/// once, ascending.
+fn pipeline_check() -> i32 {
+    // Run on a fresh OS thread: `main` is already inside a `#[tokio::main]`
+    // runtime and this check builds its own.
+    std::thread::spawn(pipeline_check_inner).join().unwrap_or(1)
+}
+
+fn pipeline_check_inner() -> i32 {
+    use stream::{run_stream_pass, run_stream_pass_prep_ahead, PassOutcome, StreamState};
+
+    // A minimal in-process data plane: accepts every well-formed chunk once.
+    struct FakeDp {
+        held: std::collections::BTreeMap<u64, String>,
+    }
+    impl stream::DataPlane for FakeDp {
+        async fn discover_resume(&mut self) -> stream::ResumeStatus {
+            stream::ResumeStatus::Ok(vec![])
+        }
+        async fn put_chunk(&mut self, index: u64, digest_wire: &str, bytes: &[u8]) -> stream::PutStatus {
+            if sha256_wire(bytes) != digest_wire {
+                return stream::PutStatus::DigestMismatch;
+            }
+            match self.held.insert(index, digest_wire.to_string()) {
+                None => stream::PutStatus::Accepted,
+                Some(_) => stream::PutStatus::AlreadyHeld,
+            }
+        }
+    }
+
+    let locator = {
+        let epoch = sources::enumerate();
+        epoch
+            .sources
+            .iter()
+            .find(|s| s.product.contains("256GB"))
+            .map(|s| s.local_locator.clone())
+            .expect("stub SSD")
+    };
+    // small bounded extent so the stub `pattern()` generation stays fast
+    let chunk = 1u64 << 20; // 1 MiB
+    let extent = 6 * chunk + 12345; // short final chunk
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("rt");
+
+    // serial
+    let serial_digest = rt.block_on(async {
+        let mut c = Counters::default();
+        let src = sources::RawReadSource::open(&locator, &mut c).expect("open");
+        let reader = DeviceReader { src, counters: std::cell::RefCell::new(c) };
+        let mut state = StreamState::new(extent, chunk).unwrap();
+        let mut dp = FakeDp { held: Default::default() };
+        let out = run_stream_pass(&mut state, &reader, &mut dp, &mut |_| {}, &mut |_| {})
+            .await
+            .expect("serial pass");
+        assert_eq!(out, PassOutcome::Complete);
+        assert_eq!(state.prepared_peak(), 0, "serial never uses prep buffers");
+        state.finish_digest().expect("serial digest")
+    });
+
+    // prep-ahead
+    let (prep_digest, peak, read_log_ok) = rt.block_on(async {
+        let mut state = StreamState::new(extent, chunk).unwrap();
+        let mut dp = FakeDp { held: Default::default() };
+        let loc = locator.clone();
+        let factory = move || -> Result<DeviceReader, String> {
+            let mut c = Counters::default();
+            let src = sources::RawReadSource::open(&loc, &mut c)?;
+            Ok(DeviceReader { src, counters: std::cell::RefCell::new(c) })
+        };
+        let out =
+            run_stream_pass_prep_ahead(&mut state, factory, &mut dp, &mut |_| {}, &mut |_| {})
+                .await
+                .expect("prep-ahead pass");
+        assert_eq!(out, PassOutcome::Complete);
+        let n = state.chunk_count();
+        let want: Vec<u64> = (0..n).collect();
+        (
+            state.finish_digest().expect("prep digest"),
+            state.prepared_peak(),
+            state.producer_read_log() == &want[..],
+        )
+    });
+
+    if serial_digest != prep_digest {
+        eprintln!("pipeline-check: prep-ahead digest != serial digest");
+        return 1;
+    }
+    if peak != 2 {
+        eprintln!("pipeline-check: prepared_buffer_peak = {peak} (want 2)");
+        return 1;
+    }
+    if !read_log_ok {
+        eprintln!("pipeline-check: producer read log not 0..N ascending");
+        return 1;
+    }
+    println!(
+        "PROBE_PIPELINE_CHECK_PASS (serial digest == prep-ahead digest; prepared_buffer_peak=2; \
+         each chunk read once ascending)"
+    );
+    0
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     if std::env::args().nth(1).as_deref() == Some("--self-check") {
         std::process::exit(self_check());
+    }
+    if std::env::args().nth(1).as_deref() == Some("--pipeline-check") {
+        std::process::exit(pipeline_check());
     }
     let log = Log::new();
     let args = parse_args();

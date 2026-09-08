@@ -7,7 +7,10 @@ separate from — the closed Issue #61 scaffolding
 the host-only Phase-A benchmark
 (`../../benchmarks/issue-63-data-plane-throughput/`).
 
-The work is delivered in **owner-reviewed stages**. Only Stage 1 exists so far.
+The work is delivered in **owner-reviewed stages**. Stage 1 and the Stage-3
+36-case chunk-size matrix have PHYSICALLY PASSED (committed). Stage 4 (64 MiB
+serial vs prep-ahead depth-2 + Worker PUT decomposition) is BUILT + off-device
+validated, awaiting physical arm review.
 
 ---
 
@@ -219,7 +222,7 @@ no VCRUNTIME/UCRT, no new dependency.
 
 ---
 
-## Stage 3 — ARM the minimum physical matrix path (BUILT + PREFLIGHTED; NOT yet run)
+## Stage 3 — ARM the minimum physical matrix path (PHYSICALLY RUN — `matrix_pass`)
 
 Owner-approved. Stage 3 composes the already-proven pieces into ONE foreground
 supervisor for the exact clean-fast-path matrix — **4 warm-ups + 8 balanced
@@ -376,6 +379,99 @@ export RUSTFLAGS="-C target-feature=+crt-static"
   ws2_32` — both a strict subset of the #60/#61-proven stock-WinPE set; the
   Stage-3 deltas added NO new import.
 
-The real physical MiniPC boot, the physical SSD `GENERIC_READ` path, and the
-36-case matrix have **NOT** been run. Stops here for owner final physical
-authorization.
+### Stage 3 — physical result (authoritative)
+
+- **run_id `i63s3-20260907T185027`** — `matrix_pass`. 36/36 `CaseResult`, 0
+  `excluded_unverified`, every Artifact `Artifact::Verified`. One WinPE boot, no
+  reboot between cases, zero deliberate fault injection. Runtime evidence is
+  git-ignored and not committed.
+- Median throughput (MiB/s), `bulk` / `verified`:
+
+  | chunk | bulk | verified |
+  |---|---|---|
+  | 8 MiB | 31.3437 | 30.4337 |
+  | 16 MiB | 32.1515 | 30.8837 |
+  | 32 MiB | 34.0892 | 30.9899 |
+  | 64 MiB | 37.3213 | 33.6851 |
+
+- 32 → 64 MiB paired physical `bulk`: median ratio **1.10066**, 64 MiB faster in
+  **7/8** cycles.
+- Timing diagnosis (64 MiB cases): `read_ms` ~5.5–5.9 s, `chunk_sha_ms`
+  ~5.36–5.48 s, `rolling_sha_ms` ~6.06–6.18 s, `proof_ms` ~6 ms, `put_ack_ms`
+  commonly ~31–36 s (slower outliers), `bulk` wall commonly ~50–55 s. **`put_ack`
+  dominates**; serial local preparation **plus** PUT/ACK waiting explains nearly
+  the whole `bulk` wall, because the probe prepares chunk N+1 only after
+  `put_chunk(N)` returns.
+- Conclusion: **64 MiB is the best of the tested serial chunk sizes**, but chunk
+  size is not the dominant remaining lever — the serial prep↔PUT dependency and
+  the Worker-observed PUT boundary are. This is the Stage-4 question.
+
+---
+
+## Stage 4 — 64 MiB serial vs prep-ahead pipeline depth 2 + Worker PUT decomposition (micro-Spike)
+
+Owner-approved throwaway micro-Spike. Answers exactly two questions:
+
+- **Q1** — how much physical `bulk` throughput is recovered when local
+  preparation of chunk N+1 overlaps the in-flight PUT/ACK of chunk N?
+- **Q2** — inside the Worker-observed PUT boundary, where is the remaining time
+  spent, enough to choose the next optimization?
+
+**Pipeline depth 2 here = PREP-AHEAD ONLY.** At most: chunk N is being
+PUT/awaiting ACK while chunk N+1 is read + hashed concurrently. Still exactly
+**one network PUT in flight**, **ascending PUT order**, **no out-of-order durable
+acceptance**, **no two concurrent Worker PUT requests**. Multi-PUT concurrency is
+explicitly out of scope for this stage.
+
+### Status — BUILT + OFF-DEVICE VALIDATED; physical 10-case matrix NOT yet run
+
+| Path | What it is (delta only) | authored |
+|---|---|---|
+| `stage2-probe/src/stream.rs` | `run_stream_pass_prep_ahead` + the dedicated **producer thread** (owns its own `GENERIC_READ` handle — a 2nd open of the already-safety-PASSED locator — and the rolling `Sha256` for the whole pass; `sync_channel(1)`; NO `unsafe`). Foreground: one `current` buffer, one `put_chunk().await`, one outstanding `Prepare`. `StreamState::{prepared_peak,producer_read_log,finalized_digest}`. Serial `run_stream_pass` **byte-identical**. | ~330 |
+| `stage2-probe/src/main.rs` | `--mode serial \| prep_ahead_2` (default `serial` ⇒ every Stage-1/2/3 invocation unchanged); prep-ahead builds a `Send + 'static` reader factory per `'outer` pass; `mode` + `prepared_buffer_peak` on `probe.plan` / `probe.case_result`; `--pipeline-check` host synthetic serial-vs-prep-ahead digest-parity smoke. | ~140 |
+| `crates/worker/src/data_plane/i63_timing.rs` (+ `http.rs` / `upload.rs` deltas) | env-gated (`BAMEP_I63_WORKER_PUT_TIMING`) best-effort NDJSON per chunk PUT keyed `transfer_id`+`chunk_index`: `authorize` / `stage_call` / **overlapping** `body_pump` + `staging_worker` / `begin_stage` / `write_sum` / `digest` / `finalize` (fsync/placement) / `commit_chunk` / `handler_total`. Absent ⇒ **zero** clock reads, zero I/O, zero behaviour change. No fsync of the sink, no secrets, write failure never affects auth/durability/integrity/status/outcome. | ~180 |
+| `stage2-engine/src/stage4.rs` | the deterministic **10-case plan** (2 warm-up `S,P` + 4 cycles `(S,P)(P,S)(S,P)(P,S)`, 64 MiB only, 32 chunks/2048 MiB), `S4CaseResult`, `analyse_s4` (per-mode medians + within-cycle paired **P/S** ratios, `n=4`, **no significance claim**, `overlap_saved_ms` derived diagnostic), `WorkerPutRecord` + `analyse_worker_decomp` (per-interval medians/p10-p90, overlapping intervals kept labelled). | ~430 |
+| `coordinator/src/stage4_net.rs` (+ `--stage4` / `--stage4-selftest`) | ARMED networked 10-case authority: `server_utc` / `next_case` / `case_ready` / `case_started` / `case_completed{S4CaseResult}` / `case_failed`; strict linear per-case order; halt on any non-`Verified` / failure; at terminal writes `analysis.json` (S-vs-P + Worker decomp joined by `transfer_id`→mode) + `matrix.verdict` = `stage4_pass` / `stage4_fail` / **`stage4_invalid`** (10/10 done but Worker timing missing/short ⇒ Q2 unanswerable). `--stage4` without `--arm` ⇒ `STAGE4 NOT ARMED`. | ~430 |
+| `winpe-runner/src/matrix.rs` (`--stage4` / `--stage4 --arm`) | the Stage-4 loop: `parse_s4_case` (carries `mode`), `s4_probe_argv` (= Stage-3 argv + `--mode <wire>`), `build_s4_case_result`, per-case clock re-align OUTSIDE the measured wall, one probe process per case, halt-on-non-verified. Committed `--matrix` path untouched. | ~330 |
+| `stage3-harness` (`--stage4`) | same #61-shaped real PG/WSS/Worker composition; `--stage4` only swaps `runtime-stage4/`, the 30 GiB budget floor, and **requires `--worker-timing-file <path>`** (fails closed early; must be OUTSIDE the chunk-store tree) → exports `BAMEP_I63_WORKER_PUT_TIMING` before the in-process Worker spawns. Per-case orchestration / coord protocol / action (`bamep.m1.data-plane-transfer`) unchanged. | ~70 |
+| `stage3/derive-stage3-runtime.sh --stage 4` | same Phase-9d lineage / 5 injections / secret sweep; `--stage 4` swaps the injected bootstrap `.cmd` (`--stage4 --arm`) + `winpeshl-stage4.ini`. Phase-9d re-hashed before/after; unchanged. | ~20 |
+| `stage4/run-stage4-lab.sh` | one-command foreground supervisor; `--arm` required; `--preflight` / `--arm --preflight` stop after host checks. `READY_FOR_STAGE4_MINIPC_POWER_ON`. Reverts only the lab network state it created. | ~570 |
+| `stage4/run-stage4-checks.sh` | every Stage-4 off-device check in order. | ~110 |
+
+### Off-device validation performed
+
+- `stage4/run-stage4-checks.sh` → **STAGE4_CHECKS_PASS**: stage2-engine (67 tests
+  incl. 15 `stage4`) + `clippy -D warnings`; coordinator (30 tests incl. 5
+  `stage4_net`) + `--stage4-selftest` (`STAGE4_SELFTEST_PASS`) + `--stage4` NOT
+  ARMED banner; stage2-probe (19 tests) + `--self-check` + **`--pipeline-check`**
+  (`PROBE_PIPELINE_CHECK_PASS`: prep-ahead full-Artifact digest **bit-identical**
+  to serial over the same bounded stub source, `prepared_buffer_peak == 2`, every
+  chunk read once ascending); winpe-runner (28 tests incl. 5 stage4-loop);
+  `bamep-worker` (108 tests incl. the env-gated timing hook) + inert-with-var-unset
+  check; **generated Stage-4 bootstrap → runner argv contract** (renders the
+  template, runs the exact `--stage4 --arm …` argv → `STAGE4_RUNNER_ARMED`, NOT
+  `BAD_ARGS`, reaches the deliberately unreachable network boundary, exits `20`);
+  stage3-harness release build + `--stage4` requires `--worker-timing-file`;
+  `bash -n` all scripts.
+- **prep-ahead pipeline RED→GREEN** (`stage2-probe cargo test`): RED = the serial
+  pass reads no chunk N+1 while PUT(N) is in flight (reads at PUT exit == entry ==
+  `N+1`); GREEN = prep-ahead reads+hashes chunk N+1 during PUT(N) (reads at PUT
+  exit `≥ N+2`), `max_in_flight == 1`, PUT order `0..n`, `finish_digest ==`
+  serial reference digest, `prepared_peak() == 2`, producer opened its source
+  once; plus contamination-stops (401 on a PUT → `SuspendedNeedsAuthorization` +
+  `PutAuthDenied`, no retry-to-green) and producer-open-failure → `Fatal`.
+- **Stage-3 regression**: `stage3/run-stage3-checks.sh` → **STAGE3_CHECKS_PASS**
+  (serial path + committed `--matrix` runner + Stage-3 bootstrap→argv contract all
+  unchanged).
+- WinPE cross-build (`cargo xwin`, `-C target-feature=+crt-static`) clean. PE
+  imports (`llvm-objdump -p`): runner `api-ms-win-core-synch-l1-2-0 kernel32 ntdll
+  ws2_32`; probe `ADVAPI32 api-ms-win-core-synch-l1-2-0 bcrypt bcryptprimitives
+  kernel32 ntdll ws2_32` — **identical to the committed Stage-3 executables**; the
+  `--mode` / prep-ahead producer thread (`std::thread` + `std::sync::mpsc`) and
+  the Stage-4 runner loop added **no new import**.
+- `run-stage4-lab.sh --preflight` / `--arm --preflight` run every host-side check
+  and stop before any service, derive, or boot.
+
+The physical MiniPC boot, the physical SSD `GENERIC_READ` prep-ahead path, the
+env-gated Worker PUT timing under real load, and the 10-case matrix have **NOT**
+been run. Stops here for owner blocker/safety review + physical arm authorization.

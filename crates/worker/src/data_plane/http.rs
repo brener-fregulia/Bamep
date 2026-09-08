@@ -15,6 +15,9 @@ use crate::ipc::{ResumeAggregate, ResumeDiscovery, ResumeDiscoveryInput, WorkerC
 use crate::storage::FilesystemChunkStore;
 
 #[cfg(unix)]
+use std::time::Instant;
+
+#[cfg(unix)]
 use super::upload;
 #[cfg(unix)]
 use crate::ipc::{
@@ -232,6 +235,8 @@ async fn chunk_upload(
     let Some(chunk_index) = parse_canonical_chunk_index(&chunk_index_raw) else {
         return malformed_request();
     };
+    // ISSUE #63 STAGE 4 — inert unless `BAMEP_I63_WORKER_PUT_TIMING` is set.
+    let mut i63 = super::i63_timing::PutTimer::start(transfer_id, chunk_index);
     let Ok(proof) = parse_common(&headers) else {
         return malformed_request();
     };
@@ -254,11 +259,20 @@ async fn chunk_upload(
         issued_at: proof.issued_at,
         signature: proof.signature,
     };
-    let approved = match state.control.authorize_chunk(input).await {
+    let i63_m = i63.active().then(Instant::now);
+    let authorize_result = state.control.authorize_chunk(input).await;
+    if let Some(m) = i63_m {
+        i63.set_authorize_ns(m.elapsed().as_nanos());
+    }
+    let approved = match authorize_result {
         Ok(ChunkAuthorization::Approved(approved)) => approved,
-        Ok(ChunkAuthorization::Denied) => return authorization_denied(),
+        Ok(ChunkAuthorization::Denied) => {
+            i63.finish("authorization_denied", None);
+            return authorization_denied();
+        }
         Err(error) => {
             log_control_failure("chunk_upload authorize", &error);
+            i63.finish("authorize_control_error", None);
             return authorization_denied();
         }
     };
@@ -271,17 +285,20 @@ async fn chunk_upload(
     // ---- pre-body rejections (step 3) ----
     if let Some(expected) = &approved.expected_chunk_digest {
         if *expected != declared_digest {
+            i63.finish("chunk_identity_conflict_pre_body", None);
             return chunk_identity_conflict();
         }
     }
     if let Some(announced_len) = declared_content_length(&headers) {
         if announced_len > u64::from(approved.chunk_size) {
+            i63.finish("chunk_too_large_pre_body", None);
             return chunk_too_large();
         }
     }
 
     // ---- stream into D1, hash, validate, finalize (steps 4-5) ----
-    let staged = upload::stage_chunk_body(
+    let i63_m = i63.active().then(Instant::now);
+    let (staged, stage_timing) = upload::stage_chunk_body(
         state.chunk_store.clone(),
         upload::StageRequest {
             transfer_id,
@@ -290,38 +307,68 @@ async fn chunk_upload(
             declared_digest,
         },
         body,
+        i63.active(),
     )
     .await;
+    i63.set_stage(
+        i63_m.map(|m| m.elapsed().as_nanos()).unwrap_or(0),
+        stage_timing,
+    );
     let (verified_digest, verified_size) = match staged {
         upload::StageOutcome::Finalized { size, digest } => (digest, size),
-        // A zero-byte body cannot represent a `1..=chunk_size` chunk.
-        upload::StageOutcome::EmptyBody => return malformed_request(),
-        upload::StageOutcome::TooLarge => return chunk_too_large(),
-        upload::StageOutcome::DigestMismatch => return digest_mismatch(),
-        // Restart-stable local residue whose bytes differ from this upload —
-        // a source-mutation transfer failure, fail closed (not an enumerable
-        // `409`, which are `bamepd`-authoritative outcomes).
-        upload::StageOutcome::LocalIdentityConflict | upload::StageOutcome::StorageUnavailable => {
-            return authorization_denied();
+        other => {
+            i63.finish(
+                match other {
+                    upload::StageOutcome::EmptyBody => "staged_empty_body",
+                    upload::StageOutcome::TooLarge => "staged_too_large",
+                    upload::StageOutcome::DigestMismatch => "staged_digest_mismatch",
+                    upload::StageOutcome::LocalIdentityConflict => "staged_local_identity_conflict",
+                    _ => "staged_storage_unavailable",
+                },
+                None,
+            );
+            return match other {
+                // A zero-byte body cannot represent a `1..=chunk_size` chunk.
+                upload::StageOutcome::EmptyBody => malformed_request(),
+                upload::StageOutcome::TooLarge => chunk_too_large(),
+                upload::StageOutcome::DigestMismatch => digest_mismatch(),
+                // Restart-stable local residue whose bytes differ from this
+                // upload — a source-mutation transfer failure, fail closed (not
+                // an enumerable `409`, which are `bamepd`-authoritative).
+                _ => authorization_denied(),
+            };
         }
     };
 
     // ---- durable acceptance, then the HTTP response (steps 6-8) ----
-    match state
+    let i63_m = i63.active().then(Instant::now);
+    let commit_result = state
         .control
         .commit_chunk(approved.acceptance_ticket, verified_digest, verified_size)
-        .await
-    {
-        Ok(ChunkAcceptance::Committed) => chunk_accepted(chunk_index),
-        Ok(ChunkAcceptance::AlreadyCommitted) => chunk_already_held(chunk_index),
+        .await;
+    if let Some(m) = i63_m {
+        i63.set_commit_ns(m.elapsed().as_nanos());
+    }
+    match commit_result {
+        Ok(ChunkAcceptance::Committed) => {
+            i63.finish("accepted", Some(verified_size));
+            chunk_accepted(chunk_index)
+        }
+        Ok(ChunkAcceptance::AlreadyCommitted) => {
+            i63.finish("already_held", Some(verified_size));
+            chunk_already_held(chunk_index)
+        }
         Ok(ChunkAcceptance::Rejected(ChunkAcceptanceRejectionReason::ChunkIdentityConflict)) => {
+            i63.finish("commit_identity_conflict", Some(verified_size));
             chunk_identity_conflict()
         }
         Ok(ChunkAcceptance::Rejected(ChunkAcceptanceRejectionReason::TransferNotContinuable)) => {
+            i63.finish("commit_not_continuable", Some(verified_size));
             transfer_not_continuable()
         }
         Err(error) => {
             log_control_failure("chunk_upload commit", &error);
+            i63.finish("commit_control_error", Some(verified_size));
             authorization_denied()
         }
     }

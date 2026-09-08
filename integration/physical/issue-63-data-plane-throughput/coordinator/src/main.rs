@@ -112,6 +112,23 @@ struct Shared {
 fn stage2_subcommand() -> Option<i32> {
     match std::env::args().nth(1).as_deref() {
         Some("--matrix-selftest") => Some(matrix_selftest()),
+        Some("--stage4-selftest") => Some(stage4_selftest()),
+        Some("--stage4") => {
+            // Issue #63 Stage 4: `--stage4 --arm ...` runs the ARMED networked
+            // 64 MiB serial-vs-prep-ahead micro-matrix authority (the Stage-4
+            // lab supervisor passes `--arm` only after host-side preflight).
+            if std::env::args().any(|a| a == "--arm") {
+                let cfg = bamep_i63_stage1_coordinator::stage4_net::parse_cfg();
+                bamep_i63_stage1_coordinator::stage4_net::run(cfg); // -> !
+            }
+            println!("STAGE4 NOT ARMED");
+            println!(
+                "coordinator: the Stage-4 micro-matrix (2 warm-up + 8 measured S/P transfers, \
+                 64 MiB only) is armed ONLY behind `--stage4 --arm` and started ONLY by \
+                 run-stage4-lab.sh after host-side preflight."
+            );
+            Some(0)
+        }
         Some("--matrix") => {
             // Stage 3: `--matrix --arm ...` runs the ARMED networked matrix
             // authority (the Stage-3 lab supervisor passes `--arm` only after
@@ -221,6 +238,83 @@ fn matrix_selftest() -> i32 {
                 return 1;
             }
         }
+    }
+}
+
+/// In-memory: build the deterministic Issue #63 Stage-4 10-case plan, run
+/// `analyse_s4` over stub Verified results, and assert the S-vs-P shape. NO
+/// socket, NO transfer, NO device.
+fn stage4_selftest() -> i32 {
+    use bamep_i63_stage2_engine::stage4::{analyse_s4, S4CaseResult, S4Mode, S4Plan};
+    let plan = match S4Plan::build("i63s4-selftest") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("stage4-selftest: plan did not build: {e:?}");
+            return 1;
+        }
+    };
+    if plan.cases.len() != 10 || plan.warmups().count() != 2 || plan.measured().count() != 8 {
+        eprintln!("stage4-selftest: plan shape wrong");
+        return 1;
+    }
+    let results: Vec<S4CaseResult> = plan
+        .cases
+        .iter()
+        .map(|c| {
+            // prep-ahead deterministically faster in the stub.
+            let (b, v) = if c.mode == S4Mode::PrepAhead2 {
+                (40_000.0, 46_000.0)
+            } else {
+                (52_000.0, 58_000.0)
+            };
+            S4CaseResult {
+                run_id: c.run_id.clone(),
+                case_id: c.case_id.clone(),
+                mode: c.mode,
+                phase: c.phase,
+                cycle: c.cycle,
+                slot: c.slot,
+                chunk_size_bytes: c.chunk_size_bytes,
+                extent_bytes: c.extent_bytes,
+                chunk_count: c.expected_chunk_count,
+                transfer_id: Some(format!("stub-t-{}", c.case_id)),
+                artifact_id: Some("stub-a".into()),
+                bulk_stream_wall_ms: b,
+                verified_transfer_wall_ms: v,
+                resume_ms: 3.0,
+                seal_d2_ms: 5_000.0,
+                read_ms: 5_700.0,
+                chunk_sha_ms: 5_400.0,
+                rolling_sha_ms: 6_100.0,
+                proof_ms: 6.0,
+                put_ack_ms: 33_000.0,
+                prepared_buffer_peak: if c.mode == S4Mode::PrepAhead2 { 2 } else { 0 },
+                device_read_count: 32,
+                final_artifact_status: "Verified".into(),
+                case_status: "completed".into(),
+            }
+        })
+        .collect();
+    let a = analyse_s4(&results);
+    let (Some(s), Some(p)) = (a.serial.as_ref(), a.prep_ahead.as_ref()) else {
+        eprintln!("stage4-selftest: missing a mode summary");
+        return 1;
+    };
+    println!(
+        "STAGE4_SELFTEST plan=10 warmups=2 measured=8 extent={} chunk=64MiB chunks=32 \
+         serial_n={} prep_ahead_n={} paired_series={} excluded={}",
+        plan.cases[0].extent_bytes,
+        s.n,
+        p.n,
+        a.paired.len(),
+        a.excluded_unverified.len()
+    );
+    if s.n == 4 && p.n == 4 && a.paired.len() == 2 && a.excluded_unverified.is_empty() {
+        println!("STAGE4_SELFTEST_PASS");
+        0
+    } else {
+        eprintln!("stage4-selftest: expected serial_n=4 prep_ahead_n=4 paired=2 excluded=0");
+        1
     }
 }
 
