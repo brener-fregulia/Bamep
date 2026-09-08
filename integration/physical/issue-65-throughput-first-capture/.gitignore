@@ -1,8 +1,10 @@
 # Issue #65 throughput-first capture Spike — build + runtime + physical evidence.
 # Authored source is versioned:
-#   capture-probe/src/**, capture-probe/build.rs, sink/src/**, */Cargo.toml,
-#   */Cargo.lock, derive-issue65-runtime.sh, run-issue65-lab.sh, winpeshl.ini,
-#   bamep-i65-bootstrap.cmd.template, README.md, this .gitignore.
+#   capture-probe/src/**, capture-probe/build.rs, sink/src/**,
+#   http-probe/src/**, http-sink/src/**, */Cargo.toml, */Cargo.lock,
+#   derive-issue65-runtime.sh, run-issue65-lab.sh, run-issue65-http-control.sh,
+#   winpeshl.ini, bamep-i65-bootstrap.cmd.template,
+#   bamep-i65-http-bootstrap.cmd.template, README.md, this .gitignore.
 # Everything below is regenerable, runtime, or physical-run output.
 target/
 evidence/

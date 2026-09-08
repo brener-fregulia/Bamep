@@ -1,0 +1,26 @@
+# Issue #65 — Fedora-side plain-HTTP throughput CONTROL sink (THROWAWAY Spike).
+#
+# NOT the Bamep data plane, NOT the Worker, NOT the control plane, NOT an HTTP
+# server framework. ONE plain-TCP listener that speaks just enough HTTP/1.1 to
+# accept a POST, drain exactly Content-Length body bytes, DISCARD them (never
+# touches disk), and reply with a one-line JSON measurement. It emits the same
+# I65_SINK_LISTENING / i65_sink_result / I65_SINK_DONE control vocabulary as the
+# capture sink so the existing launcher supervise/watchdog logic is reused.
+# std-only: no serde, no sha2, no tokio. Standalone workspace.
+[package]
+name = "bamep-i65-http-sink"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bamep-i65-http-sink"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

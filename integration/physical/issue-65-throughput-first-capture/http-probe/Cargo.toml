@@ -1,0 +1,42 @@
+# Issue #65 — WinPE plain-HTTP throughput CONTROL probe (THROWAWAY Spike artifact).
+#
+# LAB-ONLY. NOT the Bamep Agent, NOT crates/agent, NOT bamepd, NOT a transfer
+# architecture. It proves ONE thing with the Bamep capture path UNTOUCHED:
+# whether stock WinPE + its NIC/driver + the physical 1 GbE link can sustain
+# >= 110 MB/s with a minimal native WinHTTP POST.
+#
+#   WinHttpOpen -> WinHttpConnect -> WinHttpOpenRequest("POST", plain HTTP)
+#   -> WinHttpSendRequest(dwTotalLength = 2 GiB)
+#   -> 64x WinHttpWriteData(ONE 32 MiB buffer, allocated + filled once)
+#   -> WinHttpReceiveResponse -> HTTP status + the sink's JSON line
+#
+# NO source resolver, NO disk, NO producer/consumer queue, NO SHA, NO TLS, NO
+# auth, NO DB, NO Bamep protocol framing. winhttp.dll + iphlpapi.dll are both
+# present in the exact stock WinPE boot.wim already used by the lab (verified).
+# Standalone workspace so it never joins the main Bamep workspace.
+[package]
+name = "bamep-i65-http-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bamep-i65-http-probe"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinHttp",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -46,6 +46,7 @@ EXTENT_BYTES="2147483648"
 CONNECT_WAIT_SECS="60"
 TOTAL_TRANSFERS="3"
 PROBE_EXTRA_ARGS=""
+CONTROL="capture"          # capture (default) | http (WinPE plain-HTTP throughput control)
 RUN_ID="issue65"
 IFACE="enp8s0"
 
@@ -64,6 +65,7 @@ while [ $# -gt 0 ]; do
     --connect-wait-secs) CONNECT_WAIT_SECS="$2"; shift 2 ;;
     --total-transfers) TOTAL_TRANSFERS="$2"; shift 2 ;;
     --probe-extra-args) PROBE_EXTRA_ARGS="$2"; shift 2 ;;
+    --control) CONTROL="$2"; shift 2 ;;
     --run-id) RUN_ID="$2"; shift 2 ;;
     --iface) IFACE="$2"; shift 2 ;;
     -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -90,6 +92,20 @@ for _tok in ${PROBE_EXTRA_ARGS}; do
     *) die "--probe-extra-args token not allowed: '${_tok}' (allowed: --no-digest --digest --synthetic-source)" ;;
   esac
 done
+
+# The control selects which throwaway WinPE probe + bootstrap gets injected. The
+# bootstrap output filename stays bamep-i65-bootstrap.cmd for both (winpeshl.ini
+# is reused verbatim); only the probe .exe basename and the template differ.
+case "${CONTROL}" in
+  capture)
+    PROBE_BASENAME="bamep-i65-capture-probe.exe"
+    BOOTSTRAP_TEMPLATE="${SCRIPT_DIR}/bamep-i65-bootstrap.cmd.template" ;;
+  http)
+    PROBE_BASENAME="bamep-i65-http-probe.exe"
+    BOOTSTRAP_TEMPLATE="${SCRIPT_DIR}/bamep-i65-http-bootstrap.cmd.template" ;;
+  *) die "--control must be 'capture' or 'http' (got: ${CONTROL})" ;;
+esac
+[ -f "${BOOTSTRAP_TEMPLATE}" ] || die "bootstrap template not found: ${BOOTSTRAP_TEMPLATE}"
 
 hash_of() { sha256sum "$1" | awk '{print $1}'; }
 
@@ -126,7 +142,7 @@ initrd http://${LAB_IP}:${HTTP_PORT}/BCD BCD
 initrd http://${LAB_IP}:${HTTP_PORT}/boot.sdi boot.sdi
 initrd http://${LAB_IP}:${HTTP_PORT}/winpeshl.ini winpeshl.ini
 initrd http://${LAB_IP}:${HTTP_PORT}/bamep-i65-bootstrap.cmd bamep-i65-bootstrap.cmd
-initrd http://${LAB_IP}:${HTTP_PORT}/bamep-i65-capture-probe.exe bamep-i65-capture-probe.exe
+initrd http://${LAB_IP}:${HTTP_PORT}/${PROBE_BASENAME} ${PROBE_BASENAME}
 initrd http://${LAB_IP}:${HTTP_PORT}/boot.wim boot.wim
 imgstat
 boot
@@ -139,13 +155,16 @@ sed -e "s|@LAB_IP@|${LAB_IP}|g" \
     -e "s|@CONNECT_WAIT_SECS@|${CONNECT_WAIT_SECS}|g" \
     -e "s|@TOTAL_TRANSFERS@|${TOTAL_TRANSFERS}|g" \
     -e "s| \{0,1\}@PROBE_EXTRA_ARGS@|${PROBE_EXTRA_ARGS:+ ${PROBE_EXTRA_ARGS}}|g" \
-    "${SCRIPT_DIR}/bamep-i65-bootstrap.cmd.template" > "${OUT}/http/bamep-i65-bootstrap.cmd"
+    "${BOOTSTRAP_TEMPLATE}" > "${OUT}/http/bamep-i65-bootstrap.cmd"
 chmod 0644 "${OUT}/http/bamep-i65-bootstrap.cmd"
 grep -qE '@[A-Z_]+@' "${OUT}/http/bamep-i65-bootstrap.cmd" && die "unsubstituted @TOKEN@ left in bamep-i65-bootstrap.cmd"
 grep -qF "for /L %%i in (1,1,${TOTAL_TRANSFERS}) do" "${OUT}/http/bamep-i65-bootstrap.cmd" || die "bootstrap.cmd missing the ${TOTAL_TRANSFERS}-transfer loop"
-grep -qF -- '--sink %SINK% --label t%%i --extent-bytes' "${OUT}/http/bamep-i65-bootstrap.cmd" || die "bootstrap.cmd missing the probe invocation"
+case "${CONTROL}" in
+  capture) grep -qF -- '--sink %SINK% --label t%%i --extent-bytes' "${OUT}/http/bamep-i65-bootstrap.cmd" || die "bootstrap.cmd missing the capture probe invocation" ;;
+  http)    grep -qF -- '--host %HOST% --port %PORT% --path /i65-http-control --label t%%i' "${OUT}/http/bamep-i65-bootstrap.cmd" || die "bootstrap.cmd missing the http probe invocation" ;;
+esac
 grep -qF 'wpeinit' "${OUT}/http/bamep-i65-bootstrap.cmd" || die "bootstrap.cmd does not run wpeinit"
-install -m 0644 "${PROBE_EXE}" "${OUT}/http/bamep-i65-capture-probe.exe"
+install -m 0644 "${PROBE_EXE}" "${OUT}/http/${PROBE_BASENAME}"
 
 cat > "${OUT}/dnsmasq.conf" <<EOF
 # Bamep Issue #65 - THROWAWAY lab harness. NOT production configuration.
@@ -215,7 +234,7 @@ echo "derive-issue65: no secret / key / credential material in the derived tree"
 AX="${OUT}/tftp/ipxeboot/x86_64-sb/autoexec.ipxe"
 grep -qxF 'initrd http://'"${LAB_IP}:${HTTP_PORT}"'/winpeshl.ini winpeshl.ini' "${AX}" || die "autoexec missing winpeshl.ini injection"
 grep -qxF 'initrd http://'"${LAB_IP}:${HTTP_PORT}"'/bamep-i65-bootstrap.cmd bamep-i65-bootstrap.cmd' "${AX}" || die "autoexec missing bootstrap.cmd injection"
-grep -qxF 'initrd http://'"${LAB_IP}:${HTTP_PORT}"'/bamep-i65-capture-probe.exe bamep-i65-capture-probe.exe' "${AX}" || die "autoexec missing probe.exe injection"
+grep -qxF 'initrd http://'"${LAB_IP}:${HTTP_PORT}"'/'"${PROBE_BASENAME}"' '"${PROBE_BASENAME}" "${AX}" || die "autoexec missing probe.exe injection"
 [ "$(grep -c '^initrd .*/boot.wim boot.wim$' "${AX}")" = "1" ] || die "autoexec must contain exactly one boot.wim initrd"
 [ "$(grep '^initrd ' "${AX}" | tail -1)" = "initrd http://${LAB_IP}:${HTTP_PORT}/boot.wim boot.wim" ] || die "boot.wim initrd must be the LAST initrd line"
 STRAY="$(grep -n '#' "${AX}" | grep -v '^1:#!ipxe$' || true)"
@@ -227,6 +246,7 @@ echo "derive-issue65: derived autoexec.ipxe structurally OK (3 injections, boot.
 {
   echo "# Bamep Issue #65 derived-runtime manifest ($(date -Is))"
   echo "# run_id=${RUN_ID} lab_ip=${LAB_IP} http=${HTTP_PORT} sink=${SINK_PORT}"
+  echo "# control=${CONTROL} probe=${PROBE_BASENAME}"
   echo "# extent_bytes=${EXTENT_BYTES} connect_wait_secs=${CONNECT_WAIT_SECS} total_transfers=${TOTAL_TRANSFERS} iface=${IFACE}"
   echo "# probe_extra_args=${PROBE_EXTRA_ARGS:-<none>}"
   echo
@@ -234,7 +254,7 @@ echo "derive-issue65: derived autoexec.ipxe structurally OK (3 injections, boot.
   sha256sum "${AX}" \
             "${OUT}/http/winpeshl.ini" \
             "${OUT}/http/bamep-i65-bootstrap.cmd" \
-            "${OUT}/http/bamep-i65-capture-probe.exe" \
+            "${OUT}/http/${PROBE_BASENAME}" \
             "${OUT}/tftp/ipxe.efi" \
             "${OUT}/tftp/ipxeboot/x86_64-sb/snponly-shim.efi" \
             "${OUT}/tftp/ipxeboot/x86_64-sb/snponly.efi" \
