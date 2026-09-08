@@ -103,11 +103,12 @@ struct Args {
     /// only — NOT transfer resume/retry: once the stream starts, a failure is
     /// fatal.
     connect_wait_secs: u64,
-    /// #65 source-isolation CONTROL RUN. When set, the producer generates a
-    /// deterministic in-memory pattern instead of reading a physical device:
-    /// NO enumeration, NO `CreateFileW`, NO device handle, ZERO disk bytes read.
-    /// Isolates whether the raw source-read path is the throughput limiter.
-    /// Not a real capture — no payload-correctness meaning.
+    /// #65 network/1GbE-ceiling CONTROL RUN. When set, the send path is one
+    /// immutable 64 MiB buffer (allocated + filled once) written to the same
+    /// TCP connection 32 times = 2 GiB: NO enumeration, NO `CreateFileW`, NO
+    /// device handle, ZERO disk bytes read, NO producer thread, NO queue, NO
+    /// per-write allocation/fill/SHA. Isolates the physical TCP ceiling from
+    /// source cost. Not a real capture — no payload-correctness meaning.
     synthetic_source: bool,
 }
 
@@ -285,58 +286,34 @@ fn resolve_and_gate(args: &Args) -> Result<GatedSource, i32> {
     }
 }
 
-/// One `READ_BLOCK`-shaped synthetic source slice for the `--synthetic-source`
-/// control run: a single fixed-byte allocation the exact size a real
-/// `read_bytes_at` slice would be. Deterministic, non-crypto, no RNG, no
-/// compression, no disk — one allocation + one fill, the same copy shape the
-/// real producer path already pays per block.
-fn synthetic_block(len: u64) -> Vec<u8> {
-    vec![0xA5u8; len as usize]
-}
-
-/// The producer thread. Real mode: opens its own GENERIC_READ handle to
-/// `locator` and reads ascending `READ_BLOCK` slices. `--synthetic-source`
-/// mode: generates each slice in memory ([`synthetic_block`]) and NEVER opens
-/// a device. Either way it streams `extent_bytes` into `tx`, hashing each slice
+/// The producer thread: opens its own GENERIC_READ handle to `locator`, streams
+/// `extent_bytes` in ascending `READ_BLOCK` slices into `tx`, hashing each slice
 /// exactly once (in order) if `want_digest`. Returns the final digest.
 fn spawn_producer(
     locator: String,
     extent_bytes: u64,
     want_digest: bool,
-    synthetic: bool,
     tx: std::sync::mpsc::SyncSender<Vec<u8>>,
 ) -> std::io::Result<std::thread::JoinHandle<Result<Option<[u8; 32]>, String>>> {
     std::thread::Builder::new()
         .name("i65-source".into())
         .spawn(move || -> Result<Option<[u8; 32]>, String> {
             let mut c = Counters::default();
-            let src = if synthetic {
-                None
-            } else {
-                Some(
-                    sources::RawReadSource::open(&locator, &mut c)
-                        .map_err(|e| format!("producer: open source: {e}"))?,
-                )
-            };
+            let src = sources::RawReadSource::open(&locator, &mut c)
+                .map_err(|e| format!("producer: open source: {e}"))?;
             let mut hasher = want_digest.then(Sha256::new);
             let mut offset = 0u64;
             while offset < extent_bytes {
                 let len = READ_BLOCK.min(extent_bytes - offset);
-                let buf = match &src {
-                    Some(s) => {
-                        let b = s
-                            .read_bytes_at(offset, len, &mut c)
-                            .map_err(|e| format!("producer: read at {offset}: {e}"))?;
-                        if b.len() as u64 != len {
-                            return Err(format!(
-                                "producer: short read at {offset}: got {} want {len}",
-                                b.len()
-                            ));
-                        }
-                        b
-                    }
-                    None => synthetic_block(len),
-                };
+                let buf = src
+                    .read_bytes_at(offset, len, &mut c)
+                    .map_err(|e| format!("producer: read at {offset}: {e}"))?;
+                if buf.len() as u64 != len {
+                    return Err(format!(
+                        "producer: short read at {offset}: got {} want {len}",
+                        buf.len()
+                    ));
+                }
                 if let Some(h) = hasher.as_mut() {
                     h.update(&buf);
                 }
@@ -345,12 +322,6 @@ fn spawn_producer(
                 }
                 offset += len;
             }
-            eprintln!(
-                "i65: producer done mode={} bytes={extent_bytes} data_device_open_count={} data_read_count={}",
-                if synthetic { "synthetic-in-memory" } else { "physical-source" },
-                c.data_device_open_count,
-                c.data_read_count
-            );
             Ok(hasher.map(|h| {
                 let d = h.finalize();
                 let mut o = [0u8; 32];
@@ -358,6 +329,49 @@ fn spawn_producer(
                 o
             }))
         })
+}
+
+/// Bytes sent per write in `--synthetic-source` mode: ONE buffer this size is
+/// allocated and filled ONCE, then written to the socket `extent_bytes / this`
+/// times. 2 GiB / 64 MiB = exactly 32 writes.
+const SYNTHETIC_BUF_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `--synthetic-source` network/1GbE-ceiling CONTROL. Deliberately NOT the
+/// production source pipeline: no device, no producer thread, no bounded queue,
+/// no per-write allocation, no per-write fill, no RNG, no SHA. Allocate one
+/// immutable `SYNTHETIC_BUF_BYTES` buffer, fill it once, and write that same
+/// borrowed buffer to the already-open connection until `extent_bytes` have
+/// been sent. Returns `(bytes_sent, send_wall, None)`.
+fn send_synthetic(
+    stream: &mut TcpStream,
+    extent_bytes: u64,
+) -> Result<(u64, Duration, Option<[u8; 32]>), i32> {
+    let repeat = extent_bytes / SYNTHETIC_BUF_BYTES;
+    if repeat == 0 || repeat * SYNTHETIC_BUF_BYTES != extent_bytes {
+        eprintln!(
+            "i65: --synthetic-source needs extent_bytes a multiple of {SYNTHETIC_BUF_BYTES} (got {extent_bytes})"
+        );
+        return Err(exit::BAD_ARGS);
+    }
+    // ONE allocation, ONE fill. The send loop only borrows `&buf`.
+    let buf = vec![0xA5u8; SYNTHETIC_BUF_BYTES as usize];
+    eprintln!(
+        "i65: --synthetic-source: 1 buffer of {SYNTHETIC_BUF_BYTES} bytes allocated+filled once; sending it {repeat}x over the SAME connection (no device, no thread, no queue, no per-write copy)"
+    );
+    let t0 = Instant::now();
+    let mut sent = 0u64;
+    for _ in 0..repeat {
+        if let Err(e) = stream.write_all(&buf) {
+            eprintln!("i65: synthetic socket write at {sent}: {e}");
+            return Err(exit::STREAM_FATAL);
+        }
+        sent += SYNTHETIC_BUF_BYTES;
+    }
+    let _ = stream.flush();
+    let wall = t0.elapsed();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    eprintln!("i65: --synthetic-source: sent {sent} bytes in {repeat} writes of {SYNTHETIC_BUF_BYTES}");
+    Ok((sent, wall, None))
 }
 
 /// One continuous streamed capture over a single fresh TCP connection.
@@ -390,21 +404,6 @@ fn run_capture(args: &Args, locator: &str) -> i32 {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(120)));
 
-    let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
-    let producer = match spawn_producer(
-        locator.to_string(),
-        args.extent_bytes,
-        args.digest,
-        args.synthetic_source,
-        tx,
-    ) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("i65: spawn producer: {e}");
-            return exit::STREAM_FATAL;
-        }
-    };
-
     // One JSON preamble line, then the raw byte stream. This is the ONLY
     // framing — not a protocol.
     let header = format!(
@@ -421,41 +420,65 @@ fn run_capture(args: &Args, locator: &str) -> i32 {
         return exit::STREAM_FATAL;
     }
 
-    let t0 = Instant::now();
-    let mut sent = 0u64;
-    while sent < args.extent_bytes {
-        let buf = match rx.recv() {
-            Ok(b) => b,
-            Err(_) => {
-                let perr = producer
-                    .join()
-                    .map(|r| r.err().unwrap_or_else(|| "producer ended early".into()))
-                    .unwrap_or_else(|_| "producer panicked".into());
-                eprintln!("i65: stream aborted: {perr}");
+    // Fill the extent over this one connection. `--synthetic-source` is a
+    // network-ceiling control (one immutable buffer, no thread/queue); the
+    // real path is the unchanged producer/consumer stream.
+    let (sent, client_wall, digest): (u64, Duration, Option<[u8; 32]>) = if args.synthetic_source {
+        match send_synthetic(&mut stream, args.extent_bytes) {
+            Ok(v) => v,
+            Err(code) => return code,
+        }
+    } else {
+        let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
+        let producer = match spawn_producer(
+            locator.to_string(),
+            args.extent_bytes,
+            args.digest,
+            tx,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("i65: spawn producer: {e}");
                 return exit::STREAM_FATAL;
             }
         };
-        if let Err(e) = stream.write_all(&buf) {
-            eprintln!("i65: socket write at {sent}: {e}");
-            let _ = producer.join();
-            return exit::STREAM_FATAL;
+        let t0 = Instant::now();
+        let mut sent = 0u64;
+        while sent < args.extent_bytes {
+            let buf = match rx.recv() {
+                Ok(b) => b,
+                Err(_) => {
+                    let perr = producer
+                        .join()
+                        .map(|r| r.err().unwrap_or_else(|| "producer ended early".into()))
+                        .unwrap_or_else(|_| "producer panicked".into());
+                    eprintln!("i65: stream aborted: {perr}");
+                    return exit::STREAM_FATAL;
+                }
+            };
+            if let Err(e) = stream.write_all(&buf) {
+                eprintln!("i65: socket write at {sent}: {e}");
+                let _ = producer.join();
+                return exit::STREAM_FATAL;
+            }
+            sent += buf.len() as u64;
         }
-        sent += buf.len() as u64;
-    }
-    let _ = stream.flush();
-    let client_wall = t0.elapsed();
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+        let _ = stream.flush();
+        let client_wall = t0.elapsed();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
 
-    let digest = match producer.join() {
-        Ok(Ok(d)) => d,
-        Ok(Err(e)) => {
-            eprintln!("i65: producer error: {e}");
-            return exit::STREAM_FATAL;
-        }
-        Err(_) => {
-            eprintln!("i65: producer panicked");
-            return exit::STREAM_FATAL;
-        }
+        let digest = match producer.join() {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => {
+                eprintln!("i65: producer error: {e}");
+                return exit::STREAM_FATAL;
+            }
+            Err(_) => {
+                eprintln!("i65: producer panicked");
+                return exit::STREAM_FATAL;
+            }
+        };
+        (sent, client_wall, digest)
     };
 
     let mut sink_line = String::new();
@@ -638,12 +661,12 @@ fn main() {
         std::process::exit(self_check(&args));
     }
 
-    // #65 source-isolation CONTROL RUN: bypass enumeration / selection / open /
-    // safety predicate entirely — there is no physical source in this mode. The
-    // producer generates the stream in memory; ZERO disk bytes are read.
+    // #65 network-ceiling CONTROL RUN: bypass enumeration / selection / open /
+    // safety predicate entirely — there is no physical source in this mode.
+    // ZERO disk bytes are read; see `send_synthetic`.
     if args.synthetic_source {
         eprintln!(
-            "i65: --synthetic-source CONTROL RUN — NO enumeration, NO device open, NO disk read; deterministic in-memory source, extent_bytes={}",
+            "i65: --synthetic-source CONTROL RUN — NO enumeration, NO device open, NO disk read; one immutable 64 MiB buffer sent repeatedly, extent_bytes={}",
             args.extent_bytes
         );
         let code = run_capture(&args, "<synthetic>");
