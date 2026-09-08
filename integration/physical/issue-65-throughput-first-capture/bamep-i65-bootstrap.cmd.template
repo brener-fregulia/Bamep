@@ -23,7 +23,7 @@ set "SINK=@LAB_IP@:@SINK_PORT@"
 for /L %%i in (1,1,@TOTAL_TRANSFERS@) do (
   echo.
   echo [bamep-i65] ===== transfer %%i / @TOTAL_TRANSFERS@ =====
-  "%PROBE%" --sink %SINK% --label t%%i --extent-bytes @EXTENT_BYTES@ --connect-wait-secs @CONNECT_WAIT_SECS@
+  "%PROBE%" --sink %SINK% --label t%%i --extent-bytes @EXTENT_BYTES@ --connect-wait-secs @CONNECT_WAIT_SECS@ @PROBE_EXTRA_ARGS@
   echo BAMEP_I65_XFER_%%i_EXITCODE=!ERRORLEVEL!
 )
 

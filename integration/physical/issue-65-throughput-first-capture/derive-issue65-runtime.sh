@@ -45,6 +45,7 @@ SINK_PORT="9265"
 EXTENT_BYTES="2147483648"
 CONNECT_WAIT_SECS="60"
 TOTAL_TRANSFERS="3"
+PROBE_EXTRA_ARGS=""
 RUN_ID="issue65"
 IFACE="enp8s0"
 
@@ -62,6 +63,7 @@ while [ $# -gt 0 ]; do
     --extent-bytes) EXTENT_BYTES="$2"; shift 2 ;;
     --connect-wait-secs) CONNECT_WAIT_SECS="$2"; shift 2 ;;
     --total-transfers) TOTAL_TRANSFERS="$2"; shift 2 ;;
+    --probe-extra-args) PROBE_EXTRA_ARGS="$2"; shift 2 ;;
     --run-id) RUN_ID="$2"; shift 2 ;;
     --iface) IFACE="$2"; shift 2 ;;
     -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -78,6 +80,16 @@ done
 [ -e "${OUT}" ] && die "refusing to overwrite existing ${OUT} — pass a fresh --out path"
 case "${TOTAL_TRANSFERS}" in ''|*[!0-9]*) die "--total-transfers must be a positive integer" ;; esac
 [ "${TOTAL_TRANSFERS}" -ge 1 ] || die "--total-transfers must be >= 1"
+# The extra-args string is injected verbatim into the WinPE bootstrap probe
+# invocation. Allowlist every space-separated token (flags only, no values, no
+# shell metacharacters) so a combination like "--no-digest --synthetic-source"
+# is accepted while anything else fails closed.
+for _tok in ${PROBE_EXTRA_ARGS}; do
+  case "${_tok}" in
+    --no-digest|--digest|--synthetic-source) : ;;
+    *) die "--probe-extra-args token not allowed: '${_tok}' (allowed: --no-digest --digest --synthetic-source)" ;;
+  esac
+done
 
 hash_of() { sha256sum "$1" | awk '{print $1}'; }
 
@@ -126,6 +138,7 @@ sed -e "s|@LAB_IP@|${LAB_IP}|g" \
     -e "s|@EXTENT_BYTES@|${EXTENT_BYTES}|g" \
     -e "s|@CONNECT_WAIT_SECS@|${CONNECT_WAIT_SECS}|g" \
     -e "s|@TOTAL_TRANSFERS@|${TOTAL_TRANSFERS}|g" \
+    -e "s| \{0,1\}@PROBE_EXTRA_ARGS@|${PROBE_EXTRA_ARGS:+ ${PROBE_EXTRA_ARGS}}|g" \
     "${SCRIPT_DIR}/bamep-i65-bootstrap.cmd.template" > "${OUT}/http/bamep-i65-bootstrap.cmd"
 chmod 0644 "${OUT}/http/bamep-i65-bootstrap.cmd"
 grep -qE '@[A-Z_]+@' "${OUT}/http/bamep-i65-bootstrap.cmd" && die "unsubstituted @TOKEN@ left in bamep-i65-bootstrap.cmd"
@@ -215,6 +228,7 @@ echo "derive-issue65: derived autoexec.ipxe structurally OK (3 injections, boot.
   echo "# Bamep Issue #65 derived-runtime manifest ($(date -Is))"
   echo "# run_id=${RUN_ID} lab_ip=${LAB_IP} http=${HTTP_PORT} sink=${SINK_PORT}"
   echo "# extent_bytes=${EXTENT_BYTES} connect_wait_secs=${CONNECT_WAIT_SECS} total_transfers=${TOTAL_TRANSFERS} iface=${IFACE}"
+  echo "# probe_extra_args=${PROBE_EXTRA_ARGS:-<none>}"
   echo
   echo "## authored / substituted / copied (independent bytes):"
   sha256sum "${AX}" \

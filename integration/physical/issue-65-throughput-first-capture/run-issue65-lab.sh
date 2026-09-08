@@ -46,6 +46,17 @@ EXTENT_BYTES="${I65_EXTENT_BYTES:-2147483648}"
 TRANSFERS="${I65_TRANSFERS:-3}"        # per destination: 1 warmup + 2 measured
 CONNECT_WAIT_SECS="${I65_CONNECT_WAIT_SECS:-60}"
 
+# Issue #65 control-run switches, both routed through the probe's existing flags
+# via derive's --probe-extra-args (throwaway Spike isolation knobs, not product):
+#   I65_NO_DIGEST=1        -> --no-digest        (disable endpoint SHA-256 / hashing)
+#   I65_SYNTHETIC_SOURCE=1 -> --synthetic-source (deterministic in-memory source;
+#                             NO enumeration / device open / disk read — isolates
+#                             whether the raw source-read path is the limiter)
+# Neither run carries any payload-correctness meaning.
+PROBE_EXTRA_ARGS=""
+if [ "${I65_NO_DIGEST:-0}" = "1" ]; then PROBE_EXTRA_ARGS="${PROBE_EXTRA_ARGS:+${PROBE_EXTRA_ARGS} }--no-digest"; fi
+if [ "${I65_SYNTHETIC_SOURCE:-0}" = "1" ]; then PROBE_EXTRA_ARGS="${PROBE_EXTRA_ARGS:+${PROBE_EXTRA_ARGS} }--synthetic-source"; fi
+
 # Optional per-disk destination comparison (Issue #65 disk test). Comma-separated
 # list of writable directories, each on the filesystem under test. When set, the
 # sink runs ${TRANSFERS} connections against each directory IN ORDER
@@ -251,6 +262,7 @@ git -C "${REPO_ROOT}" rev-parse HEAD > "${EVID}/repo-head.txt" 2>/dev/null || ec
   echo "lab_ip        ${LAB_IP}"
   echo "ports         http=${PORT_HTTP} sink=${PORT_SINK}"
   echo "extent_bytes  ${EXTENT_BYTES}"
+  echo "probe_extra   ${PROBE_EXTRA_ARGS:-<none> (real source, digest enabled)}"
   echo "transfers     ${TRANSFERS}/dest (1 warmup + $((TRANSFERS - 1)) measured); total ${TOTAL_TRANSFERS}"
   if [ "${NDIRS}" -gt 0 ]; then
     echo "dest_dirs     ${DEST_DIRS[*]}"
@@ -329,10 +341,13 @@ trap cleanup EXIT
 hr
 log "DERIVING the Issue-65 PXE/WinPE runtime (Phase-9d assets consumed READ-ONLY)"
 DERIVE_OUT="${EVID}/derived-runtime"
+DERIVE_EXTRA=()
+[ -n "${PROBE_EXTRA_ARGS}" ] && DERIVE_EXTRA=(--probe-extra-args "${PROBE_EXTRA_ARGS}")
 if ! "${DERIVE}" --out "${DERIVE_OUT}" --probe-exe "${PROBE_EXE}" \
       --lab-ip "${LAB_IP}" --http-port "${PORT_HTTP}" --sink-port "${PORT_SINK}" \
       --extent-bytes "${EXTENT_BYTES}" --connect-wait-secs "${CONNECT_WAIT_SECS}" \
       --total-transfers "${TOTAL_TRANSFERS}" \
+      ${DERIVE_EXTRA[@]+"${DERIVE_EXTRA[@]}"} \
       --run-id "${RUN_ID}" --iface "${LAB_IFACE}" \
       > "${EVID}/derive.log" 2>&1; then
   cat "${EVID}/derive.log" >&2
@@ -444,6 +459,9 @@ gate "autoexec: boot.wim initrd is last"    bash -c "[ \"\$(grep '^initrd ' '${A
 gate "bootstrap.cmd runs the ${TOTAL_TRANSFERS}-transfer loop" bash -c "grep -qF 'for /L %%i in (1,1,${TOTAL_TRANSFERS}) do' '${DERIVE_OUT}/http/bamep-i65-bootstrap.cmd' && grep -qF -- '--sink %SINK% --label t%%i --extent-bytes' '${DERIVE_OUT}/http/bamep-i65-bootstrap.cmd'"
 if [ "${NDIRS}" -gt 0 ]; then
   gate "sink schedule = ${TOTAL_TRANSFERS} total connections" bash -c "grep -q 'total_connections=${TOTAL_TRANSFERS} ' '${EVID}/sink.log'"
+fi
+if [ -n "${PROBE_EXTRA_ARGS}" ]; then
+  gate "bootstrap.cmd passes ${PROBE_EXTRA_ARGS} to the probe" bash -c "grep -qF -- '--connect-wait-secs ${CONNECT_WAIT_SECS} ${PROBE_EXTRA_ARGS}' '${DERIVE_OUT}/http/bamep-i65-bootstrap.cmd'"
 fi
 
 for i in "${!CHILD_PID[@]}"; do

@@ -103,6 +103,12 @@ struct Args {
     /// only — NOT transfer resume/retry: once the stream starts, a failure is
     /// fatal.
     connect_wait_secs: u64,
+    /// #65 source-isolation CONTROL RUN. When set, the producer generates a
+    /// deterministic in-memory pattern instead of reading a physical device:
+    /// NO enumeration, NO `CreateFileW`, NO device handle, ZERO disk bytes read.
+    /// Isolates whether the raw source-read path is the throughput limiter.
+    /// Not a real capture — no payload-correctness meaning.
+    synthetic_source: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -115,6 +121,7 @@ fn parse_args() -> Result<Args, String> {
         self_check: false,
         loopback: false,
         connect_wait_secs: 60,
+        synthetic_source: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -135,6 +142,7 @@ fn parse_args() -> Result<Args, String> {
             "--no-digest" => a.digest = false,
             "--self-check" => a.self_check = true,
             "--loopback" => a.loopback = true,
+            "--synthetic-source" => a.synthetic_source = true,
             "--connect-wait-secs" => {
                 a.connect_wait_secs = it
                     .next()
@@ -277,34 +285,58 @@ fn resolve_and_gate(args: &Args) -> Result<GatedSource, i32> {
     }
 }
 
-/// The producer thread: opens its own GENERIC_READ handle to `locator`, streams
-/// `extent_bytes` in ascending `READ_BLOCK` slices into `tx`, hashing each slice
+/// One `READ_BLOCK`-shaped synthetic source slice for the `--synthetic-source`
+/// control run: a single fixed-byte allocation the exact size a real
+/// `read_bytes_at` slice would be. Deterministic, non-crypto, no RNG, no
+/// compression, no disk — one allocation + one fill, the same copy shape the
+/// real producer path already pays per block.
+fn synthetic_block(len: u64) -> Vec<u8> {
+    vec![0xA5u8; len as usize]
+}
+
+/// The producer thread. Real mode: opens its own GENERIC_READ handle to
+/// `locator` and reads ascending `READ_BLOCK` slices. `--synthetic-source`
+/// mode: generates each slice in memory ([`synthetic_block`]) and NEVER opens
+/// a device. Either way it streams `extent_bytes` into `tx`, hashing each slice
 /// exactly once (in order) if `want_digest`. Returns the final digest.
 fn spawn_producer(
     locator: String,
     extent_bytes: u64,
     want_digest: bool,
+    synthetic: bool,
     tx: std::sync::mpsc::SyncSender<Vec<u8>>,
 ) -> std::io::Result<std::thread::JoinHandle<Result<Option<[u8; 32]>, String>>> {
     std::thread::Builder::new()
         .name("i65-source".into())
         .spawn(move || -> Result<Option<[u8; 32]>, String> {
             let mut c = Counters::default();
-            let src = sources::RawReadSource::open(&locator, &mut c)
-                .map_err(|e| format!("producer: open source: {e}"))?;
+            let src = if synthetic {
+                None
+            } else {
+                Some(
+                    sources::RawReadSource::open(&locator, &mut c)
+                        .map_err(|e| format!("producer: open source: {e}"))?,
+                )
+            };
             let mut hasher = want_digest.then(Sha256::new);
             let mut offset = 0u64;
             while offset < extent_bytes {
                 let len = READ_BLOCK.min(extent_bytes - offset);
-                let buf = src
-                    .read_bytes_at(offset, len, &mut c)
-                    .map_err(|e| format!("producer: read at {offset}: {e}"))?;
-                if buf.len() as u64 != len {
-                    return Err(format!(
-                        "producer: short read at {offset}: got {} want {len}",
-                        buf.len()
-                    ));
-                }
+                let buf = match &src {
+                    Some(s) => {
+                        let b = s
+                            .read_bytes_at(offset, len, &mut c)
+                            .map_err(|e| format!("producer: read at {offset}: {e}"))?;
+                        if b.len() as u64 != len {
+                            return Err(format!(
+                                "producer: short read at {offset}: got {} want {len}",
+                                b.len()
+                            ));
+                        }
+                        b
+                    }
+                    None => synthetic_block(len),
+                };
                 if let Some(h) = hasher.as_mut() {
                     h.update(&buf);
                 }
@@ -313,6 +345,12 @@ fn spawn_producer(
                 }
                 offset += len;
             }
+            eprintln!(
+                "i65: producer done mode={} bytes={extent_bytes} data_device_open_count={} data_read_count={}",
+                if synthetic { "synthetic-in-memory" } else { "physical-source" },
+                c.data_device_open_count,
+                c.data_read_count
+            );
             Ok(hasher.map(|h| {
                 let d = h.finalize();
                 let mut o = [0u8; 32];
@@ -353,7 +391,13 @@ fn run_capture(args: &Args, locator: &str) -> i32 {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(120)));
 
     let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
-    let producer = match spawn_producer(locator.to_string(), args.extent_bytes, args.digest, tx) {
+    let producer = match spawn_producer(
+        locator.to_string(),
+        args.extent_bytes,
+        args.digest,
+        args.synthetic_source,
+        tx,
+    ) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("i65: spawn producer: {e}");
@@ -532,6 +576,7 @@ fn self_check(args: &Args) -> i32 {
         self_check: true,
         loopback: false,
         connect_wait_secs: args.connect_wait_secs,
+        synthetic_source: false,
     };
     match resolve_and_gate(&bad) {
         Err(exit::SAFETY_REJECTED) => eprintln!("i65: self-check REJECT path ok (extent > device)"),
@@ -541,7 +586,15 @@ fn self_check(args: &Args) -> i32 {
         }
     }
     // Optional loopback stream — one real transfer against --sink.
-    if args.loopback {
+    if args.loopback && args.synthetic_source {
+        eprintln!("i65: self-check loopback in --synthetic-source mode: no gate, no device");
+        let code = run_capture(args, "<synthetic>");
+        if code != exit::PASS {
+            eprintln!("i65: self-check synthetic loopback stream failed (exit {code})");
+            return 1;
+        }
+        eprintln!("i65: self-check synthetic loopback stream ok");
+    } else if args.loopback {
         match resolve_and_gate(args) {
             Ok(g) => {
                 let code = run_capture(args, &g.locator);
@@ -583,6 +636,19 @@ fn main() {
 
     if args.self_check {
         std::process::exit(self_check(&args));
+    }
+
+    // #65 source-isolation CONTROL RUN: bypass enumeration / selection / open /
+    // safety predicate entirely — there is no physical source in this mode. The
+    // producer generates the stream in memory; ZERO disk bytes are read.
+    if args.synthetic_source {
+        eprintln!(
+            "i65: --synthetic-source CONTROL RUN — NO enumeration, NO device open, NO disk read; deterministic in-memory source, extent_bytes={}",
+            args.extent_bytes
+        );
+        let code = run_capture(&args, "<synthetic>");
+        println!("BAMEP_I65_CAPTURE_EXITCODE={code} label={}", args.label);
+        std::process::exit(code);
     }
 
     let gated = match resolve_and_gate(&args) {
