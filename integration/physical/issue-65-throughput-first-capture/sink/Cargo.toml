@@ -1,0 +1,28 @@
+# Issue #65 — Fedora-side capture sink (THROWAWAY Spike plumbing).
+#
+# NOT the Bamep data plane, NOT the Worker, NOT the control plane. ONE plain-TCP
+# listener on the isolated lab link. Per connection: read one JSON preamble
+# line, stream exactly `extent_bytes` into ONE fresh sequential destination
+# file, ONE final fsync, reply with a one-line JSON measurement. NO TLS, NO
+# auth, NO DB, NO per-chunk file/fsync/commit/ACK. Standalone workspace.
+[package]
+name = "bamep-i65-capture-sink"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bamep-i65-capture-sink"
+path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

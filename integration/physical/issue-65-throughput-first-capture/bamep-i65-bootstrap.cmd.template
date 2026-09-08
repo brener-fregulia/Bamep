@@ -1,0 +1,35 @@
+@echo off
+rem  Bamep Issue #65 — WinPE auto-start bootstrap. THROWAWAY LAB ONLY.
+rem
+rem  Injected into X:\Windows\System32 by the DERIVED Issue-65 autoexec.ipxe via
+rem  wimboot's boot-time file overlay. The Issue #53 Phase-9d boot.wim / BCD /
+rem  boot.sdi are NOT modified.
+rem
+rem  winpeshl.ini launches:  cmd.exe /k X:\Windows\System32\bamep-i65-bootstrap.cmd
+rem  so this window stays open after the probe runs.
+rem
+rem  Sequence: wpeinit (network + PnP), then @TOTAL_TRANSFERS@ back-to-back 2 GiB
+rem  captures against the Fedora sink. Each capture is a fresh process, fresh
+rem  source open (GENERIC_READ), fresh single TCP connection; the Fedora sink
+rem  decides which destination filesystem each connection lands on (per-disk
+rem  comparison). The first probe waits (bounded) for the sink to be reachable.
+setlocal enabledelayedexpansion
+echo [bamep-i65] wpeinit (network + PnP init)...
+wpeinit
+
+set "PROBE=X:\Windows\System32\bamep-i65-capture-probe.exe"
+set "SINK=@LAB_IP@:@SINK_PORT@"
+
+for /L %%i in (1,1,@TOTAL_TRANSFERS@) do (
+  echo.
+  echo [bamep-i65] ===== transfer %%i / @TOTAL_TRANSFERS@ =====
+  "%PROBE%" --sink %SINK% --label t%%i --extent-bytes @EXTENT_BYTES@ --connect-wait-secs @CONNECT_WAIT_SECS@
+  echo BAMEP_I65_XFER_%%i_EXITCODE=!ERRORLEVEL!
+)
+
+echo.
+echo BAMEP_I65_ALL_DONE
+echo [bamep-i65] All @TOTAL_TRANSFERS@ transfers complete. Read the throughput on
+echo             the Fedora launcher terminal (I65_SINK_LINE / result lines),
+echo             then power the MiniPC off. This CMD stays open.
+endlocal

@@ -1,0 +1,49 @@
+# Issue #65 — throughput-first endpoint-capture probe (THROWAWAY Spike artifact).
+#
+# LAB-ONLY. NOT the Bamep Agent, NOT crates/agent, NOT bamepd, NOT a production
+# transfer architecture. It proves ONE thing: whether the simplest physical
+# MiniPC -> server capture byte path can sustain >= 100 MB/s on the 1 GbE lab.
+#
+#   opaque same-boot source epoch -> resolver -> Issue-63 source-safety predicate
+#   -> GENERIC_READ open -> dedicated producer thread streams a fixed 2 GiB
+#      sequential extent (+ incremental SHA-256) into a bounded queue
+#   -> the foreground writes that queue to ONE continuous TCP stream.
+#
+# NO per-chunk files/fsync/DB/ACK. NO resume/retry. NO TLS/auth/protocol. NO
+# tokio. Minimal deps: std TCP + sha2 + getrandom + windows-sys file/IOCTL APIs
+# (all in the #60/#61-proven stock-WinPE DLL set). The pure source-safety
+# predicate is reused from the Issue-63 stage2-engine (no re-implementation).
+# Standalone workspace so it never joins the main Bamep workspace.
+[package]
+name = "bamep-i65-capture-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[workspace]
+
+[[bin]]
+name = "bamep-i65-capture-probe"
+path = "src/main.rs"
+
+[dependencies]
+bamep-i63-stage2-engine = { path = "../../issue-63-data-plane-throughput/stage2-engine" }
+sha2 = "0.10"
+getrandom = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

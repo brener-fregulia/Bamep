@@ -1,0 +1,17 @@
+# Issue #65 throughput-first capture Spike — build + runtime + physical evidence.
+# Authored source is versioned:
+#   capture-probe/src/**, capture-probe/build.rs, sink/src/**, */Cargo.toml,
+#   */Cargo.lock, derive-issue65-runtime.sh, run-issue65-lab.sh, winpeshl.ini,
+#   bamep-i65-bootstrap.cmd.template, README.md, this .gitignore.
+# Everything below is regenerable, runtime, or physical-run output.
+target/
+evidence/
+*.log
+*.exe
+*.pdb
+*.bin
+# Issue #65 carries NO credential/key/token. Never commit any key material.
+*.pem
+*.key
+*.crt
+*.cred
