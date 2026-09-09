@@ -17,7 +17,7 @@ Bamep currently has eight Rust crates:
 | `bamep-simulator` | Simulated Agent participant using real trusted-bootstrap and WSS/Agent Protocol boundaries |
 | `bamep-worker-protocol` | Rust wire model/codec/framing for the implemented Worker Protocol v1 handshake + business-message catalog |
 | `bamep-worker` | The isolated Worker process: concurrent UDS control client, fail-closed authority tracking, Server TLS identity, local chunk storage + full-Artifact reconstruction, and the HTTPS `/api/data/v1/` data plane |
-| `bamep-bve` | Host-side lifecycle for one disposable Bamep Virtual Endpoint: validated machine definition, direct QEMU/KVM invocation, owned process + QMP control socket, and the `create/start/observe/reset/stop/destroy` lifecycle |
+| `bamep-ve` | Host-side lifecycle for one disposable Bamep Virtual Endpoint (BVE): validated machine definition, direct QEMU/KVM invocation, owned process + QMP control socket, and the `create/start/observe/reset/stop/destroy` lifecycle |
 
 Planned components remain outside Architecture until corresponding code exists.
 
@@ -72,7 +72,9 @@ The implemented structure preserves these rules:
 - `bamep-domain` contains pure business logic: transitions take time/secrets explicitly and
   perform no I/O or persistence.
 - `bamep-simulator` depends on Agent Protocol and trusted-bootstrap, not Domain or Server; it
-  exercises the external Agent-side boundary.
+  exercises the external Agent-side boundary. It also depends on `bamep-ve` for optional
+  single-BVE orchestration (`SimulatorBve`) — an additive capability that is not on the
+  lightweight in-process participant's execution path.
 - `bamep-server` contains `application`, `ports`, and `adapters`; Application coordinates
   through Ports and Domain, while infrastructure-specific dependencies stay in Adapters.
 - PostgreSQL/SQLx and Agent transport/gateway implementations are Server Adapter concerns.
@@ -92,18 +94,19 @@ The implemented structure preserves these rules:
   not on `bamep-worker` itself in production code, preserving one-directional isolation; the
   `bamepd` binary spawns the compiled `bamep-worker` executable as a separate OS process
   rather than linking against its crate.
-- `bamep-bve` depends only on `thiserror` and `serde_json` (the latter to parse QEMU's
+- `bamep-ve` depends only on `thiserror` and `serde_json` (the latter to parse QEMU's
   line-delimited JSON QMP protocol). It has no `bamep-agent-protocol`, `bamep-simulator`,
-  `bamep-domain`, or `bamep-server` dependency and no async runtime. A future Simulator-side
-  consumer would depend on `bamep-bve`, never the reverse
+  `bamep-domain`, or `bamep-server` dependency and no async runtime. The dependency
+  direction is strictly `bamep-simulator -> bamep-ve`, never the reverse
   (`m0-bamep-virtual-endpoint-contract.md` "Code boundary").
 
 Infrastructure must not leak into Domain transitions.
 
-## Bamep Virtual Endpoint host runtime (`bamep-bve`)
+## Bamep Virtual Endpoint host runtime (`bamep-ve`)
 
-`bamep-bve` is the host-side runtime for one disposable Bamep Virtual Endpoint (BVE),
-implemented directly against QEMU/KVM per ADR-0022. It is transversal
+`bamep-ve` is the host-side runtime for one disposable Bamep Virtual Endpoint (BVE),
+implemented directly against QEMU/KVM per ADR-0022. The crate/package is named `bamep-ve`
+(`crates/ve`); the concept it implements keeps the name BVE. It is transversal
 validation/development infrastructure related to the Simulator, not part of the M2 Endpoint
 Capture product surface.
 
@@ -147,6 +150,26 @@ The real end-to-end QEMU/KVM lifecycle is proved by an opt-in
 and CI never trigger. BVE never proves physical firmware, PXE, NIC, storage-controller, or
 WinPE behavior (`m0-bamep-virtual-endpoint-contract.md` "Validation and fidelity
 boundary").
+
+### Simulator BVE orchestration (Issue #68)
+
+`bamep-simulator` can orchestrate one BVE through `bve::SimulatorBve`, a thin boundary that
+owns a `bamep_ve::BveRuntime` and re-exposes the same
+`create/start/observe/reset/stop/destroy` lifecycle plus a small
+`SimulatorBveError { Prerequisite, Runtime }` composition that preserves the underlying
+cause. `SimulatorBve::start` composes `bamep_ve::detect_host_prerequisites` so a scenario
+does not thread `HostPrerequisites` itself. No QEMU argument construction, QMP parsing,
+`/dev/kvm` check, process ownership, or control-socket path lives in the Simulator; those
+stay in `bamep-ve`. A Simulator BVE scenario builds its definition from the `bamep-ve`
+types directly (re-exported, not re-modelled).
+
+This is additive: the lightweight in-process Agent participant (`action`, `handshake`,
+`transport`, `data_plane`, `trusted_bootstrap`, `transfer_action`) is unchanged and never
+routes through a BVE. #68 deliberately introduces no `EndpointBackend`-style trait over the
+two — there is no second real backend sharing the VM power lifecycle, and ADR-0022 defers
+any generic hypervisor/backend abstraction. `crates/simulator/examples/bve_lifecycle.rs`
+(`cargo run -p bamep-simulator --example bve_lifecycle`) is the developer entrypoint that
+drives one real VM through this boundary.
 
 ## Implemented Agent-side path
 

@@ -79,8 +79,8 @@ a BVE-owning responsibility, never the reverse, and BVE must not depend on
 `bamep-agent-protocol` or any Agent Protocol semantics merely to control a virtual machine.
 
 This Specification does not materialize that boundary as a crate, module, or path. The
-concrete package structure (illustratively a future `bamep-bve` crate) is implementation
-work for the Work Package that first implements a BVE.
+concrete package structure (the `bamep-ve` crate) is implementation work for the Work
+Package that first implements a BVE.
 
 ## Lifecycle
 

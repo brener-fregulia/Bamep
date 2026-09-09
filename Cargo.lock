@@ -178,15 +178,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bamep-bve"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
 name = "bamep-domain"
 version = "0.1.0"
 dependencies = [
@@ -245,6 +236,7 @@ dependencies = [
  "bamep-domain",
  "bamep-server",
  "bamep-trusted-bootstrap",
+ "bamep-ve",
  "bamep-worker",
  "bamep-worker-protocol",
  "base64",
@@ -277,6 +269,15 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "bamep-ve"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

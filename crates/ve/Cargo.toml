@@ -1,11 +1,11 @@
 [package]
-name = "bamep-bve"
+name = "bamep-ve"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 
 [lib]
-name = "bamep_bve"
+name = "bamep_ve"
 path = "src/lib.rs"
 
 [dependencies]

@@ -11,6 +11,12 @@ path = "src/lib.rs"
 [dependencies]
 bamep-agent-protocol = { path = "../agent-protocol" }
 bamep-trusted-bootstrap = { path = "../trusted-bootstrap", features = ["fixture-signing"] }
+# Issue #68 — the Simulator can orchestrate one real BVE (QEMU/KVM virtual
+# Endpoint) through the `bve` boundary. Dependency direction is strictly
+# `simulator -> ve`; `bamep-ve` never depends back on the Simulator, Agent
+# Protocol, Domain, or Server. This is an additive capability: the lightweight
+# in-process Agent participant keeps working with no BVE on its path.
+bamep-ve = { path = "../ve" }
 tokio = { version = "1", features = ["net", "rt", "io-util", "time"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

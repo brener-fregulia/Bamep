@@ -8,7 +8,7 @@
 //! a prepared Linux reference host with:
 //!
 //! ```text
-//! BAMEP_BVE_HOST_TEST=1 cargo test -p bamep-bve --test host_lifecycle -- --nocapture
+//! BAMEP_BVE_HOST_TEST=1 cargo test -p bamep-ve --test host_lifecycle -- --nocapture
 //! ```
 //!
 //! It boots no guest OS. It uses a small throwaway raw disk with no bootable
@@ -23,7 +23,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use bamep_bve::{
+use bamep_ve::{
     detect_host_prerequisites, BveDefinition, BveId, BveRuntime, Firmware, LifecycleState,
     RuntimeRoot,
 };

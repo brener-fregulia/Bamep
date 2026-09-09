@@ -18,12 +18,20 @@
 //! added the post-session inventory-reporting helper
 //! ([`handshake::send_inventory_report`]).
 //!
+//! Issue #68 adds an **additive** capability: [`bve::SimulatorBve`] lets a
+//! scenario orchestrate one real Bamep Virtual Endpoint (QEMU/KVM) through the
+//! `bamep-ve` boundary, owning a `bamep_ve::BveRuntime` without the Simulator
+//! learning any QEMU/QMP detail. The lightweight in-process Agent participant
+//! above is unchanged and never routes through a BVE.
+//!
 //! Production dependency direction: `bamep-simulator` depends on
-//! `bamep-agent-protocol` for the wire model and on
-//! `bamep-trusted-bootstrap` for the trusted-bootstrap contract primitives.
-//! It does not depend on `bamep-domain` or `bamep-server`.
+//! `bamep-agent-protocol` for the wire model, on `bamep-trusted-bootstrap`
+//! for the trusted-bootstrap contract primitives, and on `bamep-ve` for
+//! single-BVE orchestration (strictly `simulator -> ve`). It does not depend
+//! on `bamep-domain` or `bamep-server`.
 
 pub mod action;
+pub mod bve;
 pub mod data_plane;
 pub mod handshake;
 pub mod transfer_action;
@@ -37,6 +45,10 @@ pub use action::{
     CancelBehavior, ScenarioOutcome, SimulatedActionAgent, M1_ACTION_TYPE, M1_ACTION_VERSION,
 };
 pub use bamep_trusted_bootstrap::ServerCertFingerprint;
+pub use bve::{
+    BveDefinition, BveId, Firmware, LifecycleState as BveLifecycleState,
+    RuntimeRoot as BveRuntimeRoot, SimulatorBve, SimulatorBveError,
+};
 pub use data_plane::{
     DataPlaneClient, DataPlaneClientError, DataPlaneTransportError, HeldChunk as ResumeHeldChunk,
     PutChunkOutcome, ResumeManifest, ResumeOutcome, SealArtifactStatus, SealOutcome,
