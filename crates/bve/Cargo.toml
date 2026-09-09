@@ -1,0 +1,24 @@
+[package]
+name = "bamep-bve"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "bamep_bve"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "1"
+# QMP is QEMU's line-delimited JSON control protocol. The runtime parses
+# objects QEMU emits (greeting, command `return`/`error`, `query-status`
+# result) rather than hand-rolling a JSON reader over an external process's
+# output. `serde_json` with no derive is the same minimal parser the rest of
+# the workspace already depends on; no new HTTP/serde-derive weight.
+serde_json = "1"
+
+[dev-dependencies]
+# Unique disposable temp-dir names for isolated tests, matching the
+# `std::env::temp_dir().join(format!("bamep-...-{uuid}"))` convention the
+# `bamep-worker` tests already use. Test-only.
+uuid = { version = "1", features = ["v4"] }
