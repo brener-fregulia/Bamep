@@ -1,6 +1,6 @@
 # ADR-0022: BVE Linux/QEMU/KVM Reference Backend
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 

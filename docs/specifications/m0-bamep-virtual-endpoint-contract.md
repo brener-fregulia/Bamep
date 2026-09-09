@@ -1,6 +1,6 @@
 # M0 — Bamep Virtual Endpoint (BVE) Contract
 
-Status: **Proposed**
+Status: **Approved**
 
 This Specification defines the normative responsibility, Simulator relationship, minimal
 lifecycle, and validation/fidelity boundary of the Bamep Virtual Endpoint (BVE). It does not
