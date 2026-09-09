@@ -21,8 +21,11 @@
 //! Issue #68 adds an **additive** capability: [`bve::SimulatorBve`] lets a
 //! scenario orchestrate one real Bamep Virtual Endpoint (QEMU/KVM) through the
 //! `bamep-ve` boundary, owning a `bamep_ve::BveRuntime` without the Simulator
-//! learning any QEMU/QMP detail. The lightweight in-process Agent participant
-//! above is unchanged and never routes through a BVE.
+//! learning any QEMU/QMP/`qemu-img` detail. Issue #69 adds deterministic BVE
+//! storage (immutable base + disposable QCOW2 overlay + source fixture) and a
+//! `SimulatorBve::reset_system_storage` delegate, distinct from the VM
+//! `reset`. The lightweight in-process Agent participant above is unchanged
+//! and never routes through a BVE.
 //!
 //! Production dependency direction: `bamep-simulator` depends on
 //! `bamep-agent-protocol` for the wire model, on `bamep-trusted-bootstrap`
@@ -46,8 +49,10 @@ pub use action::{
 };
 pub use bamep_trusted_bootstrap::ServerCertFingerprint;
 pub use bve::{
-    BveDefinition, BveId, Firmware, LifecycleState as BveLifecycleState,
-    RuntimeRoot as BveRuntimeRoot, SimulatorBve, SimulatorBveError,
+    check_qemu_img_binary, destroy_instance_storage, ensure_system_base, prepare_instance,
+    BveDefinition, BveId, BveStorageError, BveStorageLayout, BveStorageRoot, DiskAttachment,
+    DiskFormat, DiskRole, Firmware, LifecycleState as BveLifecycleState, PreparedInstanceStorage,
+    RuntimeRoot as BveRuntimeRoot, SimulatorBve, SimulatorBveError, SourceDiskSpec, SystemBaseSpec,
 };
 pub use data_plane::{
     DataPlaneClient, DataPlaneClientError, DataPlaneTransportError, HeldChunk as ResumeHeldChunk,

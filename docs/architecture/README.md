@@ -17,7 +17,7 @@ Bamep currently has eight Rust crates:
 | `bamep-simulator` | Simulated Agent participant using real trusted-bootstrap and WSS/Agent Protocol boundaries |
 | `bamep-worker-protocol` | Rust wire model/codec/framing for the implemented Worker Protocol v1 handshake + business-message catalog |
 | `bamep-worker` | The isolated Worker process: concurrent UDS control client, fail-closed authority tracking, Server TLS identity, local chunk storage + full-Artifact reconstruction, and the HTTPS `/api/data/v1/` data plane |
-| `bamep-ve` | Host-side lifecycle for one disposable Bamep Virtual Endpoint (BVE): validated machine definition, direct QEMU/KVM invocation, owned process + QMP control socket, and the `create/start/observe/reset/stop/destroy` lifecycle |
+| `bamep-ve` | Host-side lifecycle for one disposable Bamep Virtual Endpoint (BVE): validated machine definition, direct QEMU/KVM invocation, owned process + QMP control socket, deterministic disk storage (sparse RAW base + per-instance QCOW2 overlay + source fixture, `qemu-img`), and the `create/start/observe/reset/reset_system_storage/stop/destroy` lifecycle |
 
 Planned components remain outside Architecture until corresponding code exists.
 
@@ -94,11 +94,12 @@ The implemented structure preserves these rules:
   not on `bamep-worker` itself in production code, preserving one-directional isolation; the
   `bamepd` binary spawns the compiled `bamep-worker` executable as a separate OS process
   rather than linking against its crate.
-- `bamep-ve` depends only on `thiserror` and `serde_json` (the latter to parse QEMU's
-  line-delimited JSON QMP protocol). It has no `bamep-agent-protocol`, `bamep-simulator`,
-  `bamep-domain`, or `bamep-server` dependency and no async runtime. The dependency
-  direction is strictly `bamep-simulator -> bamep-ve`, never the reverse
-  (`m0-bamep-virtual-endpoint-contract.md` "Code boundary").
+- `bamep-ve` depends only on `thiserror` and `serde_json` (to parse QEMU's line-delimited
+  JSON QMP protocol and `qemu-img info` output). It has no `bamep-agent-protocol`,
+  `bamep-simulator`, `bamep-domain`, or `bamep-server` dependency and no async runtime. It
+  runs external `qemu-system-x86_64` (VM lifecycle) and `qemu-img` (storage preparation) as
+  child processes. The dependency direction is strictly `bamep-simulator -> bamep-ve`,
+  never the reverse (`m0-bamep-virtual-endpoint-contract.md` "Code boundary").
 
 Infrastructure must not leak into Domain transitions.
 
@@ -110,58 +111,78 @@ implemented directly against QEMU/KVM per ADR-0022. The crate/package is named `
 validation/development infrastructure related to the Simulator, not part of the M2 Endpoint
 Capture product surface.
 
-Implemented at this stage (Issue #67):
+Implemented across Issues #67 and #69:
 
-- `BveDefinition` — a validated, deliberately minimal machine description: a path-safe
-  `BveId`, vCPU count, RAM (MiB), a `Firmware::Default` (SeaBIOS) boot choice, a
-  deterministic locally-administered NIC MAC derived from the id, and one system-disk
-  reference. Rejects zero/oversized vCPUs, zero/out-of-range RAM, and (at `create` time) a
-  missing or non-file system disk. It is not a future-complete configuration surface;
-  storage-reset, PXE, WinPE, and Buildroot fields are intentionally absent.
-- `QemuCommand` — a pure, testable builder for the exact `qemu-system-x86_64` invocation:
-  `-accel kvm -cpu host` with no TCG fallback anywhere (ADR-0022 fail-closed), `-smp`/`-m`
-  from the definition, headless, an unprivileged user-mode NIC with the deterministic MAC
-  (no TAP/bridge), one raw virtio system disk (no qcow2/overlay semantics — Issue #69), and
-  a listening `-qmp unix:` control socket.
+- `BveDefinition` — a validated machine description: a path-safe `BveId`, vCPU count, RAM
+  (MiB), a `Firmware::Default` (SeaBIOS) boot choice, a deterministic locally-administered
+  NIC MAC derived from the id, and the disks actually attached — a required `System`
+  `DiskAttachment` and an optional `Source` one, each carrying an explicit `DiskRole` and
+  `DiskFormat`. Rejects zero/oversized vCPUs, zero/out-of-range RAM, a disk path that would
+  break QEMU `-drive` parsing (a `,`), a wrong-role attachment, and (at `create` time) a
+  missing/non-file image. It is not a future-complete configuration surface; PXE, WinPE,
+  and Buildroot fields are intentionally absent.
+- `storage` (ADR-0023) — the disk model. `BveStorageRoot` is a validated, crate-owned root;
+  `BveStorageLayout::for_bve` derives deterministic paths (`base/system-base.raw`,
+  `instances/<bve-id>/system.qcow2`, `instances/<bve-id>/source.raw`). `ensure_system_base`
+  creates the shared **sparse RAW** base at its logical capacity once (80 GiB dev profile),
+  read-only, never clobbered; `prepare_instance` creates a per-instance **QCOW2 overlay**
+  (`qemu-img create -f qcow2 -F raw -b <base>`, explicit format) plus an optional RAW source
+  fixture, returning a `PreparedInstanceStorage` (whose `define_bve` builds a matching
+  `BveDefinition`). `reset_system_storage` removes only the known overlay and recreates it
+  from the same base — the source and base are untouched. `destroy_instance_storage` removes
+  only that instance's overlay + source + (non-recursively) its directory; an unexpected
+  leftover fails closed. `qemu-img` is invoked via argv (never a shell string) with exit
+  status and stderr captured, and is a **storage-only** prerequisite — `check_qemu_img_binary`
+  is separate from `detect_host_prerequisites`, so a BVE whose storage is already prepared
+  still runs with only `qemu-system-x86_64` + KVM.
+- `QemuCommand` — a pure builder for the exact `qemu-system-x86_64` invocation: `-accel kvm
+  -cpu host` with no TCG fallback anywhere (ADR-0022 fail-closed), `-smp`/`-m` from the
+  definition, headless, an unprivileged user-mode NIC with the deterministic MAC (no
+  TAP/bridge). Each disk is `-drive if=none,id=<role>,file=<path>,format=<fmt>` plus
+  `-device virtio-blk-pci,drive=<role>,serial=bamep-<role>` — identity is the explicit
+  `id=`/`serial=`, not argument order; the format is always explicit; the immutable backing
+  base is never attached. Plus a listening `-qmp unix:` control socket.
 - prerequisite checks — `qemu-system-x86_64` probed with `--version`, and `/dev/kvm`
   confirmed present and openable read/write. Both fail closed with actionable errors; there
   is no downgrade to software emulation.
 - `BveRuntime` — owns the exact QEMU `std::process::Child` it spawned, that process's QMP
-  Unix socket, and a per-instance `<runtime-root>/<bve-id>/` directory. Lifecycle:
-  `create` (validate + prepare dir + clear any stale socket), `start` (spawn QEMU, then
-  confirm startup by completing the QMP capabilities handshake, failing if the process
-  exits or the control boundary never answers), `observe` (`Stopped` when no live owned
-  process, `Running` when the owned process is alive and QMP answered — never inferring
-  guest health; a live process with an unresponsive QMP boundary is a reported error, not a
-  fabricated state), `reset` (`system_reset` on that same VM), `stop` (QMP `quit`, wait for
-  exit, single kill fallback for the owned process only), `destroy` (ensure not running,
-  then remove only the QMP socket and the now-empty instance directory — non-recursive, so
-  an unexpected leftover surfaces as an error rather than a blind recursive delete). A
-  `Drop` guard kills an owned process that outlived its runtime.
-- QMP is used as the sole control boundary: a small synchronous client over the Unix socket
-  implementing only the greeting/`qmp_capabilities` handshake, `query-status`,
-  `system_reset`, and `quit`. It is not a general QMP library.
+  Unix socket, a per-instance `<runtime-root>/<bve-id>/` **control** directory, and the
+  `PreparedInstanceStorage` it runs on. `create` rejects a definition whose attachments
+  disagree with the prepared storage. Lifecycle: `create`, `start` (spawn QEMU, confirm the
+  QMP capabilities handshake), `observe` (`Stopped`/`Running` from the owned process +
+  QMP — never inferring guest health), `reset` (QMP `system_reset` on that VM — no disk
+  effect), `reset_system_storage` (distinct: fails closed unless stopped, then delegates to
+  `storage`), `stop` (QMP `quit`, single kill fallback), `destroy` (control resources only —
+  QMP socket + non-recursive instance-dir removal; **never** disk images). A `Drop` guard
+  kills an owned process that outlived its runtime.
+- QMP is the sole control boundary: a small synchronous client implementing only the
+  greeting/`qmp_capabilities` handshake, `query-status`, `system_reset`, `quit`, and
+  `query-block`. Not a general QMP library.
 
-Deterministic logic (definition validation, MAC derivation, QEMU argument construction,
-prerequisite-absence errors, QMP command/response handling, runtime-path isolation, stale
-socket handling, fail-closed cleanup) is covered by unit tests that need no QEMU or KVM.
-The real end-to-end QEMU/KVM lifecycle is proved by an opt-in
-`tests/host_lifecycle.rs` gated on `BAMEP_BVE_HOST_TEST=1`, which an ordinary `cargo test`
-and CI never trigger. BVE never proves physical firmware, PXE, NIC, storage-controller, or
-WinPE behavior (`m0-bamep-virtual-endpoint-contract.md` "Validation and fidelity
-boundary").
+Deterministic logic (definition/attachment validation, MAC derivation, QEMU argument
+construction, storage path geometry and fail-closed deletion sets, storage/definition
+consistency, prerequisite-absence errors, QMP handling) is covered by unit tests needing no
+QEMU or `qemu-img`. Two opt-in host proofs, which an ordinary `cargo test` and CI never
+trigger, exercise the real thing: `tests/host_lifecycle.rs` (`BAMEP_BVE_HOST_TEST=1`) for
+the QEMU/KVM lifecycle, and `tests/storage_host.rs` (`BAMEP_VE_STORAGE_HOST_TEST=1`) for
+sparse allocation (80 GiB logical / ~4 KiB allocated), base immutability under a write
+through the overlay, reproducible reset, independent system/source attachment, and scoped
+disposal. BVE never proves physical firmware, PXE, NIC, storage-controller, or WinPE
+behavior (`m0-bamep-virtual-endpoint-contract.md` "Validation and fidelity boundary").
 
 ### Simulator BVE orchestration (Issue #68)
 
 `bamep-simulator` can orchestrate one BVE through `bve::SimulatorBve`, a thin boundary that
 owns a `bamep_ve::BveRuntime` and re-exposes the same
-`create/start/observe/reset/stop/destroy` lifecycle plus a small
+`create/start/observe/reset/reset_system_storage/stop/destroy` lifecycle plus a small
 `SimulatorBveError { Prerequisite, Runtime }` composition that preserves the underlying
-cause. `SimulatorBve::start` composes `bamep_ve::detect_host_prerequisites` so a scenario
-does not thread `HostPrerequisites` itself. No QEMU argument construction, QMP parsing,
-`/dev/kvm` check, process ownership, or control-socket path lives in the Simulator; those
-stay in `bamep-ve`. A Simulator BVE scenario builds its definition from the `bamep-ve`
-types directly (re-exported, not re-modelled).
+cause (storage failures arrive as `Runtime`). `SimulatorBve::start` composes
+`bamep_ve::detect_host_prerequisites` so a scenario does not thread `HostPrerequisites`
+itself; `reset_system_storage` is a one-line delegate. No QEMU argument construction, QMP
+parsing, `/dev/kvm` check, `qemu-img` call, process ownership, storage path, or
+control-socket path lives in the Simulator; those stay in `bamep-ve`. A Simulator BVE
+scenario builds its storage and definition from the re-exported `bamep-ve` types directly
+(not re-modelled).
 
 This is additive: the lightweight in-process Agent participant (`action`, `handshake`,
 `transport`, `data_plane`, `trusted_bootstrap`, `transfer_action`) is unchanged and never

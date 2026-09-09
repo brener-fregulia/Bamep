@@ -121,6 +121,28 @@ pub fn quit_command() -> String {
     r#"{"execute":"quit"}"#.to_string()
 }
 
+/// `{"execute": "query-block"}` — lists attached block devices.
+pub fn query_block_command() -> String {
+    r#"{"execute":"query-block"}"#.to_string()
+}
+
+/// Extracts the `device` names from a `query-block` `return` array whose
+/// entry has an `inserted` medium (an actual disk, not an empty `ide-cd`
+/// slot).
+pub fn inserted_block_device_names(return_value: &Value) -> Vec<String> {
+    return_value
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| entry.get("inserted").is_some())
+                .filter_map(|entry| entry.get("device").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Validates that `line` is a QMP greeting (`{"QMP": {...}}`).
 pub fn parse_greeting(line: &str) -> Result<(), QmpError> {
     let value: Value = serde_json::from_str(line).map_err(|_| QmpError::MalformedJson {
@@ -244,6 +266,14 @@ impl QmpConnection {
     pub fn system_reset(&mut self) -> Result<(), QmpError> {
         self.execute("system_reset", &system_reset_command())?;
         Ok(())
+    }
+
+    /// The names of the block devices with inserted media (Issue #69 — proof
+    /// that the system overlay and the source fixture are attached
+    /// independently).
+    pub fn inserted_block_devices(&mut self) -> Result<Vec<String>, QmpError> {
+        let value = self.execute("query-block", &query_block_command())?;
+        Ok(inserted_block_device_names(&value))
     }
 
     /// Issues `quit`. QEMU may close the socket before or after replying;

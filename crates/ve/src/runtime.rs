@@ -11,7 +11,14 @@
 //! guest health); `reset` issues `system_reset` on the same VM; `stop`
 //! requests a controlled `quit` and waits for exit; `destroy` guarantees the
 //! runtime is not left active and removes only the transitory control
-//! artifacts it created. Storage retention/reset is out of scope (Issue #69).
+//! artifacts it created.
+//!
+//! `reset` and [`BveRuntime::reset_system_storage`] are **distinct** (Issue
+//! #69): `reset` reboots the running machine and touches no disk;
+//! `reset_system_storage` requires the VM stopped and discards + recreates
+//! only the disposable system overlay from the same immutable base.
+//! `destroy` still removes only lifecycle/control resources — disk images are
+//! disposed explicitly via [`crate::storage::destroy_instance_storage`].
 
 use std::fs;
 use std::io::{ErrorKind, Read};
@@ -22,6 +29,7 @@ use std::time::{Duration, Instant};
 use crate::definition::{BveDefinition, BveId, DefinitionError};
 use crate::qemu::{HostPrerequisites, QemuCommand};
 use crate::qmp::{QmpConnection, QmpError};
+use crate::storage::{self, BveStorageError, PreparedInstanceStorage};
 
 /// How long [`BveRuntime::start`] waits for QEMU's QMP socket to accept a
 /// handshake before treating startup as failed.
@@ -130,23 +138,69 @@ pub enum RuntimeError {
         #[source]
         source: std::io::Error,
     },
+
+    /// The definition's disk attachments do not match the prepared storage
+    /// handed to [`BveRuntime::create`] (Issue #69 — storage/definition
+    /// consistency).
+    #[error("BVE definition does not match its prepared storage: {detail}")]
+    StorageDefinitionMismatch {
+        /// What disagreed.
+        detail: String,
+    },
+
+    /// Storage reset was requested while the VM was still running. It fails
+    /// closed: the disposable overlay is never unlinked or recreated under a
+    /// live QEMU process (Issue #69 §15).
+    #[error("cannot reset BVE storage while the VM is running; stop it first")]
+    StorageResetWhileRunning,
+
+    /// A storage operation failed.
+    #[error(transparent)]
+    Storage(#[from] BveStorageError),
 }
 
 /// One BVE's host-side lifecycle. Not `Clone`: it owns a process handle.
 #[derive(Debug)]
 pub struct BveRuntime {
     definition: BveDefinition,
+    storage: PreparedInstanceStorage,
     instance_dir: PathBuf,
     qmp_socket: PathBuf,
     child: Option<Child>,
 }
 
 impl BveRuntime {
-    /// Prepares one BVE: validates the system disk, creates the per-instance
-    /// runtime directory, and clears any stale control socket left by a
-    /// previous instance. Does **not** start QEMU.
-    pub fn create(root: &RuntimeRoot, definition: BveDefinition) -> Result<Self, RuntimeError> {
-        definition.ensure_system_disk_present()?;
+    /// Prepares one BVE: checks the definition's disk attachments agree with
+    /// `storage`, verifies the images exist, creates the per-instance runtime
+    /// directory, and clears any stale control socket. Does **not** start
+    /// QEMU.
+    ///
+    /// `storage` must come from [`crate::storage::prepare_instance`]; the
+    /// definition should be built with
+    /// [`PreparedInstanceStorage::define_bve`] so the two cannot disagree,
+    /// and this constructor rejects them if they do
+    /// ([`RuntimeError::StorageDefinitionMismatch`]).
+    pub fn create(
+        root: &RuntimeRoot,
+        definition: BveDefinition,
+        storage: PreparedInstanceStorage,
+    ) -> Result<Self, RuntimeError> {
+        if definition.system_disk() != &storage.system_attachment() {
+            return Err(RuntimeError::StorageDefinitionMismatch {
+                detail: format!(
+                    "system disk {} vs prepared overlay {}",
+                    definition.system_disk().path().display(),
+                    storage.layout().system_overlay().display()
+                ),
+            });
+        }
+        if definition.source_disk() != storage.source_attachment().as_ref() {
+            return Err(RuntimeError::StorageDefinitionMismatch {
+                detail: "source disk attachment does not match the prepared source fixture"
+                    .to_string(),
+            });
+        }
+        definition.ensure_disks_present()?;
 
         let instance_dir = root.instance_dir(definition.id());
         fs::create_dir_all(&instance_dir)?;
@@ -156,10 +210,32 @@ impl BveRuntime {
 
         Ok(Self {
             definition,
+            storage,
             instance_dir,
             qmp_socket,
             child: None,
         })
+    }
+
+    /// The prepared storage this BVE runs on.
+    pub fn storage(&self) -> &PreparedInstanceStorage {
+        &self.storage
+    }
+
+    /// Discards the disposable system overlay and recreates a fresh one from
+    /// the same immutable base (Issue #69). The source fixture and the base
+    /// are untouched.
+    ///
+    /// This is **not** [`BveRuntime::reset`] (a QMP `system_reset` reboot). It
+    /// fails closed with [`RuntimeError::StorageResetWhileRunning`] unless the
+    /// VM is stopped, so the overlay is never recreated under a live QEMU
+    /// process.
+    pub fn reset_system_storage(&mut self) -> Result<(), RuntimeError> {
+        if self.process_is_alive()? {
+            return Err(RuntimeError::StorageResetWhileRunning);
+        }
+        storage::reset_system_storage(&self.storage)?;
+        Ok(())
     }
 
     /// The per-instance runtime directory.
@@ -312,15 +388,25 @@ impl BveRuntime {
         }
     }
 
-    fn ensure_process_alive(&mut self) -> Result<(), RuntimeError> {
+    /// Whether this runtime owns a QEMU process that is still alive. Reaps a
+    /// process that has exited.
+    fn process_is_alive(&mut self) -> Result<bool, RuntimeError> {
         let Some(child) = self.child.as_mut() else {
-            return Err(RuntimeError::NotRunning);
+            return Ok(false);
         };
         if child.try_wait()?.is_some() {
             self.child = None;
-            return Err(RuntimeError::NotRunning);
+            return Ok(false);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    fn ensure_process_alive(&mut self) -> Result<(), RuntimeError> {
+        if self.process_is_alive()? {
+            Ok(())
+        } else {
+            Err(RuntimeError::NotRunning)
+        }
     }
 
     /// Removes a socket path if it exists as a leftover. A stale socket file
@@ -373,27 +459,24 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<Option<ExitStat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::definition::Firmware;
-    use std::io::Write;
+    use crate::definition::{DiskAttachment, DiskFormat, Firmware};
+    use crate::storage::{BveStorageLayout, BveStorageRoot, PreparedInstanceStorage};
 
     struct TempRoot(PathBuf);
 
     impl TempRoot {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("bamep-bve-rt-{}", uuid::Uuid::new_v4()));
+            let dir = std::env::temp_dir().join(format!("bamep-ve-rt-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
 
-        fn root(&self) -> RuntimeRoot {
-            RuntimeRoot::new(&self.0)
+        fn runtime_root(&self) -> RuntimeRoot {
+            RuntimeRoot::new(self.0.join("control"))
         }
 
-        fn disk(&self, name: &str) -> PathBuf {
-            let path = self.0.join(name);
-            let mut f = fs::File::create(&path).unwrap();
-            f.write_all(&[0u8; 512]).unwrap();
-            path
+        fn storage_root(&self) -> BveStorageRoot {
+            BveStorageRoot::new(self.0.join("storage")).unwrap()
         }
     }
 
@@ -403,21 +486,37 @@ mod tests {
         }
     }
 
-    fn definition(temp: &TempRoot, id: &str) -> BveDefinition {
-        BveDefinition::new(
-            BveId::new(id).unwrap(),
-            1,
-            256,
-            Firmware::Default,
-            temp.disk(&format!("{id}.raw")),
-        )
-        .unwrap()
+    /// Fakes the on-disk result of `storage::prepare_instance` without
+    /// `qemu-img`: real files at the deterministic layout paths (their
+    /// contents are irrelevant to lifecycle/path logic).
+    fn fake_prepared(
+        storage_root: &BveStorageRoot,
+        id: &BveId,
+        with_source: bool,
+    ) -> PreparedInstanceStorage {
+        let layout = BveStorageLayout::for_bve(storage_root, id);
+        fs::create_dir_all(layout.instance_dir()).unwrap();
+        fs::create_dir_all(layout.system_base().parent().unwrap()).unwrap();
+        fs::write(layout.system_base(), b"fake-base").unwrap();
+        fs::write(layout.system_overlay(), b"fake-overlay").unwrap();
+        if with_source {
+            fs::write(layout.source_disk(), b"fake-source").unwrap();
+        }
+        PreparedInstanceStorage::from_prepared_layout(layout, with_source)
+    }
+
+    fn bve(temp: &TempRoot, id: &str) -> (BveRuntime, PreparedInstanceStorage) {
+        let id = BveId::new(id).unwrap();
+        let storage = fake_prepared(&temp.storage_root(), &id, true);
+        let def = storage.define_bve(id, 1, 256, Firmware::Default).unwrap();
+        let rt = BveRuntime::create(&temp.runtime_root(), def, storage.clone()).unwrap();
+        (rt, storage)
     }
 
     #[test]
     fn instance_dirs_are_isolated_and_inside_the_root() {
         let temp = TempRoot::new();
-        let root = temp.root();
+        let root = temp.runtime_root();
         let a = root.instance_dir(&BveId::new("bve-a").unwrap());
         let b = root.instance_dir(&BveId::new("bve-b").unwrap());
 
@@ -430,7 +529,7 @@ mod tests {
     #[test]
     fn create_prepares_the_instance_without_starting() {
         let temp = TempRoot::new();
-        let rt = BveRuntime::create(&temp.root(), definition(&temp, "bve-create")).unwrap();
+        let (rt, _storage) = bve(&temp, "bve-create");
 
         assert!(rt.instance_dir().is_dir());
         assert_eq!(rt.qmp_socket(), rt.instance_dir().join("qmp.sock"));
@@ -441,24 +540,21 @@ mod tests {
     #[test]
     fn create_clears_a_stale_control_socket() {
         let temp = TempRoot::new();
-        let root = temp.root();
         let id = BveId::new("bve-stale").unwrap();
-        let dir = root.instance_dir(&id);
+        let dir = temp.runtime_root().instance_dir(&id);
         fs::create_dir_all(&dir).unwrap();
-        let stale = dir.join("qmp.sock");
-        fs::File::create(&stale).unwrap();
-        assert!(stale.exists());
+        fs::File::create(dir.join("qmp.sock")).unwrap();
 
-        let def =
-            BveDefinition::new(id, 1, 256, Firmware::Default, temp.disk("bve-stale.raw")).unwrap();
-        let rt = BveRuntime::create(&root, def).unwrap();
+        let storage = fake_prepared(&temp.storage_root(), &id, true);
+        let def = storage.define_bve(id, 1, 256, Firmware::Default).unwrap();
+        let rt = BveRuntime::create(&temp.runtime_root(), def, storage).unwrap();
         assert!(!rt.qmp_socket().exists(), "stale socket must be cleared");
     }
 
     #[test]
     fn observe_reports_stopped_before_start_even_with_a_stale_socket() {
         let temp = TempRoot::new();
-        let mut rt = BveRuntime::create(&temp.root(), definition(&temp, "bve-obs")).unwrap();
+        let (mut rt, _s) = bve(&temp, "bve-obs");
 
         // A leftover socket file must not fabricate a Running result: observe
         // keys off the owned process handle, which is absent here.
@@ -467,57 +563,111 @@ mod tests {
     }
 
     #[test]
-    fn reset_on_a_stopped_bve_is_not_running() {
+    fn vm_reset_on_a_stopped_bve_is_not_running() {
         let temp = TempRoot::new();
-        let mut rt = BveRuntime::create(&temp.root(), definition(&temp, "bve-reset")).unwrap();
+        let (mut rt, _s) = bve(&temp, "bve-reset");
         assert!(matches!(rt.reset(), Err(RuntimeError::NotRunning)));
     }
 
     #[test]
     fn stop_on_a_stopped_bve_succeeds_without_fabricating_state() {
         let temp = TempRoot::new();
-        let mut rt = BveRuntime::create(&temp.root(), definition(&temp, "bve-stop")).unwrap();
+        let (mut rt, _s) = bve(&temp, "bve-stop");
         assert!(rt.stop().is_ok());
         assert_eq!(rt.observe().unwrap(), LifecycleState::Stopped);
     }
 
     #[test]
-    fn create_rejects_a_missing_system_disk() {
+    fn storage_reset_fails_closed_while_a_process_is_alive() {
         let temp = TempRoot::new();
-        let def = BveDefinition::new(
-            BveId::new("bve-nodisk").unwrap(),
-            1,
-            256,
-            Firmware::Default,
-            temp.0.join("absent.raw"),
-        )
-        .unwrap();
+        let (mut rt, _s) = bve(&temp, "bve-storage-running");
+
+        // Simulate a live VM by owning a real, still-running child.
+        rt.child = Some(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn a placeholder child"),
+        );
         assert!(matches!(
-            BveRuntime::create(&temp.root(), def),
+            rt.reset_system_storage(),
+            Err(RuntimeError::StorageResetWhileRunning)
+        ));
+
+        let mut child = rt.child.take().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn create_rejects_a_missing_disk_image() {
+        let temp = TempRoot::new();
+        let id = BveId::new("bve-nodisk").unwrap();
+        let storage = fake_prepared(&temp.storage_root(), &id, true);
+        fs::remove_file(storage.layout().system_overlay()).unwrap();
+        let def = storage.define_bve(id, 1, 256, Firmware::Default).unwrap();
+
+        assert!(matches!(
+            BveRuntime::create(&temp.runtime_root(), def, storage),
             Err(RuntimeError::Definition(
-                DefinitionError::SystemDiskMissing { .. }
+                DefinitionError::DiskImageMissing { .. }
             ))
         ));
     }
 
     #[test]
-    fn destroy_removes_only_the_control_artifacts_it_created() {
+    fn create_rejects_a_definition_that_disagrees_with_prepared_storage() {
         let temp = TempRoot::new();
-        let rt = BveRuntime::create(&temp.root(), definition(&temp, "bve-destroy")).unwrap();
-        let dir = rt.instance_dir().to_path_buf();
-        fs::File::create(dir.join("qmp.sock")).unwrap();
+        let id = BveId::new("bve-mismatch").unwrap();
+        let storage = fake_prepared(&temp.storage_root(), &id, true);
 
-        rt.destroy().unwrap();
-        assert!(!dir.exists());
-        // The root itself and the disk beside it are untouched.
-        assert!(temp.0.is_dir());
-        assert!(temp.0.join("bve-destroy.raw").is_file());
+        // A definition pointing at a different system image than was prepared.
+        let elsewhere = temp.0.join("elsewhere.qcow2");
+        fs::write(&elsewhere, b"x").unwrap();
+        let def = BveDefinition::new(
+            id,
+            1,
+            256,
+            Firmware::Default,
+            DiskAttachment::system(&elsewhere, DiskFormat::Qcow2).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            BveRuntime::create(&temp.runtime_root(), def, storage),
+            Err(RuntimeError::StorageDefinitionMismatch { .. })
+        ));
     }
 
     #[test]
-    fn destroy_fails_closed_on_unexpected_leftovers() {
+    fn destroy_removes_only_control_artifacts_and_never_storage() {
         let temp = TempRoot::new();
-        let rt = BveRuntime::create(&temp.root(), definition(&temp, "bve-dirty")).unwrap();
+        let (rt, storage) = bve(&temp, "bve-destroy");
+        let control_dir = rt.instance_dir().to_path_buf();
+        fs::File::create(control_dir.join("qmp.sock")).unwrap();
+
+        rt.destroy().unwrap();
+
+        assert!(!control_dir.exists(), "control dir removed");
+        // Storage is disposed only by the explicit storage operation.
+        assert!(
+            storage.layout().system_overlay().is_file(),
+            "overlay survives destroy"
+        );
+        assert!(
+            storage.layout().source_disk().is_file(),
+            "source survives destroy"
+        );
+        assert!(
+            storage.layout().system_base().is_file(),
+            "base survives destroy"
+        );
+    }
+
+    #[test]
+    fn destroy_fails_closed_on_unexpected_control_leftovers() {
+        let temp = TempRoot::new();
+        let (rt, _s) = bve(&temp, "bve-dirty");
         let dir = rt.instance_dir().to_path_buf();
         fs::write(dir.join("not-ours.txt"), b"x").unwrap();
 

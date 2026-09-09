@@ -44,8 +44,12 @@ impl QemuCommand {
     /// - headless: `-display none -serial none`, no stdio console;
     /// - `-netdev user` (unprivileged SLIRP — no TAP/bridge, out of scope for
     ///   #67) with a `virtio-net-pci` device carrying the deterministic MAC;
-    /// - one `virtio` `-drive` for the system disk, `format=raw` (no
-    ///   qcow2/overlay semantics — Issue #69);
+    /// - the `System` disk, and the `Source` disk when present, each as a
+    ///   `-drive if=none,id=<role>,file=<path>,format=<fmt>` plus a matching
+    ///   `-device virtio-blk-pci,drive=<role>,serial=<role-serial>`. Disk
+    ///   identity is the explicit `id=`/`serial=`, never argument order; the
+    ///   format is always explicit, never auto-detected; the immutable
+    ///   backing base is never attached (Issue #69);
     /// - `-qmp unix:<socket>,server=on,wait=off` — a listening control socket
     ///   that does not block startup on a client;
     /// - `-name <id>`.
@@ -85,13 +89,26 @@ impl QemuCommand {
             definition.mac()
         ));
 
-        // One raw system disk on a virtio controller. Raw, not qcow2 — storage
-        // reset/overlay semantics are Issue #69, and must not be implied here.
-        push("-drive");
-        push(&format!(
-            "file={},format=raw,if=virtio",
-            definition.system_disk().display()
-        ));
+        // System disk (always), then the source fixture (when present). Each
+        // is a headless `if=none` blockdev bound to an explicit virtio-blk
+        // device by a stable `id=`/`serial=` — deterministic identity, not
+        // argument order. Formats are stated explicitly; the immutable
+        // backing base is never attached here (Issue #69).
+        for attachment in std::iter::once(definition.system_disk()).chain(definition.source_disk())
+        {
+            let id = attachment.role().as_qemu_id();
+            push("-drive");
+            push(&format!(
+                "if=none,id={id},file={},format={}",
+                attachment.path().display(),
+                attachment.format().as_qemu_str()
+            ));
+            push("-device");
+            push(&format!(
+                "virtio-blk-pci,drive={id},serial={}",
+                attachment.role().as_qemu_serial()
+            ));
+        }
 
         // QMP control boundary: a listening Unix socket, non-blocking so QEMU
         // does not wait for a client during startup.
@@ -236,17 +253,27 @@ pub fn detect_host_prerequisites() -> Result<HostPrerequisites, PrerequisiteErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::definition::BveId;
+    use crate::definition::{BveId, DiskAttachment, DiskFormat};
 
-    fn definition() -> BveDefinition {
+    const SYSTEM_OVERLAY: &str = "/srv/bamep/storage/instances/bve-argv/system.qcow2";
+    const SOURCE_DISK: &str = "/srv/bamep/storage/instances/bve-argv/source.raw";
+    const SYSTEM_BASE: &str = "/srv/bamep/storage/base/system-base.raw";
+
+    fn system_only() -> BveDefinition {
         BveDefinition::new(
             BveId::new("bve-argv").unwrap(),
             4,
             512,
             Firmware::Default,
-            "/var/lib/bamep/bve-argv/system.raw",
+            DiskAttachment::system(SYSTEM_OVERLAY, DiskFormat::Qcow2).unwrap(),
         )
         .unwrap()
+    }
+
+    fn with_source() -> BveDefinition {
+        system_only()
+            .with_source(DiskAttachment::source(SOURCE_DISK, DiskFormat::Raw).unwrap())
+            .unwrap()
     }
 
     /// The value immediately following the first `flag` occurrence.
@@ -257,10 +284,20 @@ mod tests {
             .map(String::as_str)
     }
 
+    /// Every value that follows a `flag` occurrence, in order.
+    fn values_after<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
+        args.iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == flag)
+            .filter_map(|(i, _)| args.get(i + 1))
+            .map(String::as_str)
+            .collect()
+    }
+
     #[test]
-    fn builds_the_expected_invocation() {
-        let def = definition();
-        let socket = Path::new("/run/bamep-bve/bve-argv/qmp.sock");
+    fn builds_the_expected_machine_invocation() {
+        let def = with_source();
+        let socket = Path::new("/run/bamep-ve/bve-argv/qmp.sock");
         let cmd = QemuCommand::for_bve(&def, socket);
 
         assert_eq!(cmd.program(), "qemu-system-x86_64");
@@ -273,26 +310,93 @@ mod tests {
         assert_eq!(value_after(args, "-m"), Some("512M"));
         assert_eq!(value_after(args, "-display"), Some("none"));
 
-        let device = value_after(args, "-device").unwrap();
-        assert!(device.contains("virtio-net-pci"));
+        let net = values_after(args, "-device")
+            .into_iter()
+            .find(|d| d.contains("virtio-net-pci"))
+            .unwrap();
         assert!(
-            device.contains(&format!("mac={}", def.mac())),
-            "device arg {device:?} must carry the deterministic MAC"
+            net.contains(&format!("mac={}", def.mac())),
+            "net device {net:?} must carry the deterministic MAC"
         );
 
-        let drive = value_after(args, "-drive").unwrap();
-        assert!(drive.contains("file=/var/lib/bamep/bve-argv/system.raw"));
-        assert!(drive.contains("format=raw"));
-
         let qmp = value_after(args, "-qmp").unwrap();
-        assert!(qmp.contains("unix:/run/bamep-bve/bve-argv/qmp.sock"));
+        assert!(qmp.contains("unix:/run/bamep-ve/bve-argv/qmp.sock"));
         assert!(qmp.contains("server=on"));
         assert!(qmp.contains("wait=off"));
     }
 
     #[test]
+    fn attaches_the_system_overlay_deterministically_by_id() {
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"));
+        let drives = values_after(cmd.args(), "-drive");
+        let blk: Vec<&str> = values_after(cmd.args(), "-device")
+            .into_iter()
+            .filter(|d| d.contains("virtio-blk-pci"))
+            .collect();
+
+        assert_eq!(
+            drives.len(),
+            1,
+            "system-only BVE attaches exactly one drive"
+        );
+        assert!(drives[0].contains("if=none"));
+        assert!(drives[0].contains("id=system"));
+        assert!(drives[0].contains(&format!("file={SYSTEM_OVERLAY}")));
+        assert!(
+            drives[0].contains("format=qcow2"),
+            "system overlay format must be explicit"
+        );
+        assert_eq!(blk.len(), 1);
+        assert!(blk[0].contains("drive=system"));
+        assert!(blk[0].contains("serial=bamep-system"));
+    }
+
+    #[test]
+    fn attaches_the_source_disk_independently_only_when_present() {
+        let none = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"));
+        assert!(
+            !none.args().iter().any(|a| a.contains("id=source")),
+            "no source disk when the definition has none"
+        );
+
+        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"));
+        let drives = values_after(cmd.args(), "-drive");
+        assert_eq!(drives.len(), 2);
+        let source = drives.iter().find(|d| d.contains("id=source")).unwrap();
+        assert!(source.contains(&format!("file={SOURCE_DISK}")));
+        assert!(
+            source.contains("format=raw"),
+            "source format must be explicit"
+        );
+        assert!(!source.contains("id=system"));
+
+        let blk_source = values_after(cmd.args(), "-device")
+            .into_iter()
+            .find(|d| d.contains("virtio-blk-pci") && d.contains("drive=source"))
+            .unwrap();
+        assert!(blk_source.contains("serial=bamep-source"));
+    }
+
+    #[test]
+    fn every_drive_states_its_format_and_the_backing_base_is_never_attached() {
+        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"));
+        for drive in values_after(cmd.args(), "-drive") {
+            assert!(
+                drive.contains("format="),
+                "drive {drive:?} must not rely on format auto-detection"
+            );
+        }
+        for arg in cmd.args() {
+            assert!(
+                !arg.contains(SYSTEM_BASE),
+                "the immutable backing base must never appear in argv: {arg:?}"
+            );
+        }
+    }
+
+    #[test]
     fn never_enables_software_cpu_emulation() {
-        let cmd = QemuCommand::for_bve(&definition(), Path::new("/run/x/qmp.sock"));
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/run/x/qmp.sock"));
         for arg in cmd.args() {
             assert!(
                 !arg.contains("tcg"),
@@ -310,7 +414,7 @@ mod tests {
             8,
             2048,
             Firmware::Default,
-            "/disk.raw",
+            DiskAttachment::system("/d.qcow2", DiskFormat::Qcow2).unwrap(),
         )
         .unwrap();
         let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"));
@@ -320,7 +424,7 @@ mod tests {
 
     #[test]
     fn missing_qemu_binary_is_an_actionable_error() {
-        let err = check_qemu_binary("bamep-bve-no-such-qemu-binary-xyzzy").unwrap_err();
+        let err = check_qemu_binary("bamep-ve-no-such-qemu-binary-xyzzy").unwrap_err();
         assert!(matches!(
             err,
             PrerequisiteError::QemuBinaryUnavailable { .. }
