@@ -3,10 +3,10 @@
 Status: **Approved**
 
 This Specification defines the normative responsibility, Simulator relationship, minimal
-lifecycle, and validation/fidelity boundary of the Bamep Virtual Endpoint (BVE). It does not
-select or justify a concrete virtualization backend; that decision belongs to ADR-0022.
-Storage retention/reset/disposal semantics are intentionally left undefined by this
-Specification; they are currently tracked as follow-up work in Issue #69.
+lifecycle, disposable-storage semantics, and validation/fidelity boundary of the Bamep
+Virtual Endpoint (BVE). It does not select or justify a concrete virtualization backend or
+image format; the backend decision belongs to ADR-0022 and the initial disk storage
+mechanism to ADR-0023.
 
 BVE is transversal validation/development infrastructure related to the Simulator, not a
 component of the M2 Endpoint Capture product surface, even though it is being prioritized
@@ -91,17 +91,43 @@ A BVE exposes the following minimal semantic lifecycle:
 | `create` | Establishes the instance/definition needed to represent one BVE. |
 | `start` | Begins execution of that instance. |
 | `observe` | Returns truthful lifecycle state. It must not infer or imply guest OS/Agent health. |
-| `reset` | Resets execution/volatile machine state of the existing BVE instance. It does not create a replacement instance or imply guest OS/Agent health. |
+| `reset` | Resets execution/volatile machine state of the existing BVE instance. It does not create a replacement instance, discard disk state, or imply guest OS/Agent health. |
 | `stop` | Ends execution of that instance. |
-| `destroy` | Removes the transitory lifecycle/control resources owned by that instance. |
+| `destroy` | Removes the transitory lifecycle/control resources owned by that instance. It does not delete disk images. |
 
-`destroy` is scoped to lifecycle/control resources only. This Specification does not define
-storage retention/disposal semantics (for example: whether a system disk, an overlay, or a
-source fixture is deleted, preserved, or reset). That contract belongs to a later Work
-Package (currently anticipated as Issue #69).
+`destroy` is scoped to lifecycle/control resources only. Disk images are disposed by a
+separate, explicit storage operation (see "Storage").
 
 This lifecycle is intentionally backend-independent. It is the contract a consumer (such as
 the Simulator) programs against; it does not itself select QEMU/KVM or any other mechanism.
+
+## Storage
+
+A BVE has a reproducible disk model with a distinct lifecycle from the machine:
+
+- **Known base state.** A BVE derives its system disk from one identified, immutable base
+  state. Ordinary BVE operation — running the machine, `reset`, `stop`, `destroy` — must not
+  mutate that base.
+- **Disposable writable system instance.** The disk the guest boots and writes to is a
+  per-instance, disposable instance derived from the base. Guest writes land in the
+  disposable instance, not the base.
+- **Storage reset is distinct from `reset`.** `reset` reboots the running machine and
+  changes no disk state. A separate storage-reset operation discards the disposable system
+  instance and derives a fresh one from the same base; it does not reboot a running
+  machine, reinstall any guest, or create a replacement BVE instance. Two consecutive
+  storage resets begin from the same base state.
+- **Independent source fixture.** A BVE may carry one additional virtual disk that is
+  independent of the system disk, deterministically identified, and separate from the boot
+  path. Storage reset does not alter it; it is removed only by explicit instance-storage
+  disposal.
+- **Scoped, fail-closed deletion.** Storage reset and instance-storage disposal act only on
+  disk state owned by that BVE instance, derived from a validated instance-owned location.
+  They never delete the base, another BVE's storage, or an arbitrary host path, and an
+  unexpected leftover fails closed rather than escalating to a broad recursive delete.
+
+The concrete image format, backing mechanism, host tooling, sparse-allocation technique,
+and the initial Windows-oriented logical capacity are an implementation decision owned by
+ADR-0023, not this Specification. A future change to that model is a new/updated ADR.
 
 ## Validation and fidelity boundary
 
@@ -127,8 +153,11 @@ change the responsibility, lifecycle, or fidelity boundary defined above.
 
 ## Out of scope
 
-- qcow2 vs. raw, backing images, overlays, and storage reset/disposal policy (Issue #69);
-- disk size/vCPU/RAM defaults or profiles;
+- concrete image format/backing mechanism, host image tooling, sparse-allocation
+  technique, and disk capacity values (ADR-0023);
+- guest OS, filesystem, or partition content in the base; snapshot trees, image catalogs,
+  deduplication, compression, encryption, and remote/cross-host image distribution;
+- vCPU/RAM defaults or profiles;
 - disk attachment details, TAP/bridge/macvtap, and DHCP;
 - PXE implementation and PXE service topology;
 - WinPE assets and Buildroot configuration;
@@ -139,15 +168,17 @@ change the responsibility, lifecycle, or fidelity boundary defined above.
 - CI integration;
 - traffic shaping and throughput thresholds;
 - port allocation, console mechanism, and backend process/control-supervision
-  implementation details;
-- concrete package/crate materialization.
+  implementation details.
 
 ## Related
 
 - ADR-0022 — Linux/QEMU/KVM initial BVE backend decision.
+- ADR-0023 — initial BVE disk storage mechanism (sparse RAW base + per-instance QCOW2
+  overlay).
 - `docs/development/testing.md` — general test-layer model and WSL2/container fidelity
   boundary.
 - `docs/specifications/m0-simulator-contract-and-validation-strategy.md` — Simulator
   fidelity boundary and Agent-side protocol contract this Specification does not redefine.
 - Issue #66 — Work Package that produced this Specification.
-- Issue #67 — first implementation Work Package this Specification unblocks.
+- Issues #67–#69 — implementation Work Packages: one-BVE lifecycle, Simulator
+  orchestration, deterministic storage and reproducible reset.
