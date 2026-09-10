@@ -391,6 +391,114 @@ pub enum NetworkAttachment {
     },
 }
 
+/// The maximum accepted kernel command-line length. `-append` is a single QEMU
+/// argument; this bound only rejects an obviously-wrong value (unit confusion,
+/// runaway concatenation) before it reaches the process.
+pub const MAX_KERNEL_CMDLINE_LEN: usize = 4096;
+
+/// A direct Linux kernel boot payload for QEMU's `-kernel` / `-initrd` /
+/// `-append` (Issue #72).
+///
+/// This is deliberately the *smallest* representation that lets a BVE boot a
+/// kernel + initramfs directly, with no firmware boot device, no bootloader,
+/// and no ISO. It is **not** a generic boot-source framework, and it carries
+/// no BARE/Buildroot semantics: `bamep-ve` only understands "boot this kernel
+/// and this initrd", never "this is BARE" — software inside the guest is the
+/// guest's responsibility, not BVE's
+/// (`m0-bamep-virtual-endpoint-contract.md`).
+///
+/// Direct kernel boot is orthogonal to [`Firmware`], [`NicModel`] and
+/// [`BootMode`]. It does conflict with [`BootMode::NetworkFirst`] (two
+/// competing boot intents); [`BveDefinition::with_direct_kernel`] rejects that
+/// pair and [`BveDefinition::ensure_direct_kernel_ready`] re-checks it before
+/// launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectKernelBoot {
+    kernel: PathBuf,
+    initrd: PathBuf,
+    command_line: String,
+}
+
+impl DirectKernelBoot {
+    /// Validates and builds a direct-kernel payload.
+    ///
+    /// Rejects a `kernel`/`initrd` path that cannot be safely placed in a QEMU
+    /// argument (contains `,`, a newline, or a carriage return — the same guard
+    /// [`DiskAttachment`] uses), and a `command_line` containing a newline,
+    /// carriage return, or NUL, or longer than [`MAX_KERNEL_CMDLINE_LEN`]. It
+    /// performs no I/O; [`DirectKernelBoot::ensure_files_present`] checks the
+    /// images exist at `create` time.
+    pub fn new(
+        kernel: impl Into<PathBuf>,
+        initrd: impl Into<PathBuf>,
+        command_line: impl Into<String>,
+    ) -> Result<Self, DefinitionError> {
+        let kernel = kernel.into();
+        let initrd = initrd.into();
+        let command_line = command_line.into();
+
+        for path in [&kernel, &initrd] {
+            let text = path.to_string_lossy();
+            if text.contains(',') || text.contains('\n') || text.contains('\r') {
+                return Err(DefinitionError::DirectKernelPathRejected { path: path.clone() });
+            }
+        }
+        if command_line.contains('\n') || command_line.contains('\r') || command_line.contains('\0')
+        {
+            return Err(DefinitionError::DirectKernelCommandLineRejected {
+                reason: "must not contain a newline, carriage return, or NUL",
+            });
+        }
+        if command_line.len() > MAX_KERNEL_CMDLINE_LEN {
+            return Err(DefinitionError::DirectKernelCommandLineRejected {
+                reason: "longer than the accepted maximum",
+            });
+        }
+
+        Ok(Self {
+            kernel,
+            initrd,
+            command_line,
+        })
+    }
+
+    /// The kernel image path (QEMU `-kernel`).
+    pub fn kernel(&self) -> &Path {
+        &self.kernel
+    }
+
+    /// The initramfs image path (QEMU `-initrd`).
+    pub fn initrd(&self) -> &Path {
+        &self.initrd
+    }
+
+    /// The kernel command line (QEMU `-append`).
+    pub fn command_line(&self) -> &str {
+        &self.command_line
+    }
+
+    /// Verifies the kernel and initrd exist and are regular files. Kept out of
+    /// [`DirectKernelBoot::new`] so configuration validation performs no I/O;
+    /// [`BveDefinition::ensure_direct_kernel_ready`] calls it at `create` time,
+    /// mirroring [`BveDefinition::ensure_disks_present`].
+    pub fn ensure_files_present(&self) -> Result<(), DefinitionError> {
+        for (which, path) in [("kernel", &self.kernel), ("initrd", &self.initrd)] {
+            let meta =
+                std::fs::metadata(path).map_err(|_| DefinitionError::DirectKernelImageMissing {
+                    which,
+                    path: path.clone(),
+                })?;
+            if !meta.is_file() {
+                return Err(DefinitionError::DirectKernelImageNotAFile {
+                    which,
+                    path: path.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The validated definition of one BVE, including the disks attached to it.
 ///
 /// Build it from prepared storage with
@@ -410,6 +518,7 @@ pub struct BveDefinition {
     network: NetworkAttachment,
     system: DiskAttachment,
     source: Option<DiskAttachment>,
+    direct_kernel: Option<DirectKernelBoot>,
 }
 
 impl BveDefinition {
@@ -457,13 +566,40 @@ impl BveDefinition {
             network: NetworkAttachment::UserMode,
             system,
             source: None,
+            direct_kernel: None,
         })
     }
 
     /// Sets the firmware boot-order intent (default [`BootMode::Default`]).
+    ///
+    /// [`BootMode::NetworkFirst`] must not be combined with a
+    /// [`DirectKernelBoot`] (two competing boot intents). This builder stays
+    /// infallible for its many existing callers; the conflict is rejected
+    /// eagerly by [`BveDefinition::with_direct_kernel`] and, as a fail-closed
+    /// catch-all for any other ordering, by
+    /// [`BveDefinition::ensure_direct_kernel_ready`] before launch.
     pub fn with_boot_mode(mut self, boot_mode: BootMode) -> Self {
         self.boot_mode = boot_mode;
         self
+    }
+
+    /// Sets a direct Linux kernel boot payload — QEMU `-kernel` / `-initrd` /
+    /// `-append` (Issue #72).
+    ///
+    /// Rejects combination with [`BootMode::NetworkFirst`]
+    /// ([`DefinitionError::DirectKernelBootModeConflict`]). Orthogonal to
+    /// [`Firmware`] and [`NicModel`]: the Issue #72 BARE profile pairs it with
+    /// [`Firmware::Default`] and [`NicModel::VirtioNetPci`], but neither is
+    /// forced here.
+    pub fn with_direct_kernel(
+        mut self,
+        direct_kernel: DirectKernelBoot,
+    ) -> Result<Self, DefinitionError> {
+        if self.boot_mode == BootMode::NetworkFirst {
+            return Err(DefinitionError::DirectKernelBootModeConflict);
+        }
+        self.direct_kernel = Some(direct_kernel);
+        Ok(self)
     }
 
     /// Sets the emulated NIC model (default [`NicModel::VirtioNetPci`]). The
@@ -547,6 +683,11 @@ impl BveDefinition {
         self.source.as_ref()
     }
 
+    /// The direct Linux kernel boot payload, if one is configured (Issue #72).
+    pub fn direct_kernel(&self) -> Option<&DirectKernelBoot> {
+        self.direct_kernel.as_ref()
+    }
+
     /// Verifies every attached disk image exists and is a regular file. This
     /// is a host-state precondition checked at `create` time, kept out of the
     /// constructors so configuration validation performs no I/O.
@@ -556,6 +697,21 @@ impl BveDefinition {
             source.ensure_present()?;
         }
         Ok(())
+    }
+
+    /// `create`-time precondition for a direct-kernel BVE (Issue #72): the boot
+    /// intent is self-consistent (not [`BootMode::NetworkFirst`]) and the
+    /// kernel and initrd exist as regular files. A no-op for a BVE with no
+    /// [`DirectKernelBoot`]. Kept out of the constructors so configuration
+    /// validation performs no I/O (mirrors [`BveDefinition::ensure_disks_present`]).
+    pub fn ensure_direct_kernel_ready(&self) -> Result<(), DefinitionError> {
+        let Some(direct_kernel) = &self.direct_kernel else {
+            return Ok(());
+        };
+        if self.boot_mode == BootMode::NetworkFirst {
+            return Err(DefinitionError::DirectKernelBootModeConflict);
+        }
+        direct_kernel.ensure_files_present()
     }
 }
 
@@ -630,6 +786,45 @@ pub enum DefinitionError {
     DiskImageNotAFile {
         /// The affected role.
         role: DiskRole,
+        /// The offending path.
+        path: PathBuf,
+    },
+
+    /// A direct-kernel `kernel`/`initrd` path cannot be safely represented in a
+    /// QEMU argument (it contains `,`, a newline, or a carriage return).
+    #[error("unsupported direct-kernel image path {path}: must not contain ',' or a newline")]
+    DirectKernelPathRejected {
+        /// The offending path.
+        path: PathBuf,
+    },
+
+    /// A direct-kernel command line was rejected (contains a newline, carriage
+    /// return, or NUL, or is longer than [`MAX_KERNEL_CMDLINE_LEN`]).
+    #[error("unsupported kernel command line: {reason}")]
+    DirectKernelCommandLineRejected {
+        /// Why it was rejected.
+        reason: &'static str,
+    },
+
+    /// [`BootMode::NetworkFirst`] was combined with a [`DirectKernelBoot`] —
+    /// two competing boot intents.
+    #[error("BootMode::NetworkFirst cannot be combined with a direct kernel boot")]
+    DirectKernelBootModeConflict,
+
+    /// A direct-kernel image (`kernel` or `initrd`) path does not exist.
+    #[error("direct-kernel {which} image not found: {path}")]
+    DirectKernelImageMissing {
+        /// Which image (`"kernel"` or `"initrd"`).
+        which: &'static str,
+        /// The missing path.
+        path: PathBuf,
+    },
+
+    /// A direct-kernel image path exists but is not a regular file.
+    #[error("direct-kernel {which} image is not a regular file: {path}")]
+    DirectKernelImageNotAFile {
+        /// Which image (`"kernel"` or `"initrd"`).
+        which: &'static str,
         /// The offending path.
         path: PathBuf,
     },
@@ -1017,6 +1212,152 @@ mod tests {
                 role: DiskRole::System,
                 path: dir.clone(),
             })
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- DirectKernelBoot (Issue #72) ------------------------------------
+
+    #[test]
+    fn direct_kernel_new_accepts_a_plain_payload() {
+        let dk = DirectKernelBoot::new(
+            "/out/images/bzImage",
+            "/out/images/rootfs.cpio.gz",
+            "console=ttyS0,115200 panic=-1",
+        )
+        .unwrap();
+        assert_eq!(dk.kernel(), Path::new("/out/images/bzImage"));
+        assert_eq!(dk.initrd(), Path::new("/out/images/rootfs.cpio.gz"));
+        assert_eq!(dk.command_line(), "console=ttyS0,115200 panic=-1");
+    }
+
+    #[test]
+    fn direct_kernel_new_rejects_qemu_hostile_image_paths() {
+        for bad in ["/a,b/bzImage", "/x/line\nbreak", "/x/carriage\rreturn"] {
+            assert_eq!(
+                DirectKernelBoot::new(bad, "/x/rootfs.cpio.gz", "console=ttyS0"),
+                Err(DefinitionError::DirectKernelPathRejected {
+                    path: PathBuf::from(bad)
+                }),
+                "expected kernel path {bad:?} to be rejected"
+            );
+            assert_eq!(
+                DirectKernelBoot::new("/x/bzImage", bad, "console=ttyS0"),
+                Err(DefinitionError::DirectKernelPathRejected {
+                    path: PathBuf::from(bad)
+                }),
+                "expected initrd path {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_kernel_new_rejects_bad_command_lines() {
+        for bad in ["console=ttyS0\nmalicious", "a\rb", "has\0nul"] {
+            assert!(matches!(
+                DirectKernelBoot::new("/x/bzImage", "/x/rootfs.cpio.gz", bad),
+                Err(DefinitionError::DirectKernelCommandLineRejected { .. })
+            ));
+        }
+        let too_long = "x".repeat(MAX_KERNEL_CMDLINE_LEN + 1);
+        assert!(matches!(
+            DirectKernelBoot::new("/x/bzImage", "/x/rootfs.cpio.gz", too_long),
+            Err(DefinitionError::DirectKernelCommandLineRejected { .. })
+        ));
+    }
+
+    #[test]
+    fn with_direct_kernel_rejects_network_first_and_is_otherwise_orthogonal() {
+        let dk = DirectKernelBoot::new("/x/bzImage", "/x/rootfs.cpio.gz", "console=ttyS0").unwrap();
+
+        let conflict =
+            BveDefinition::new(valid_id(), 1, 256, Firmware::Default, system("/s.qcow2"))
+                .unwrap()
+                .with_boot_mode(BootMode::NetworkFirst)
+                .with_direct_kernel(dk.clone());
+        assert_eq!(conflict, Err(DefinitionError::DirectKernelBootModeConflict));
+
+        // Orthogonal to Firmware / NicModel / everything else.
+        let def = BveDefinition::new(valid_id(), 2, 512, Firmware::Default, system("/s.qcow2"))
+            .unwrap()
+            .with_nic_model(NicModel::VirtioNetPci)
+            .with_direct_kernel(dk.clone())
+            .unwrap();
+        assert_eq!(def.direct_kernel(), Some(&dk));
+        assert_eq!(def.boot_mode(), BootMode::Default);
+        assert_eq!(def.nic_model(), NicModel::VirtioNetPci);
+        assert_eq!(def.firmware(), Firmware::Default);
+        assert_eq!(def.vcpus(), 2);
+    }
+
+    #[test]
+    fn a_new_definition_has_no_direct_kernel() {
+        let def =
+            BveDefinition::new(valid_id(), 1, 256, Firmware::Default, system("/s.qcow2")).unwrap();
+        assert!(def.direct_kernel().is_none());
+        assert_eq!(def.ensure_direct_kernel_ready(), Ok(()));
+    }
+
+    #[test]
+    fn ensure_direct_kernel_ready_checks_files_and_boot_consistency() {
+        let dir = temp_dir();
+        let kernel = dir.join("bzImage");
+        let initrd = dir.join("rootfs.cpio.gz");
+        std::fs::write(&kernel, b"vmlinuz").unwrap();
+        std::fs::write(&initrd, b"cpio").unwrap();
+
+        let ok = BveDefinition::new(valid_id(), 1, 256, Firmware::Default, system("/s.qcow2"))
+            .unwrap()
+            .with_direct_kernel(
+                DirectKernelBoot::new(&kernel, &initrd, "console=ttyS0,115200").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(ok.ensure_direct_kernel_ready(), Ok(()));
+
+        // Missing initrd.
+        let missing_initrd = dir.join("gone.cpio.gz");
+        let bad = BveDefinition::new(valid_id(), 1, 256, Firmware::Default, system("/s.qcow2"))
+            .unwrap()
+            .with_direct_kernel(
+                DirectKernelBoot::new(&kernel, &missing_initrd, "console=ttyS0").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            bad.ensure_direct_kernel_ready(),
+            Err(DefinitionError::DirectKernelImageMissing {
+                which: "initrd",
+                path: missing_initrd,
+            })
+        );
+
+        // A directory is not a regular file.
+        let dir_kernel =
+            BveDefinition::new(valid_id(), 1, 256, Firmware::Default, system("/s.qcow2"))
+                .unwrap()
+                .with_direct_kernel(DirectKernelBoot::new(&dir, &initrd, "console=ttyS0").unwrap())
+                .unwrap();
+        assert_eq!(
+            dir_kernel.ensure_direct_kernel_ready(),
+            Err(DefinitionError::DirectKernelImageNotAFile {
+                which: "kernel",
+                path: dir.clone(),
+            })
+        );
+
+        // Boot-intent conflict caught fail-closed even if NetworkFirst was set
+        // after with_direct_kernel.
+        let reordered =
+            BveDefinition::new(valid_id(), 1, 256, Firmware::Default, system("/s.qcow2"))
+                .unwrap()
+                .with_direct_kernel(
+                    DirectKernelBoot::new(&kernel, &initrd, "console=ttyS0").unwrap(),
+                )
+                .unwrap()
+                .with_boot_mode(BootMode::NetworkFirst);
+        assert_eq!(
+            reordered.ensure_direct_kernel_ready(),
+            Err(DefinitionError::DirectKernelBootModeConflict)
         );
 
         std::fs::remove_dir_all(&dir).ok();

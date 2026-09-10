@@ -17,7 +17,7 @@ Bamep currently has eight Rust crates:
 | `bamep-simulator` | Simulated Agent participant using real trusted-bootstrap and WSS/Agent Protocol boundaries |
 | `bamep-worker-protocol` | Rust wire model/codec/framing for the implemented Worker Protocol v1 handshake + business-message catalog |
 | `bamep-worker` | The isolated Worker process: concurrent UDS control client, fail-closed authority tracking, Server TLS identity, local chunk storage + full-Artifact reconstruction, and the HTTPS `/api/data/v1/` data plane |
-| `bamep-ve` | Host-side lifecycle for one disposable Bamep Virtual Endpoint (BVE): validated machine definition (SeaBIOS or OVMF non-Secure-Boot UEFI firmware; `virtio-net-pci` or `e1000` NIC), direct QEMU/KVM invocation, owned process + QMP control socket, deterministic disk storage (sparse RAW base + per-instance QCOW2 overlay + source fixture, `qemu-img`), an optional isolated PXE-capable provisioning network (private bridge + user-owned TAP + fixture netns, `ip`) with a WinPE UEFI-PXE host-proof fixture (`dnsmasq` DHCP/TFTP + `python3` HTTP), and the `create/start/observe/reset/reset_system_storage/stop/destroy` lifecycle |
+| `bamep-ve` | Host-side lifecycle for one disposable Bamep Virtual Endpoint (BVE): validated machine definition (SeaBIOS or OVMF non-Secure-Boot UEFI firmware; `virtio-net-pci` or `e1000` NIC; optional `DirectKernelBoot` kernel+initramfs payload), direct QEMU/KVM invocation, owned process + QMP control socket, optional headless serial capture, deterministic disk storage (sparse RAW base + per-instance QCOW2 overlay + source fixture, `qemu-img`), an optional isolated PXE-capable provisioning network (private bridge + user-owned TAP + fixture netns, `ip`) with a WinPE UEFI-PXE host-proof fixture (`dnsmasq` DHCP/TFTP + `python3` HTTP), and the `create/start/observe/reset/reset_system_storage/stop/destroy` lifecycle. The BARE build tree (`bare/`, Buildroot `BR2_EXTERNAL`) and its build/direct-boot-proof scripts live alongside it |
 
 Planned components remain outside Architecture until corresponding code exists.
 
@@ -114,7 +114,7 @@ implemented directly against QEMU/KVM per ADR-0022. The crate/package is named `
 validation/development infrastructure related to the Simulator, not part of the M2 Endpoint
 Capture product surface.
 
-Implemented across Issues #67, #69, #70 and #71:
+Implemented across Issues #67, #69, #70, #71 and #72:
 
 - `BveDefinition` — a validated machine description: a path-safe `BveId`, vCPU count, RAM
   (MiB), a `Firmware` choice (`Default` = SeaBIOS, or `Uefi` = OVMF **without** Secure Boot
@@ -123,13 +123,19 @@ Implemented across Issues #67, #69, #70 and #71:
   stock WinPE has an inbox driver for it but none for VirtIO; the deterministic MAC is
   identical for both), a deterministic locally-administered NIC MAC derived from the id, a
   `NetworkAttachment` (`UserMode` by default, or `IsolatedTap { ifname }` set only via a
-  `PreparedBveNetwork`), and the disks actually attached — a required `System`
+  `PreparedBveNetwork`), the disks actually attached — a required `System`
   `DiskAttachment` and an optional `Source` one, each carrying an explicit `DiskRole` and
-  `DiskFormat`. `Firmware` and `NicModel` are independent (UEFI does not imply a NIC model,
-  and vice versa). Rejects zero/oversized vCPUs, zero/out-of-range RAM, a disk path that
-  would break QEMU `-drive` parsing (a `,`), a wrong-role attachment, an invalid interface
-  name, and (at `create` time) a missing/non-file image. It is not a future-complete
-  configuration surface; WinPE and Buildroot fields are intentionally absent.
+  `DiskFormat` — and an optional `DirectKernelBoot { kernel, initrd, command_line }` (Issue
+  #72 / ADR-0026): a narrow direct Linux kernel boot payload for QEMU
+  `-kernel`/`-initrd`/`-append`, orthogonal to `Firmware`/`NicModel`/`BootMode` and rejected
+  in combination with `BootMode::NetworkFirst` (two competing boot intents). `Firmware` and
+  `NicModel` are independent (UEFI does not imply a NIC model, and vice versa). Rejects
+  zero/oversized vCPUs, zero/out-of-range RAM, a disk or kernel/initrd path that would break
+  QEMU parsing (a `,`), a command line with a newline/NUL or over 4 KiB, a wrong-role
+  attachment, an invalid interface name, and (at `create` time) a missing/non-file image or
+  kernel/initrd. It is not a future-complete configuration surface; WinPE fields are absent,
+  and `DirectKernelBoot` carries no BARE/Buildroot semantics — BVE understands only "boot
+  this kernel and initrd", never "this is BARE".
 - `storage` (ADR-0023) — the disk model. `BveStorageRoot` is a validated, crate-owned root;
   `BveStorageLayout::for_bve` derives deterministic paths (`base/system-base.raw`,
   `instances/<bve-id>/system.qcow2`, `instances/<bve-id>/source.raw`). `ensure_system_base`
@@ -158,7 +164,13 @@ Implemented across Issues #67, #69, #70 and #71:
   optical / El-Torito device. Each disk is `-drive if=none,id=<role>,file=<path>,format=<fmt>`
   plus `-device virtio-blk-pci,drive=<role>,serial=bamep-<role>` — identity is the explicit
   `id=`/`serial=`, not argument order; the format is always explicit; the immutable backing
-  base is never attached. Plus a listening `-qmp unix:` control socket.
+  base is never attached. Plus a listening `-qmp unix:` control socket. For a
+  `DirectKernelBoot` (Issue #72) `-kernel <bzImage> -initrd <rootfs.cpio.gz> -append
+  "<cmdline>"` — QEMU/KVM loads the kernel + initramfs directly, with no `-boot`, no
+  bootloader and no optical device. The serial line is `-serial none` by default (every path
+  before #72 is byte-identical) or, when the runtime enables capture, `-chardev
+  file,id=char0,path=<serial.log>,append=on` + `-serial chardev:char0` — a headless
+  machine-readable log, never a display/VNC/SPICE path (Issue #74).
 - `network` (ADR-0024) — the optional isolated provisioning network.
   `BveNetworkPlan::for_bve` derives deterministic, `IFNAMSIZ`-safe host-resource names
   (`bvbr<h>`, `bvtap<h>`, `bvh<h>`/`bvp<h>`, netns `bve-<h>`, where `<h>` is the low 32
@@ -210,7 +222,12 @@ Implemented across Issues #67, #69, #70 and #71:
   on. `create` rejects a definition whose attachments disagree with the prepared storage,
   and for `Firmware::Uefi` runs `check_uefi_firmware` and writes a pristine per-BVE VARS
   copy from the immutable template (once, at `create` — not refreshed per `start`, so PXE
-  repeats with the same firmware state); `destroy` removes that copy. `create_with_isolated_network`
+  repeats with the same firmware state); `destroy` removes that copy. `create` also runs
+  `ensure_direct_kernel_ready` (kernel + initrd exist as regular files; boot intent
+  self-consistent) for a `DirectKernelBoot` BVE. `with_serial_capture` (Issue #72) opts one
+  BVE into an append-mode `<control-dir>/serial.log` (`SERIAL_LOG_FILENAME`) so a
+  `stop`/`start` cycle accumulates both boots' serial output for per-boot line-range
+  evidence; `destroy` removes it (control state, like the VARS copy). `create_with_isolated_network`
   additionally cross-checks the definition's `NetworkAttachment` against a
   `PreparedBveNetwork` (same consistency lesson as ADR-0023) and performs no privileged
   network operation — QEMU opens the already-prepared, user-owned TAP unprivileged.
@@ -227,18 +244,22 @@ Implemented across Issues #67, #69, #70 and #71:
   `query-block`. Not a general QMP library.
 
 Deterministic logic (definition/attachment validation, MAC derivation, `Firmware`/`NicModel`
-argv including the OVMF pflash pair and the no-optical-fallback guard, QEMU argument
-construction, the per-BVE UEFI VARS copy/remove lifecycle, storage path geometry and
-fail-closed deletion sets, storage/definition and network/definition consistency, network
-resource-name derivation and ownership/rollback sets, L2-isolation checks, DHCP-forward and
-bridged-forward accommodation rule scoping, the WinPE fixture `dnsmasq`/HTTP argv and
-loop-free two-stage `dhcp-boot`, prerequisite-absence errors, QMP handling) is covered by
-unit tests needing no QEMU, `qemu-img`, OVMF, or host networking. Opt-in host proofs, which an ordinary `cargo test` and CI never trigger,
-exercise the real thing: `tests/host_lifecycle.rs` (`BAMEP_BVE_HOST_TEST=1`) for the
-QEMU/KVM lifecycle, `tests/storage_host.rs` (`BAMEP_VE_STORAGE_HOST_TEST=1`) for sparse
-allocation (80 GiB logical / ~4 KiB allocated), base immutability, reproducible reset,
-independent system/source attachment, and scoped disposal, and `tests/network_host.rs`
-(`BAMEP_VE_NETWORK_HOST_TEST=1`, read-only pre-flight only). The full isolated-network
+argv including the OVMF pflash pair and the no-optical-fallback guard, the `DirectKernelBoot`
+`-kernel`/`-initrd`/`-append` argv and its `BootMode::NetworkFirst` rejection, the serial
+`file` chardev argv, QEMU argument construction, the per-BVE UEFI VARS and serial-log
+copy/remove lifecycle, storage path geometry and fail-closed deletion sets,
+storage/definition and network/definition consistency, network resource-name derivation and
+ownership/rollback sets, L2-isolation checks, DHCP-forward and bridged-forward accommodation
+rule scoping, the WinPE fixture `dnsmasq`/HTTP argv and loop-free two-stage `dhcp-boot`,
+prerequisite-absence errors, QMP handling) is covered by unit tests needing no QEMU,
+`qemu-img`, OVMF, or host networking. Opt-in host proofs, which an ordinary `cargo test` and
+CI never trigger, exercise the real thing: `tests/host_lifecycle.rs` (`BAMEP_BVE_HOST_TEST=1`)
+for the QEMU/KVM lifecycle, `tests/storage_host.rs` (`BAMEP_VE_STORAGE_HOST_TEST=1`) for
+sparse allocation (80 GiB logical / ~4 KiB allocated), base immutability, reproducible reset,
+independent system/source attachment, and scoped disposal, `tests/network_host.rs`
+(`BAMEP_VE_NETWORK_HOST_TEST=1`, read-only pre-flight only), and `tests/bare_direct_host.rs`
+(`BAMEP_BVE_BARE_HOST_TEST=1` + `BAMEP_BVE_BARE_KERNEL`/`BAMEP_BVE_BARE_INITRD`) for two
+direct BARE boots of one BVE. The full isolated-network
 proof — create the network, boot the BVE PXE-first, assert the DHCP DORA for the
 deterministic MAC, stop the real `dnsmasq` deterministically (pid-file validated against
 `ip netns pids`, never the `sudo` wrapper PID), tear down, `verify-clean`, repeat — is the
@@ -268,10 +289,47 @@ whole-log text count. It is #71-specific and depends on external Microsoft/iPXE 
 so the generic #70 proof stays separate and unchanged. Its empirical result and fidelity
 limits live in `docs/reference/bve-winpe-uefi-pxe-host-proof.md`.
 
+### BARE — Bamep Agent Runtime Environment (Issue #72 / ADR-0026)
+
+**BARE** is the minimal bootable runtime environment that hosts the (future) Bamep Agent —
+not a general-purpose OS. Its build inputs are repository-owned in **`bare/`**, a Buildroot
+`BR2_EXTERNAL` tree (`external.desc` name `BAMEP_BARE`): `configs/bamep_bare_x86_64_defconfig`,
+`board/bamep/bare/linux.fragment` (forced-builtin virtio / 8250-serial / initramfs symbols),
+`board/bamep/bare/rootfs-overlay/etc/init.d/S50bare` (the BARE startup hook), and
+`buildroot.lock` pinning Buildroot **Stable 2026.08**, its signing-key fingerprint, and the
+archive SHA-256. Buildroot itself is consumed as an external pinned source (never vendored);
+its source, `BR2_DL_DIR` cache and `O=` build tree live outside the repo under
+`${XDG_CACHE_HOME:-$HOME/.cache}/bamep-bare/`. `scripts/build-bare.sh`
+(`--preflight` / `--pin` / build / `clean`) runs Buildroot under an explicit whitespace-free
+Linux PATH (`scripts/lib/bare-build-env.sh` — Buildroot aborts on a PATH with spaces, and
+the WSL-inherited PATH carries Windows entries; the user environment is untouched),
+authenticates the first pin against the official Buildroot release PGP signature, and
+produces two separate artifacts — `bzImage` and `rootfs.cpio.gz` — shaped so #73 can load
+them with iPXE `kernel`/`initrd` unchanged; generated images are not committed. A generated
+BARE image bundles GPL-2.0 and other third-party components and is not "Apache-2.0 only".
+
+The direct-boot proof, `scripts/bve-bare-direct-proof.sh` (with `examples/bve_bare`
+`plan`/`check`/`run-bve` for debugging), never rebuilds BARE: it boots one BVE
+(`Firmware::Default` + `NicModel::VirtioNetPci` + a `DirectKernelBoot` payload + user-mode
+SLIRP + a blank virtio-blk overlay), captures the serial console, and requires the
+BARE-emitted markers `BARE_READY nic=<iface> block=<dev> …` (kernel+init reached, `/proc`
+`/sys` `/dev` usable, virtio-net and virtio-blk present and bound) and — a separate, honest
+claim — `BARE_NET_READY nic=<iface> addr=<ipv4>` (BusyBox `udhcpc` obtained a lease) in each
+of two boots of the same `BveRuntime`/definition/storage/kernel/initrd. Serial evidence is
+parsed per boot by `scripts/lib/bare-serial-evidence.sh` (`bare_ready_in_range` /
+`bare_net_ready_in_range`), unit-tested by `scripts/bve-bare-direct-proof-parser-test.sh`
+(and the build environment by `scripts/build-bare-env-test.sh`);
+`crates/ve/tests/bare_direct_host.rs` (`BAMEP_BVE_BARE_HOST_TEST=1` +
+`BAMEP_BVE_BARE_KERNEL`/`BAMEP_BVE_BARE_INITRD`) is the in-crate regression anchor. Empirical
+result and fidelity limits: `docs/reference/bve-bare-direct-boot-host-proof.md`. #72 does not
+implement PXE/DHCP/TFTP/HTTP/iPXE/Secure Boot for BARE (that boundary is #73) or a visual
+console (#74); the production Agent is future work.
+
 BVE never proves physical firmware, option-ROM, NIC, switch/VLAN, storage-controller,
 Secure Boot, or physical WinPE/PXE behavior, and host-internal virtual-network evidence is
 not physical-network evidence (`m0-bamep-virtual-endpoint-contract.md` "Validation and
-fidelity boundary").
+fidelity boundary"). #72's direct kernel boot bypasses firmware and NVRAM entirely, so it
+proves a QEMU/KVM direct Linux load, not any firmware/UEFI path.
 
 ### Simulator BVE orchestration (Issue #68)
 

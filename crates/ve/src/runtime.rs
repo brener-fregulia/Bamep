@@ -49,6 +49,12 @@ pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// [`BveRuntime::destroy`].
 pub const UEFI_VARS_FILENAME: &str = "OVMF_VARS.fd";
 
+/// Filename of the headless serial capture log inside the instance control
+/// directory, when [`BveRuntime::with_serial_capture`] is enabled (Issue #72).
+/// QEMU appends to it, so a `stop`/`start` cycle accumulates both boots'
+/// output; [`BveRuntime::destroy`] removes it.
+pub const SERIAL_LOG_FILENAME: &str = "serial.log";
+
 /// The truthful lifecycle state Issue #67 requires. Nothing here implies guest
 /// OS or Agent health.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +203,11 @@ pub struct BveRuntime {
     /// [`Firmware::Default`] (SeaBIOS). Preserved across `stop`/`start`;
     /// removed by `destroy` (ADR-0025).
     uefi_vars: Option<PathBuf>,
+    /// When set (via [`BveRuntime::with_serial_capture`], Issue #72): the
+    /// `<instance-dir>/serial.log` this BVE's guest serial line is appended to.
+    /// `None` by default — every path before Issue #72 leaves the serial line
+    /// detached. Removed by `destroy`.
+    serial_log: Option<PathBuf>,
     child: Option<Child>,
 }
 
@@ -232,6 +243,10 @@ impl BveRuntime {
             });
         }
         definition.ensure_disks_present()?;
+        // For a direct-kernel BVE (Issue #72): the kernel and initrd must exist
+        // as regular files and the boot intent must be self-consistent
+        // (not BootMode::NetworkFirst). A no-op for every other BVE.
+        definition.ensure_direct_kernel_ready()?;
 
         let instance_dir = root.instance_dir(definition.id());
         fs::create_dir_all(&instance_dir)?;
@@ -260,8 +275,24 @@ impl BveRuntime {
             instance_dir,
             qmp_socket,
             uefi_vars,
+            serial_log: None,
             child: None,
         })
+    }
+
+    /// Enables headless serial capture for this BVE (Issue #72).
+    ///
+    /// The guest serial line is written to `<instance-dir>/`
+    /// [`SERIAL_LOG_FILENAME`] via a QEMU file chardev in **append** mode, so a
+    /// `stop`/`start` cycle accumulates both boots' output and each boot can be
+    /// proven independently over its own line range (the Issue #71 evidence
+    /// pattern). Off by default: every path before Issue #72 leaves the serial
+    /// line detached (`-serial none`) and is byte-identical. `destroy` removes
+    /// the log. This is a machine-readable proof capture only — never a
+    /// VNC/SPICE/display path (Issue #74).
+    pub fn with_serial_capture(mut self) -> Self {
+        self.serial_log = Some(self.instance_dir.join(SERIAL_LOG_FILENAME));
+        self
     }
 
     /// Like [`BveRuntime::create`], but for a BVE that uses a prepared
@@ -338,6 +369,13 @@ impl BveRuntime {
         self.uefi_vars.as_deref()
     }
 
+    /// This BVE's headless serial capture log path, when
+    /// [`BveRuntime::with_serial_capture`] is enabled (Issue #72). `None`
+    /// otherwise.
+    pub fn serial_log(&self) -> Option<&Path> {
+        self.serial_log.as_deref()
+    }
+
     /// The definition this runtime represents.
     pub fn definition(&self) -> &BveDefinition {
         &self.definition
@@ -361,7 +399,12 @@ impl BveRuntime {
             (Some(code), Some(vars)) => Some(UefiPflash { code, vars }),
             _ => None,
         };
-        let command = QemuCommand::for_bve(&self.definition, &self.qmp_socket, uefi);
+        let command = QemuCommand::for_bve(
+            &self.definition,
+            &self.qmp_socket,
+            uefi,
+            self.serial_log.as_deref(),
+        );
         let mut child = Command::new(command.program())
             .args(command.args())
             .stdin(Stdio::null())
@@ -487,6 +530,16 @@ impl BveRuntime {
             }
         }
 
+        // The serial capture log is likewise control state this runtime
+        // created (Issue #72); remove it explicitly for the same reason.
+        if let Some(serial_log) = &self.serial_log {
+            match fs::remove_file(serial_log) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(RuntimeError::Io(e)),
+            }
+        }
+
         match fs::remove_dir(&self.instance_dir) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
@@ -582,7 +635,7 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<Option<ExitStat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::definition::{DiskAttachment, DiskFormat, Firmware};
+    use crate::definition::{BootMode, DirectKernelBoot, DiskAttachment, DiskFormat, Firmware};
     use crate::network::{BveNetworkPlan, PreparedBveNetwork};
     use crate::storage::{BveStorageLayout, BveStorageRoot, PreparedInstanceStorage};
 
@@ -659,6 +712,101 @@ mod tests {
         assert_eq!(rt.qmp_socket(), rt.instance_dir().join("qmp.sock"));
         assert!(rt.child.is_none());
         assert!(!rt.qmp_socket().exists());
+    }
+
+    // ---- serial capture + direct kernel boot (Issue #72) ---------------
+
+    #[test]
+    fn serial_capture_is_off_by_default_and_opt_in_points_at_the_instance_log() {
+        let temp = TempRoot::new();
+        let (rt, _s) = bve(&temp, "bve-serial-default");
+        assert!(rt.serial_log().is_none());
+
+        let (rt, _s) = bve(&temp, "bve-serial-on");
+        let rt = rt.with_serial_capture();
+        assert_eq!(
+            rt.serial_log(),
+            Some(rt.instance_dir().join(SERIAL_LOG_FILENAME).as_path())
+        );
+    }
+
+    #[test]
+    fn destroy_removes_the_serial_log_and_leaves_the_control_dir_clean() {
+        let temp = TempRoot::new();
+        let (rt, _s) = bve(&temp, "bve-serial-destroy");
+        let rt = rt.with_serial_capture();
+        let control_dir = rt.instance_dir().to_path_buf();
+        let log = rt.serial_log().unwrap().to_path_buf();
+        fs::write(&log, b"BARE_READY nic=eth0 block=vda\n").unwrap();
+
+        rt.destroy().unwrap();
+        assert!(!log.exists(), "the serial log is removed by destroy");
+        assert!(!control_dir.exists(), "control dir removed (non-recursive)");
+    }
+
+    fn direct_kernel_storage(temp: &TempRoot, id: &str) -> (BveId, PreparedInstanceStorage) {
+        let id = BveId::new(id).unwrap();
+        let storage = fake_prepared(&temp.storage_root(), &id, false);
+        (id, storage)
+    }
+
+    #[test]
+    fn create_rejects_a_direct_kernel_bve_whose_images_are_missing() {
+        let temp = TempRoot::new();
+        let (id, storage) = direct_kernel_storage(&temp, "bve-dk-missing");
+        let def = storage
+            .define_bve(id, 2, 512, Firmware::Default)
+            .unwrap()
+            .with_direct_kernel(
+                DirectKernelBoot::new(
+                    temp.0.join("no-such-bzImage"),
+                    temp.0.join("no-such-rootfs.cpio.gz"),
+                    "console=ttyS0,115200",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let err = BveRuntime::create(&temp.runtime_root(), def, storage).unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::Definition(DefinitionError::DirectKernelImageMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn create_accepts_a_direct_kernel_bve_with_real_images_and_rejects_network_first() {
+        let temp = TempRoot::new();
+        let (id, storage) = direct_kernel_storage(&temp, "bve-dk-ok");
+        let kernel = temp.0.join("bzImage");
+        let initrd = temp.0.join("rootfs.cpio.gz");
+        fs::write(&kernel, b"vmlinuz").unwrap();
+        fs::write(&initrd, b"cpio").unwrap();
+
+        let ok = storage
+            .define_bve(id.clone(), 2, 512, Firmware::Default)
+            .unwrap()
+            .with_direct_kernel(
+                DirectKernelBoot::new(&kernel, &initrd, "console=ttyS0,115200").unwrap(),
+            )
+            .unwrap();
+        let rt = BveRuntime::create(&temp.runtime_root(), ok, storage.clone()).unwrap();
+        assert!(rt.definition().direct_kernel().is_some());
+
+        // NetworkFirst set after with_direct_kernel is caught fail-closed at create.
+        let conflict = storage
+            .define_bve(id, 2, 512, Firmware::Default)
+            .unwrap()
+            .with_direct_kernel(
+                DirectKernelBoot::new(&kernel, &initrd, "console=ttyS0,115200").unwrap(),
+            )
+            .unwrap()
+            .with_boot_mode(BootMode::NetworkFirst);
+        let err = BveRuntime::create(&temp.runtime_root(), conflict, storage).unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::Definition(DefinitionError::DirectKernelBootModeConflict)
+        ));
     }
 
     #[test]

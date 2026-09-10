@@ -1,0 +1,54 @@
+# BARE - Bamep Agent Runtime Environment: pinned Buildroot baseline.
+# Issue #72 / ADR-0026.
+#
+# This file selects the EXACT upstream Buildroot release the BARE image is
+# built and validated against. scripts/build-bare.sh reads it and REFUSES to
+# build against any other version.
+#
+# Trust model:
+#   - the FIRST pin is authenticated:  scripts/build-bare.sh --pin  downloads
+#     the archive and its official PGP signature (buildroot-<v>.tar.xz.sign),
+#     fetches the Buildroot signing key, checks the key fingerprint against
+#     buildroot_signing_fpr below, verifies the signature, and records the
+#     SHA-256 taken from the *signed* text into buildroot_sha256;
+#   - every REBUILD then just checks the archive against the pinned SHA-256
+#     (local authority - no network trust needed).
+#
+# Rules (ADR-0026):
+#   - never resolve "latest";
+#   - never auto-bump to 2026.11 or any later release;
+#   - never fall back to another version or series;
+#   - changing this baseline is a deliberate ADR-0026 update, not a side effect.
+#
+# The baseline is Buildroot STABLE 2026.08 (released 2026-09-04). BARE is still
+# being established; a maintenance/LTS policy for BARE may pick an LTS series
+# later when there is a concrete operational need.
+
+buildroot_version = 2026.08
+buildroot_archive = buildroot-2026.08.tar.xz
+buildroot_url     = https://buildroot.org/downloads/buildroot-2026.08.tar.xz
+
+# Buildroot release signing identity - Peter Korsgaard (the Buildroot
+# maintainer), DSA key, hosted at the URL the .sign message itself points to.
+# --pin refuses a key served under any other fingerprint.
+buildroot_signing_fpr     = AB07D806D2CE741FB886EE50B025BA8B59C36319
+buildroot_signing_key_url = https://buildroot.org/~jacmet/pubkey.gpg
+
+# SHA-256 of buildroot-2026.08.tar.xz, taken from the PGP-signed .sign message
+# and cross-checked against the downloaded archive by scripts/build-bare.sh --pin.
+buildroot_sha256 = 87aaca4164ea9d5c8085854953018263f7963f07c22e73a2a2185cc98c581c34
+
+# --- Recorded from the owner-run validated build (evidence, not architecture
+#     pins; a repeat build may differ - NOT a bit-for-bit claim) ---
+# linux_kernel_version    = 7.1.13 (Buildroot 2026.08 LATEST_VERSION)
+# artifact_bzImage        = 14959616 bytes  sha256 5db627be920603b8862c97101a695a20b024e3a64b8e7d5e38512dd8a51d7c04
+# artifact_rootfs_cpio_gz =  1165658 bytes  sha256 57ed483302a5b110eeaffe130cb232cf1ef3a0a329c33d721aef52fc08063eae
+#   (bzImage byte-identical across builds on this host; rootfs.cpio.gz hash
+#    varies between builds - cpio/gzip embed per-build metadata)
+# built_on                = 2026-09-10, WSL2 Ubuntu 24.04, Buildroot musl toolchain (gcc 15.3.0)
+# note                    = needs BR2_LINUX_KERNEL_NEEDS_HOST_LIBELF=y
+#                           (x86_64 CONFIG_UNWINDER_ORC -> objtool -> host-elfutils 0.195)
+# direct BVE boot proof   = PASS (scripts/bve-bare-direct-proof.sh: BARE_READY +
+#                           BARE_NET_READY in two boots; bare_direct_host test PASS)
+# make legal-info         = produced OK; "source code has not been saved" warning noted
+# See docs/reference/bve-bare-direct-boot-host-proof.md for the full transcript.

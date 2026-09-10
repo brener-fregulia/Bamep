@@ -1,0 +1,55 @@
+# BARE - Bamep Agent Runtime Environment
+# x86_64 direct-boot profile (Issue #72 / ADR-0026).
+#
+# BARE is the minimal bootable runtime environment that hosts the Bamep Agent.
+# It is NOT a general-purpose operating system. This defconfig produces exactly
+# two artifacts, kept separate on purpose so #73 (iPXE) and a future Agent Work
+# Package can evolve them independently:
+#
+#   output/images/bzImage           - the Linux kernel
+#   output/images/rootfs.cpio.gz    - a standalone gzip-compressed initramfs
+#
+# Build with scripts/build-bare.sh (which pins Buildroot to bare/buildroot.lock).
+
+BR2_x86_64=y
+BR2_TOOLCHAIN_BUILDROOT_MUSL=y
+
+# --- Kernel -----------------------------------------------------------------
+# The upstream x86_64 arch default config (well exercised under QEMU/KVM) plus
+# the BARE fragment, which forces the virtio / 8250 serial-console / initramfs
+# symbols to built-in. A hand-rolled minimal kernel config may replace this in
+# a later BARE revision once this baseline is proven.
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_LATEST_VERSION=y
+BR2_LINUX_KERNEL_USE_ARCH_DEFAULT_CONFIG=y
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_BAMEP_BARE_PATH)/board/bamep/bare/linux.fragment"
+# The x86_64 arch default config enables CONFIG_UNWINDER_ORC, whose `objtool`
+# host tool needs <gelf.h>. Buildroot supplies libelf via host-elfutils when
+# this is set - the native, self-contained fix (not a host libelf-dev package,
+# not disabling ORC/objtool).
+BR2_LINUX_KERNEL_NEEDS_HOST_LIBELF=y
+
+# --- Root filesystem ------------------------------------------------------
+# A standalone gzip cpio initramfs. NOT embedded in the kernel: bzImage and
+# rootfs.cpio.gz stay independent artifacts.
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_CPIO_GZIP=y
+# BR2_TARGET_ROOTFS_EXT2 is not set
+# BR2_TARGET_ROOTFS_TAR is not set
+
+# --- Init / userspace ---------------------------------------------------
+# BusyBox init only. No systemd. No getty - BARE is not interactive; the BARE
+# startup hook runs from /etc/init.d, emits its ready markers on the serial
+# console, and init then idles in a predictable safe state.
+BR2_INIT_BUSYBOX=y
+# BR2_TARGET_GENERIC_GETTY is not set
+BR2_TARGET_GENERIC_HOSTNAME="bare"
+BR2_TARGET_GENERIC_ISSUE="BARE - Bamep Agent Runtime Environment"
+BR2_SYSTEM_BIN_SH_BUSYBOX=y
+
+# BARE-owned startup hook and static files.
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_BAMEP_BARE_PATH)/board/bamep/bare/rootfs-overlay"
+
+# Deliberately absent (all default-off, listed as intent): bootloader, in-image
+# compiler/toolchain, package manager, Python, SSH server, graphical stack,
+# systemd, persistent endpoint state, updater.

@@ -1,0 +1,78 @@
+#!/bin/sh
+#
+# BARE startup hook - Bamep Agent Runtime Environment (Issue #72 / ADR-0026).
+#
+# Emits deterministic readiness markers on the serial console. It must not lie:
+#
+#   BARE_READY nic=<iface> block=<dev> ...   only after the virtio NIC and the
+#                                            virtio block device are actually
+#                                            present AND bound to their drivers
+#   BARE_NET_READY nic=<iface> addr=<ipv4>   only after udhcpc obtains a lease
+#
+# Absence of BARE_NET_READY never permits a "networking is ready" claim. This
+# hook starts no Agent (that is future work); after the markers it returns and
+# BusyBox init idles in a predictable safe state.
+
+case "$1" in
+	start | "") ;;
+	*) exit 0 ;;
+esac
+
+mark() { printf 'BARE %s\n' "$*"; }
+
+# Buildroot's inittab mounts these before rcS runs; mount defensively and
+# ignore an "already mounted" error.
+[ -e /proc/self ]  || mount -t proc     proc     /proc 2>/dev/null
+[ -e /sys/class ]  || mount -t sysfs    sysfs    /sys  2>/dev/null
+[ -e /dev/null ]   || mount -t devtmpfs devtmpfs /dev  2>/dev/null
+
+driver_of() {
+	# basename of the driver a /sys device node is bound to, or "" if none.
+	target=$(readlink -f "$1/device/driver" 2>/dev/null) || return 0
+	printf '%s' "${target##*/}"
+}
+
+# --- virtio network interface --------------------------------------------
+nic=""
+for d in /sys/class/net/*; do
+	[ -e "$d" ] || continue
+	name=${d##*/}
+	[ "$name" = "lo" ] && continue
+	if [ "$(driver_of "$d")" = "virtio_net" ]; then
+		nic=$name
+		break
+	fi
+done
+
+# --- virtio block device ------------------------------------------------
+blk=""
+for d in /sys/block/*; do
+	[ -e "$d" ] || continue
+	name=${d##*/}
+	if [ "$(driver_of "$d")" = "virtio_blk" ]; then
+		blk=$name
+		break
+	fi
+done
+
+if [ -z "$nic" ] || [ -z "$blk" ]; then
+	mark "NOT_READY nic=${nic:-none} block=${blk:-none}"
+	exit 0
+fi
+
+# Non-destructive block evidence: the size is readable. No partitioning, no
+# mkfs, no mount, no write - Issue #72 implies no destructive storage.
+blk_sectors=$(cat "/sys/block/$blk/size" 2>/dev/null || echo 0)
+
+mark "READY nic=$nic block=$blk block_sectors=$blk_sectors"
+
+# --- networking: a separate, honest claim ------------------------------
+ifconfig "$nic" up 2>/dev/null
+if udhcpc -i "$nic" -n -q -t 5 -T 3 >/dev/null 2>&1; then
+	addr=$(ifconfig "$nic" 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | head -n1)
+	mark "NET_READY nic=$nic addr=${addr:-unknown}"
+else
+	mark "NET_NOT_READY nic=$nic reason=dhcp-failed"
+fi
+
+exit 0

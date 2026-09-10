@@ -1,0 +1,8 @@
+# BARE — Bamep Agent Runtime Environment
+#
+# This BR2_EXTERNAL tree owns Bamep's minimal bootable Agent-hosting runtime.
+# BARE V1 (Issue #72) is BusyBox + a kernel config fragment + a rootfs-overlay
+# startup hook; it deliberately has NO BR2_EXTERNAL packages.
+#
+# A future Work Package that adds the Bamep Agent (a separate executable BARE
+# hosts) will add its package menu here. Do not add packages speculatively.

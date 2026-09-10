@@ -35,6 +35,17 @@
 //! unprivileged. A minimal [`BootMode::NetworkFirst`] makes the firmware
 //! attempt PXE.
 //!
+//! Direct kernel boot (Issue #72): a BVE may carry a [`DirectKernelBoot`]
+//! (`with_direct_kernel`) so QEMU/KVM loads a Linux kernel + initramfs
+//! directly (`-kernel`/`-initrd`/`-append`) with no firmware boot device, no
+//! bootloader and no ISO — the substrate BARE (the Bamep Agent Runtime
+//! Environment, built with Buildroot) boots on. It is orthogonal to
+//! [`Firmware`]/[`NicModel`]/[`BootMode`] and conflicts only with
+//! [`BootMode::NetworkFirst`]. [`BveRuntime::with_serial_capture`] adds a
+//! headless append-mode serial log for machine-readable boot evidence (never a
+//! display/VNC path — Issue #74). BVE understands only "boot this kernel and
+//! initrd", never "this is BARE".
+//!
 //! This crate does **not** depend on `bamep-agent-protocol` or any Agent
 //! Protocol semantics. The lifecycle is synchronous: one VM, one owned
 //! `std::process::Child`, one QMP Unix socket. No async runtime.
@@ -47,8 +58,9 @@ pub mod runtime;
 pub mod storage;
 
 pub use definition::{
-    fnv1a_64, BootMode, BveDefinition, BveId, DefinitionError, DiskAttachment, DiskFormat,
-    DiskRole, Firmware, IfName, MacAddress, NetworkAttachment, NicModel, MAX_IFNAME_LEN,
+    fnv1a_64, BootMode, BveDefinition, BveId, DefinitionError, DirectKernelBoot, DiskAttachment,
+    DiskFormat, DiskRole, Firmware, IfName, MacAddress, NetworkAttachment, NicModel,
+    MAX_IFNAME_LEN, MAX_KERNEL_CMDLINE_LEN,
 };
 pub use network::{
     apply_bridged_forward_accommodation, apply_dhcp_forward_accommodation, assert_l2_isolation,
@@ -70,7 +82,9 @@ pub use qemu::{
     OVMF_VARS_TEMPLATE_ENV, QEMU_BINARY,
 };
 pub use qmp::{QmpConnection, QmpError, QmpResponse, RunState};
-pub use runtime::{BveRuntime, LifecycleState, RuntimeError, RuntimeRoot, UEFI_VARS_FILENAME};
+pub use runtime::{
+    BveRuntime, LifecycleState, RuntimeError, RuntimeRoot, SERIAL_LOG_FILENAME, UEFI_VARS_FILENAME,
+};
 pub use storage::{
     check_qemu_img_binary, destroy_instance_storage, ensure_system_base, prepare_instance,
     reset_system_storage, BveStorageError, BveStorageLayout, BveStorageRoot,

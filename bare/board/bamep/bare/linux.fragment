@@ -1,0 +1,48 @@
+# BARE kernel config fragment (Issue #72 / ADR-0026).
+#
+# Merged on top of the x86_64 arch default config. Everything here is forced
+# BUILT-IN (=y), never a module: BARE boots from a tiny initramfs with no
+# module-loading step. The static build-validation check asserts each of these
+# is "=y" in the final .config.
+
+# 64-bit, PCI, MSI
+CONFIG_64BIT=y
+CONFIG_PCI=y
+CONFIG_PCI_MSI=y
+
+# VirtIO transport + the two devices BARE must see
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MENU=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_NET=y
+CONFIG_VIRTIO_BLK=y
+
+# 8250/16550 serial console on ttyS0 (QEMU -serial)
+CONFIG_TTY=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_8250_PCI=y
+CONFIG_SERIAL_CORE=y
+CONFIG_SERIAL_CORE_CONSOLE=y
+
+# Pseudo-filesystems BARE mounts and inspects
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_TMPFS=y
+
+# Standalone gzip initramfs
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_GZIP=y
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+
+# Networking stack for BusyBox udhcpc over virtio-net + QEMU user-mode/SLIRP
+CONFIG_NET=y
+CONFIG_INET=y
+CONFIG_UNIX=y
+CONFIG_PACKET=y
+CONFIG_NETDEVICES=y
+
+CONFIG_PRINTK=y

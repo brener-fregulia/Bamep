@@ -87,7 +87,12 @@ impl QemuCommand {
     /// - `-accel kvm` and `-cpu host` — explicit hardware acceleration, and
     ///   **no** `tcg` anywhere (ADR-0022 fail-closed);
     /// - `-smp <vcpus>` and `-m <memory_mib>M` from the definition;
-    /// - headless: `-display none -serial none`, no stdio console;
+    /// - headless: `-display none`, no stdio console. The serial line is
+    ///   `-serial none` when `serial` is `None` (every path before Issue #72),
+    ///   or, when `serial` is `Some(path)`, a file chardev the runtime resolved
+    ///   — `-chardev file,id=char0,path=<path>,append=on` + `-serial
+    ///   chardev:char0` — a headless, machine-readable capture (Issue #72). No
+    ///   VNC/SPICE/display (that is Issue #74);
     /// - networking from `definition.network()`: `-netdev user,id=net0`
     ///   (unprivileged SLIRP — the default) **or**, for an isolated TAP
     ///   (Issue #70), `-netdev tap,id=net0,ifname=<prepared>,script=no,\
@@ -97,6 +102,13 @@ impl QemuCommand {
     ///   MAC;
     /// - for [`BootMode::NetworkFirst`], `-boot order=n` so the firmware runs
     ///   its NIC PXE option ROM; [`BootMode::Default`] emits no `-boot`;
+    /// - for a [`crate::definition::DirectKernelBoot`] (Issue #72), `-kernel
+    ///   <kernel> -initrd <initrd> -append <command_line>` — QEMU/KVM loads the
+    ///   Linux kernel + initramfs directly, with no firmware boot device, no
+    ///   bootloader, and no ISO. Orthogonal to `Firmware`/`NicModel`; the BARE
+    ///   profile pairs it with `Firmware::Default`. `BootMode::NetworkFirst` +
+    ///   direct kernel is a caller bug rejected at
+    ///   [`crate::BveRuntime::create`], not here;
     /// - the NIC `-device` model is `definition.nic_model()` — `virtio-net-pci`
     ///   (default) or `e1000` (Issue #71); the deterministic MAC is identical
     ///   for both;
@@ -120,6 +132,7 @@ impl QemuCommand {
         definition: &BveDefinition,
         qmp_socket: &Path,
         uefi: Option<UefiPflash<'_>>,
+        serial: Option<&Path>,
     ) -> Self {
         let mut args: Vec<String> = Vec::new();
         let mut push = |a: &str| args.push(a.to_string());
@@ -140,11 +153,24 @@ impl QemuCommand {
         push("-m");
         push(&format!("{}M", definition.memory_mib()));
 
-        // Headless: no graphical backend, no serial line attached to stdio.
+        // Headless: no graphical backend. The serial line is either detached
+        // (`none`, every path before Issue #72) or captured to a runtime-owned
+        // file chardev in append mode — a machine-readable proof log, never a
+        // VNC/SPICE/display path (Issue #74).
         push("-display");
         push("none");
-        push("-serial");
-        push("none");
+        match serial {
+            None => {
+                push("-serial");
+                push("none");
+            }
+            Some(path) => {
+                push("-chardev");
+                push(&format!("file,id=char0,path={},append=on", path.display()));
+                push("-serial");
+                push("chardev:char0");
+            }
+        }
 
         // Networking. User-mode SLIRP is the unprivileged default; an isolated
         // TAP (Issue #70) is opened by name — QEMU never runs a bridge helper
@@ -226,6 +252,19 @@ impl QemuCommand {
                 push("-boot");
                 push("order=n");
             }
+        }
+
+        // Direct Linux kernel boot (Issue #72): QEMU/KVM loads the kernel +
+        // initramfs directly. No firmware boot device, no bootloader, no ISO —
+        // the only boot path is this payload. `BootMode::NetworkFirst` + a
+        // direct kernel is rejected at `BveRuntime::create`.
+        if let Some(direct_kernel) = definition.direct_kernel() {
+            push("-kernel");
+            push(&direct_kernel.kernel().display().to_string());
+            push("-initrd");
+            push(&direct_kernel.initrd().display().to_string());
+            push("-append");
+            push(direct_kernel.command_line());
         }
 
         Self {
@@ -443,7 +482,7 @@ mod tests {
     fn builds_the_expected_machine_invocation() {
         let def = with_source();
         let socket = Path::new("/run/bamep-ve/bve-argv/qmp.sock");
-        let cmd = QemuCommand::for_bve(&def, socket, None);
+        let cmd = QemuCommand::for_bve(&def, socket, None, None);
 
         assert_eq!(cmd.program(), "qemu-system-x86_64");
         let args = cmd.args();
@@ -472,7 +511,7 @@ mod tests {
 
     #[test]
     fn attaches_the_system_overlay_deterministically_by_id() {
-        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None);
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
         let drives = values_after(cmd.args(), "-drive");
         let blk: Vec<&str> = values_after(cmd.args(), "-device")
             .into_iter()
@@ -498,13 +537,13 @@ mod tests {
 
     #[test]
     fn attaches_the_source_disk_independently_only_when_present() {
-        let none = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None);
+        let none = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
         assert!(
             !none.args().iter().any(|a| a.contains("id=source")),
             "no source disk when the definition has none"
         );
 
-        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"), None);
+        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"), None, None);
         let drives = values_after(cmd.args(), "-drive");
         assert_eq!(drives.len(), 2);
         let source = drives.iter().find(|d| d.contains("id=source")).unwrap();
@@ -524,7 +563,7 @@ mod tests {
 
     #[test]
     fn every_drive_states_its_format_and_the_backing_base_is_never_attached() {
-        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"), None);
+        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"), None, None);
         for drive in values_after(cmd.args(), "-drive") {
             assert!(
                 drive.contains("format="),
@@ -541,7 +580,7 @@ mod tests {
 
     #[test]
     fn user_mode_networking_is_unchanged_and_emits_no_boot_flag() {
-        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None);
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
         assert_eq!(value_after(cmd.args(), "-netdev"), Some("user,id=net0"));
         assert!(
             !cmd.args().iter().any(|a| a == "-boot"),
@@ -552,7 +591,7 @@ mod tests {
     #[test]
     fn isolated_tap_networking_opens_the_prepared_tap_by_name_only() {
         let def = system_only().with_isolated_tap(IfName::new("bvtapdeadbeef").unwrap());
-        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None);
+        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None, None);
 
         assert_eq!(
             value_after(cmd.args(), "-netdev"),
@@ -588,7 +627,7 @@ mod tests {
     #[test]
     fn network_first_boot_mode_emits_exactly_boot_order_n() {
         let def = system_only().with_boot_mode(BootMode::NetworkFirst);
-        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None);
+        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None, None);
         assert_eq!(value_after(cmd.args(), "-boot"), Some("order=n"));
         assert_eq!(
             cmd.args().iter().filter(|a| a.as_str() == "-boot").count(),
@@ -627,9 +666,13 @@ mod tests {
     #[test]
     fn default_firmware_emits_no_pflash_and_ignores_the_vars_path() {
         let ignored = Path::new("/should/be/ignored/OVMF_VARS.fd");
-        let with_vars =
-            QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), Some(pflash(ignored)));
-        let without = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None);
+        let with_vars = QemuCommand::for_bve(
+            &system_only(),
+            Path::new("/s.sock"),
+            Some(pflash(ignored)),
+            None,
+        );
+        let without = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
         assert_eq!(
             with_vars, without,
             "Firmware::Default must ignore the UEFI pflash entirely"
@@ -647,7 +690,8 @@ mod tests {
     #[test]
     fn uefi_firmware_emits_the_ovmf_pflash_pair_code_readonly_vars_writable() {
         let vars = Path::new("/run/bamep-ve/bve-argv/OVMF_VARS.fd");
-        let cmd = QemuCommand::for_bve(&uefi_only(), Path::new("/s.sock"), Some(pflash(vars)));
+        let cmd =
+            QemuCommand::for_bve(&uefi_only(), Path::new("/s.sock"), Some(pflash(vars)), None);
         let drives: Vec<&str> = values_after(cmd.args(), "-drive")
             .into_iter()
             .filter(|d| d.contains("if=pflash"))
@@ -684,12 +728,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "requires an instance OVMF_VARS path")]
     fn uefi_firmware_without_a_vars_path_is_a_caller_bug() {
-        let _ = QemuCommand::for_bve(&uefi_only(), Path::new("/s.sock"), None);
+        let _ = QemuCommand::for_bve(&uefi_only(), Path::new("/s.sock"), None, None);
     }
 
     #[test]
     fn nic_model_default_is_virtio_and_e1000_is_opt_in_with_the_same_mac() {
-        let virtio = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None);
+        let virtio = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
         let virtio_dev = values_after(virtio.args(), "-device")
             .into_iter()
             .find(|d| d.starts_with("virtio-net-pci,"))
@@ -697,7 +741,7 @@ mod tests {
         assert!(virtio_dev.contains(&format!("mac={}", system_only().mac())));
 
         let e1000_def = system_only().with_nic_model(NicModel::E1000);
-        let e1000 = QemuCommand::for_bve(&e1000_def, Path::new("/s.sock"), None);
+        let e1000 = QemuCommand::for_bve(&e1000_def, Path::new("/s.sock"), None, None);
         let e1000_dev = values_after(e1000.args(), "-device")
             .into_iter()
             .find(|d| d.starts_with("e1000,"))
@@ -725,6 +769,7 @@ mod tests {
             &uefi_e1000_network_first(),
             Path::new("/s.sock"),
             Some(pflash(vars)),
+            None,
         );
         let args = cmd.args();
 
@@ -764,7 +809,7 @@ mod tests {
 
     #[test]
     fn never_enables_software_cpu_emulation() {
-        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/run/x/qmp.sock"), None);
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/run/x/qmp.sock"), None, None);
         for arg in cmd.args() {
             assert!(
                 !arg.contains("tcg"),
@@ -785,9 +830,119 @@ mod tests {
             DiskAttachment::system("/d.qcow2", DiskFormat::Qcow2).unwrap(),
         )
         .unwrap();
-        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None);
+        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None, None);
         assert_eq!(value_after(cmd.args(), "-smp"), Some("8"));
         assert_eq!(value_after(cmd.args(), "-m"), Some("2048M"));
+    }
+
+    // ---- serial capture (Issue #72) ------------------------------------
+
+    #[test]
+    fn no_serial_argument_keeps_the_pre_72_serial_none_and_no_chardev() {
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
+        assert_eq!(value_after(cmd.args(), "-serial"), Some("none"));
+        assert!(
+            !cmd.args().iter().any(|a| a.contains("chardev")),
+            "no -chardev when serial capture is not requested"
+        );
+    }
+
+    #[test]
+    fn serial_some_emits_an_append_file_chardev_bound_to_the_serial_line() {
+        let log = Path::new("/run/bamep-ve/bve-argv/serial.log");
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, Some(log));
+        assert_eq!(
+            value_after(cmd.args(), "-chardev"),
+            Some("file,id=char0,path=/run/bamep-ve/bve-argv/serial.log,append=on")
+        );
+        assert_eq!(value_after(cmd.args(), "-serial"), Some("chardev:char0"));
+        // Headless only — never a display/VNC/SPICE path (Issue #74).
+        assert_eq!(value_after(cmd.args(), "-display"), Some("none"));
+        for arg in cmd.args() {
+            let a = arg.to_lowercase();
+            assert!(
+                !a.contains("vnc")
+                    && !a.contains("spice")
+                    && !a.contains("gtk")
+                    && !a.contains("sdl"),
+                "serial capture must not pull in a display backend: {arg:?}"
+            );
+        }
+    }
+
+    // ---- direct kernel boot (Issue #72) --------------------------------
+
+    fn direct_kernel_def() -> BveDefinition {
+        system_only()
+            .with_direct_kernel(
+                crate::definition::DirectKernelBoot::new(
+                    "/out/images/bzImage",
+                    "/out/images/rootfs.cpio.gz",
+                    "console=ttyS0,115200 panic=-1",
+                )
+                .unwrap(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn direct_kernel_emits_kernel_initrd_append_and_no_boot_or_optical() {
+        let cmd = QemuCommand::for_bve(&direct_kernel_def(), Path::new("/s.sock"), None, None);
+        let args = cmd.args();
+
+        assert_eq!(value_after(args, "-kernel"), Some("/out/images/bzImage"));
+        assert_eq!(
+            value_after(args, "-initrd"),
+            Some("/out/images/rootfs.cpio.gz")
+        );
+        let append = value_after(args, "-append").unwrap();
+        assert!(
+            append.contains("console=ttyS0"),
+            "-append must carry the serial console: {append:?}"
+        );
+
+        // BootMode::Default -> no -boot; direct kernel is the only boot path.
+        assert!(!args.iter().any(|a| a == "-boot"));
+        for arg in args {
+            let a = arg.to_lowercase();
+            assert!(
+                !a.contains("cdrom")
+                    && !a.contains("ide-cd")
+                    && !a.contains("scsi-cd")
+                    && !a.contains(".iso"),
+                "direct-kernel boot must expose no optical/ISO device: {arg:?}"
+            );
+        }
+        // Still the virtio machine profile.
+        assert!(values_after(args, "-device")
+            .iter()
+            .any(|d| d.starts_with("virtio-net-pci,")));
+        assert!(values_after(args, "-device")
+            .iter()
+            .any(|d| d.contains("virtio-blk-pci")));
+    }
+
+    #[test]
+    fn no_direct_kernel_emits_no_kernel_initrd_or_append() {
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
+        for flag in ["-kernel", "-initrd", "-append"] {
+            assert!(
+                !cmd.args().iter().any(|a| a == flag),
+                "{flag} must not appear without a DirectKernelBoot"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_kernel_and_serial_compose_for_the_bare_proof_profile() {
+        let log = Path::new("/run/bamep-ve/bve-bare/serial.log");
+        let cmd = QemuCommand::for_bve(&direct_kernel_def(), Path::new("/s.sock"), None, Some(log));
+        let args = cmd.args();
+        assert_eq!(value_after(args, "-kernel"), Some("/out/images/bzImage"));
+        assert_eq!(value_after(args, "-serial"), Some("chardev:char0"));
+        assert_eq!(value_after(args, "-accel"), Some("kvm"));
+        assert!(!args.iter().any(|a| a.contains("tcg")));
+        assert!(!args.iter().any(|a| a == "-boot"));
     }
 
     #[test]
