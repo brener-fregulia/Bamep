@@ -86,6 +86,23 @@ pub enum Firmware {
     Default,
 }
 
+/// The firmware boot-order intent.
+///
+/// Issue #70 needs the guest firmware to attempt the virtual NIC so it emits
+/// DHCP/PXE discovery across the NIC boundary. This enum expresses exactly
+/// that and nothing more — it is not a boot-order DSL, and it does not pull in
+/// UEFI/OVMF (that is Issue #71).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootMode {
+    /// The firmware's own default order (current behaviour). No `-boot` is
+    /// emitted.
+    Default,
+    /// Ask the firmware to attempt the virtual NIC first (PXE). Emits
+    /// `-boot order=n` — the minimum for the guest firmware to run its virtio
+    /// PXE option ROM and send `DHCPDISCOVER`.
+    NetworkFirst,
+}
+
 /// The image format of a disk QEMU attaches. Always stated explicitly to QEMU
 /// — never left to format auto-detection (Issue #69).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +293,71 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Maximum length of a Linux network-interface name. The kernel's `IFNAMSIZ`
+/// is 16 including the trailing NUL, so a usable name is at most 15 bytes.
+pub const MAX_IFNAME_LEN: usize = 15;
+
+/// A validated Linux network-interface name.
+///
+/// Constrained so it is always safe as an `ip` / `bridge` / `qemu` argument
+/// and within kernel limits: 1..=[`MAX_IFNAME_LEN`] bytes, ASCII
+/// `[A-Za-z0-9_-]` only, not starting with `-` (argument confusion), and never
+/// `.`/`..`. BVE isolated-network interface names are always *derived* from a
+/// validated [`BveId`] by [`crate::network`]; a caller never supplies one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IfName(String);
+
+impl IfName {
+    /// Validates and wraps an interface name.
+    pub fn new(value: impl Into<String>) -> Result<Self, DefinitionError> {
+        let value = value.into();
+        let invalid = || DefinitionError::InvalidIfName {
+            value: value.clone(),
+        };
+        if value.is_empty() || value.len() > MAX_IFNAME_LEN {
+            return Err(invalid());
+        }
+        if value.starts_with('-') || value == "." || value == ".." {
+            return Err(invalid());
+        }
+        if !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(invalid());
+        }
+        Ok(Self(value))
+    }
+
+    /// The validated name text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for IfName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How a BVE's virtio NIC is connected to the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkAttachment {
+    /// Unprivileged QEMU user-mode (SLIRP) networking — the default. No
+    /// TAP/bridge and no privilege: exactly the Issue #67–#69 behaviour.
+    UserMode,
+    /// A prepared, host-side isolated TAP (Issue #70). The interface name is
+    /// derived by [`crate::network`] from the BVE id and reaches a definition
+    /// only through [`crate::network::PreparedBveNetwork::attach`] — never
+    /// from a caller string, so no arbitrary QEMU `-netdev` value can escape
+    /// in.
+    IsolatedTap {
+        /// The prepared TAP this BVE opens.
+        ifname: IfName,
+    },
+}
+
 /// The validated definition of one BVE, including the disks attached to it.
 ///
 /// Build it from prepared storage with
@@ -289,7 +371,9 @@ pub struct BveDefinition {
     vcpus: u32,
     memory_mib: u32,
     firmware: Firmware,
+    boot_mode: BootMode,
     mac: MacAddress,
+    network: NetworkAttachment,
     system: DiskAttachment,
     source: Option<DiskAttachment>,
 }
@@ -333,10 +417,29 @@ impl BveDefinition {
             vcpus,
             memory_mib,
             firmware,
+            boot_mode: BootMode::Default,
             mac,
+            network: NetworkAttachment::UserMode,
             system,
             source: None,
         })
+    }
+
+    /// Sets the firmware boot-order intent (default [`BootMode::Default`]).
+    pub fn with_boot_mode(mut self, boot_mode: BootMode) -> Self {
+        self.boot_mode = boot_mode;
+        self
+    }
+
+    /// Sets an isolated-TAP network attachment.
+    ///
+    /// Crate-internal on purpose: the only public path is
+    /// [`crate::network::PreparedBveNetwork::attach`], so a TAP name always
+    /// comes from a realised [`crate::network::BveNetworkPlan`] and can never
+    /// be injected by a caller.
+    pub(crate) fn with_isolated_tap(mut self, ifname: IfName) -> Self {
+        self.network = NetworkAttachment::IsolatedTap { ifname };
+        self
     }
 
     /// Attaches an independent source-disk fixture. Rejects an attachment
@@ -370,6 +473,16 @@ impl BveDefinition {
     /// The firmware/boot choice.
     pub fn firmware(&self) -> Firmware {
         self.firmware
+    }
+
+    /// The firmware boot-order intent.
+    pub fn boot_mode(&self) -> BootMode {
+        self.boot_mode
+    }
+
+    /// How this BVE's NIC is attached to the host (user-mode by default).
+    pub fn network(&self) -> &NetworkAttachment {
+        &self.network
     }
 
     /// The deterministic NIC MAC.
@@ -410,6 +523,15 @@ pub enum DefinitionError {
         MAX_ID_LEN
     )]
     InvalidId { id: String },
+
+    /// An interface name is empty, longer than [`MAX_IFNAME_LEN`], starts with
+    /// `-`, is `.`/`..`, or contains a character outside `[A-Za-z0-9_-]`.
+    #[error(
+        "invalid interface name {value:?}: expected 1..={} chars of [A-Za-z0-9_-] \
+         not starting with '-'",
+        MAX_IFNAME_LEN
+    )]
+    InvalidIfName { value: String },
 
     /// A BVE needs at least one vCPU.
     #[error("BVE must have at least one vCPU")]
@@ -685,6 +807,59 @@ mod tests {
         // FNV-1a 64-bit of "" and of "a" — fixed reference values.
         assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    #[test]
+    fn ifname_accepts_kernel_safe_names_and_rejects_the_rest() {
+        for good in ["eth0", "bvbr1a2b3c4d", "a", &"n".repeat(MAX_IFNAME_LEN)] {
+            assert!(IfName::new(good).is_ok(), "expected {good:?} to be valid");
+        }
+        for bad in [
+            "",
+            &"n".repeat(MAX_IFNAME_LEN + 1),
+            "-lead",
+            ".",
+            "..",
+            "a b",
+            "a/b",
+            "a;b",
+            "a$b",
+            "a,b",
+            "a\nb",
+        ] {
+            assert_eq!(
+                IfName::new(bad),
+                Err(DefinitionError::InvalidIfName {
+                    value: bad.to_string()
+                }),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_definition_defaults_to_user_mode_networking_and_default_boot() {
+        let def =
+            BveDefinition::new(valid_id(), 1, 256, Firmware::Default, system("/s.qcow2")).unwrap();
+        assert_eq!(def.network(), &NetworkAttachment::UserMode);
+        assert_eq!(def.boot_mode(), BootMode::Default);
+    }
+
+    #[test]
+    fn with_boot_mode_and_with_isolated_tap_set_only_their_field() {
+        let tap = IfName::new("bvtapdeadbeef").unwrap();
+        let def = BveDefinition::new(valid_id(), 1, 256, Firmware::Default, system("/s.qcow2"))
+            .unwrap()
+            .with_boot_mode(BootMode::NetworkFirst)
+            .with_isolated_tap(tap.clone());
+        assert_eq!(def.boot_mode(), BootMode::NetworkFirst);
+        assert_eq!(
+            def.network(),
+            &NetworkAttachment::IsolatedTap { ifname: tap }
+        );
+        // Everything else is untouched.
+        assert_eq!(def.vcpus(), 1);
+        assert_eq!(def.mac(), MacAddress::deterministic_for(&valid_id()));
     }
 
     #[test]

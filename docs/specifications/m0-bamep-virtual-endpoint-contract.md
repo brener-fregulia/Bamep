@@ -129,6 +129,35 @@ The concrete image format, backing mechanism, host tooling, sparse-allocation te
 and the initial Windows-oriented logical capacity are an implementation decision owned by
 ADR-0023, not this Specification. A future change to that model is a new/updated ADR.
 
+## Provisioning network
+
+A BVE's virtual NIC may be attached either to a lightweight unprivileged path or to an
+**isolated, Layer-2-capable provisioning network** suitable for observing guest
+firmware PXE/DHCP discovery:
+
+- **Deterministic identity is preserved.** The BVE keeps its deterministic NIC MAC
+  regardless of attachment; a MAC address remains inventory evidence, not identity.
+- **Isolation.** The isolated network has no physical uplink, assigns the BVE no route to
+  a real network, and performs no NAT. Any DHCP/PXE peer used to exercise the exchange is
+  a disposable validation fixture confined to that isolated network — never production
+  DHCP/PXE service, and never exposed to the developer's normal network.
+- **Explicit, scoped, fail-closed host-resource lifecycle.** Host network resources for an
+  isolated BVE network are created and destroyed by explicit operations, act only on
+  resources that operation owns (derived, deterministic names — never an arbitrary or
+  pattern-matched host object), refuse to adopt a pre-existing resource, roll back a
+  partial setup to exactly what it created, and fail closed on an unexpected state rather
+  than escalating to a broad delete.
+- **Privilege is bounded.** Creating the isolated network may require host
+  network-administration privilege; that is an explicit preparation/teardown step. It is
+  not a precondition for the lightweight path, and the BVE runtime never escalates
+  privilege on its own.
+
+The concrete host virtual-network mechanism (bridge/TAP/veth/namespace layout), the
+disposable DHCP/PXE fixture tooling, boot-order handling for firmware network boot, and
+any host firewall/routing interaction are an implementation decision owned by ADR-0024,
+not this Specification. Production PXE/DHCP delivery architecture is owned elsewhere
+(ADR-0021) and is out of scope here.
+
 ## Validation and fidelity boundary
 
 `docs/development/testing.md` owns the general test-layer model and the existing WSL2/
@@ -136,14 +165,16 @@ container fidelity boundary; this section does not restate it.
 
 A BVE may provide useful evidence for software-visible, virtualized behavior, illustratively:
 VM lifecycle; virtual firmware/UEFI behavior; virtual NIC/block devices; reboot/reset;
-virtual PXE flow; WinPE/Buildroot boot inside the VM; guest Agent execution; and protocol/
-data-plane behavior crossing the guest's virtual network boundary.
+virtual PXE flow; guest firmware DHCP/PXE discovery crossing the virtual NIC onto an
+isolated virtual network; WinPE/Buildroot boot inside the VM; guest Agent execution; and
+protocol/data-plane behavior crossing the guest's virtual network boundary.
 
 A BVE is never authoritative for physical behavior, illustratively: real motherboard
-firmware; real NIC/driver/offload behavior; physical SATA/NVMe controller behavior; real
-SSD/HDD characteristics; PHY/switch/cabling behavior; real Secure Boot interoperability;
-real hardware PXE compatibility; and physical network throughput. The physical Integration
-Environment remains the authority for those claims.
+firmware; real NIC/driver/option-ROM/offload behavior; physical SATA/NVMe controller
+behavior; real SSD/HDD characteristics; PHY/switch/cabling/VLAN behavior; real Secure Boot
+interoperability; real hardware PXE compatibility; physical DHCP coexistence; and physical
+network throughput. Host-internal virtual-network evidence is not physical-network
+evidence. The physical Integration Environment remains the authority for those claims.
 
 ## Backend
 
@@ -158,8 +189,10 @@ change the responsibility, lifecycle, or fidelity boundary defined above.
 - guest OS, filesystem, or partition content in the base; snapshot trees, image catalogs,
   deduplication, compression, encryption, and remote/cross-host image distribution;
 - vCPU/RAM defaults or profiles;
-- disk attachment details, TAP/bridge/macvtap, and DHCP;
-- PXE implementation and PXE service topology;
+- disk attachment details;
+- the concrete host virtual-network mechanism, the disposable DHCP/PXE fixture tooling,
+  and host firewall/routing interaction (ADR-0024);
+- production PXE/DHCP implementation and production PXE/DHCP service topology;
 - WinPE assets and Buildroot configuration;
 - production Agent implementation;
 - multi-BVE orchestration;
@@ -175,10 +208,13 @@ change the responsibility, lifecycle, or fidelity boundary defined above.
 - ADR-0022 — Linux/QEMU/KVM initial BVE backend decision.
 - ADR-0023 — initial BVE disk storage mechanism (sparse RAW base + per-instance QCOW2
   overlay).
+- ADR-0024 — isolated BVE provisioning network (private bridge + TAP + fixture network
+  namespace) and its privilege model.
 - `docs/development/testing.md` — general test-layer model and WSL2/container fidelity
   boundary.
 - `docs/specifications/m0-simulator-contract-and-validation-strategy.md` — Simulator
   fidelity boundary and Agent-side protocol contract this Specification does not redefine.
 - Issue #66 — Work Package that produced this Specification.
-- Issues #67–#69 — implementation Work Packages: one-BVE lifecycle, Simulator
-  orchestration, deterministic storage and reproducible reset.
+- Issues #67–#70 — implementation Work Packages: one-BVE lifecycle, Simulator
+  orchestration, deterministic storage and reproducible reset, and the isolated
+  PXE-capable provisioning network.

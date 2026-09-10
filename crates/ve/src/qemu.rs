@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::definition::{BveDefinition, Firmware};
+use crate::definition::{BootMode, BveDefinition, Firmware, NetworkAttachment};
 
 /// The QEMU system-emulator binary this runtime drives.
 pub const QEMU_BINARY: &str = "qemu-system-x86_64";
@@ -42,8 +42,15 @@ impl QemuCommand {
     ///   **no** `tcg` anywhere (ADR-0022 fail-closed);
     /// - `-smp <vcpus>` and `-m <memory_mib>M` from the definition;
     /// - headless: `-display none -serial none`, no stdio console;
-    /// - `-netdev user` (unprivileged SLIRP — no TAP/bridge, out of scope for
-    ///   #67) with a `virtio-net-pci` device carrying the deterministic MAC;
+    /// - networking from `definition.network()`: `-netdev user,id=net0`
+    ///   (unprivileged SLIRP — the default) **or**, for an isolated TAP
+    ///   (Issue #70), `-netdev tap,id=net0,ifname=<prepared>,script=no,\
+    ///   downscript=no` (no `qemu-bridge-helper`, no `/etc/qemu/bridge.conf`,
+    ///   no auto-run scripts; the ifname comes from validated prepared network
+    ///   state). Either way a `virtio-net-pci` device carries the deterministic
+    ///   MAC;
+    /// - for [`BootMode::NetworkFirst`], `-boot order=n` so the firmware runs
+    ///   its virtio PXE option ROM; [`BootMode::Default`] emits no `-boot`;
     /// - the `System` disk, and the `Source` disk when present, each as a
     ///   `-drive if=none,id=<role>,file=<path>,format=<fmt>` plus a matching
     ///   `-device virtio-blk-pci,drive=<role>,serial=<role-serial>`. Disk
@@ -79,10 +86,18 @@ impl QemuCommand {
         push("-serial");
         push("none");
 
-        // Unprivileged user-mode networking, deterministic MAC. No TAP/bridge
-        // (Issue #67 out of scope).
+        // Networking. User-mode SLIRP is the unprivileged default; an isolated
+        // TAP (Issue #70) is opened by name — QEMU never runs a bridge helper
+        // or a setup/teardown script, and the ifname is validated prepared
+        // state, not a caller string. The deterministic MAC is unchanged in
+        // both cases.
         push("-netdev");
-        push("user,id=net0");
+        match definition.network() {
+            NetworkAttachment::UserMode => push("user,id=net0"),
+            NetworkAttachment::IsolatedTap { ifname } => push(&format!(
+                "tap,id=net0,ifname={ifname},script=no,downscript=no"
+            )),
+        }
         push("-device");
         push(&format!(
             "virtio-net-pci,netdev=net0,mac={}",
@@ -119,6 +134,18 @@ impl QemuCommand {
             // SeaBIOS default: no -bios / -pflash. Smallest boot path that
             // proves lifecycle for #67.
             Firmware::Default => {}
+        }
+
+        match definition.boot_mode() {
+            // Firmware's own order — current behaviour, no -boot.
+            BootMode::Default => {}
+            // Attempt the NIC. `order=n` is the minimum that makes the
+            // firmware run its virtio PXE option ROM and send DHCPDISCOVER
+            // (Issue #70). Not a boot-order DSL; UEFI/OVMF is Issue #71.
+            BootMode::NetworkFirst => {
+                push("-boot");
+                push("order=n");
+            }
         }
 
         Self {
@@ -253,7 +280,7 @@ pub fn detect_host_prerequisites() -> Result<HostPrerequisites, PrerequisiteErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::definition::{BveId, DiskAttachment, DiskFormat};
+    use crate::definition::{BveId, DiskAttachment, DiskFormat, IfName};
 
     const SYSTEM_OVERLAY: &str = "/srv/bamep/storage/instances/bve-argv/system.qcow2";
     const SOURCE_DISK: &str = "/srv/bamep/storage/instances/bve-argv/source.raw";
@@ -392,6 +419,63 @@ mod tests {
                 "the immutable backing base must never appear in argv: {arg:?}"
             );
         }
+    }
+
+    #[test]
+    fn user_mode_networking_is_unchanged_and_emits_no_boot_flag() {
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"));
+        assert_eq!(value_after(cmd.args(), "-netdev"), Some("user,id=net0"));
+        assert!(
+            !cmd.args().iter().any(|a| a == "-boot"),
+            "BootMode::Default must not emit -boot"
+        );
+    }
+
+    #[test]
+    fn isolated_tap_networking_opens_the_prepared_tap_by_name_only() {
+        let def = system_only().with_isolated_tap(IfName::new("bvtapdeadbeef").unwrap());
+        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"));
+
+        assert_eq!(
+            value_after(cmd.args(), "-netdev"),
+            Some("tap,id=net0,ifname=bvtapdeadbeef,script=no,downscript=no")
+        );
+        // The NIC device still carries the deterministic MAC, unchanged.
+        let net = values_after(cmd.args(), "-device")
+            .into_iter()
+            .find(|d| d.contains("virtio-net-pci"))
+            .unwrap();
+        assert!(net.contains(&format!("mac={}", def.mac())));
+
+        for arg in cmd.args() {
+            assert!(
+                !arg.contains("helper=") && !arg.contains("br=") && !arg.contains("bridge"),
+                "isolated TAP argv must not use a bridge helper: {arg:?}"
+            );
+            for physical in ["eth0", "wlan0", "docker0", "bond0"] {
+                assert!(
+                    !arg.split(['=', ',']).any(|tok| tok == physical),
+                    "no physical interface may appear in argv: {arg:?}"
+                );
+            }
+        }
+        assert!(
+            !cmd.args()
+                .iter()
+                .any(|a| a.contains("script=") && !a.contains("script=no")),
+            "no auto-run script"
+        );
+    }
+
+    #[test]
+    fn network_first_boot_mode_emits_exactly_boot_order_n() {
+        let def = system_only().with_boot_mode(BootMode::NetworkFirst);
+        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"));
+        assert_eq!(value_after(cmd.args(), "-boot"), Some("order=n"));
+        assert_eq!(
+            cmd.args().iter().filter(|a| a.as_str() == "-boot").count(),
+            1
+        );
     }
 
     #[test]

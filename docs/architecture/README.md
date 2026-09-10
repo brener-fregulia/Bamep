@@ -17,7 +17,7 @@ Bamep currently has eight Rust crates:
 | `bamep-simulator` | Simulated Agent participant using real trusted-bootstrap and WSS/Agent Protocol boundaries |
 | `bamep-worker-protocol` | Rust wire model/codec/framing for the implemented Worker Protocol v1 handshake + business-message catalog |
 | `bamep-worker` | The isolated Worker process: concurrent UDS control client, fail-closed authority tracking, Server TLS identity, local chunk storage + full-Artifact reconstruction, and the HTTPS `/api/data/v1/` data plane |
-| `bamep-ve` | Host-side lifecycle for one disposable Bamep Virtual Endpoint (BVE): validated machine definition, direct QEMU/KVM invocation, owned process + QMP control socket, deterministic disk storage (sparse RAW base + per-instance QCOW2 overlay + source fixture, `qemu-img`), and the `create/start/observe/reset/reset_system_storage/stop/destroy` lifecycle |
+| `bamep-ve` | Host-side lifecycle for one disposable Bamep Virtual Endpoint (BVE): validated machine definition, direct QEMU/KVM invocation, owned process + QMP control socket, deterministic disk storage (sparse RAW base + per-instance QCOW2 overlay + source fixture, `qemu-img`), an optional isolated PXE-capable provisioning network (private bridge + user-owned TAP + fixture netns, `ip`), and the `create/start/observe/reset/reset_system_storage/stop/destroy` lifecycle |
 
 Planned components remain outside Architecture until corresponding code exists.
 
@@ -95,11 +95,14 @@ The implemented structure preserves these rules:
   `bamepd` binary spawns the compiled `bamep-worker` executable as a separate OS process
   rather than linking against its crate.
 - `bamep-ve` depends only on `thiserror` and `serde_json` (to parse QEMU's line-delimited
-  JSON QMP protocol and `qemu-img info` output). It has no `bamep-agent-protocol`,
-  `bamep-simulator`, `bamep-domain`, or `bamep-server` dependency and no async runtime. It
-  runs external `qemu-system-x86_64` (VM lifecycle) and `qemu-img` (storage preparation) as
-  child processes. The dependency direction is strictly `bamep-simulator -> bamep-ve`,
-  never the reverse (`m0-bamep-virtual-endpoint-contract.md` "Code boundary").
+  JSON QMP protocol, `qemu-img info` output, and `ip -j` output). It has no
+  `bamep-agent-protocol`, `bamep-simulator`, `bamep-domain`, or `bamep-server` dependency
+  and no async runtime. It runs external `qemu-system-x86_64` (VM lifecycle), `qemu-img`
+  (storage preparation), `ip` (isolated provisioning network, privileged) and `iptables`
+  (only the opt-out DHCP-forward accommodation on a `br_netfilter`-filtering host) as child
+  processes via argv — never a shell — and never calls `sudo`. The dependency direction is
+  strictly `bamep-simulator -> bamep-ve`, never the reverse
+  (`m0-bamep-virtual-endpoint-contract.md` "Code boundary").
 
 Infrastructure must not leak into Domain transitions.
 
@@ -111,16 +114,19 @@ implemented directly against QEMU/KVM per ADR-0022. The crate/package is named `
 validation/development infrastructure related to the Simulator, not part of the M2 Endpoint
 Capture product surface.
 
-Implemented across Issues #67 and #69:
+Implemented across Issues #67, #69 and #70:
 
 - `BveDefinition` — a validated machine description: a path-safe `BveId`, vCPU count, RAM
-  (MiB), a `Firmware::Default` (SeaBIOS) boot choice, a deterministic locally-administered
-  NIC MAC derived from the id, and the disks actually attached — a required `System`
-  `DiskAttachment` and an optional `Source` one, each carrying an explicit `DiskRole` and
-  `DiskFormat`. Rejects zero/oversized vCPUs, zero/out-of-range RAM, a disk path that would
-  break QEMU `-drive` parsing (a `,`), a wrong-role attachment, and (at `create` time) a
-  missing/non-file image. It is not a future-complete configuration surface; PXE, WinPE,
-  and Buildroot fields are intentionally absent.
+  (MiB), a `Firmware::Default` (SeaBIOS) boot choice, a `BootMode` (`Default`, or
+  `NetworkFirst` → `-boot order=n`), a deterministic locally-administered NIC MAC derived
+  from the id, a `NetworkAttachment` (`UserMode` by default, or `IsolatedTap { ifname }`
+  set only via a `PreparedBveNetwork`), and the disks actually attached — a required
+  `System` `DiskAttachment` and an optional `Source` one, each carrying an explicit
+  `DiskRole` and `DiskFormat`. Rejects zero/oversized vCPUs, zero/out-of-range RAM, a disk
+  path that would break QEMU `-drive` parsing (a `,`), a wrong-role attachment, an invalid
+  interface name, and (at `create` time) a missing/non-file image. It is not a
+  future-complete configuration surface; WinPE and Buildroot fields are intentionally
+  absent.
 - `storage` (ADR-0023) — the disk model. `BveStorageRoot` is a validated, crate-owned root;
   `BveStorageLayout::for_bve` derives deterministic paths (`base/system-base.raw`,
   `instances/<bve-id>/system.qcow2`, `instances/<bve-id>/source.raw`). `ensure_system_base`
@@ -137,18 +143,54 @@ Implemented across Issues #67 and #69:
   still runs with only `qemu-system-x86_64` + KVM.
 - `QemuCommand` — a pure builder for the exact `qemu-system-x86_64` invocation: `-accel kvm
   -cpu host` with no TCG fallback anywhere (ADR-0022 fail-closed), `-smp`/`-m` from the
-  definition, headless, an unprivileged user-mode NIC with the deterministic MAC (no
-  TAP/bridge). Each disk is `-drive if=none,id=<role>,file=<path>,format=<fmt>` plus
-  `-device virtio-blk-pci,drive=<role>,serial=bamep-<role>` — identity is the explicit
+  definition, headless, and a `virtio-net-pci` NIC with the deterministic MAC on either
+  `-netdev user,id=net0` (unprivileged default) or `-netdev
+  tap,id=net0,ifname=<prepared>,script=no,downscript=no` (isolated TAP, opened by name —
+  no `qemu-bridge-helper`, no `/etc/qemu/bridge.conf`, no auto-run scripts), plus `-boot
+  order=n` for `BootMode::NetworkFirst`. Each disk is `-drive
+  if=none,id=<role>,file=<path>,format=<fmt>` plus `-device
+  virtio-blk-pci,drive=<role>,serial=bamep-<role>` — identity is the explicit
   `id=`/`serial=`, not argument order; the format is always explicit; the immutable backing
   base is never attached. Plus a listening `-qmp unix:` control socket.
+- `network` (ADR-0024) — the optional isolated provisioning network.
+  `BveNetworkPlan::for_bve` derives deterministic, `IFNAMSIZ`-safe host-resource names
+  (`bvbr<h>`, `bvtap<h>`, `bvh<h>`/`bvp<h>`, netns `bve-<h>`, where `<h>` is the low 32
+  bits of `fnv1a_64(BveId)` in hex). `prepare` (privileged) creates a private bridge (no
+  IP, no uplink), a TAP owned by the invoking user and enslaved to it, a veth pair, and a
+  dedicated netns holding the peer with a `192.0.2.1/24` (RFC 5737) address, `lo` up, no
+  default route and no NAT; it refuses to adopt a pre-existing name
+  (`ResourceAlreadyExists`), rolls a partial setup back to exactly what it created
+  (newest-first), and asserts the bridge carries only the TAP + fixture veth
+  (`assert_l2_isolation`). `teardown` is fail-closed and ordered: it refuses while the
+  `dnsmasq` fixture is still running in the netns (`FixtureStillRunning`) or the TAP still
+  has a client (`NetworkStillInUse`), then sweeps the netfilter accommodation, then removes
+  the recorded resources newest-first. `prepare` performs no firewall/sysctl change; on a
+  `br_netfilter`-filtering host (evidenced on WSL2 + Docker — Issue #70 host proof) the
+  bridged DHCP exchange needs `apply_dhcp_forward_accommodation`: two `physdev`-scoped,
+  UDP-67, runtime-only `FORWARD` ACCEPT rules limited to this BVE's TAP and fixture veth,
+  removed by `remove_dhcp_forward_accommodation`/`teardown`, opt-out with
+  `--no-netfilter-accommodation`; no sysctl is touched, nothing is persisted.
+  `residual_resources` reports leftover state for a reproducibility check. `ip`/`iptables`
+  are run via argv, never a shell string; missing `CAP_NET_ADMIN` is a `PrivilegeRequired`
+  error — the crate never calls `sudo`. `fixture_dnsmasq_argv` / `fixture_command`
+  build the `ip netns exec <ns> dnsmasq …` invocation for the disposable DHCP/PXE fixture,
+  bound to the peer interface only. `fixture_run_dir` (privileged, root-owned scratch —
+  `leases`/`pid`) and `bve_run_dir` (non-privileged, process-specific scratch — control
+  dir, storage, QMP socket) are deliberately disjoint sibling trees under the OS temp
+  root, so a `sudo`-run fixture never creates a directory a normal-user BVE run must write
+  into. `PreparedBveNetwork::attach` is the sole path a TAP name reaches a `BveDefinition`.
 - prerequisite checks — `qemu-system-x86_64` probed with `--version`, and `/dev/kvm`
-  confirmed present and openable read/write. Both fail closed with actionable errors; there
-  is no downgrade to software emulation.
+  confirmed present and openable read/write (VM lifecycle); `check_network_prerequisites`
+  confirms `ip` runs and `/dev/net/tun` is a character device (isolated network only). All
+  fail closed with actionable errors; there is no downgrade to software emulation.
 - `BveRuntime` — owns the exact QEMU `std::process::Child` it spawned, that process's QMP
   Unix socket, a per-instance `<runtime-root>/<bve-id>/` **control** directory, and the
   `PreparedInstanceStorage` it runs on. `create` rejects a definition whose attachments
-  disagree with the prepared storage. Lifecycle: `create`, `start` (spawn QEMU, confirm the
+  disagree with the prepared storage; `create_with_isolated_network` additionally
+  cross-checks the definition's `NetworkAttachment` against a `PreparedBveNetwork` (same
+  consistency lesson as ADR-0023) and performs no privileged network operation — QEMU
+  opens the already-prepared, user-owned TAP unprivileged. Lifecycle: `create`, `start`
+  (spawn QEMU, confirm the
   QMP capabilities handshake), `observe` (`Stopped`/`Running` from the owned process +
   QMP — never inferring guest health), `reset` (QMP `system_reset` on that VM — no disk
   effect), `reset_system_storage` (distinct: fails closed unless stopped, then delegates to
@@ -160,15 +202,31 @@ Implemented across Issues #67 and #69:
   `query-block`. Not a general QMP library.
 
 Deterministic logic (definition/attachment validation, MAC derivation, QEMU argument
-construction, storage path geometry and fail-closed deletion sets, storage/definition
-consistency, prerequisite-absence errors, QMP handling) is covered by unit tests needing no
-QEMU or `qemu-img`. Two opt-in host proofs, which an ordinary `cargo test` and CI never
-trigger, exercise the real thing: `tests/host_lifecycle.rs` (`BAMEP_BVE_HOST_TEST=1`) for
-the QEMU/KVM lifecycle, and `tests/storage_host.rs` (`BAMEP_VE_STORAGE_HOST_TEST=1`) for
-sparse allocation (80 GiB logical / ~4 KiB allocated), base immutability under a write
-through the overlay, reproducible reset, independent system/source attachment, and scoped
-disposal. BVE never proves physical firmware, PXE, NIC, storage-controller, or WinPE
-behavior (`m0-bamep-virtual-endpoint-contract.md` "Validation and fidelity boundary").
+construction, storage path geometry and fail-closed deletion sets, storage/definition and
+network/definition consistency, network resource-name derivation and ownership/rollback
+sets, L2-isolation checks, DHCP-forward accommodation rule scoping, prerequisite-absence
+errors, QMP handling) is covered by unit tests needing no QEMU, `qemu-img`, or host
+networking. Opt-in host proofs, which an ordinary `cargo test` and CI never trigger,
+exercise the real thing: `tests/host_lifecycle.rs` (`BAMEP_BVE_HOST_TEST=1`) for the
+QEMU/KVM lifecycle, `tests/storage_host.rs` (`BAMEP_VE_STORAGE_HOST_TEST=1`) for sparse
+allocation (80 GiB logical / ~4 KiB allocated), base immutability, reproducible reset,
+independent system/source attachment, and scoped disposal, and `tests/network_host.rs`
+(`BAMEP_VE_NETWORK_HOST_TEST=1`, read-only pre-flight only). The full isolated-network
+proof — create the network, boot the BVE PXE-first, assert the DHCP DORA for the
+deterministic MAC, stop the real `dnsmasq` deterministically (pid-file validated against
+`ip netns pids`, never the `sudo` wrapper PID), tear down, `verify-clean`, repeat — is the
+owner-run `scripts/bve-network-proof.sh` harness (a versioned dev tool that may call
+`sudo`; the crate never does), with the `examples/bve_isolated_net` subcommands
+(`plan`/`env`/`check`/`check-l2`/`verify-clean` + privileged `setup`/`start-fixture`/
+`teardown` + normal-user `run-bve`) for manual debugging. It was executed on WSL2 + Docker
+and is recorded in `docs/reference/bve-isolated-network-host-proof.md`: a full DHCP `DISCOVER/OFFER/REQUEST/
+ACK` from the deterministic MAC reached the isolated fixture, the `br_netfilter` +
+Docker-`FORWARD` interaction was diagnosed and handled by the scoped accommodation, and
+repeated cycles left no residual state. BVE never proves physical firmware, option-ROM,
+NIC, switch/VLAN, storage-controller, Secure Boot, or WinPE behavior, and host-internal
+virtual-network evidence is not physical-network evidence
+(`m0-bamep-virtual-endpoint-contract.md` "Validation and
+fidelity boundary").
 
 ### Simulator BVE orchestration (Issue #68)
 

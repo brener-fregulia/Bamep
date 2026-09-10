@@ -24,19 +24,40 @@
 //! same base) are distinct operations. Storage-image work needs `qemu-img`;
 //! VM lifecycle execution still needs only `qemu-system-x86_64` + KVM.
 //!
+//! Networking (Issue #70; ADR-0024): a BVE NIC is user-mode SLIRP by default
+//! (unprivileged, unchanged), or attached to an **isolated, PXE-capable**
+//! provisioning network — a private host bridge + a user-owned TAP + a veth
+//! into a dedicated netns that holds a disposable DHCP/PXE fixture, with no
+//! physical uplink, no default route and no NAT. Creating those host resources
+//! needs `CAP_NET_ADMIN` and is an explicit owner-run step ([`network`]); this
+//! crate never calls `sudo` and never changes host firewall/routing. Once the
+//! TAP exists, QEMU opens it as the normal user and the VM lifecycle stays
+//! unprivileged. A minimal [`BootMode::NetworkFirst`] makes the firmware
+//! attempt PXE.
+//!
 //! This crate does **not** depend on `bamep-agent-protocol` or any Agent
 //! Protocol semantics. The lifecycle is synchronous: one VM, one owned
 //! `std::process::Child`, one QMP Unix socket. No async runtime.
 
 pub mod definition;
+pub mod network;
 pub mod qemu;
 pub mod qmp;
 pub mod runtime;
 pub mod storage;
 
 pub use definition::{
-    fnv1a_64, BveDefinition, BveId, DefinitionError, DiskAttachment, DiskFormat, DiskRole,
-    Firmware, MacAddress,
+    fnv1a_64, BootMode, BveDefinition, BveId, DefinitionError, DiskAttachment, DiskFormat,
+    DiskRole, Firmware, IfName, MacAddress, NetworkAttachment, MAX_IFNAME_LEN,
+};
+pub use network::{
+    apply_dhcp_forward_accommodation, assert_l2_isolation, bve_run_dir,
+    check_network_prerequisites, dhcp_forward_accommodation_rules, fixture_command,
+    fixture_dnsmasq_argv, fixture_lease_file, fixture_pid_file, fixture_run_dir,
+    prepare as prepare_network, remove_dhcp_forward_accommodation, residual_resources,
+    teardown as teardown_network, BveNetworkError, BveNetworkPlan, NetResource, NetResourceKind,
+    PreparedBveNetwork, DNSMASQ_BINARY, FIXTURE_DHCP_FIRST, FIXTURE_DHCP_LAST, FIXTURE_PEER_CIDR,
+    FIXTURE_PEER_IP, IPTABLES_BINARY, IP_BINARY, TUN_DEVICE,
 };
 pub use qemu::{
     check_kvm_device, check_qemu_binary, detect_host_prerequisites, HostPrerequisites,

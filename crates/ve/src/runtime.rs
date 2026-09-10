@@ -26,7 +26,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::definition::{BveDefinition, BveId, DefinitionError};
+use crate::definition::{BveDefinition, BveId, DefinitionError, NetworkAttachment};
+use crate::network::PreparedBveNetwork;
 use crate::qemu::{HostPrerequisites, QemuCommand};
 use crate::qmp::{QmpConnection, QmpError};
 use crate::storage::{self, BveStorageError, PreparedInstanceStorage};
@@ -148,6 +149,16 @@ pub enum RuntimeError {
         detail: String,
     },
 
+    /// The definition's network attachment does not match the
+    /// [`PreparedBveNetwork`] handed to
+    /// [`BveRuntime::create_with_isolated_network`] (Issue #70 —
+    /// network/definition consistency, same lesson as #69).
+    #[error("BVE definition network does not match its prepared isolated network: {detail}")]
+    NetworkDefinitionMismatch {
+        /// What disagreed.
+        detail: String,
+    },
+
     /// Storage reset was requested while the VM was still running. It fails
     /// closed: the disposable overlay is never unlinked or recreated under a
     /// live QEMU process (Issue #69 §15).
@@ -215,6 +226,43 @@ impl BveRuntime {
             qmp_socket,
             child: None,
         })
+    }
+
+    /// Like [`BveRuntime::create`], but for a BVE that uses a prepared
+    /// isolated TAP network (Issue #70).
+    ///
+    /// `definition` must already carry the matching isolated-TAP attachment —
+    /// build it with [`PreparedBveNetwork::attach`] so the two cannot
+    /// disagree. This constructor still cross-checks and rejects a mismatch
+    /// ([`RuntimeError::NetworkDefinitionMismatch`]), the same guard #69 added
+    /// for storage. It performs **no** privileged network operation: the
+    /// network must already be prepared, and QEMU opens the user-owned TAP
+    /// unprivileged.
+    pub fn create_with_isolated_network(
+        root: &RuntimeRoot,
+        definition: BveDefinition,
+        storage: PreparedInstanceStorage,
+        network: &PreparedBveNetwork,
+    ) -> Result<Self, RuntimeError> {
+        match definition.network() {
+            NetworkAttachment::IsolatedTap { ifname } if ifname == network.tap_ifname() => {}
+            NetworkAttachment::IsolatedTap { ifname } => {
+                return Err(RuntimeError::NetworkDefinitionMismatch {
+                    detail: format!(
+                        "definition TAP {ifname} vs prepared TAP {}",
+                        network.tap_ifname()
+                    ),
+                });
+            }
+            NetworkAttachment::UserMode => {
+                return Err(RuntimeError::NetworkDefinitionMismatch {
+                    detail: "definition uses user-mode networking but a prepared isolated \
+                             network was supplied"
+                        .to_string(),
+                });
+            }
+        }
+        Self::create(root, definition, storage)
     }
 
     /// The prepared storage this BVE runs on.
@@ -460,6 +508,7 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<Option<ExitStat
 mod tests {
     use super::*;
     use crate::definition::{DiskAttachment, DiskFormat, Firmware};
+    use crate::network::{BveNetworkPlan, PreparedBveNetwork};
     use crate::storage::{BveStorageLayout, BveStorageRoot, PreparedInstanceStorage};
 
     struct TempRoot(PathBuf);
@@ -636,6 +685,58 @@ mod tests {
         assert!(matches!(
             BveRuntime::create(&temp.runtime_root(), def, storage),
             Err(RuntimeError::StorageDefinitionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn create_with_isolated_network_rejects_mismatch_and_accepts_the_matching_pair() {
+        let temp = TempRoot::new();
+        let id = BveId::new("bve-net").unwrap();
+        let storage = fake_prepared(&temp.storage_root(), &id, false);
+
+        let net_a = PreparedBveNetwork::from_prepared_plan(BveNetworkPlan::for_bve(&id));
+        let net_b = PreparedBveNetwork::from_prepared_plan(BveNetworkPlan::for_bve(
+            &BveId::new("bve-net-other").unwrap(),
+        ));
+
+        // A user-mode definition + a prepared network -> mismatch.
+        let usermode = storage
+            .define_bve(id.clone(), 1, 256, Firmware::Default)
+            .unwrap();
+        assert!(matches!(
+            BveRuntime::create_with_isolated_network(
+                &temp.runtime_root(),
+                usermode,
+                storage.clone(),
+                &net_a
+            ),
+            Err(RuntimeError::NetworkDefinitionMismatch { .. })
+        ));
+
+        // Attached to net_b but created against net_a -> mismatch.
+        let def_b = net_b.attach(
+            storage
+                .define_bve(id.clone(), 1, 256, Firmware::Default)
+                .unwrap(),
+        );
+        assert!(matches!(
+            BveRuntime::create_with_isolated_network(
+                &temp.runtime_root(),
+                def_b,
+                storage.clone(),
+                &net_a
+            ),
+            Err(RuntimeError::NetworkDefinitionMismatch { .. })
+        ));
+
+        // Attached to net_a and created against net_a -> ok.
+        let def_a = net_a.attach(storage.define_bve(id, 1, 256, Firmware::Default).unwrap());
+        let rt =
+            BveRuntime::create_with_isolated_network(&temp.runtime_root(), def_a, storage, &net_a)
+                .unwrap();
+        assert!(matches!(
+            rt.definition().network(),
+            NetworkAttachment::IsolatedTap { .. }
         ));
     }
 
