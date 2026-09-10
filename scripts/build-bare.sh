@@ -15,7 +15,7 @@
 #       <cache>/output/bamep_bare_x86_64/images/rootfs.cpio.gz
 #
 # Cache layout (BAMEP_BARE_CACHE_ROOT, default ${XDG_CACHE_HOME:-$HOME/.cache}/bamep-bare):
-#   <cache>/buildroot-<version>/      pinned Buildroot source (or $BAMEP_BARE_BUILDROOT_SRC)
+#   <cache>/buildroot-<version>/      Buildroot source, extracted once from the verified archive
 #   <cache>/dl/                       BR2_DL_DIR - downloaded package sources (reusable offline)
 #   <cache>/output/bamep_bare_x86_64/ Buildroot O= tree ($BAMEP_BARE_OUTPUT overrides)
 #
@@ -83,7 +83,10 @@ BR_KEY_URL="$(lock_get buildroot_signing_key_url)"
 
 CACHE_ROOT="${BAMEP_BARE_CACHE_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/bamep-bare}"
 DL_DIR="$CACHE_ROOT/dl"
-SRC_DIR="${BAMEP_BARE_BUILDROOT_SRC:-$CACHE_ROOT/buildroot-$BR_VERSION}"
+# Buildroot source is ALWAYS the pinned version extracted from the verified
+# archive into the controlled cache - there is no source-tree override, so the
+# compiled Buildroot's identity is exactly what bare/buildroot.lock verifies.
+SRC_DIR="$CACHE_ROOT/buildroot-$BR_VERSION"
 OUT_DIR="${BAMEP_BARE_OUTPUT:-$CACHE_ROOT/output/$OUTPUT_NAME}"
 ARCHIVE_PATH="$CACHE_ROOT/$BR_ARCHIVE"
 SIGN_PATH="$CACHE_ROOT/$BR_ARCHIVE.sign"
@@ -122,9 +125,6 @@ preflight() {
 sha256_of() { run_build sha256sum -- "$1" | awk '{print $1}'; }
 
 acquire_archive() {
-	if [[ -n "${BAMEP_BARE_BUILDROOT_SRC:-}" ]]; then
-		return 0 # pre-staged tree: no archive needed
-	fi
 	mkdir -p "$CACHE_ROOT"
 	if [[ ! -s "$ARCHIVE_PATH" ]]; then
 		echo "downloading $BR_URL"
@@ -249,13 +249,9 @@ pin() {
 }
 
 extract_source() {
-	if [[ -n "${BAMEP_BARE_BUILDROOT_SRC:-}" ]]; then
-		[[ -f "$SRC_DIR/Makefile" ]] || {
-			echo "BAMEP_BARE_BUILDROOT_SRC=$SRC_DIR is not a Buildroot tree" >&2
-			exit 1
-		}
-		return 0
-	fi
+	# Extract once from the verified archive into the persistent cache tree;
+	# later builds reuse it (so incremental builds stay fast). A version bump in
+	# bare/buildroot.lock changes SRC_DIR, forcing a fresh extraction.
 	if [[ ! -f "$SRC_DIR/Makefile" ]]; then
 		echo "extracting Buildroot $BR_VERSION -> $SRC_DIR"
 		mkdir -p "$SRC_DIR"

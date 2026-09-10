@@ -86,8 +86,11 @@ clean           remove ONLY the generated output tree (validated, fail-closed)
   the SHA-256 from the *verified* text, and cross-checks the downloaded archive.
   Rebuilds only compare against the pinned SHA-256. `gpg` is a `--pin`-only
   prerequisite (present on the reference host).
-- Source: `BAMEP_BARE_BUILDROOT_SRC=<pre-staged tree>` or the pinned archive
-  download. Never `latest`, never a fallback version.
+- Source: the pinned archive is downloaded (or reused from the cache), verified
+  against `buildroot.lock`, and extracted once into `<cache>/buildroot-<version>/`
+  — a persistent tree later builds reuse. Never `latest`, never a fallback
+  version, and no source-tree override (the compiled Buildroot always
+  originates from the verified archive).
 - Cache root `BAMEP_BARE_CACHE_ROOT` (default
   `${XDG_CACHE_HOME:-$HOME/.cache}/bamep-bare`): `buildroot-2026.08/`, `dl/`
   (`BR2_DL_DIR`, reusable offline after the first build), `output/bamep_bare_x86_64/`.

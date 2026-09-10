@@ -68,9 +68,11 @@ adds its package menu there.
 
 ### 3. Buildroot itself is consumed as an external, pinned source — never vendored
 
-`scripts/build-bare.sh` resolves Buildroot from either a pre-staged tree
-(`BAMEP_BARE_BUILDROOT_SRC`) or a download of the exact pinned archive, verified
-against `bare/buildroot.lock` before use. Buildroot source, its `BR2_DL_DIR`
+`scripts/build-bare.sh` resolves Buildroot only from the exact pinned archive
+named in `bare/buildroot.lock`: the archive is downloaded (or reused from the
+cache), verified against the lock, and extracted once into a persistent tree
+under the cache root. There is no source-tree override — the compiled Buildroot
+always originates from the verified archive. Buildroot source, its `BR2_DL_DIR`
 package-source cache, and the `O=` build tree all live **outside** the
 repository (default `${XDG_CACHE_HOME:-$HOME/.cache}/bamep-bare/`), so no heavy
 tree lands in Git or on a `/mnt/*` DrvFs path. Generated images are not

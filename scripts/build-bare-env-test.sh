@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 #
-# Pure unit tests for scripts/lib/bare-build-env.sh - the controlled build
-# environment of the Issue #72 BARE build. No Buildroot, no download, no build.
+# Pure unit tests for scripts/lib/bare-build-env.sh + the source-provenance
+# discipline of scripts/build-bare.sh - the controlled build environment of the
+# Issue #72 BARE build. No Buildroot, no download, no build.
 #
-# Regression: `build-bare.sh --preflight` reported "ok" while the environment it
-# would hand to Buildroot was invalid (Windows PATH entries with spaces ->
-# Buildroot aborts: "Your PATH contains spaces, TABs, and/or newline").
+# Regressions guarded here:
+#  1. `build-bare.sh --preflight` reported "ok" while the environment it would
+#     hand to Buildroot was invalid (Windows PATH entries with spaces ->
+#     Buildroot aborts: "Your PATH contains spaces, TABs, and/or newline").
+#  2. A `BAMEP_BARE_BUILDROOT_SRC` override let the compiled Buildroot come from
+#     an arbitrary pre-extracted tree while SHA-256 verification still ran
+#     against the (possibly absent, possibly unrelated) cached archive - so the
+#     verification did not establish the identity of the source actually built.
 #
 #   ./scripts/build-bare-env-test.sh
 
@@ -61,6 +67,18 @@ got="$(bare_missing_tools "$TMP" make gcc)"
 [[ -z "$got" ]] &&
 	ok "bare_missing_tools is silent when every tool resolves" ||
 	bad "bare_missing_tools should be silent, got: [$got]"
+
+# --- source provenance: the Buildroot BARE compiles always originates from the
+#     archive identified and verified by bare/buildroot.lock ---------------
+BUILD_BARE="./build-bare.sh"
+[[ -f "$BUILD_BARE" ]] || bad "cannot find $BUILD_BARE"
+
+check "build-bare.sh carries no BAMEP_BARE_BUILDROOT_SRC source-tree override" 1 \
+	grep -q 'BAMEP_BARE_BUILDROOT_SRC' "$BUILD_BARE"
+check "SRC_DIR is derived only from the pinned version in the controlled cache" 0 \
+	grep -qF 'SRC_DIR="$CACHE_ROOT/buildroot-$BR_VERSION"' "$BUILD_BARE"
+check "extract_source extracts from the verified archive (\$ARCHIVE_PATH)" 0 \
+	grep -qF 'tar -xf "$ARCHIVE_PATH"' "$BUILD_BARE"
 
 echo
 if ((FAIL == 0)); then
