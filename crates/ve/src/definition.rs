@@ -74,16 +74,49 @@ impl std::fmt::Display for BveId {
 
 /// The firmware / boot path for the VM.
 ///
-/// Issue #67 deliberately uses the smallest firmware that proves QEMU/KVM
-/// lifecycle. UEFI/OVMF gains importance only in the later PXE/WinPE Work
-/// Packages and is not made a mandatory dependency here. This enum exists so
-/// the choice is explicit in the definition, not so it is a firmware
-/// contract.
+/// Issue #67 deliberately used the smallest firmware that proves QEMU/KVM
+/// lifecycle. Issue #71 adds [`Firmware::Uefi`] for the WinPE UEFI-PXE proof.
+/// This enum exists so the choice is explicit in the definition, not so it is
+/// a firmware contract (ADR-0025).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Firmware {
     /// QEMU's built-in default firmware for the target machine (SeaBIOS on
     /// `x86_64`). No `-bios`/`-pflash` is passed.
     Default,
+    /// OVMF **without** Secure Boot: a shared read-only `OVMF_CODE` pflash plus
+    /// a per-BVE writable `OVMF_VARS` copy derived from an immutable template
+    /// (ADR-0025). This variant does **not** imply Secure Boot and does **not**
+    /// imply a NIC model — [`NicModel`] is chosen independently.
+    Uefi,
+}
+
+/// The emulated NIC model QEMU presents to the guest.
+///
+/// The deterministic MAC ([`BveDefinition::mac`]) is identical for every
+/// model. [`NicModel::VirtioNetPci`] is the default and is what every existing
+/// path (#67–#70, user-mode SLIRP, the #70 isolated-network proof) uses.
+/// Issue #71 selects [`NicModel::E1000`] explicitly because the retained stock
+/// WinPE image has an inbox driver for the Intel 82540EM (`8086:100E`,
+/// `nete1g3e.inf`) while it has no NetKVM/VirtIO network driver. This is not a
+/// NIC framework (ADR-0025).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NicModel {
+    /// `virtio-net-pci` — the paravirtualised NIC. Default; OVMF drives it
+    /// natively (`VirtioNetDxe`).
+    VirtioNetPci,
+    /// `e1000` — the emulated Intel 82540EM. Its EFI PXE bootstrap is provided
+    /// by the iPXE EFI option ROM QEMU attaches, executed by OVMF.
+    E1000,
+}
+
+impl NicModel {
+    /// The token QEMU's `-device <model>` expects.
+    pub fn as_qemu_device(self) -> &'static str {
+        match self {
+            NicModel::VirtioNetPci => "virtio-net-pci",
+            NicModel::E1000 => "e1000",
+        }
+    }
 }
 
 /// The firmware boot-order intent.
@@ -372,6 +405,7 @@ pub struct BveDefinition {
     memory_mib: u32,
     firmware: Firmware,
     boot_mode: BootMode,
+    nic_model: NicModel,
     mac: MacAddress,
     network: NetworkAttachment,
     system: DiskAttachment,
@@ -418,6 +452,7 @@ impl BveDefinition {
             memory_mib,
             firmware,
             boot_mode: BootMode::Default,
+            nic_model: NicModel::VirtioNetPci,
             mac,
             network: NetworkAttachment::UserMode,
             system,
@@ -428,6 +463,13 @@ impl BveDefinition {
     /// Sets the firmware boot-order intent (default [`BootMode::Default`]).
     pub fn with_boot_mode(mut self, boot_mode: BootMode) -> Self {
         self.boot_mode = boot_mode;
+        self
+    }
+
+    /// Sets the emulated NIC model (default [`NicModel::VirtioNetPci`]). The
+    /// deterministic MAC is unchanged.
+    pub fn with_nic_model(mut self, nic_model: NicModel) -> Self {
+        self.nic_model = nic_model;
         self
     }
 
@@ -478,6 +520,11 @@ impl BveDefinition {
     /// The firmware boot-order intent.
     pub fn boot_mode(&self) -> BootMode {
         self.boot_mode
+    }
+
+    /// The emulated NIC model (`virtio-net-pci` by default).
+    pub fn nic_model(&self) -> NicModel {
+        self.nic_model
     }
 
     /// How this BVE's NIC is attached to the host (user-mode by default).
@@ -843,6 +890,57 @@ mod tests {
             BveDefinition::new(valid_id(), 1, 256, Firmware::Default, system("/s.qcow2")).unwrap();
         assert_eq!(def.network(), &NetworkAttachment::UserMode);
         assert_eq!(def.boot_mode(), BootMode::Default);
+        assert_eq!(
+            def.nic_model(),
+            NicModel::VirtioNetPci,
+            "virtio-net-pci is the default NIC for every existing path"
+        );
+    }
+
+    #[test]
+    fn nic_model_default_is_virtio_and_e1000_is_opt_in_without_changing_the_mac() {
+        let base =
+            BveDefinition::new(valid_id(), 1, 256, Firmware::Default, system("/s.qcow2")).unwrap();
+        assert_eq!(base.nic_model(), NicModel::VirtioNetPci);
+
+        let e1000 = base.clone().with_nic_model(NicModel::E1000);
+        assert_eq!(e1000.nic_model(), NicModel::E1000);
+        assert_eq!(
+            e1000.mac(),
+            base.mac(),
+            "the deterministic MAC must be identical for every NIC model"
+        );
+        // with_nic_model changes only its own field.
+        assert_eq!(e1000.firmware(), base.firmware());
+        assert_eq!(e1000.boot_mode(), base.boot_mode());
+        assert_eq!(e1000.network(), base.network());
+    }
+
+    #[test]
+    fn firmware_uefi_and_nic_model_are_independent() {
+        // The #71 WinPE proof profile: UEFI + E1000 + NetworkFirst.
+        let def = BveDefinition::new(valid_id(), 1, 256, Firmware::Uefi, system("/s.qcow2"))
+            .unwrap()
+            .with_nic_model(NicModel::E1000)
+            .with_boot_mode(BootMode::NetworkFirst);
+        assert_eq!(def.firmware(), Firmware::Uefi);
+        assert_eq!(def.nic_model(), NicModel::E1000);
+
+        // ...but UEFI does not force a NIC model, and E1000 does not force UEFI.
+        let uefi_virtio =
+            BveDefinition::new(valid_id(), 1, 256, Firmware::Uefi, system("/s.qcow2")).unwrap();
+        assert_eq!(uefi_virtio.nic_model(), NicModel::VirtioNetPci);
+        let seabios_e1000 =
+            BveDefinition::new(valid_id(), 1, 256, Firmware::Default, system("/s.qcow2"))
+                .unwrap()
+                .with_nic_model(NicModel::E1000);
+        assert_eq!(seabios_e1000.firmware(), Firmware::Default);
+    }
+
+    #[test]
+    fn nic_model_qemu_device_tokens() {
+        assert_eq!(NicModel::VirtioNetPci.as_qemu_device(), "virtio-net-pci");
+        assert_eq!(NicModel::E1000.as_qemu_device(), "e1000");
     }
 
     #[test]

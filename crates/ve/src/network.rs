@@ -487,6 +487,128 @@ pub fn fixture_command(plan: &BveNetworkPlan, dnsmasq_argv: &[String]) -> (Strin
 }
 
 // ---------------------------------------------------------------------------
+// Issue #71: WinPE UEFI-PXE host-proof fixture.
+//
+// A superset of the #70 DHCP-only fixture: `dnsmasq` also serves TFTP and does
+// architecture / iPXE-user-class tagging, and a disposable `python3` HTTP
+// server (in the same netns) serves the boot script + wimboot + the pristine
+// WinPE assets. Kept a *host-validation fixture*, never production DHCP/PXE.
+// The #70 `fixture_dnsmasq_argv` is left untouched so `bve-network-proof.sh`
+// keeps exercising its current contract.
+// ---------------------------------------------------------------------------
+
+/// The disposable HTTP fixture binary (Python standard library). Present on the
+/// reference host; never installed automatically.
+pub const PYTHON3_BINARY: &str = "python3";
+
+/// TCP port the WinPE HTTP fixture listens on, inside the isolated netns only
+/// (bound to [`FIXTURE_PEER_IP`]). A host port conflict is impossible.
+pub const WINPE_FIXTURE_HTTP_PORT: u16 = 8080;
+
+/// The bootstrap NBP offered over TFTP to a firmware EFI-x64 PXE client that is
+/// not yet iPXE. The harness stages the retained official non-Secure-Boot
+/// `snponly.efi` at this name in the TFTP root.
+pub const WINPE_TFTP_BOOTFILE: &str = "snponly.efi";
+
+/// TFTP root for the WinPE fixture: [`fixture_run_dir`]`/tftp`. Holds exactly
+/// [`WINPE_TFTP_BOOTFILE`].
+pub fn winpe_tftp_root(plan: &BveNetworkPlan) -> std::path::PathBuf {
+    fixture_run_dir(plan).join("tftp")
+}
+
+/// HTTP root for the WinPE fixture: [`fixture_run_dir`]`/http`. Holds
+/// `boot.ipxe`, `wimboot`, `BCD`, `boot.sdi`, `boot.wim`.
+pub fn winpe_http_root(plan: &BveNetworkPlan) -> std::path::PathBuf {
+    fixture_run_dir(plan).join("http")
+}
+
+/// The `http://<peer>:<port>` base URL the fixture serves the WinPE chain from.
+pub fn winpe_http_base_url() -> String {
+    format!("http://{FIXTURE_PEER_IP}:{WINPE_FIXTURE_HTTP_PORT}")
+}
+
+/// The `boot.ipxe` script the fixture serves: fetch `wimboot` as the kernel and
+/// the pristine `BCD` + `boot.sdi` + `boot.wim` as initrds, then boot. This is
+/// the ADR-0021 mechanism (iPXE + wimboot + external pristine WinPE assets)
+/// minus the physical Secure-Boot wrapper. Pure — writes nothing.
+pub fn winpe_boot_ipxe_script() -> String {
+    let base = winpe_http_base_url();
+    format!(
+        "#!ipxe\n\
+         echo Bamep BVE Issue 71 WinPE UEFI-PXE proof\n\
+         kernel {base}/wimboot\n\
+         initrd {base}/BCD BCD\n\
+         initrd {base}/boot.sdi boot.sdi\n\
+         initrd {base}/boot.wim boot.wim\n\
+         boot\n"
+    )
+}
+
+/// The exact `dnsmasq` argv for the WinPE fixture (Issue #71). Pure.
+///
+/// Adds to the #70 DHCP fixture: TFTP serving from [`winpe_tftp_root`], an
+/// architecture match (`option:client-arch,7` → EFI x86-64), an iPXE match
+/// (encapsulated option 175 **and** the `iPXE` user-class), and a **two-stage**
+/// `dhcp-boot`:
+///
+/// - a firmware EFI-x64 PXE client that is *not* iPXE is sent
+///   [`WINPE_TFTP_BOOTFILE`] over TFTP;
+/// - an iPXE client is sent `boot.ipxe` over HTTP.
+///
+/// The two tag sets (`!ipxe` vs `ipxe`) are mutually exclusive, so there is no
+/// PXE→iPXE loop regardless of `dhcp-boot` order. `--log-queries` records the
+/// TFTP request/transfer for the stage evidence.
+pub fn winpe_fixture_dnsmasq_argv(plan: &BveNetworkPlan) -> Vec<String> {
+    vec![
+        "--keep-in-foreground".to_string(),
+        "--log-facility=-".to_string(),
+        "--log-dhcp".to_string(),
+        "--log-queries".to_string(),
+        "--no-resolv".to_string(),
+        "--no-hosts".to_string(),
+        "--port=0".to_string(),
+        "--no-ping".to_string(),
+        "--bind-interfaces".to_string(),
+        format!("--interface={}", plan.veth_peer()),
+        format!("--listen-address={FIXTURE_PEER_IP}"),
+        "--dhcp-authoritative".to_string(),
+        format!("--dhcp-range={FIXTURE_DHCP_FIRST},{FIXTURE_DHCP_LAST},255.255.255.0,5m"),
+        "--enable-tftp".to_string(),
+        format!("--tftp-root={}", winpe_tftp_root(plan).display()),
+        "--tftp-no-fail".to_string(),
+        "--dhcp-match=set:efi-x64,option:client-arch,7".to_string(),
+        "--dhcp-match=set:ipxe,175".to_string(),
+        "--dhcp-userclass=set:ipxe,iPXE".to_string(),
+        format!("--dhcp-boot=tag:efi-x64,tag:!ipxe,{WINPE_TFTP_BOOTFILE}"),
+        format!("--dhcp-boot=tag:ipxe,{}/boot.ipxe", winpe_http_base_url()),
+        format!("--dhcp-leasefile={}", fixture_lease_file(plan).display()),
+        format!("--pid-file={}", fixture_pid_file(plan).display()),
+    ]
+}
+
+/// The `(program, args)` to run the WinPE HTTP fixture inside its netns:
+/// `ip netns exec <ns> python3 -m http.server <port> --bind <peer>
+/// --directory <http_root>`. Privileged (run as an explicit step). Pure.
+pub fn winpe_http_fixture_command(plan: &BveNetworkPlan) -> (String, Vec<String>) {
+    (
+        IP_BINARY.to_string(),
+        vec![
+            "netns".to_string(),
+            "exec".to_string(),
+            plan.netns().to_string(),
+            PYTHON3_BINARY.to_string(),
+            "-m".to_string(),
+            "http.server".to_string(),
+            WINPE_FIXTURE_HTTP_PORT.to_string(),
+            "--bind".to_string(),
+            FIXTURE_PEER_IP.to_string(),
+            "--directory".to_string(),
+            winpe_http_root(plan).display().to_string(),
+        ],
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Host-proof DHCP-forward accommodation.
 //
 // NOT part of the ADR-0024 topology. On a host whose `br_netfilter` is active
@@ -537,8 +659,65 @@ pub fn dhcp_forward_accommodation_rules(plan: &BveNetworkPlan) -> [Vec<String>; 
 /// is absent (a host that needs no accommodation) — the caller may treat that
 /// as "nothing to do".
 pub fn apply_dhcp_forward_accommodation(plan: &BveNetworkPlan) -> Result<(), BveNetworkError> {
+    apply_forward_rules(&dhcp_forward_accommodation_rules(plan))
+}
+
+/// **PRIVILEGED, idempotent.** Removes every copy of `plan`'s DHCP-forward
+/// accommodation rules. A rule that is already absent is not an error; a rule
+/// that exists but cannot be removed is [`BveNetworkError::CleanupFailed`].
+/// `iptables` being absent means there is nothing to remove.
+pub fn remove_dhcp_forward_accommodation(plan: &BveNetworkPlan) -> Result<(), BveNetworkError> {
+    remove_forward_rules(plan, &dhcp_forward_accommodation_rules(plan))
+}
+
+/// The two **bridged-forward accommodation** rules for `plan` (Issue #71). Pure.
+///
+/// A generalisation of [`dhcp_forward_accommodation_rules`] from "UDP/67 only"
+/// to **all** traffic between exactly this BVE's TAP and its fixture veth, both
+/// directions. The WinPE UEFI-PXE proof has to carry DHCP **and** TFTP (UDP/69
+/// plus a dynamic data port) **and** HTTP (TCP), so per-port rules do not
+/// suffice on a `br_netfilter`-filtering host.
+///
+/// Still tightly bounded and reversible (ADR-0024 amendment): the private
+/// bridge has exactly two ports, both `physdev`-named here, both existing only
+/// between `prepare` and `teardown`; no uplink, no route, no NAT, no sysctl
+/// change; removed by [`remove_bridged_forward_accommodation`] / [`teardown`].
+/// Not applied by [`prepare`] — the #71 harness applies it explicitly, and the
+/// #70 proof never does.
+pub fn bridged_forward_accommodation_rules(plan: &BveNetworkPlan) -> [Vec<String>; 2] {
+    let tap = plan.tap.as_str().to_string();
+    let veth = plan.veth_host.as_str().to_string();
+    let rule = |physdev_in: &str, physdev_out: &str| {
+        vec![
+            "FORWARD".to_string(),
+            "-m".to_string(),
+            "physdev".to_string(),
+            "--physdev-in".to_string(),
+            physdev_in.to_string(),
+            "--physdev-out".to_string(),
+            physdev_out.to_string(),
+            "-j".to_string(),
+            "ACCEPT".to_string(),
+        ]
+    };
+    [rule(&tap, &veth), rule(&veth, &tap)]
+}
+
+/// **PRIVILEGED, optional (Issue #71).** Inserts `plan`'s
+/// [`bridged_forward_accommodation_rules`], pre-deleting a stale copy of each.
+pub fn apply_bridged_forward_accommodation(plan: &BveNetworkPlan) -> Result<(), BveNetworkError> {
+    apply_forward_rules(&bridged_forward_accommodation_rules(plan))
+}
+
+/// **PRIVILEGED, idempotent (Issue #71).** Removes every copy of `plan`'s
+/// [`bridged_forward_accommodation_rules`].
+pub fn remove_bridged_forward_accommodation(plan: &BveNetworkPlan) -> Result<(), BveNetworkError> {
+    remove_forward_rules(plan, &bridged_forward_accommodation_rules(plan))
+}
+
+fn apply_forward_rules(rules: &[Vec<String>]) -> Result<(), BveNetworkError> {
     check_iptables()?;
-    for rule in dhcp_forward_accommodation_rules(plan) {
+    for rule in rules {
         let mut predelete = vec!["-w".to_string(), "-D".to_string()];
         predelete.extend(rule.iter().cloned());
         let _ = run_iptables("accommodation-predelete", &predelete);
@@ -550,16 +729,15 @@ pub fn apply_dhcp_forward_accommodation(plan: &BveNetworkPlan) -> Result<(), Bve
     Ok(())
 }
 
-/// **PRIVILEGED, idempotent.** Removes every copy of `plan`'s DHCP-forward
-/// accommodation rules. A rule that is already absent is not an error; a rule
-/// that exists but cannot be removed is [`BveNetworkError::CleanupFailed`].
-/// `iptables` being absent means there is nothing to remove.
-pub fn remove_dhcp_forward_accommodation(plan: &BveNetworkPlan) -> Result<(), BveNetworkError> {
+fn remove_forward_rules(
+    plan: &BveNetworkPlan,
+    rules: &[Vec<String>],
+) -> Result<(), BveNetworkError> {
     if check_iptables().is_err() {
         return Ok(());
     }
     let mut first_error: Option<BveNetworkError> = None;
-    for rule in dhcp_forward_accommodation_rules(plan) {
+    for rule in rules {
         loop {
             let mut delete = vec!["-w".to_string(), "-D".to_string()];
             delete.extend(rule.iter().cloned());
@@ -748,7 +926,13 @@ pub fn teardown(prepared: PreparedBveNetwork) -> Result<(), BveNetworkError> {
     }
 
     let mut first_error: Option<BveNetworkError> = None;
+    // Sweep both accommodations idempotently — the narrow #70 DHCP-only one and
+    // the broad #71 bridged one — so a proof never leaves an `iptables` rule
+    // behind regardless of which harness applied one.
     if let Err(e) = remove_dhcp_forward_accommodation(&prepared.plan) {
+        first_error.get_or_insert(e);
+    }
+    if let Err(e) = remove_bridged_forward_accommodation(&prepared.plan) {
         first_error.get_or_insert(e);
     }
     for resource in prepared.teardown_order() {
@@ -1255,5 +1439,148 @@ mod tests {
             dhcp_forward_accommodation_rules(&plan),
             dhcp_forward_accommodation_rules(&BveNetworkPlan::for_bve(&id("bve-nf")))
         );
+    }
+
+    // ---- Issue #71 WinPE UEFI-PXE fixture --------------------------------
+
+    #[test]
+    fn winpe_dnsmasq_argv_adds_tftp_arch_and_ipxe_tags_with_a_loop_free_two_stage_boot() {
+        let plan = BveNetworkPlan::for_bve(&id("bve-winpe"));
+        let argv = winpe_fixture_dnsmasq_argv(&plan);
+
+        // Still bound only to the peer; DNS off; DHCP range unchanged from #70.
+        assert!(argv.contains(&format!("--interface={}", plan.veth_peer())));
+        assert!(argv.iter().any(|a| a == "--port=0"));
+        assert!(argv
+            .iter()
+            .any(|a| a.starts_with("--dhcp-range=192.0.2.50,192.0.2.100")));
+
+        // TFTP from the plan's own root, holding the bootstrap NBP.
+        assert!(argv.iter().any(|a| a == "--enable-tftp"));
+        assert!(argv.contains(&format!("--tftp-root={}", winpe_tftp_root(&plan).display())));
+
+        // Architecture (EFI x86-64 = option 93 value 7) and iPXE detection.
+        assert!(argv.contains(&"--dhcp-match=set:efi-x64,option:client-arch,7".to_string()));
+        assert!(argv.contains(&"--dhcp-match=set:ipxe,175".to_string()));
+        assert!(argv.contains(&"--dhcp-userclass=set:ipxe,iPXE".to_string()));
+
+        // Two-stage, mutually exclusive tags -> no PXE/iPXE loop.
+        let firmware_stage = argv
+            .iter()
+            .find(|a| a.starts_with("--dhcp-boot=tag:efi-x64,tag:!ipxe,"))
+            .expect("firmware EFI-x64 non-iPXE client gets the TFTP bootstrap");
+        assert!(firmware_stage.ends_with("snponly.efi"));
+        assert!(!firmware_stage.contains("http"));
+        let ipxe_stage = argv
+            .iter()
+            .find(|a| a.starts_with("--dhcp-boot=tag:ipxe,"))
+            .expect("an iPXE client gets the HTTP script");
+        assert!(ipxe_stage.contains("http://192.0.2.1:8080/boot.ipxe"));
+
+        // TFTP evidence for the stage parser.
+        assert!(argv.iter().any(|a| a == "--log-queries"));
+        // No physical interface, ever.
+        for arg in &argv {
+            for physical in ["eth0", "wlan0", "docker0", "bond0"] {
+                assert!(!arg.split(['=', ',', '/']).any(|t| t == physical));
+            }
+        }
+    }
+
+    #[test]
+    fn winpe_http_fixture_runs_python_in_the_netns_bound_to_the_peer_only() {
+        let plan = BveNetworkPlan::for_bve(&id("bve-winpe-http"));
+        let (program, args) = winpe_http_fixture_command(&plan);
+        assert_eq!(program, "ip");
+        assert_eq!(&args[..3], &["netns", "exec", plan.netns()]);
+        assert!(args.contains(&"python3".to_string()));
+        assert!(args.contains(&"http.server".to_string()));
+        assert!(args.contains(&"8080".to_string()));
+        // Bound to the isolated peer address, serving the plan's own http root.
+        let bind = args.iter().position(|a| a == "--bind").unwrap();
+        assert_eq!(args[bind + 1], "192.0.2.1");
+        let dir = args.iter().position(|a| a == "--directory").unwrap();
+        assert_eq!(args[dir + 1], winpe_http_root(&plan).display().to_string());
+    }
+
+    #[test]
+    fn winpe_boot_ipxe_script_is_the_wimboot_chain_over_http() {
+        let s = winpe_boot_ipxe_script();
+        assert!(s.starts_with("#!ipxe\n"));
+        assert!(s.contains("kernel http://192.0.2.1:8080/wimboot"));
+        assert!(s.contains("initrd http://192.0.2.1:8080/BCD BCD"));
+        assert!(s.contains("initrd http://192.0.2.1:8080/boot.sdi boot.sdi"));
+        assert!(s.contains("initrd http://192.0.2.1:8080/boot.wim boot.wim"));
+        assert!(s.trim_end().ends_with("boot"));
+        // The Secure-Boot wrapper is out of scope: no shim anywhere.
+        assert!(!s.contains("shim"));
+    }
+
+    #[test]
+    fn winpe_fixture_roots_are_disjoint_children_of_the_privileged_fixture_dir() {
+        let plan = BveNetworkPlan::for_bve(&id("bve-winpe-roots"));
+        let tftp = winpe_tftp_root(&plan);
+        let http = winpe_http_root(&plan);
+        assert!(tftp.starts_with(fixture_run_dir(&plan)));
+        assert!(http.starts_with(fixture_run_dir(&plan)));
+        assert_ne!(tftp, http);
+        // Never the non-privileged BVE run dir.
+        assert!(!tftp.starts_with(bve_run_dir(&plan)));
+    }
+
+    #[test]
+    fn bridged_forward_accommodation_is_all_traffic_between_exactly_this_bves_two_ports() {
+        let plan = BveNetworkPlan::for_bve(&id("bve-brnf"));
+        let other = BveNetworkPlan::for_bve(&id("bve-brnf-other"));
+        let [fwd, rev] = bridged_forward_accommodation_rules(&plan);
+
+        for rule in [&fwd, &rev] {
+            assert_eq!(rule[0], "FORWARD");
+            assert!(rule.contains(&"physdev".to_string()));
+            assert_eq!(rule.last().unwrap(), "ACCEPT");
+            // No -p / port restriction: DHCP + TFTP (69 + dynamic) + HTTP all pass.
+            assert!(!rule.contains(&"-p".to_string()));
+            assert!(!rule
+                .iter()
+                .any(|t| t == "67" || t == "69" || t == "udp" || t == "tcp"));
+            // Only this BVE's own TAP and fixture veth are named.
+            for forbidden in [
+                plan.bridge().as_str(),
+                plan.veth_peer().as_str(),
+                other.tap().as_str(),
+                other.veth_host().as_str(),
+                "eth0",
+                "docker0",
+            ] {
+                assert!(
+                    !rule.iter().any(|t| t == forbidden),
+                    "rule names {forbidden:?}: {rule:?}"
+                );
+            }
+        }
+        // Exactly the two directions between tap and veth_host.
+        assert!(fwd
+            .windows(2)
+            .any(|w| w[0] == "--physdev-in" && w[1] == plan.tap().as_str()));
+        assert!(fwd
+            .windows(2)
+            .any(|w| w[0] == "--physdev-out" && w[1] == plan.veth_host().as_str()));
+        assert!(rev
+            .windows(2)
+            .any(|w| w[0] == "--physdev-in" && w[1] == plan.veth_host().as_str()));
+        assert_eq!(
+            bridged_forward_accommodation_rules(&plan),
+            bridged_forward_accommodation_rules(&BveNetworkPlan::for_bve(&id("bve-brnf")))
+        );
+    }
+
+    #[test]
+    fn winpe_fixture_leaves_the_70_dhcp_only_fixture_untouched() {
+        // Regression guard: #70's argv must not gain TFTP / arch tags.
+        let plan = BveNetworkPlan::for_bve(&id("bve-70-intact"));
+        let seventy = fixture_dnsmasq_argv(&plan);
+        assert!(seventy.iter().any(|a| a == "--dhcp-boot=bootx64.efi"));
+        assert!(!seventy.iter().any(|a| a == "--enable-tftp"));
+        assert!(!seventy.iter().any(|a| a.contains("client-arch")));
     }
 }

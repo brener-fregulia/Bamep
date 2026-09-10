@@ -26,9 +26,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::definition::{BveDefinition, BveId, DefinitionError, NetworkAttachment};
+use crate::definition::{BveDefinition, BveId, DefinitionError, Firmware, NetworkAttachment};
 use crate::network::PreparedBveNetwork;
-use crate::qemu::{HostPrerequisites, QemuCommand};
+use crate::qemu::{
+    check_uefi_firmware, ovmf_code_path, ovmf_vars_template_path, HostPrerequisites,
+    PrerequisiteError, QemuCommand, UefiPflash,
+};
 use crate::qmp::{QmpConnection, QmpError};
 use crate::storage::{self, BveStorageError, PreparedInstanceStorage};
 
@@ -39,6 +42,12 @@ pub const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long [`BveRuntime::stop`] waits for QEMU to exit after `quit` before
 /// falling back to killing the owned process.
 pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Filename of the per-BVE writable OVMF variables copy inside the instance
+/// control directory, for [`Firmware::Uefi`] (ADR-0025). Created once at
+/// [`BveRuntime::create`] from [`OVMF_VARS_4M_TEMPLATE`]; removed at
+/// [`BveRuntime::destroy`].
+pub const UEFI_VARS_FILENAME: &str = "OVMF_VARS.fd";
 
 /// The truthful lifecycle state Issue #67 requires. Nothing here implies guest
 /// OS or Agent health.
@@ -168,6 +177,12 @@ pub enum RuntimeError {
     /// A storage operation failed.
     #[error(transparent)]
     Storage(#[from] BveStorageError),
+
+    /// [`Firmware::Uefi`] was requested but the OVMF firmware images are not
+    /// usable, or the per-BVE writable VARS copy could not be created
+    /// (ADR-0025). This crate never downloads a firmware image.
+    #[error(transparent)]
+    UefiFirmware(#[from] PrerequisiteError),
 }
 
 /// One BVE's host-side lifecycle. Not `Clone`: it owns a process handle.
@@ -177,6 +192,11 @@ pub struct BveRuntime {
     storage: PreparedInstanceStorage,
     instance_dir: PathBuf,
     qmp_socket: PathBuf,
+    /// For [`Firmware::Uefi`]: this BVE's writable OVMF VARS copy, made once at
+    /// [`BveRuntime::create`] from [`OVMF_VARS_4M_TEMPLATE`]. `None` for
+    /// [`Firmware::Default`] (SeaBIOS). Preserved across `stop`/`start`;
+    /// removed by `destroy` (ADR-0025).
+    uefi_vars: Option<PathBuf>,
     child: Option<Child>,
 }
 
@@ -219,11 +239,27 @@ impl BveRuntime {
         let qmp_socket = instance_dir.join("qmp.sock");
         Self::clear_stale_socket(&qmp_socket)?;
 
+        // For a UEFI BVE, verify OVMF is installed and lay down this BVE's own
+        // pristine writable VARS copy now (ADR-0025). Done once here — not on
+        // every `start` — so `stop`/`start` reuses the same firmware state and
+        // the repeatability proof is not weakened by a hidden reset.
+        let uefi_vars = match definition.firmware() {
+            Firmware::Default => None,
+            Firmware::Uefi => {
+                check_uefi_firmware()?;
+                Some(write_pristine_uefi_vars(
+                    &ovmf_vars_template_path(),
+                    &instance_dir,
+                )?)
+            }
+        };
+
         Ok(Self {
             definition,
             storage,
             instance_dir,
             qmp_socket,
+            uefi_vars,
             child: None,
         })
     }
@@ -296,6 +332,12 @@ impl BveRuntime {
         &self.qmp_socket
     }
 
+    /// This BVE's writable OVMF VARS copy, for [`Firmware::Uefi`]. `None` for
+    /// SeaBIOS.
+    pub fn uefi_vars(&self) -> Option<&Path> {
+        self.uefi_vars.as_deref()
+    }
+
     /// The definition this runtime represents.
     pub fn definition(&self) -> &BveDefinition {
         &self.definition
@@ -311,7 +353,15 @@ impl BveRuntime {
         }
         Self::clear_stale_socket(&self.qmp_socket)?;
 
-        let command = QemuCommand::for_bve(&self.definition, &self.qmp_socket);
+        // For a UEFI BVE, pair the shared read-only CODE with this BVE's own
+        // VARS copy prepared at `create` — reused as-is on every `start`, never
+        // refreshed here (ADR-0025).
+        let code = self.uefi_vars.is_some().then(ovmf_code_path);
+        let uefi = match (&code, &self.uefi_vars) {
+            (Some(code), Some(vars)) => Some(UefiPflash { code, vars }),
+            _ => None,
+        };
+        let command = QemuCommand::for_bve(&self.definition, &self.qmp_socket, uefi);
         let mut child = Command::new(command.program())
             .args(command.args())
             .stdin(Stdio::null())
@@ -426,6 +476,17 @@ impl BveRuntime {
             Err(e) => return Err(RuntimeError::Io(e)),
         }
 
+        // The per-BVE UEFI VARS copy is control state this runtime created
+        // (ADR-0025); remove it explicitly so the non-recursive instance-dir
+        // cleanup below stays fail-closed on anything unexpected.
+        if let Some(vars) = &self.uefi_vars {
+            match fs::remove_file(vars) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(RuntimeError::Io(e)),
+            }
+        }
+
         match fs::remove_dir(&self.instance_dir) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
@@ -488,6 +549,20 @@ impl Drop for BveRuntime {
             }
         }
     }
+}
+
+/// Copies `template` to `<instance_dir>/`[`UEFI_VARS_FILENAME`], overwriting any
+/// stale copy, so a UEFI BVE always starts life from pristine firmware NVRAM
+/// (ADR-0025). Returns the copy's path.
+fn write_pristine_uefi_vars(template: &Path, instance_dir: &Path) -> Result<PathBuf, RuntimeError> {
+    let vars = instance_dir.join(UEFI_VARS_FILENAME);
+    fs::copy(template, &vars).map_err(|e| {
+        RuntimeError::UefiFirmware(PrerequisiteError::UefiFirmwareUnavailable {
+            path: template.to_path_buf(),
+            detail: format!("could not copy to {}: {e}", vars.display()),
+        })
+    })?;
+    Ok(vars)
 }
 
 /// Polls `child` until it exits or `timeout` elapses.
@@ -763,6 +838,120 @@ mod tests {
             storage.layout().system_base().is_file(),
             "base survives destroy"
         );
+    }
+
+    // ---- UEFI firmware VARS lifecycle (ADR-0025) --------------------------
+
+    /// Serialises the handful of tests that override the OVMF env vars, so a
+    /// parallel test never sees another's `BAMEP_VE_OVMF_*`.
+    static OVMF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct OvmfEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl OvmfEnvGuard {
+        /// Points `BAMEP_VE_OVMF_CODE` / `BAMEP_VE_OVMF_VARS_TEMPLATE` at fake
+        /// firmware files under `dir` and returns a guard that clears them.
+        fn fake_firmware(dir: &Path) -> Self {
+            let lock = OVMF_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let code = dir.join("OVMF_CODE.fake.fd");
+            let template = dir.join("OVMF_VARS.template.fake.fd");
+            fs::write(&code, b"fake-ovmf-code").unwrap();
+            fs::write(&template, b"fake-ovmf-vars-template-PRISTINE").unwrap();
+            std::env::set_var(crate::qemu::OVMF_CODE_ENV, &code);
+            std::env::set_var(crate::qemu::OVMF_VARS_TEMPLATE_ENV, &template);
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for OvmfEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(crate::qemu::OVMF_CODE_ENV);
+            std::env::remove_var(crate::qemu::OVMF_VARS_TEMPLATE_ENV);
+        }
+    }
+
+    #[test]
+    fn write_pristine_uefi_vars_copies_the_template_and_overwrites_a_stale_copy() {
+        let temp = TempRoot::new();
+        let instance = temp.0.join("inst");
+        fs::create_dir_all(&instance).unwrap();
+        let template = temp.0.join("template.fd");
+        fs::write(&template, b"PRISTINE").unwrap();
+
+        let vars = write_pristine_uefi_vars(&template, &instance).unwrap();
+        assert_eq!(vars, instance.join(UEFI_VARS_FILENAME));
+        assert_eq!(fs::read(&vars).unwrap(), b"PRISTINE");
+
+        // A previous run's dirtied VARS is replaced, not merged.
+        fs::write(&vars, b"DIRTIED-BY-A-PRIOR-BOOT").unwrap();
+        let again = write_pristine_uefi_vars(&template, &instance).unwrap();
+        assert_eq!(fs::read(again).unwrap(), b"PRISTINE");
+    }
+
+    #[test]
+    fn write_pristine_uefi_vars_reports_a_missing_template_actionably() {
+        let temp = TempRoot::new();
+        let instance = temp.0.join("inst");
+        fs::create_dir_all(&instance).unwrap();
+        let err = write_pristine_uefi_vars(&temp.0.join("nope.fd"), &instance).unwrap_err();
+        assert!(matches!(err, RuntimeError::UefiFirmware(_)));
+        assert!(err.to_string().contains("nope.fd"));
+    }
+
+    #[test]
+    fn create_with_default_firmware_prepares_no_uefi_vars() {
+        let temp = TempRoot::new();
+        let (rt, _s) = bve(&temp, "bve-seabios");
+        assert!(rt.uefi_vars().is_none());
+        assert!(!rt.instance_dir().join(UEFI_VARS_FILENAME).exists());
+    }
+
+    #[test]
+    fn create_with_uefi_lays_down_one_pristine_per_bve_vars_copy() {
+        let temp = TempRoot::new();
+        let _env = OvmfEnvGuard::fake_firmware(&temp.0);
+
+        let id = BveId::new("bve-uefi").unwrap();
+        let storage = fake_prepared(&temp.storage_root(), &id, false);
+        let def = storage
+            .define_bve(id, 1, 256, crate::definition::Firmware::Uefi)
+            .unwrap();
+        let rt = BveRuntime::create(&temp.runtime_root(), def, storage).unwrap();
+
+        let vars = rt
+            .uefi_vars()
+            .expect("UEFI BVE has a VARS copy")
+            .to_path_buf();
+        assert_eq!(vars, rt.instance_dir().join(UEFI_VARS_FILENAME));
+        assert_eq!(
+            fs::read(&vars).unwrap(),
+            b"fake-ovmf-vars-template-PRISTINE",
+            "VARS is a copy of the template"
+        );
+        // It is a copy, not the template itself.
+        assert_ne!(vars, temp.0.join("OVMF_VARS.template.fake.fd"));
+    }
+
+    #[test]
+    fn destroy_removes_the_uefi_vars_copy_and_leaves_the_control_dir_clean() {
+        let temp = TempRoot::new();
+        let _env = OvmfEnvGuard::fake_firmware(&temp.0);
+
+        let id = BveId::new("bve-uefi-destroy").unwrap();
+        let storage = fake_prepared(&temp.storage_root(), &id, false);
+        let def = storage
+            .define_bve(id, 1, 256, crate::definition::Firmware::Uefi)
+            .unwrap();
+        let rt = BveRuntime::create(&temp.runtime_root(), def, storage).unwrap();
+        let control_dir = rt.instance_dir().to_path_buf();
+        let vars = rt.uefi_vars().unwrap().to_path_buf();
+        assert!(vars.is_file());
+
+        rt.destroy().unwrap();
+        assert!(!vars.exists(), "the VARS copy is removed by destroy");
+        assert!(!control_dir.exists(), "control dir removed (non-recursive)");
     }
 
     #[test]

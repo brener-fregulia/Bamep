@@ -114,8 +114,12 @@ and active on the diskless Endpoint throughout.
 
 - ADR-0010 — trusted bootstrap and Secure Boot baseline.
 - ADR-0011 — site trust-anchor operator-verified pairing.
+- ADR-0025 — BVE virtual UEFI firmware; Issue #71 exercises this mechanism
+  (minus the physical Secure-Boot wrapper) in a virtual endpoint.
 - `docs/reference/physical-secure-boot-winpe-network-delivery.md` —
   empirical basis for this decision.
+- `docs/reference/bve-winpe-uefi-pxe-host-proof.md` — the virtualized BVE
+  exercise of this mechanism (Issue #71).
 - `docs/reference/physical-uefi-pxe-boot-chain.md` — prior physical
   PXE/shim/GRUB evidence.
 - `docs/reference/winpe-boot-mechanism-spike.md` — prior virtualized WinPE

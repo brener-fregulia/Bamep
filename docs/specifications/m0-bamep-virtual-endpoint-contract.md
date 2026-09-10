@@ -210,11 +210,14 @@ change the responsibility, lifecycle, or fidelity boundary defined above.
   overlay).
 - ADR-0024 — isolated BVE provisioning network (private bridge + TAP + fixture network
   namespace) and its privilege model.
+- ADR-0025 — BVE virtual UEFI firmware (OVMF non-Secure-Boot, per-BVE writable VARS) and
+  the independent `NicModel` choice.
 - `docs/development/testing.md` — general test-layer model and WSL2/container fidelity
   boundary.
 - `docs/specifications/m0-simulator-contract-and-validation-strategy.md` — Simulator
   fidelity boundary and Agent-side protocol contract this Specification does not redefine.
 - Issue #66 — Work Package that produced this Specification.
-- Issues #67–#70 — implementation Work Packages: one-BVE lifecycle, Simulator
-  orchestration, deterministic storage and reproducible reset, and the isolated
-  PXE-capable provisioning network.
+- Issues #67–#71 — implementation Work Packages: one-BVE lifecycle, Simulator
+  orchestration, deterministic storage and reproducible reset, the isolated
+  PXE-capable provisioning network, and the virtual UEFI PXE boot of the
+  existing WinPE path.

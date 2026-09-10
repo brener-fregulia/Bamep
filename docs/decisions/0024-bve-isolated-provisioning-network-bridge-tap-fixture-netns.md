@@ -173,6 +173,27 @@ QEMU (host network namespace, the same owned std::process::Child as #67)
 - Later UEFI PXE (#71) reuses this substrate and `BootMode`; it does not
   redefine the topology.
 
+### Amendment (Issue #71): broader bridged-forward accommodation for host proofs
+
+The DHCP-forward accommodation above is scoped to UDP/67. A host proof that has
+to carry more than DHCP between the BVE TAP and its fixture veth — the #71 WinPE
+proof needs DHCP **and** TFTP (UDP/69 plus a dynamic data port) **and** HTTP
+(TCP) — may instead apply a **bridged-forward accommodation**: two
+`physdev`-scoped `FORWARD` ACCEPT rules matching **all** traffic between exactly
+this BVE's TAP and its fixture veth, both directions, with no protocol/port
+restriction.
+
+This stays within the same bounds as the DHCP-only rule and does **not** reopen
+the topology: the private bridge still has exactly two ports (both named in the
+rules), both exist only between `prepare` and `teardown`; still no uplink, no
+route, no NAT, no sysctl change; still runtime-only, never persisted; still
+opt-out and removed by `teardown` (idempotent). It is host-proof scaffolding,
+not a topology element, and it is never applied by `prepare` — the #71 harness
+applies it explicitly, and the #70 proof never does. Implemented as
+`network::apply_bridged_forward_accommodation` /
+`remove_bridged_forward_accommodation`; `teardown` sweeps both the narrow and
+the broad rule sets.
+
 ## Related architecture
 
 - `docs/architecture/README.md` — "Bamep Virtual Endpoint host runtime
@@ -186,6 +207,8 @@ QEMU (host network namespace, the same owned std::process::Child as #67)
   pattern this decision mirrors).
 - ADR-0021 — iPXE + wimboot network-delivered WinPE baseline (the production
   PXE mechanism this substrate is *not*).
+- ADR-0025 — BVE virtual UEFI firmware; Issue #71 reuses this substrate and adds
+  the broader bridged-forward accommodation amended above.
 - `docs/reference/bve-isolated-network-host-proof.md` — the executed host-proof
   evidence (DHCP DORA transcript, the `br_netfilter` diagnosis, the scoped
   accommodation, reproducibility).

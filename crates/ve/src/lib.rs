@@ -48,23 +48,29 @@ pub mod storage;
 
 pub use definition::{
     fnv1a_64, BootMode, BveDefinition, BveId, DefinitionError, DiskAttachment, DiskFormat,
-    DiskRole, Firmware, IfName, MacAddress, NetworkAttachment, MAX_IFNAME_LEN,
+    DiskRole, Firmware, IfName, MacAddress, NetworkAttachment, NicModel, MAX_IFNAME_LEN,
 };
 pub use network::{
-    apply_dhcp_forward_accommodation, assert_l2_isolation, bve_run_dir,
-    check_network_prerequisites, dhcp_forward_accommodation_rules, fixture_command,
-    fixture_dnsmasq_argv, fixture_lease_file, fixture_pid_file, fixture_run_dir,
-    prepare as prepare_network, remove_dhcp_forward_accommodation, residual_resources,
-    teardown as teardown_network, BveNetworkError, BveNetworkPlan, NetResource, NetResourceKind,
-    PreparedBveNetwork, DNSMASQ_BINARY, FIXTURE_DHCP_FIRST, FIXTURE_DHCP_LAST, FIXTURE_PEER_CIDR,
-    FIXTURE_PEER_IP, IPTABLES_BINARY, IP_BINARY, TUN_DEVICE,
+    apply_bridged_forward_accommodation, apply_dhcp_forward_accommodation, assert_l2_isolation,
+    bridged_forward_accommodation_rules, bve_run_dir, check_network_prerequisites,
+    dhcp_forward_accommodation_rules, fixture_command, fixture_dnsmasq_argv, fixture_lease_file,
+    fixture_pid_file, fixture_run_dir, prepare as prepare_network,
+    remove_bridged_forward_accommodation, remove_dhcp_forward_accommodation, residual_resources,
+    teardown as teardown_network, winpe_boot_ipxe_script, winpe_fixture_dnsmasq_argv,
+    winpe_http_base_url, winpe_http_fixture_command, winpe_http_root, winpe_tftp_root,
+    BveNetworkError, BveNetworkPlan, NetResource, NetResourceKind, PreparedBveNetwork,
+    DNSMASQ_BINARY, FIXTURE_DHCP_FIRST, FIXTURE_DHCP_LAST, FIXTURE_PEER_CIDR, FIXTURE_PEER_IP,
+    IPTABLES_BINARY, IP_BINARY, PYTHON3_BINARY, TUN_DEVICE, WINPE_FIXTURE_HTTP_PORT,
+    WINPE_TFTP_BOOTFILE,
 };
 pub use qemu::{
-    check_kvm_device, check_qemu_binary, detect_host_prerequisites, HostPrerequisites,
-    PrerequisiteError, QemuCommand, DEFAULT_KVM_DEVICE, QEMU_BINARY,
+    check_kvm_device, check_qemu_binary, check_uefi_firmware, detect_host_prerequisites,
+    ovmf_code_path, ovmf_vars_template_path, HostPrerequisites, PrerequisiteError, QemuCommand,
+    UefiPflash, DEFAULT_KVM_DEVICE, OVMF_CODE_4M, OVMF_CODE_ENV, OVMF_VARS_4M_TEMPLATE,
+    OVMF_VARS_TEMPLATE_ENV, QEMU_BINARY,
 };
 pub use qmp::{QmpConnection, QmpError, QmpResponse, RunState};
-pub use runtime::{BveRuntime, LifecycleState, RuntimeError, RuntimeRoot};
+pub use runtime::{BveRuntime, LifecycleState, RuntimeError, RuntimeRoot, UEFI_VARS_FILENAME};
 pub use storage::{
     check_qemu_img_binary, destroy_instance_storage, ensure_system_base, prepare_instance,
     reset_system_storage, BveStorageError, BveStorageLayout, BveStorageRoot,

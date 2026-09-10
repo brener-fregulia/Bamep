@@ -21,6 +21,52 @@ pub const QEMU_BINARY: &str = "qemu-system-x86_64";
 /// The KVM character device checked for usable hardware acceleration.
 pub const DEFAULT_KVM_DEVICE: &str = "/dev/kvm";
 
+/// Default path of the shared, read-only OVMF firmware **code** pflash image
+/// for [`Firmware::Uefi`] (ADR-0025), as installed by the Debian/Ubuntu `ovmf`
+/// package. Non-Secure-Boot (`OVMF_CODE_4M.fd`, **not**
+/// `OVMF_CODE_4M.secboot.fd`). Never written; never in any deletion set.
+/// Override with `BAMEP_VE_OVMF_CODE` (e.g. the Fedora lab installs OVMF under
+/// `/usr/share/edk2/ovmf/`).
+pub const OVMF_CODE_4M: &str = "/usr/share/OVMF/OVMF_CODE_4M.fd";
+
+/// Default path of the immutable OVMF firmware **variables** template. Each
+/// [`Firmware::Uefi`] BVE gets its own writable copy of this, made once at
+/// `create` (ADR-0025). This file itself is never written by this crate.
+/// Override with `BAMEP_VE_OVMF_VARS_TEMPLATE`.
+pub const OVMF_VARS_4M_TEMPLATE: &str = "/usr/share/OVMF/OVMF_VARS_4M.fd";
+
+/// Environment override for [`OVMF_CODE_4M`].
+pub const OVMF_CODE_ENV: &str = "BAMEP_VE_OVMF_CODE";
+/// Environment override for [`OVMF_VARS_4M_TEMPLATE`].
+pub const OVMF_VARS_TEMPLATE_ENV: &str = "BAMEP_VE_OVMF_VARS_TEMPLATE";
+
+/// The OVMF CODE pflash path in effect: `$BAMEP_VE_OVMF_CODE` if set, else
+/// [`OVMF_CODE_4M`].
+pub fn ovmf_code_path() -> PathBuf {
+    std::env::var_os(OVMF_CODE_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(OVMF_CODE_4M))
+}
+
+/// The OVMF VARS template path in effect: `$BAMEP_VE_OVMF_VARS_TEMPLATE` if
+/// set, else [`OVMF_VARS_4M_TEMPLATE`].
+pub fn ovmf_vars_template_path() -> PathBuf {
+    std::env::var_os(OVMF_VARS_TEMPLATE_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(OVMF_VARS_4M_TEMPLATE))
+}
+
+/// The two OVMF pflash images for one [`Firmware::Uefi`] launch. The runtime
+/// resolves these ([`ovmf_code_path`] + the per-BVE VARS copy) and hands them
+/// in, so [`QemuCommand::for_bve`] stays a pure function of its arguments.
+#[derive(Debug, Clone, Copy)]
+pub struct UefiPflash<'a> {
+    /// The shared read-only CODE image.
+    pub code: &'a Path,
+    /// This BVE's own writable VARS copy.
+    pub vars: &'a Path,
+}
+
 /// The concrete process + argument vector the runtime will spawn for one BVE.
 ///
 /// Building this is pure and deterministic, so the full invocation can be
@@ -50,7 +96,17 @@ impl QemuCommand {
     ///   state). Either way a `virtio-net-pci` device carries the deterministic
     ///   MAC;
     /// - for [`BootMode::NetworkFirst`], `-boot order=n` so the firmware runs
-    ///   its virtio PXE option ROM; [`BootMode::Default`] emits no `-boot`;
+    ///   its NIC PXE option ROM; [`BootMode::Default`] emits no `-boot`;
+    /// - the NIC `-device` model is `definition.nic_model()` — `virtio-net-pci`
+    ///   (default) or `e1000` (Issue #71); the deterministic MAC is identical
+    ///   for both;
+    /// - for [`Firmware::Uefi`] (Issue #71 / ADR-0025), a pflash pair:
+    ///   `-drive if=pflash,unit=0,format=raw,readonly=on,file=<code>` plus
+    ///   `-drive if=pflash,unit=1,format=raw,file=<vars>` from the supplied
+    ///   [`UefiPflash`] — a shared read-only CODE and the per-BVE writable VARS
+    ///   copy the runtime prepared. [`Firmware::Default`] emits no pflash and
+    ///   ignores `uefi`. Passing `Firmware::Uefi` with `uefi == None` is a
+    ///   caller bug and panics;
     /// - the `System` disk, and the `Source` disk when present, each as a
     ///   `-drive if=none,id=<role>,file=<path>,format=<fmt>` plus a matching
     ///   `-device virtio-blk-pci,drive=<role>,serial=<role-serial>`. Disk
@@ -60,7 +116,11 @@ impl QemuCommand {
     /// - `-qmp unix:<socket>,server=on,wait=off` — a listening control socket
     ///   that does not block startup on a client;
     /// - `-name <id>`.
-    pub fn for_bve(definition: &BveDefinition, qmp_socket: &Path) -> Self {
+    pub fn for_bve(
+        definition: &BveDefinition,
+        qmp_socket: &Path,
+        uefi: Option<UefiPflash<'_>>,
+    ) -> Self {
         let mut args: Vec<String> = Vec::new();
         let mut push = |a: &str| args.push(a.to_string());
 
@@ -100,7 +160,8 @@ impl QemuCommand {
         }
         push("-device");
         push(&format!(
-            "virtio-net-pci,netdev=net0,mac={}",
+            "{},netdev=net0,mac={}",
+            definition.nic_model().as_qemu_device(),
             definition.mac()
         ));
 
@@ -134,6 +195,25 @@ impl QemuCommand {
             // SeaBIOS default: no -bios / -pflash. Smallest boot path that
             // proves lifecycle for #67.
             Firmware::Default => {}
+            // OVMF non-Secure-Boot pflash pair (ADR-0025): shared read-only
+            // CODE + this BVE's own writable VARS copy. The runtime always
+            // supplies the VARS path for a UEFI definition.
+            Firmware::Uefi => {
+                let pflash = uefi.expect(
+                    "Firmware::Uefi requires an instance OVMF_VARS path; the runtime must \
+                     prepare it at create time (ADR-0025)",
+                );
+                push("-drive");
+                push(&format!(
+                    "if=pflash,unit=0,format=raw,readonly=on,file={}",
+                    pflash.code.display()
+                ));
+                push("-drive");
+                push(&format!(
+                    "if=pflash,unit=1,format=raw,file={}",
+                    pflash.vars.display()
+                ));
+            }
         }
 
         match definition.boot_mode() {
@@ -220,6 +300,18 @@ pub enum PrerequisiteError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A UEFI firmware image ([`OVMF_CODE_4M`] or [`OVMF_VARS_4M_TEMPLATE`])
+    /// needed for [`Firmware::Uefi`] is missing or unreadable. Install `ovmf`
+    /// (Debian/Ubuntu) — this crate never downloads a firmware image
+    /// (ADR-0025).
+    #[error("UEFI firmware image {path} is not usable ({detail}); install the 'ovmf' package")]
+    UefiFirmwareUnavailable {
+        /// The firmware path that was checked.
+        path: PathBuf,
+        /// What was wrong (missing, not a file, unreadable).
+        detail: String,
+    },
 }
 
 /// Probes a QEMU binary with `--version`, returning its first version line.
@@ -265,6 +357,32 @@ pub fn check_kvm_device(device: &Path) -> Result<(), PrerequisiteError> {
     Ok(())
 }
 
+/// Confirms both OVMF firmware images [`Firmware::Uefi`] needs are present and
+/// readable regular files: the resolved [`ovmf_code_path`] and
+/// [`ovmf_vars_template_path`]. **Read-only** and **UEFI-only** — kept separate
+/// from [`detect_host_prerequisites`] so a `Firmware::Default` BVE never needs
+/// OVMF installed (same split as `check_qemu_img_binary` for storage).
+pub fn check_uefi_firmware() -> Result<(), PrerequisiteError> {
+    for path in [ovmf_code_path(), ovmf_vars_template_path()] {
+        let meta =
+            std::fs::metadata(&path).map_err(|e| PrerequisiteError::UefiFirmwareUnavailable {
+                path: path.clone(),
+                detail: e.to_string(),
+            })?;
+        if !meta.is_file() {
+            return Err(PrerequisiteError::UefiFirmwareUnavailable {
+                path: path.clone(),
+                detail: "not a regular file".to_string(),
+            });
+        }
+        std::fs::File::open(&path).map_err(|e| PrerequisiteError::UefiFirmwareUnavailable {
+            path: path.clone(),
+            detail: e.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
 /// Gathers every host prerequisite a BVE launch needs: a working
 /// `qemu-system-x86_64` and a usable [`DEFAULT_KVM_DEVICE`].
 pub fn detect_host_prerequisites() -> Result<HostPrerequisites, PrerequisiteError> {
@@ -280,7 +398,7 @@ pub fn detect_host_prerequisites() -> Result<HostPrerequisites, PrerequisiteErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::definition::{BveId, DiskAttachment, DiskFormat, IfName};
+    use crate::definition::{BveId, DiskAttachment, DiskFormat, IfName, NicModel};
 
     const SYSTEM_OVERLAY: &str = "/srv/bamep/storage/instances/bve-argv/system.qcow2";
     const SOURCE_DISK: &str = "/srv/bamep/storage/instances/bve-argv/source.raw";
@@ -325,7 +443,7 @@ mod tests {
     fn builds_the_expected_machine_invocation() {
         let def = with_source();
         let socket = Path::new("/run/bamep-ve/bve-argv/qmp.sock");
-        let cmd = QemuCommand::for_bve(&def, socket);
+        let cmd = QemuCommand::for_bve(&def, socket, None);
 
         assert_eq!(cmd.program(), "qemu-system-x86_64");
         let args = cmd.args();
@@ -354,7 +472,7 @@ mod tests {
 
     #[test]
     fn attaches_the_system_overlay_deterministically_by_id() {
-        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"));
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None);
         let drives = values_after(cmd.args(), "-drive");
         let blk: Vec<&str> = values_after(cmd.args(), "-device")
             .into_iter()
@@ -380,13 +498,13 @@ mod tests {
 
     #[test]
     fn attaches_the_source_disk_independently_only_when_present() {
-        let none = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"));
+        let none = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None);
         assert!(
             !none.args().iter().any(|a| a.contains("id=source")),
             "no source disk when the definition has none"
         );
 
-        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"));
+        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"), None);
         let drives = values_after(cmd.args(), "-drive");
         assert_eq!(drives.len(), 2);
         let source = drives.iter().find(|d| d.contains("id=source")).unwrap();
@@ -406,7 +524,7 @@ mod tests {
 
     #[test]
     fn every_drive_states_its_format_and_the_backing_base_is_never_attached() {
-        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"));
+        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"), None);
         for drive in values_after(cmd.args(), "-drive") {
             assert!(
                 drive.contains("format="),
@@ -423,7 +541,7 @@ mod tests {
 
     #[test]
     fn user_mode_networking_is_unchanged_and_emits_no_boot_flag() {
-        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"));
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None);
         assert_eq!(value_after(cmd.args(), "-netdev"), Some("user,id=net0"));
         assert!(
             !cmd.args().iter().any(|a| a == "-boot"),
@@ -434,7 +552,7 @@ mod tests {
     #[test]
     fn isolated_tap_networking_opens_the_prepared_tap_by_name_only() {
         let def = system_only().with_isolated_tap(IfName::new("bvtapdeadbeef").unwrap());
-        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"));
+        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None);
 
         assert_eq!(
             value_after(cmd.args(), "-netdev"),
@@ -470,7 +588,7 @@ mod tests {
     #[test]
     fn network_first_boot_mode_emits_exactly_boot_order_n() {
         let def = system_only().with_boot_mode(BootMode::NetworkFirst);
-        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"));
+        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None);
         assert_eq!(value_after(cmd.args(), "-boot"), Some("order=n"));
         assert_eq!(
             cmd.args().iter().filter(|a| a.as_str() == "-boot").count(),
@@ -478,9 +596,175 @@ mod tests {
         );
     }
 
+    /// A `Firmware::Uefi` definition (built directly — firmware is a `new` arg).
+    fn uefi_only() -> BveDefinition {
+        BveDefinition::new(
+            BveId::new("bve-argv").unwrap(),
+            4,
+            512,
+            Firmware::Uefi,
+            DiskAttachment::system(SYSTEM_OVERLAY, DiskFormat::Qcow2).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// The Issue #71 WinPE-proof profile: UEFI + E1000 + NetworkFirst.
+    fn uefi_e1000_network_first() -> BveDefinition {
+        uefi_only()
+            .with_boot_mode(BootMode::NetworkFirst)
+            .with_nic_model(NicModel::E1000)
+    }
+
+    const FAKE_OVMF_CODE: &str = "/opt/fake/OVMF_CODE.fd";
+
+    fn pflash(vars: &Path) -> UefiPflash<'_> {
+        UefiPflash {
+            code: Path::new(FAKE_OVMF_CODE),
+            vars,
+        }
+    }
+
+    #[test]
+    fn default_firmware_emits_no_pflash_and_ignores_the_vars_path() {
+        let ignored = Path::new("/should/be/ignored/OVMF_VARS.fd");
+        let with_vars =
+            QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), Some(pflash(ignored)));
+        let without = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None);
+        assert_eq!(
+            with_vars, without,
+            "Firmware::Default must ignore the UEFI pflash entirely"
+        );
+        assert!(
+            !without.args().iter().any(|a| a.contains("pflash")),
+            "SeaBIOS default must emit no -drive if=pflash"
+        );
+        assert!(
+            !without.args().iter().any(|a| a.contains("OVMF")),
+            "SeaBIOS default must not reference OVMF"
+        );
+    }
+
+    #[test]
+    fn uefi_firmware_emits_the_ovmf_pflash_pair_code_readonly_vars_writable() {
+        let vars = Path::new("/run/bamep-ve/bve-argv/OVMF_VARS.fd");
+        let cmd = QemuCommand::for_bve(&uefi_only(), Path::new("/s.sock"), Some(pflash(vars)));
+        let drives: Vec<&str> = values_after(cmd.args(), "-drive")
+            .into_iter()
+            .filter(|d| d.contains("if=pflash"))
+            .collect();
+        assert_eq!(drives.len(), 2, "exactly a CODE + VARS pflash pair");
+
+        let code = drives.iter().find(|d| d.contains("unit=0")).unwrap();
+        assert!(code.contains(&format!("file={FAKE_OVMF_CODE}")));
+        assert!(
+            code.contains("readonly=on"),
+            "CODE pflash must be read-only"
+        );
+        assert!(code.contains("format=raw"));
+
+        let vars_drive = drives.iter().find(|d| d.contains("unit=1")).unwrap();
+        assert!(vars_drive.contains(&format!("file={}", vars.display())));
+        assert!(
+            !vars_drive.contains("readonly"),
+            "the VARS pflash must be writable"
+        );
+        assert!(
+            !vars_drive.contains("template") && !vars_drive.contains(OVMF_VARS_4M_TEMPLATE),
+            "the VARS pflash must be the per-BVE copy, never the immutable template"
+        );
+        // Secure Boot must not be pulled in.
+        for arg in cmd.args() {
+            assert!(
+                !arg.contains("secboot") && !arg.to_lowercase().contains("smm=on"),
+                "UEFI variant must not enable Secure Boot / SMM: {arg:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "requires an instance OVMF_VARS path")]
+    fn uefi_firmware_without_a_vars_path_is_a_caller_bug() {
+        let _ = QemuCommand::for_bve(&uefi_only(), Path::new("/s.sock"), None);
+    }
+
+    #[test]
+    fn nic_model_default_is_virtio_and_e1000_is_opt_in_with_the_same_mac() {
+        let virtio = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None);
+        let virtio_dev = values_after(virtio.args(), "-device")
+            .into_iter()
+            .find(|d| d.starts_with("virtio-net-pci,"))
+            .expect("default NIC is virtio-net-pci");
+        assert!(virtio_dev.contains(&format!("mac={}", system_only().mac())));
+
+        let e1000_def = system_only().with_nic_model(NicModel::E1000);
+        let e1000 = QemuCommand::for_bve(&e1000_def, Path::new("/s.sock"), None);
+        let e1000_dev = values_after(e1000.args(), "-device")
+            .into_iter()
+            .find(|d| d.starts_with("e1000,"))
+            .expect("NicModel::E1000 emits -device e1000");
+        assert!(
+            !e1000.args().iter().any(|a| a.contains("virtio-net-pci")),
+            "no virtio-net-pci device when E1000 is selected"
+        );
+        assert_eq!(
+            e1000_dev,
+            &format!("e1000,netdev=net0,mac={}", e1000_def.mac()),
+            "e1000 device carries the unchanged deterministic MAC"
+        );
+        assert_eq!(
+            e1000_def.mac(),
+            system_only().mac(),
+            "the MAC is model-independent"
+        );
+    }
+
+    #[test]
+    fn winpe_pxe_profile_is_uefi_e1000_network_first_with_no_optical_or_alternate_boot() {
+        let vars = Path::new("/run/bamep-ve/bve-argv/OVMF_VARS.fd");
+        let cmd = QemuCommand::for_bve(
+            &uefi_e1000_network_first(),
+            Path::new("/s.sock"),
+            Some(pflash(vars)),
+        );
+        let args = cmd.args();
+
+        // UEFI PXE via the e1000 EFI option ROM: pflash pair + e1000 + order=n.
+        assert!(args
+            .iter()
+            .any(|a| a.contains("if=pflash") && a.contains("unit=1")));
+        assert!(values_after(args, "-device")
+            .iter()
+            .any(|d| d.starts_with("e1000,")));
+        assert_eq!(value_after(args, "-boot"), Some("order=n"));
+
+        // Anti-false-positive: the ONLY bootable path is the NIC. No optical
+        // media, no El-Torito, no alternate bootable device, ever.
+        for arg in args {
+            let a = arg.to_lowercase();
+            assert!(
+                !a.contains("cdrom")
+                    && !a.contains("media=cdrom")
+                    && !a.contains("-cdrom")
+                    && !a.contains("ide-cd")
+                    && !a.contains("scsi-cd")
+                    && !a.contains(".iso"),
+                "the WinPE PXE proof must expose no optical/ISO fallback: {arg:?}"
+            );
+        }
+        // Only the (blank) system overlay is a disk; no source, no extra drive.
+        let drives = values_after(args, "-drive");
+        let disk_drives: Vec<&&str> = drives.iter().filter(|d| d.contains("if=none")).collect();
+        assert_eq!(
+            disk_drives.len(),
+            1,
+            "only the blank system overlay is attached"
+        );
+        assert!(disk_drives[0].contains("id=system"));
+    }
+
     #[test]
     fn never_enables_software_cpu_emulation() {
-        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/run/x/qmp.sock"));
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/run/x/qmp.sock"), None);
         for arg in cmd.args() {
             assert!(
                 !arg.contains("tcg"),
@@ -501,7 +785,7 @@ mod tests {
             DiskAttachment::system("/d.qcow2", DiskFormat::Qcow2).unwrap(),
         )
         .unwrap();
-        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"));
+        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None);
         assert_eq!(value_after(cmd.args(), "-smp"), Some("8"));
         assert_eq!(value_after(cmd.args(), "-m"), Some("2048M"));
     }

@@ -17,7 +17,7 @@ Bamep currently has eight Rust crates:
 | `bamep-simulator` | Simulated Agent participant using real trusted-bootstrap and WSS/Agent Protocol boundaries |
 | `bamep-worker-protocol` | Rust wire model/codec/framing for the implemented Worker Protocol v1 handshake + business-message catalog |
 | `bamep-worker` | The isolated Worker process: concurrent UDS control client, fail-closed authority tracking, Server TLS identity, local chunk storage + full-Artifact reconstruction, and the HTTPS `/api/data/v1/` data plane |
-| `bamep-ve` | Host-side lifecycle for one disposable Bamep Virtual Endpoint (BVE): validated machine definition, direct QEMU/KVM invocation, owned process + QMP control socket, deterministic disk storage (sparse RAW base + per-instance QCOW2 overlay + source fixture, `qemu-img`), an optional isolated PXE-capable provisioning network (private bridge + user-owned TAP + fixture netns, `ip`), and the `create/start/observe/reset/reset_system_storage/stop/destroy` lifecycle |
+| `bamep-ve` | Host-side lifecycle for one disposable Bamep Virtual Endpoint (BVE): validated machine definition (SeaBIOS or OVMF non-Secure-Boot UEFI firmware; `virtio-net-pci` or `e1000` NIC), direct QEMU/KVM invocation, owned process + QMP control socket, deterministic disk storage (sparse RAW base + per-instance QCOW2 overlay + source fixture, `qemu-img`), an optional isolated PXE-capable provisioning network (private bridge + user-owned TAP + fixture netns, `ip`) with a WinPE UEFI-PXE host-proof fixture (`dnsmasq` DHCP/TFTP + `python3` HTTP), and the `create/start/observe/reset/reset_system_storage/stop/destroy` lifecycle |
 
 Planned components remain outside Architecture until corresponding code exists.
 
@@ -114,19 +114,22 @@ implemented directly against QEMU/KVM per ADR-0022. The crate/package is named `
 validation/development infrastructure related to the Simulator, not part of the M2 Endpoint
 Capture product surface.
 
-Implemented across Issues #67, #69 and #70:
+Implemented across Issues #67, #69, #70 and #71:
 
 - `BveDefinition` — a validated machine description: a path-safe `BveId`, vCPU count, RAM
-  (MiB), a `Firmware::Default` (SeaBIOS) boot choice, a `BootMode` (`Default`, or
-  `NetworkFirst` → `-boot order=n`), a deterministic locally-administered NIC MAC derived
-  from the id, a `NetworkAttachment` (`UserMode` by default, or `IsolatedTap { ifname }`
-  set only via a `PreparedBveNetwork`), and the disks actually attached — a required
-  `System` `DiskAttachment` and an optional `Source` one, each carrying an explicit
-  `DiskRole` and `DiskFormat`. Rejects zero/oversized vCPUs, zero/out-of-range RAM, a disk
-  path that would break QEMU `-drive` parsing (a `,`), a wrong-role attachment, an invalid
-  interface name, and (at `create` time) a missing/non-file image. It is not a
-  future-complete configuration surface; WinPE and Buildroot fields are intentionally
-  absent.
+  (MiB), a `Firmware` choice (`Default` = SeaBIOS, or `Uefi` = OVMF **without** Secure Boot
+  — ADR-0025), a `BootMode` (`Default`, or `NetworkFirst` → `-boot order=n`), a `NicModel`
+  (`VirtioNetPci` by default, or `E1000` — the Intel 82540EM, selected by Issue #71 because
+  stock WinPE has an inbox driver for it but none for VirtIO; the deterministic MAC is
+  identical for both), a deterministic locally-administered NIC MAC derived from the id, a
+  `NetworkAttachment` (`UserMode` by default, or `IsolatedTap { ifname }` set only via a
+  `PreparedBveNetwork`), and the disks actually attached — a required `System`
+  `DiskAttachment` and an optional `Source` one, each carrying an explicit `DiskRole` and
+  `DiskFormat`. `Firmware` and `NicModel` are independent (UEFI does not imply a NIC model,
+  and vice versa). Rejects zero/oversized vCPUs, zero/out-of-range RAM, a disk path that
+  would break QEMU `-drive` parsing (a `,`), a wrong-role attachment, an invalid interface
+  name, and (at `create` time) a missing/non-file image. It is not a future-complete
+  configuration surface; WinPE and Buildroot fields are intentionally absent.
 - `storage` (ADR-0023) — the disk model. `BveStorageRoot` is a validated, crate-owned root;
   `BveStorageLayout::for_bve` derives deterministic paths (`base/system-base.raw`,
   `instances/<bve-id>/system.qcow2`, `instances/<bve-id>/source.raw`). `ensure_system_base`
@@ -143,13 +146,17 @@ Implemented across Issues #67, #69 and #70:
   still runs with only `qemu-system-x86_64` + KVM.
 - `QemuCommand` — a pure builder for the exact `qemu-system-x86_64` invocation: `-accel kvm
   -cpu host` with no TCG fallback anywhere (ADR-0022 fail-closed), `-smp`/`-m` from the
-  definition, headless, and a `virtio-net-pci` NIC with the deterministic MAC on either
-  `-netdev user,id=net0` (unprivileged default) or `-netdev
+  definition, headless, and a `-device <nic_model>` NIC (`virtio-net-pci` or `e1000`) with
+  the deterministic MAC on either `-netdev user,id=net0` (unprivileged default) or `-netdev
   tap,id=net0,ifname=<prepared>,script=no,downscript=no` (isolated TAP, opened by name —
   no `qemu-bridge-helper`, no `/etc/qemu/bridge.conf`, no auto-run scripts), plus `-boot
-  order=n` for `BootMode::NetworkFirst`. Each disk is `-drive
-  if=none,id=<role>,file=<path>,format=<fmt>` plus `-device
-  virtio-blk-pci,drive=<role>,serial=bamep-<role>` — identity is the explicit
+  order=n` for `BootMode::NetworkFirst`. For `Firmware::Uefi` (ADR-0025) a pflash pair:
+  `-drive if=pflash,unit=0,format=raw,readonly=on,file=<OVMF_CODE_4M>` plus `-drive
+  if=pflash,unit=1,format=raw,file=<per-BVE VARS copy>` — a shared read-only CODE and this
+  BVE's own writable VARS, both resolved and handed in by the runtime so the builder stays
+  a pure function of its arguments; `Firmware::Default` emits no pflash. Never a `-cdrom` /
+  optical / El-Torito device. Each disk is `-drive if=none,id=<role>,file=<path>,format=<fmt>`
+  plus `-device virtio-blk-pci,drive=<role>,serial=bamep-<role>` — identity is the explicit
   `id=`/`serial=`, not argument order; the format is always explicit; the immutable backing
   base is never attached. Plus a listening `-qmp unix:` control socket.
 - `network` (ADR-0024) — the optional isolated provisioning network.
@@ -179,17 +186,35 @@ Implemented across Issues #67, #69 and #70:
   dir, storage, QMP socket) are deliberately disjoint sibling trees under the OS temp
   root, so a `sudo`-run fixture never creates a directory a normal-user BVE run must write
   into. `PreparedBveNetwork::attach` is the sole path a TAP name reaches a `BveDefinition`.
+  For the Issue #71 WinPE UEFI-PXE proof (ADR-0024 amendment / ADR-0025) the module also
+  builds a superset fixture — `winpe_fixture_dnsmasq_argv` adds TFTP serving plus an
+  architecture match (`option:client-arch,7`) and an iPXE match (option 175 + the `iPXE`
+  user-class) with a two-stage, loop-free `dhcp-boot` (a firmware EFI-x64 non-iPXE client
+  gets `snponly.efi` over TFTP; an iPXE client gets `boot.ipxe` over HTTP), and
+  `winpe_http_fixture_command` runs a disposable `python3 -m http.server` in the same netns
+  bound to the peer only — plus `apply_bridged_forward_accommodation`, a broader
+  `physdev`-scoped `FORWARD` ACCEPT (all traffic between exactly this BVE's TAP and fixture
+  veth, both directions) needed because the WinPE chain carries DHCP **and** TFTP **and**
+  HTTP; `teardown` sweeps both the narrow and the broad rule sets. The #70
+  `fixture_dnsmasq_argv` is untouched.
 - prerequisite checks — `qemu-system-x86_64` probed with `--version`, and `/dev/kvm`
   confirmed present and openable read/write (VM lifecycle); `check_network_prerequisites`
-  confirms `ip` runs and `/dev/net/tun` is a character device (isolated network only). All
-  fail closed with actionable errors; there is no downgrade to software emulation.
+  confirms `ip` runs and `/dev/net/tun` is a character device (isolated network only);
+  `check_uefi_firmware` confirms the OVMF CODE image and VARS template are readable regular
+  files (UEFI only — `Firmware::Uefi`; default paths overridable via `BAMEP_VE_OVMF_CODE` /
+  `BAMEP_VE_OVMF_VARS_TEMPLATE`). All fail closed with actionable errors; there is no
+  downgrade to software emulation and no firmware download.
 - `BveRuntime` — owns the exact QEMU `std::process::Child` it spawned, that process's QMP
-  Unix socket, a per-instance `<runtime-root>/<bve-id>/` **control** directory, and the
-  `PreparedInstanceStorage` it runs on. `create` rejects a definition whose attachments
-  disagree with the prepared storage; `create_with_isolated_network` additionally
-  cross-checks the definition's `NetworkAttachment` against a `PreparedBveNetwork` (same
-  consistency lesson as ADR-0023) and performs no privileged network operation — QEMU
-  opens the already-prepared, user-owned TAP unprivileged. Lifecycle: `create`, `start`
+  Unix socket, a per-instance `<runtime-root>/<bve-id>/` **control** directory, an optional
+  per-BVE `OVMF_VARS.fd` (for `Firmware::Uefi`), and the `PreparedInstanceStorage` it runs
+  on. `create` rejects a definition whose attachments disagree with the prepared storage,
+  and for `Firmware::Uefi` runs `check_uefi_firmware` and writes a pristine per-BVE VARS
+  copy from the immutable template (once, at `create` — not refreshed per `start`, so PXE
+  repeats with the same firmware state); `destroy` removes that copy. `create_with_isolated_network`
+  additionally cross-checks the definition's `NetworkAttachment` against a
+  `PreparedBveNetwork` (same consistency lesson as ADR-0023) and performs no privileged
+  network operation — QEMU opens the already-prepared, user-owned TAP unprivileged.
+  Lifecycle: `create`, `start`
   (spawn QEMU, confirm the
   QMP capabilities handshake), `observe` (`Stopped`/`Running` from the owned process +
   QMP — never inferring guest health), `reset` (QMP `system_reset` on that VM — no disk
@@ -201,12 +226,14 @@ Implemented across Issues #67, #69 and #70:
   greeting/`qmp_capabilities` handshake, `query-status`, `system_reset`, `quit`, and
   `query-block`. Not a general QMP library.
 
-Deterministic logic (definition/attachment validation, MAC derivation, QEMU argument
-construction, storage path geometry and fail-closed deletion sets, storage/definition and
-network/definition consistency, network resource-name derivation and ownership/rollback
-sets, L2-isolation checks, DHCP-forward accommodation rule scoping, prerequisite-absence
-errors, QMP handling) is covered by unit tests needing no QEMU, `qemu-img`, or host
-networking. Opt-in host proofs, which an ordinary `cargo test` and CI never trigger,
+Deterministic logic (definition/attachment validation, MAC derivation, `Firmware`/`NicModel`
+argv including the OVMF pflash pair and the no-optical-fallback guard, QEMU argument
+construction, the per-BVE UEFI VARS copy/remove lifecycle, storage path geometry and
+fail-closed deletion sets, storage/definition and network/definition consistency, network
+resource-name derivation and ownership/rollback sets, L2-isolation checks, DHCP-forward and
+bridged-forward accommodation rule scoping, the WinPE fixture `dnsmasq`/HTTP argv and
+loop-free two-stage `dhcp-boot`, prerequisite-absence errors, QMP handling) is covered by
+unit tests needing no QEMU, `qemu-img`, OVMF, or host networking. Opt-in host proofs, which an ordinary `cargo test` and CI never trigger,
 exercise the real thing: `tests/host_lifecycle.rs` (`BAMEP_BVE_HOST_TEST=1`) for the
 QEMU/KVM lifecycle, `tests/storage_host.rs` (`BAMEP_VE_STORAGE_HOST_TEST=1`) for sparse
 allocation (80 GiB logical / ~4 KiB allocated), base immutability, reproducible reset,
@@ -222,10 +249,28 @@ owner-run `scripts/bve-network-proof.sh` harness (a versioned dev tool that may 
 and is recorded in `docs/reference/bve-isolated-network-host-proof.md`: a full DHCP `DISCOVER/OFFER/REQUEST/
 ACK` from the deterministic MAC reached the isolated fixture, the `br_netfilter` +
 Docker-`FORWARD` interaction was diagnosed and handled by the scoped accommodation, and
-repeated cycles left no residual state. BVE never proves physical firmware, option-ROM,
-NIC, switch/VLAN, storage-controller, Secure Boot, or WinPE behavior, and host-internal
-virtual-network evidence is not physical-network evidence
-(`m0-bamep-virtual-endpoint-contract.md` "Validation and
+repeated cycles left no residual state.
+
+The Issue #71 WinPE UEFI-PXE proof is a separate owner-run harness,
+`scripts/bve-winpe-pxe-proof.sh` (with `examples/bve_winpe_pxe` subcommands for debugging):
+it stages the retained iPXE/`wimboot`/`BCD`/`boot.sdi`/`boot.wim` artifacts (hash-pinned in
+`scripts/winpe-pxe-fixture.sha256`, never downloaded), brings up the DHCP/TFTP + HTTP
+fixture, boots one BVE twice with `Firmware::Uefi` + `NicModel::E1000` +
+`BootMode::NetworkFirst` and a blank disk / no optical media, and tears down. Boot-stage
+evidence is parsed **only from the real fixture log** by
+`scripts/lib/winpe-pxe-evidence.sh` (`http_200` / `http_transfer_started` for the HTTP
+chain; `winpe_dhcp_ack_in_range` for WinPE readiness), unit-tested by
+`scripts/bve-winpe-pxe-proof-parser-test.sh`. "WinPE ready" is proven **per boot**: `run-bve
+--evidence-log` emits the fixture-log line range bounding each boot (it does not interpret
+DHCP), and each range must independently show a Windows-client DHCP transaction (`MSFT 5.0`
+/ `MININT-*`) reaching DHCPACK for the BVE MAC — so `BVE reboot` cannot be satisfied by a
+whole-log text count. It is #71-specific and depends on external Microsoft/iPXE artifacts,
+so the generic #70 proof stays separate and unchanged. Its empirical result and fidelity
+limits live in `docs/reference/bve-winpe-uefi-pxe-host-proof.md`.
+
+BVE never proves physical firmware, option-ROM, NIC, switch/VLAN, storage-controller,
+Secure Boot, or physical WinPE/PXE behavior, and host-internal virtual-network evidence is
+not physical-network evidence (`m0-bamep-virtual-endpoint-contract.md` "Validation and
 fidelity boundary").
 
 ### Simulator BVE orchestration (Issue #68)

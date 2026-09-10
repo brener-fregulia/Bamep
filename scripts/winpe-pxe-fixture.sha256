@@ -1,0 +1,22 @@
+# Bamep Issue #71 — WinPE UEFI-PXE host-proof fixture manifest.
+#
+# These files are NOT in the repository (third-party / Microsoft-restricted
+# binaries — same policy as integration/physical/issue-53-winpe-secure-boot).
+# Stage them yourself into $BAMEP_BVE_WINPE_FIXTURE_ROOT, then:
+#
+#   cd "$BAMEP_BVE_WINPE_FIXTURE_ROOT" && sha256sum -c /path/to/scripts/winpe-pxe-fixture.sha256
+#
+# Provenance and how to obtain each file: scripts/winpe-pxe-fixture.provenance.md
+# Boot Adapter mechanism decision: docs/decisions/0021-ipxe-wimboot-network-delivered-winpe-baseline.md
+#
+# Format is `sha256sum -c` compatible: <sha256>␠␠<name>
+#
+# The exact hashes below are empirical evidence (matching the Issue #53 physical
+# chain), NOT permanent version pins — a boot-artifact update needs
+# requalification per ADR-0021.
+
+f61c2ce34e05d7d857633df2e512d547df75b6aa18b2da152a7c9af222cfe28f  snponly.efi
+5f067ccdc4d084d5bf77b6c853bd0f8402dfc2b4cd1b103d358993ae97fae8e3  wimboot
+c0fd865ab0a1329d333ee6d3ab48c3030851a193a939d8b382522d40c81eea41  BCD
+cd2c00ce027687ce4a8bdc967f26a8ab82f651c9becd703658ba282ec49702bd  boot.sdi
+fbcbdb1c6651ab3a69384e9d4f95f2c02321318603849453b252e21e827c8197  boot.wim
