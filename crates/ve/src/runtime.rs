@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use crate::definition::{BveDefinition, BveId, DefinitionError, Firmware, NetworkAttachment};
 use crate::network::PreparedBveNetwork;
 use crate::qemu::{
-    check_uefi_firmware, ovmf_code_path, ovmf_vars_template_path, HostPrerequisites,
-    PrerequisiteError, QemuCommand, UefiPflash,
+    check_uefi_firmware, check_vnc_endpoint_available, ovmf_code_path, ovmf_vars_template_path,
+    HostPrerequisites, PrerequisiteError, QemuCommand, UefiPflash, VncEndpoint,
 };
 use crate::qmp::{QmpConnection, QmpError};
 use crate::storage::{self, BveStorageError, PreparedInstanceStorage};
@@ -52,7 +52,9 @@ pub const UEFI_VARS_FILENAME: &str = "OVMF_VARS.fd";
 /// Filename of the headless serial capture log inside the instance control
 /// directory, when [`BveRuntime::with_serial_capture`] is enabled (Issue #72).
 /// QEMU appends to it, so a `stop`/`start` cycle accumulates both boots'
-/// output; [`BveRuntime::destroy`] removes it.
+/// output; [`BveRuntime::destroy`] removes it. Independent of
+/// [`BveRuntime::with_visual_display`] (Issue #74) — enabling one never
+/// changes the other.
 pub const SERIAL_LOG_FILENAME: &str = "serial.log";
 
 /// The truthful lifecycle state Issue #67 requires. Nothing here implies guest
@@ -189,6 +191,21 @@ pub enum RuntimeError {
     /// (ADR-0025). This crate never downloads a firmware image.
     #[error(transparent)]
     UefiFirmware(#[from] PrerequisiteError),
+
+    /// The deterministic VNC endpoint's local TCP port
+    /// ([`crate::qemu::VncEndpoint::port`]) was not free when
+    /// [`BveRuntime::start`] checked it (Issue #74) — most likely a
+    /// display-number collision with another BVE's VNC endpoint, or an
+    /// unrelated process already bound to it. Never silently redirected to
+    /// whatever is listening there.
+    #[error("VNC endpoint port {port} is not available: {source}")]
+    VncEndpointUnavailable {
+        /// The port that was checked.
+        port: u16,
+        /// The underlying bind error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// One BVE's host-side lifecycle. Not `Clone`: it owns a process handle.
@@ -208,6 +225,12 @@ pub struct BveRuntime {
     /// `None` by default — every path before Issue #72 leaves the serial line
     /// detached. Removed by `destroy`.
     serial_log: Option<PathBuf>,
+    /// When set (via [`BveRuntime::with_visual_display`], Issue #74): this
+    /// BVE's deterministic local-only VNC endpoint. `None` by default — every
+    /// path before Issue #74 stays exactly headless (`-display none`, no
+    /// `-vnc`). Independent of every other field here: it creates no file
+    /// under `instance_dir`, so `destroy` has nothing extra to remove.
+    visual_display: Option<VncEndpoint>,
     child: Option<Child>,
 }
 
@@ -276,6 +299,7 @@ impl BveRuntime {
             qmp_socket,
             uefi_vars,
             serial_log: None,
+            visual_display: None,
             child: None,
         })
     }
@@ -292,6 +316,25 @@ impl BveRuntime {
     /// VNC/SPICE/display path (Issue #74).
     pub fn with_serial_capture(mut self) -> Self {
         self.serial_log = Some(self.instance_dir.join(SERIAL_LOG_FILENAME));
+        self
+    }
+
+    /// Enables the optional local-only VNC visual display for this BVE (Issue
+    /// #74).
+    ///
+    /// The endpoint is fully deterministic
+    /// ([`VncEndpoint::deterministic_for`]) — no argument, no randomness, no
+    /// arbitrary QEMU display escape hatch. Off by default; connecting or
+    /// disconnecting a VNC client never affects `create`, `start`, `observe`,
+    /// `reset`, `stop`, `destroy`, storage reset/destroy, QMP ownership,
+    /// serial capture, or PXE/network behavior — it only adds one `-vnc`
+    /// argument to the QEMU invocation ([`QemuCommand::for_bve`]).
+    /// [`BveRuntime::start`] validates the derived port is free
+    /// ([`check_vnc_endpoint_available`]) before spawning QEMU, so a
+    /// display-number collision fails closed rather than silently landing a
+    /// client on another BVE's console.
+    pub fn with_visual_display(mut self) -> Self {
+        self.visual_display = Some(VncEndpoint::deterministic_for(self.definition.id()));
         self
     }
 
@@ -376,6 +419,13 @@ impl BveRuntime {
         self.serial_log.as_deref()
     }
 
+    /// This BVE's VNC visual-display endpoint, when
+    /// [`BveRuntime::with_visual_display`] is enabled (Issue #74). `None` by
+    /// default.
+    pub fn visual_display(&self) -> Option<VncEndpoint> {
+        self.visual_display
+    }
+
     /// The definition this runtime represents.
     pub fn definition(&self) -> &BveDefinition {
         &self.definition
@@ -391,6 +441,18 @@ impl BveRuntime {
         }
         Self::clear_stale_socket(&self.qmp_socket)?;
 
+        // For an opt-in visual display (Issue #74), fail closed on a
+        // collision *before* ever spawning QEMU — never silently connect a
+        // client to whatever else already holds the deterministic port.
+        if let Some(endpoint) = self.visual_display {
+            check_vnc_endpoint_available(&endpoint).map_err(|source| {
+                RuntimeError::VncEndpointUnavailable {
+                    port: endpoint.port(),
+                    source,
+                }
+            })?;
+        }
+
         // For a UEFI BVE, pair the shared read-only CODE with this BVE's own
         // VARS copy prepared at `create` — reused as-is on every `start`, never
         // refreshed here (ADR-0025).
@@ -404,6 +466,7 @@ impl BveRuntime {
             &self.qmp_socket,
             uefi,
             self.serial_log.as_deref(),
+            self.visual_display,
         );
         let mut child = Command::new(command.program())
             .args(command.args())
@@ -742,6 +805,60 @@ mod tests {
         rt.destroy().unwrap();
         assert!(!log.exists(), "the serial log is removed by destroy");
         assert!(!control_dir.exists(), "control dir removed (non-recursive)");
+    }
+
+    // ---- optional VNC visual display (Issue #74) ------------------------
+
+    #[test]
+    fn visual_display_is_off_by_default_and_opt_in_derives_the_deterministic_endpoint() {
+        let temp = TempRoot::new();
+        let (rt, _s) = bve(&temp, "bve-visual-default");
+        assert!(rt.visual_display().is_none());
+
+        let (rt, _s) = bve(&temp, "bve-visual-on");
+        let expected = crate::qemu::VncEndpoint::deterministic_for(rt.definition().id());
+        let rt = rt.with_visual_display();
+        assert_eq!(rt.visual_display(), Some(expected));
+    }
+
+    #[test]
+    fn with_visual_display_changes_only_its_own_field() {
+        let temp = TempRoot::new();
+        let (rt, _s) = bve(&temp, "bve-visual-independent");
+        let before_dir = rt.instance_dir().to_path_buf();
+        let before_socket = rt.qmp_socket().to_path_buf();
+        let before_serial = rt.serial_log().map(Path::to_path_buf);
+
+        let rt = rt.with_visual_display();
+        assert_eq!(rt.instance_dir(), before_dir);
+        assert_eq!(rt.qmp_socket(), before_socket);
+        assert_eq!(rt.serial_log().map(Path::to_path_buf), before_serial);
+        assert!(rt.visual_display().is_some());
+    }
+
+    #[test]
+    fn start_fails_closed_on_a_colliding_vnc_endpoint_without_spawning_qemu() {
+        let temp = TempRoot::new();
+        let (rt, _s) = bve(&temp, "bve-vnc-collision");
+        let mut rt = rt.with_visual_display();
+        let endpoint = rt.visual_display().expect("visual display was enabled");
+
+        // Hold the exact deterministic port so `start` must observe a
+        // collision — this never needs a real qemu-system-x86_64 binary or
+        // KVM, because the check runs before the process is spawned.
+        let hold = std::net::TcpListener::bind(("127.0.0.1", endpoint.port())).unwrap();
+
+        let fake_prerequisites = HostPrerequisites {
+            qemu_binary: "unused-in-this-test".to_string(),
+            qemu_version_line: String::new(),
+            kvm_device: PathBuf::new(),
+        };
+        let err = rt.start(&fake_prerequisites).unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::VncEndpointUnavailable { port, .. } if port == endpoint.port())
+        );
+        assert!(rt.child.is_none(), "no QEMU process was ever spawned");
+        drop(hold);
     }
 
     fn direct_kernel_storage(temp: &TempRoot, id: &str) -> (BveId, PreparedInstanceStorage) {

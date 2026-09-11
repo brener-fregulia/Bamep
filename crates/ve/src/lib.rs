@@ -42,9 +42,19 @@
 //! Environment, built with Buildroot) boots on. It is orthogonal to
 //! [`Firmware`]/[`NicModel`]/[`BootMode`] and conflicts only with
 //! [`BootMode::NetworkFirst`]. [`BveRuntime::with_serial_capture`] adds a
-//! headless append-mode serial log for machine-readable boot evidence (never a
-//! display/VNC path — Issue #74). BVE understands only "boot this kernel and
-//! initrd", never "this is BARE".
+//! headless append-mode serial log for machine-readable boot evidence. BVE
+//! understands only "boot this kernel and initrd", never "this is BARE".
+//!
+//! Visual display (Issue #74): a BVE stays exactly headless (`-display none`,
+//! no `-vnc`, no SPICE) unless a caller explicitly opts in with
+//! [`BveRuntime::with_visual_display`], which derives a deterministic
+//! loopback-only VNC endpoint ([`VncEndpoint::deterministic_for`]) from the
+//! BVE id — no arbitrary port choice, no random-port race.
+//! [`BveRuntime::start`] validates that port is free before spawning QEMU and
+//! fails closed ([`RuntimeError::VncEndpointUnavailable`]) on a collision,
+//! rather than silently letting a client land on another BVE's console.
+//! Connecting or disconnecting a VNC client never affects lifecycle, storage,
+//! QMP, serial capture, or PXE/network behavior.
 //!
 //! This crate does **not** depend on `bamep-agent-protocol` or any Agent
 //! Protocol semantics. The lifecycle is synchronous: one VM, one owned
@@ -77,10 +87,11 @@ pub use network::{
     WINPE_TFTP_BOOTFILE,
 };
 pub use qemu::{
-    check_kvm_device, check_qemu_binary, check_uefi_firmware, detect_host_prerequisites,
-    ovmf_code_path, ovmf_vars_template_path, HostPrerequisites, PrerequisiteError, QemuCommand,
-    UefiPflash, DEFAULT_KVM_DEVICE, OVMF_CODE_4M, OVMF_CODE_ENV, OVMF_VARS_4M_TEMPLATE,
-    OVMF_VARS_TEMPLATE_ENV, QEMU_BINARY,
+    check_kvm_device, check_qemu_binary, check_uefi_firmware, check_vnc_endpoint_available,
+    detect_host_prerequisites, ovmf_code_path, ovmf_vars_template_path, HostPrerequisites,
+    PrerequisiteError, QemuCommand, UefiPflash, VncEndpoint, DEFAULT_KVM_DEVICE, MAX_VNC_DISPLAY,
+    OVMF_CODE_4M, OVMF_CODE_ENV, OVMF_VARS_4M_TEMPLATE, OVMF_VARS_TEMPLATE_ENV, QEMU_BINARY,
+    VNC_BASE_PORT, VNC_BIND_ADDRESS,
 };
 pub use qmp::{QmpConnection, QmpError, QmpResponse, RunState};
 pub use runtime::{

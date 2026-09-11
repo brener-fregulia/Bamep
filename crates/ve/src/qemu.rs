@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::definition::{BootMode, BveDefinition, Firmware, NetworkAttachment};
+use crate::definition::{fnv1a_64, BootMode, BveDefinition, BveId, Firmware, NetworkAttachment};
 
 /// The QEMU system-emulator binary this runtime drives.
 pub const QEMU_BINARY: &str = "qemu-system-x86_64";
@@ -67,6 +67,85 @@ pub struct UefiPflash<'a> {
     pub vars: &'a Path,
 }
 
+/// The QEMU VNC display-number base: the actual TCP port a display `d` binds
+/// is `VNC_BASE_PORT + d`.
+pub const VNC_BASE_PORT: u16 = 5900;
+
+/// Upper bound on a derived display number, chosen so the resulting TCP port
+/// (`VNC_BASE_PORT + display`) never exceeds `u16::MAX`.
+pub const MAX_VNC_DISPLAY: u16 = u16::MAX - VNC_BASE_PORT - 1;
+
+/// Loopback-only bind address for the optional VNC visual display (Issue
+/// #74). Never `0.0.0.0`/`::`/a LAN address: this is a local-only, opt-in
+/// observation transport, not a production remote-console surface, and no
+/// authentication/RBAC/proxy infrastructure belongs here.
+pub const VNC_BIND_ADDRESS: &str = "127.0.0.1";
+
+/// One BVE's optional local-only VNC visual-display endpoint (Issue #74).
+///
+/// Default behavior stays exactly headless (`-display none`, no `-vnc`, no
+/// `-spice`); a [`VncEndpoint`] only exists when a caller explicitly opts a
+/// BVE into one via [`crate::runtime::BveRuntime::with_visual_display`].
+/// Connecting or disconnecting a VNC client changes nothing about BVE
+/// lifecycle — this only shapes one extra `-vnc` argument in
+/// [`QemuCommand::for_bve`], the same way [`UefiPflash`] shapes the pflash
+/// pair and the runtime's serial-capture path shapes `-serial`.
+///
+/// The endpoint is deterministic from the [`BveId`] alone — the same
+/// construction [`crate::network::BveNetworkPlan`] uses for its hashed
+/// resource names: a bounded slice of [`fnv1a_64`] of the id, so the same id
+/// always derives the same display/port on every host and build. A hash
+/// collision between two different ids would derive the same port; this crate
+/// does not resolve that by scanning for a free port (no random-port race —
+/// the Issue #74 requirement). Instead [`check_vnc_endpoint_available`] probes
+/// the exact deterministic port before `bamep-ve` ever spawns QEMU, and the
+/// runtime fails closed with an actionable error rather than silently letting
+/// a VNC client land on whatever is already listening there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VncEndpoint {
+    display: u16,
+}
+
+impl VncEndpoint {
+    /// Derives the endpoint for `id`. Pure and deterministic: no I/O, no
+    /// randomness.
+    pub fn deterministic_for(id: &BveId) -> Self {
+        let hash = fnv1a_64(id.as_str().as_bytes());
+        let display = (hash % (MAX_VNC_DISPLAY as u64 + 1)) as u16;
+        Self { display }
+    }
+
+    /// The QEMU display number (the `<n>` in `-vnc 127.0.0.1:<n>`).
+    pub fn display(&self) -> u16 {
+        self.display
+    }
+
+    /// The actual loopback TCP port QEMU listens on (`VNC_BASE_PORT +
+    /// display`).
+    pub fn port(&self) -> u16 {
+        VNC_BASE_PORT + self.display
+    }
+
+    /// The exact `-vnc` argument value.
+    fn as_qemu_arg(&self) -> String {
+        format!("{VNC_BIND_ADDRESS}:{}", self.display)
+    }
+}
+
+/// Confirms `endpoint`'s deterministic loopback TCP port is currently free.
+///
+/// [`crate::runtime::BveRuntime::start`] calls this before spawning QEMU when
+/// a visual display was requested (Issue #74), so a display-number collision
+/// — two BVE ids whose [`VncEndpoint`] happens to derive the same port, or an
+/// unrelated process already bound to it — fails immediately with an
+/// actionable Bamep error instead of silently letting a VNC client connect to
+/// whatever answers that port. This is a best-effort probe (a bind-then-drop
+/// check has an unavoidable TOCTOU race against a concurrent bind); QEMU's own
+/// bind failure remains the fail-closed backstop either way.
+pub fn check_vnc_endpoint_available(endpoint: &VncEndpoint) -> std::io::Result<()> {
+    std::net::TcpListener::bind((VNC_BIND_ADDRESS, endpoint.port())).map(drop)
+}
+
 /// The concrete process + argument vector the runtime will spawn for one BVE.
 ///
 /// Building this is pure and deterministic, so the full invocation can be
@@ -87,12 +166,15 @@ impl QemuCommand {
     /// - `-accel kvm` and `-cpu host` — explicit hardware acceleration, and
     ///   **no** `tcg` anywhere (ADR-0022 fail-closed);
     /// - `-smp <vcpus>` and `-m <memory_mib>M` from the definition;
-    /// - headless: `-display none`, no stdio console. The serial line is
-    ///   `-serial none` when `serial` is `None` (every path before Issue #72),
-    ///   or, when `serial` is `Some(path)`, a file chardev the runtime resolved
-    ///   — `-chardev file,id=char0,path=<path>,append=on` + `-serial
-    ///   chardev:char0` — a headless, machine-readable capture (Issue #72). No
-    ///   VNC/SPICE/display (that is Issue #74);
+    /// - headless by default: `-display none`, no stdio console. The serial
+    ///   line is `-serial none` when `serial` is `None` (every path before
+    ///   Issue #72), or, when `serial` is `Some(path)`, a file chardev the
+    ///   runtime resolved — `-chardev file,id=char0,path=<path>,append=on` +
+    ///   `-serial chardev:char0` — a headless, machine-readable capture (Issue
+    ///   #72). `-display none` is always present; when `visual` is
+    ///   `Some(endpoint)` (Issue #74, opt-in only), exactly one additional
+    ///   `-vnc 127.0.0.1:<display>` is emitted — a local-only VNC transport,
+    ///   never SPICE and never a GTK/SDL window;
     /// - networking from `definition.network()`: `-netdev user,id=net0`
     ///   (unprivileged SLIRP — the default) **or**, for an isolated TAP
     ///   (Issue #70), `-netdev tap,id=net0,ifname=<prepared>,script=no,\
@@ -133,6 +215,7 @@ impl QemuCommand {
         qmp_socket: &Path,
         uefi: Option<UefiPflash<'_>>,
         serial: Option<&Path>,
+        visual: Option<VncEndpoint>,
     ) -> Self {
         let mut args: Vec<String> = Vec::new();
         let mut push = |a: &str| args.push(a.to_string());
@@ -170,6 +253,14 @@ impl QemuCommand {
                 push("-serial");
                 push("chardev:char0");
             }
+        }
+
+        // Optional local-only VNC visual display (Issue #74): additive to
+        // `-display none`, never a replacement for it. Off by default — every
+        // path before Issue #74 passes `visual: None` and this emits nothing.
+        if let Some(endpoint) = visual {
+            push("-vnc");
+            push(&endpoint.as_qemu_arg());
         }
 
         // Networking. User-mode SLIRP is the unprivileged default; an isolated
@@ -482,7 +573,7 @@ mod tests {
     fn builds_the_expected_machine_invocation() {
         let def = with_source();
         let socket = Path::new("/run/bamep-ve/bve-argv/qmp.sock");
-        let cmd = QemuCommand::for_bve(&def, socket, None, None);
+        let cmd = QemuCommand::for_bve(&def, socket, None, None, None);
 
         assert_eq!(cmd.program(), "qemu-system-x86_64");
         let args = cmd.args();
@@ -511,7 +602,7 @@ mod tests {
 
     #[test]
     fn attaches_the_system_overlay_deterministically_by_id() {
-        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None, None);
         let drives = values_after(cmd.args(), "-drive");
         let blk: Vec<&str> = values_after(cmd.args(), "-device")
             .into_iter()
@@ -537,13 +628,13 @@ mod tests {
 
     #[test]
     fn attaches_the_source_disk_independently_only_when_present() {
-        let none = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
+        let none = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None, None);
         assert!(
             !none.args().iter().any(|a| a.contains("id=source")),
             "no source disk when the definition has none"
         );
 
-        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"), None, None);
+        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"), None, None, None);
         let drives = values_after(cmd.args(), "-drive");
         assert_eq!(drives.len(), 2);
         let source = drives.iter().find(|d| d.contains("id=source")).unwrap();
@@ -563,7 +654,7 @@ mod tests {
 
     #[test]
     fn every_drive_states_its_format_and_the_backing_base_is_never_attached() {
-        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"), None, None);
+        let cmd = QemuCommand::for_bve(&with_source(), Path::new("/s.sock"), None, None, None);
         for drive in values_after(cmd.args(), "-drive") {
             assert!(
                 drive.contains("format="),
@@ -580,7 +671,7 @@ mod tests {
 
     #[test]
     fn user_mode_networking_is_unchanged_and_emits_no_boot_flag() {
-        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None, None);
         assert_eq!(value_after(cmd.args(), "-netdev"), Some("user,id=net0"));
         assert!(
             !cmd.args().iter().any(|a| a == "-boot"),
@@ -591,7 +682,7 @@ mod tests {
     #[test]
     fn isolated_tap_networking_opens_the_prepared_tap_by_name_only() {
         let def = system_only().with_isolated_tap(IfName::new("bvtapdeadbeef").unwrap());
-        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None, None);
+        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None, None, None);
 
         assert_eq!(
             value_after(cmd.args(), "-netdev"),
@@ -627,7 +718,7 @@ mod tests {
     #[test]
     fn network_first_boot_mode_emits_exactly_boot_order_n() {
         let def = system_only().with_boot_mode(BootMode::NetworkFirst);
-        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None, None);
+        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None, None, None);
         assert_eq!(value_after(cmd.args(), "-boot"), Some("order=n"));
         assert_eq!(
             cmd.args().iter().filter(|a| a.as_str() == "-boot").count(),
@@ -671,8 +762,9 @@ mod tests {
             Path::new("/s.sock"),
             Some(pflash(ignored)),
             None,
+            None,
         );
-        let without = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
+        let without = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None, None);
         assert_eq!(
             with_vars, without,
             "Firmware::Default must ignore the UEFI pflash entirely"
@@ -690,8 +782,13 @@ mod tests {
     #[test]
     fn uefi_firmware_emits_the_ovmf_pflash_pair_code_readonly_vars_writable() {
         let vars = Path::new("/run/bamep-ve/bve-argv/OVMF_VARS.fd");
-        let cmd =
-            QemuCommand::for_bve(&uefi_only(), Path::new("/s.sock"), Some(pflash(vars)), None);
+        let cmd = QemuCommand::for_bve(
+            &uefi_only(),
+            Path::new("/s.sock"),
+            Some(pflash(vars)),
+            None,
+            None,
+        );
         let drives: Vec<&str> = values_after(cmd.args(), "-drive")
             .into_iter()
             .filter(|d| d.contains("if=pflash"))
@@ -728,12 +825,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "requires an instance OVMF_VARS path")]
     fn uefi_firmware_without_a_vars_path_is_a_caller_bug() {
-        let _ = QemuCommand::for_bve(&uefi_only(), Path::new("/s.sock"), None, None);
+        let _ = QemuCommand::for_bve(&uefi_only(), Path::new("/s.sock"), None, None, None);
     }
 
     #[test]
     fn nic_model_default_is_virtio_and_e1000_is_opt_in_with_the_same_mac() {
-        let virtio = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
+        let virtio = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None, None);
         let virtio_dev = values_after(virtio.args(), "-device")
             .into_iter()
             .find(|d| d.starts_with("virtio-net-pci,"))
@@ -741,7 +838,7 @@ mod tests {
         assert!(virtio_dev.contains(&format!("mac={}", system_only().mac())));
 
         let e1000_def = system_only().with_nic_model(NicModel::E1000);
-        let e1000 = QemuCommand::for_bve(&e1000_def, Path::new("/s.sock"), None, None);
+        let e1000 = QemuCommand::for_bve(&e1000_def, Path::new("/s.sock"), None, None, None);
         let e1000_dev = values_after(e1000.args(), "-device")
             .into_iter()
             .find(|d| d.starts_with("e1000,"))
@@ -769,6 +866,7 @@ mod tests {
             &uefi_e1000_network_first(),
             Path::new("/s.sock"),
             Some(pflash(vars)),
+            None,
             None,
         );
         let args = cmd.args();
@@ -809,7 +907,13 @@ mod tests {
 
     #[test]
     fn never_enables_software_cpu_emulation() {
-        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/run/x/qmp.sock"), None, None);
+        let cmd = QemuCommand::for_bve(
+            &system_only(),
+            Path::new("/run/x/qmp.sock"),
+            None,
+            None,
+            None,
+        );
         for arg in cmd.args() {
             assert!(
                 !arg.contains("tcg"),
@@ -830,7 +934,7 @@ mod tests {
             DiskAttachment::system("/d.qcow2", DiskFormat::Qcow2).unwrap(),
         )
         .unwrap();
-        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None, None);
+        let cmd = QemuCommand::for_bve(&def, Path::new("/s.sock"), None, None, None);
         assert_eq!(value_after(cmd.args(), "-smp"), Some("8"));
         assert_eq!(value_after(cmd.args(), "-m"), Some("2048M"));
     }
@@ -839,7 +943,7 @@ mod tests {
 
     #[test]
     fn no_serial_argument_keeps_the_pre_72_serial_none_and_no_chardev() {
-        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None, None);
         assert_eq!(value_after(cmd.args(), "-serial"), Some("none"));
         assert!(
             !cmd.args().iter().any(|a| a.contains("chardev")),
@@ -850,13 +954,14 @@ mod tests {
     #[test]
     fn serial_some_emits_an_append_file_chardev_bound_to_the_serial_line() {
         let log = Path::new("/run/bamep-ve/bve-argv/serial.log");
-        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, Some(log));
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, Some(log), None);
         assert_eq!(
             value_after(cmd.args(), "-chardev"),
             Some("file,id=char0,path=/run/bamep-ve/bve-argv/serial.log,append=on")
         );
         assert_eq!(value_after(cmd.args(), "-serial"), Some("chardev:char0"));
-        // Headless only — never a display/VNC/SPICE path (Issue #74).
+        // Headless: -display none stays even with serial capture, and no
+        // visual display was requested here, so no VNC/SPICE (Issue #74).
         assert_eq!(value_after(cmd.args(), "-display"), Some("none"));
         for arg in cmd.args() {
             let a = arg.to_lowercase();
@@ -887,7 +992,8 @@ mod tests {
 
     #[test]
     fn direct_kernel_emits_kernel_initrd_append_and_no_boot_or_optical() {
-        let cmd = QemuCommand::for_bve(&direct_kernel_def(), Path::new("/s.sock"), None, None);
+        let cmd =
+            QemuCommand::for_bve(&direct_kernel_def(), Path::new("/s.sock"), None, None, None);
         let args = cmd.args();
 
         assert_eq!(value_after(args, "-kernel"), Some("/out/images/bzImage"));
@@ -924,7 +1030,7 @@ mod tests {
 
     #[test]
     fn no_direct_kernel_emits_no_kernel_initrd_or_append() {
-        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None);
+        let cmd = QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None, None);
         for flag in ["-kernel", "-initrd", "-append"] {
             assert!(
                 !cmd.args().iter().any(|a| a == flag),
@@ -936,7 +1042,13 @@ mod tests {
     #[test]
     fn direct_kernel_and_serial_compose_for_the_bare_proof_profile() {
         let log = Path::new("/run/bamep-ve/bve-bare/serial.log");
-        let cmd = QemuCommand::for_bve(&direct_kernel_def(), Path::new("/s.sock"), None, Some(log));
+        let cmd = QemuCommand::for_bve(
+            &direct_kernel_def(),
+            Path::new("/s.sock"),
+            None,
+            Some(log),
+            None,
+        );
         let args = cmd.args();
         assert_eq!(value_after(args, "-kernel"), Some("/out/images/bzImage"));
         assert_eq!(value_after(args, "-serial"), Some("chardev:char0"));
@@ -963,5 +1075,170 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("not present"));
         assert!(!msg.to_lowercase().contains("falling back"));
+    }
+
+    // ---- optional VNC visual display (Issue #74) -----------------------
+
+    #[test]
+    fn headless_default_emits_no_vnc_and_leaves_display_none_unchanged() {
+        let without_visual =
+            QemuCommand::for_bve(&system_only(), Path::new("/s.sock"), None, None, None);
+        assert_eq!(value_after(without_visual.args(), "-display"), Some("none"));
+        assert!(
+            !without_visual.args().iter().any(|a| a == "-vnc"),
+            "no -vnc without an explicit visual display request"
+        );
+        for arg in without_visual.args() {
+            let a = arg.to_lowercase();
+            assert!(
+                !a.contains("vnc") && !a.contains("spice"),
+                "headless default must not reference a display backend: {arg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vnc_enabled_emits_exactly_the_expected_local_only_argument() {
+        let id = BveId::new("bve-vnc").unwrap();
+        let endpoint = VncEndpoint::deterministic_for(&id);
+        let cmd = QemuCommand::for_bve(
+            &system_only(),
+            Path::new("/s.sock"),
+            None,
+            None,
+            Some(endpoint),
+        );
+        let args = cmd.args();
+
+        // -display none stays: -vnc is additive, never a replacement.
+        assert_eq!(value_after(args, "-display"), Some("none"));
+        assert_eq!(
+            value_after(args, "-vnc"),
+            Some(format!("127.0.0.1:{}", endpoint.display())).as_deref()
+        );
+        assert_eq!(
+            args.iter().filter(|a| a.as_str() == "-vnc").count(),
+            1,
+            "exactly one -vnc argument"
+        );
+        for arg in args {
+            assert!(
+                !arg.to_lowercase().contains("spice"),
+                "VNC must not pull in SPICE: {arg:?}"
+            );
+            assert!(
+                !arg.contains("0.0.0.0") && arg != "::",
+                "no non-loopback bind address: {arg:?}"
+            );
+        }
+        let vnc_value = value_after(args, "-vnc").unwrap();
+        assert!(
+            vnc_value.starts_with("127.0.0.1:"),
+            "the -vnc value must bind loopback only: {vnc_value:?}"
+        );
+    }
+
+    #[test]
+    fn vnc_endpoint_is_deterministic_and_differs_across_ids() {
+        let a1 = VncEndpoint::deterministic_for(&BveId::new("bve-a").unwrap());
+        let a2 = VncEndpoint::deterministic_for(&BveId::new("bve-a").unwrap());
+        let b = VncEndpoint::deterministic_for(&BveId::new("bve-b").unwrap());
+
+        assert_eq!(a1, a2, "same id -> same endpoint, every call");
+        assert_ne!(
+            a1, b,
+            "different ids -> different endpoints (for this pair)"
+        );
+        assert_eq!(a1.port(), VNC_BASE_PORT + a1.display());
+        assert!(a1.display() <= MAX_VNC_DISPLAY);
+    }
+
+    #[test]
+    fn visual_display_does_not_change_nic_disks_firmware_qmp_or_serial() {
+        let def = uefi_e1000_network_first()
+            .with_source(DiskAttachment::source(SOURCE_DISK, DiskFormat::Raw).unwrap())
+            .unwrap();
+        let vars = Path::new("/run/bamep-ve/bve-argv/OVMF_VARS.fd");
+        let log = Path::new("/run/bamep-ve/bve-argv/serial.log");
+        let endpoint = VncEndpoint::deterministic_for(def.id());
+
+        let headless = QemuCommand::for_bve(
+            &def,
+            Path::new("/s.sock"),
+            Some(pflash(vars)),
+            Some(log),
+            None,
+        );
+        let visual = QemuCommand::for_bve(
+            &def,
+            Path::new("/s.sock"),
+            Some(pflash(vars)),
+            Some(log),
+            Some(endpoint),
+        );
+
+        // Every argument other than the added -vnc pair is byte-identical.
+        let strip_vnc = |args: &[String]| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut skip_next = false;
+            for a in args {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if a == "-vnc" {
+                    skip_next = true;
+                    continue;
+                }
+                out.push(a.clone());
+            }
+            out
+        };
+        assert_eq!(strip_vnc(headless.args()), strip_vnc(visual.args()));
+
+        // Spot-check the invariants the Issue calls out explicitly.
+        assert_eq!(
+            values_after(visual.args(), "-device")
+                .into_iter()
+                .find(|d| d.starts_with("e1000,")),
+            values_after(headless.args(), "-device")
+                .into_iter()
+                .find(|d| d.starts_with("e1000,"))
+        );
+        assert_eq!(
+            values_after(visual.args(), "-drive"),
+            values_after(headless.args(), "-drive")
+        );
+        assert_eq!(
+            value_after(visual.args(), "-qmp"),
+            value_after(headless.args(), "-qmp")
+        );
+        assert_eq!(
+            value_after(visual.args(), "-serial"),
+            value_after(headless.args(), "-serial")
+        );
+        assert_eq!(
+            value_after(visual.args(), "-boot"),
+            value_after(headless.args(), "-boot")
+        );
+    }
+
+    #[test]
+    fn check_vnc_endpoint_available_fails_closed_on_a_bound_port_and_succeeds_on_a_free_one() {
+        let id = BveId::new("bve-vnc-collision-probe").unwrap();
+        let endpoint = VncEndpoint::deterministic_for(&id);
+
+        // Free: the probe succeeds (and releases the port immediately).
+        assert!(check_vnc_endpoint_available(&endpoint).is_ok());
+
+        // Occupied: an explicit failure, never a silent redirect to whatever
+        // is listening.
+        let hold = std::net::TcpListener::bind((VNC_BIND_ADDRESS, endpoint.port())).unwrap();
+        let err = check_vnc_endpoint_available(&endpoint).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        drop(hold);
+
+        // Freed again once the holder is gone.
+        assert!(check_vnc_endpoint_available(&endpoint).is_ok());
     }
 }

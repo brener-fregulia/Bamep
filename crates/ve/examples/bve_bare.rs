@@ -13,7 +13,12 @@
 //! - `check <id> --kernel <p> --initrd <p>` — host prerequisites + artifacts;
 //! - `run-bve <id> --kernel <p> --initrd <p> [--append "<s>"] [--serial-out <p>]
 //!   [--boot-hold <secs>]` — two boots of one BVE; emits the serial-log line
-//!   range bounding each boot for the harness (it does not interpret markers).
+//!   range bounding each boot for the harness (it does not interpret markers);
+//! - `run-bve <id> --kernel <p> --initrd <p> --visual` — Issue #74 manual
+//!   proof: one boot of the same BVE with the optional local-only VNC visual
+//!   display enabled, held running until Enter is pressed on stdin (instead
+//!   of the fixed two-boot timed hold above) so the owner has time to connect
+//!   a VNC viewer to the printed endpoint.
 //!
 //! BARE artifacts are NOT in the repo; build them with `scripts/build-bare.sh`.
 
@@ -65,8 +70,9 @@ fn run() -> R {
             eprintln!(
                 "usage: bve_bare <plan|check|run-bve> <bve-id> \\\n\
                  \t--kernel <bzImage> --initrd <rootfs.cpio.gz> [--append \"<cmdline>\"] \\\n\
-                 \t[--serial-out <file>] [--boot-hold <secs>]\n\
+                 \t[--serial-out <file>] [--boot-hold <secs>] [--visual]\n\
                  scripts/bve-bare-direct-proof.sh drives the whole cycle; these are for debugging.\n\
+                 --visual (Issue #74): one boot, VNC visual display enabled, held until Enter.\n\
                  unknown subcommand: {other:?}"
             );
             std::process::exit(2);
@@ -147,6 +153,7 @@ fn range(before: usize, after: usize) -> String {
 
 fn run_bve(id: &BveId) -> R {
     let dk = payload()?;
+    let visual = std::env::args().any(|a| a == "--visual");
     let boot_hold = flag_value("boot-hold")
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs)
@@ -178,6 +185,16 @@ fn run_bve(id: &BveId) -> R {
 
     let mut runtime =
         BveRuntime::create(&runtime_root, definition, storage.clone())?.with_serial_capture();
+    if visual {
+        runtime = runtime.with_visual_display();
+    }
+    if let Some(endpoint) = runtime.visual_display() {
+        println!(
+            "BVE_VNC_ENDPOINT=127.0.0.1:{} (QEMU display :{}) - connect a VNC viewer there",
+            endpoint.port(),
+            endpoint.display()
+        );
+    }
     let serial_log = runtime
         .serial_log()
         .expect("serial capture was enabled")
@@ -203,10 +220,24 @@ fn run_bve(id: &BveId) -> R {
     };
 
     let before1 = count_lines(&serial_log);
-    one_boot(&mut runtime, 1)?;
-    let after1 = count_lines(&serial_log);
-    one_boot(&mut runtime, 2)?;
-    let after2 = count_lines(&serial_log);
+    if visual {
+        // Issue #74 manual proof: one boot, held open on the owner's cue
+        // (not a fixed timeout) so there is time to connect a VNC viewer.
+        runtime.start(&prerequisites)?;
+        assert_eq!(runtime.observe()?, LifecycleState::Running);
+        println!("BVE running with visual display enabled - press Enter here to stop it.");
+        let mut discard = String::new();
+        std::io::stdin().read_line(&mut discard).ok();
+        runtime.stop()?;
+        assert_eq!(runtime.observe()?, LifecycleState::Stopped);
+    } else {
+        one_boot(&mut runtime, 1)?;
+        let after1 = count_lines(&serial_log);
+        one_boot(&mut runtime, 2)?;
+        let after2 = count_lines(&serial_log);
+        println!("BVE_BOOT1_LOG_RANGE={}", range(before1, after1));
+        println!("BVE_BOOT2_LOG_RANGE={}", range(after1, after2));
+    }
 
     // Persist the serial capture before destroy removes it.
     if let Some(out) = &serial_out {
@@ -215,13 +246,11 @@ fn run_bve(id: &BveId) -> R {
     } else {
         println!("BVE_SERIAL_LOG={}", serial_log.display());
     }
-    println!("BVE_BOOT1_LOG_RANGE={}", range(before1, after1));
-    println!("BVE_BOOT2_LOG_RANGE={}", range(after1, after2));
 
     runtime.destroy()?;
     destroy_instance_storage(storage)?;
     let _ = base;
-    println!("both boots done; BVE disposed.");
+    println!("BVE disposed.");
     Ok(())
 }
 
