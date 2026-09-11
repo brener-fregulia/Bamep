@@ -91,9 +91,11 @@ pub const VNC_BIND_ADDRESS: &str = "127.0.0.1";
 /// [`QemuCommand::for_bve`], the same way [`UefiPflash`] shapes the pflash
 /// pair and the runtime's serial-capture path shapes `-serial`.
 ///
-/// The endpoint is deterministic from the [`BveId`] alone — the same
-/// construction [`crate::network::BveNetworkPlan`] uses for its hashed
-/// resource names: a bounded slice of [`fnv1a_64`] of the id, so the same id
+/// The endpoint is deterministically derived from [`fnv1a_64`] of the
+/// [`BveId`] alone — modulo the number of available displays
+/// ([`MAX_VNC_DISPLAY`] `+ 1`), not the same construction
+/// [`crate::network::BveNetworkPlan`] uses for its hashed resource names
+/// (which formats the hash's low 32 bits as hex). Either way the same id
 /// always derives the same display/port on every host and build. A hash
 /// collision between two different ids would derive the same port; this crate
 /// does not resolve that by scanning for a free port (no random-port race —
@@ -1223,10 +1225,34 @@ mod tests {
         );
     }
 
+    /// Asks the OS for a currently-free loopback TCP port that also falls
+    /// inside the valid VNC range (`VNC_BASE_PORT..=VNC_BASE_PORT +
+    /// MAX_VNC_DISPLAY`), by binding port `0` and immediately releasing it.
+    /// Retries a bounded number of times if the OS hands back a port outside
+    /// that range, rather than ever assuming a fixed, hard-coded port is
+    /// free on the host running the test.
+    fn free_loopback_vnc_endpoint() -> VncEndpoint {
+        for _ in 0..200 {
+            let probe = std::net::TcpListener::bind((VNC_BIND_ADDRESS, 0)).unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            if (VNC_BASE_PORT..=VNC_BASE_PORT + MAX_VNC_DISPLAY).contains(&port) {
+                // `tests` is a child module of `qemu`, so it may build a
+                // `VncEndpoint` directly from a port this test itself
+                // discovered, without going through `deterministic_for` (and
+                // therefore without depending on any particular `BveId`'s
+                // hash landing on a port that happens to be free right now).
+                return VncEndpoint {
+                    display: port - VNC_BASE_PORT,
+                };
+            }
+        }
+        panic!("could not obtain a free ephemeral port inside the VNC range after 200 attempts");
+    }
+
     #[test]
     fn check_vnc_endpoint_available_fails_closed_on_a_bound_port_and_succeeds_on_a_free_one() {
-        let id = BveId::new("bve-vnc-collision-probe").unwrap();
-        let endpoint = VncEndpoint::deterministic_for(&id);
+        let endpoint = free_loopback_vnc_endpoint();
 
         // Free: the probe succeeds (and releases the port immediately).
         assert!(check_vnc_endpoint_available(&endpoint).is_ok());

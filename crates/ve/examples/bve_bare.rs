@@ -18,7 +18,11 @@
 //!   proof: one boot of the same BVE with the optional local-only VNC visual
 //!   display enabled, held running until Enter is pressed on stdin (instead
 //!   of the fixed two-boot timed hold above) so the owner has time to connect
-//!   a VNC viewer to the printed endpoint.
+//!   a VNC viewer to the printed endpoint. Without an explicit `--append`,
+//!   `--visual` automatically adds a local VGA console
+//!   (`DEFAULT_VISUAL_APPEND`) to the existing serial console, so BARE's boot
+//!   output is visible over VNC with no hidden `console=tty0` knowledge
+//!   required; an explicit `--append` always wins unchanged, in both modes.
 //!
 //! BARE artifacts are NOT in the repo; build them with `scripts/build-bare.sh`.
 
@@ -38,6 +42,35 @@ type R = Result<(), Box<dyn Error>>;
 /// Default kernel command line: serial console for the capture, immediate
 /// reboot-less panic so a wedged boot fails fast rather than hanging the hold.
 const DEFAULT_APPEND: &str = "console=ttyS0,115200 panic=-1";
+
+/// Default kernel command line for `--visual` (Issue #74 manual proof),
+/// owner-validated to show BARE/Linux boot output over the VNC endpoint
+/// without the owner needing to know this detail: the same serial console
+/// argument as [`DEFAULT_APPEND`] — the QEMU serial chardev plumbing stays
+/// configured/captured exactly as before, unchanged by `--visual` — plus a
+/// local VGA console. This does **not** claim userspace markers appear
+/// identically, or are duplicated, on the serial log when `tty0` is also
+/// present as a console; that has not been validated.
+const DEFAULT_VISUAL_APPEND: &str = "console=ttyS0,115200 panic=-1 console=tty0";
+
+/// The kernel command line to use: an explicit `--append` always wins,
+/// unchanged, in both modes; otherwise the default is chosen by `visual`
+/// ([`DEFAULT_APPEND`] vs [`DEFAULT_VISUAL_APPEND`]). Pure — no env/filesystem
+/// access — so it is unit-testable without a real invocation.
+fn resolve_append(explicit: Option<String>, visual: bool) -> String {
+    explicit.unwrap_or_else(|| {
+        if visual {
+            DEFAULT_VISUAL_APPEND.to_string()
+        } else {
+            DEFAULT_APPEND.to_string()
+        }
+    })
+}
+
+/// Whether `--visual` was passed on the command line.
+fn visual_requested() -> bool {
+    std::env::args().any(|a| a == "--visual")
+}
 
 /// How long each boot is held so BARE can reach init, probe virtio, run
 /// udhcpc, and emit both markers. BARE is tiny; 25 s is generous.
@@ -65,14 +98,15 @@ fn run() -> R {
     match cmd {
         "plan" => plan(&id()?),
         "check" => check(&id()?),
-        "run-bve" => run_bve(&id()?),
+        "run-bve" => run_bve(&id()?, visual_requested()),
         other => {
             eprintln!(
                 "usage: bve_bare <plan|check|run-bve> <bve-id> \\\n\
                  \t--kernel <bzImage> --initrd <rootfs.cpio.gz> [--append \"<cmdline>\"] \\\n\
                  \t[--serial-out <file>] [--boot-hold <secs>] [--visual]\n\
                  scripts/bve-bare-direct-proof.sh drives the whole cycle; these are for debugging.\n\
-                 --visual (Issue #74): one boot, VNC visual display enabled, held until Enter.\n\
+                 --visual (Issue #74): one boot, VNC visual display enabled, held until Enter;\n\
+                 \tadds a local console to --append's default automatically unless overridden.\n\
                  unknown subcommand: {other:?}"
             );
             std::process::exit(2);
@@ -108,15 +142,15 @@ fn require_artifact(kind: &str, flag: &str) -> Result<PathBuf, Box<dyn Error>> {
     Ok(path)
 }
 
-fn payload() -> Result<DirectKernelBoot, Box<dyn Error>> {
+fn payload(visual: bool) -> Result<DirectKernelBoot, Box<dyn Error>> {
     let kernel = require_artifact("BARE kernel (bzImage)", "kernel")?;
     let initrd = require_artifact("BARE initramfs (rootfs.cpio.gz)", "initrd")?;
-    let append = flag_value("append").unwrap_or_else(|| DEFAULT_APPEND.to_string());
+    let append = resolve_append(flag_value("append"), visual);
     Ok(DirectKernelBoot::new(kernel, initrd, append)?)
 }
 
 fn plan(id: &BveId) -> R {
-    let dk = payload()?;
+    let dk = payload(visual_requested())?;
     println!("bve id      : {id}");
     println!("mac         : {}", MacAddress::deterministic_for(id));
     println!("firmware    : Default (SeaBIOS - bypassed: QEMU/KVM loads the kernel directly)");
@@ -130,7 +164,7 @@ fn plan(id: &BveId) -> R {
 }
 
 fn check(id: &BveId) -> R {
-    let _ = payload()?;
+    let _ = payload(visual_requested())?;
     detect_host_prerequisites()?;
     bamep_ve::check_qemu_img_binary()?;
     println!("ok: qemu-system-x86_64 + /dev/kvm + qemu-img present; BARE artifacts present");
@@ -151,9 +185,8 @@ fn range(before: usize, after: usize) -> String {
     format!("{}:{}", before + 1, after.max(before))
 }
 
-fn run_bve(id: &BveId) -> R {
-    let dk = payload()?;
-    let visual = std::env::args().any(|a| a == "--visual");
+fn run_bve(id: &BveId, visual: bool) -> R {
+    let dk = payload(visual)?;
     let boot_hold = flag_value("boot-hold")
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs)
@@ -271,5 +304,26 @@ mod tests {
         assert_eq!(range(118, 118), "119:118");
         // defensive: a shrinking log never yields a wild range
         assert_eq!(range(50, 30), "51:50");
+    }
+
+    // ---- --visual console default (Issue #74 follow-up) -----------------
+
+    #[test]
+    fn resolve_append_keeps_the_existing_default_when_not_visual_and_no_explicit_append() {
+        assert_eq!(resolve_append(None, false), DEFAULT_APPEND);
+    }
+
+    #[test]
+    fn resolve_append_adds_the_local_console_only_for_visual_with_no_explicit_append() {
+        assert_eq!(resolve_append(None, true), DEFAULT_VISUAL_APPEND);
+        assert!(DEFAULT_VISUAL_APPEND.starts_with(DEFAULT_APPEND));
+        assert!(DEFAULT_VISUAL_APPEND.ends_with("console=tty0"));
+    }
+
+    #[test]
+    fn resolve_append_lets_an_explicit_append_win_unchanged_in_both_modes() {
+        let custom = "console=ttyS1 debug".to_string();
+        assert_eq!(resolve_append(Some(custom.clone()), false), custom);
+        assert_eq!(resolve_append(Some(custom.clone()), true), custom);
     }
 }
