@@ -230,3 +230,8 @@ understands only "boot this kernel and initrd", never "this is BARE".
 - Issue #72 — the Work Package that produced this decision.
 - Issue #73 — network delivery of the same BARE artifacts (hard boundary: #72
   does not implement PXE/DHCP/TFTP/HTTP/iPXE/Secure Boot for BARE).
+  Implemented reusing `bzImage`/`rootfs.cpio.gz` unchanged over the isolated
+  #70 network and the Issue #71 UEFI/iPXE bootstrap; a pre-implementation
+  spike confirmed BARE's kernel already builds `CONFIG_EFI`/`CONFIG_EFI_STUB`,
+  so no `linux.fragment`/defconfig/Buildroot change was made. See
+  `docs/reference/bve-bare-uefi-pxe-host-proof.md`.

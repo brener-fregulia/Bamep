@@ -544,6 +544,47 @@ pub fn winpe_boot_ipxe_script() -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Issue #73: BARE UEFI-PXE host-proof payload.
+//
+// Reuses the Issue #71 fixture wholesale — [`winpe_tftp_root`],
+// [`winpe_http_root`], [`winpe_fixture_dnsmasq_argv`],
+// [`winpe_http_fixture_command`], [`WINPE_TFTP_BOOTFILE`]
+// (`snponly.efi`) — unchanged: the Issue #73 spike proved the same
+// `snponly.efi` 2.0.0 UEFI/iPXE bootstrap already qualified by #71 also
+// carries BARE. Only the served `boot.ipxe` payload and the two staged
+// files differ: a Linux `bzImage` (booted via its EFI stub — already
+// present in the BARE kernel `.config`, no kernel change) and a standalone
+// `rootfs.cpio.gz` initramfs, instead of `wimboot` + WinPE assets.
+// ---------------------------------------------------------------------------
+
+/// The HTTP filename BARE's kernel is staged and requested under.
+pub const BARE_PXE_KERNEL_NAME: &str = "bzImage";
+/// The HTTP filename BARE's initramfs is staged and requested under.
+pub const BARE_PXE_INITRD_NAME: &str = "rootfs.cpio.gz";
+
+/// The `boot.ipxe` script BARE's UEFI-PXE proof serves: fetch [`BARE_PXE_KERNEL_NAME`]
+/// as an EFI kernel (iPXE hands an EFI-stub-capable `bzImage` to the firmware
+/// loader on UEFI; BARE's kernel already builds `CONFIG_EFI`/`CONFIG_EFI_STUB`
+/// — Issue #73 spike, `docs/reference/bve-bare-uefi-pxe-host-proof.md`) and
+/// [`BARE_PXE_INITRD_NAME`] as its initrd, then boot. `console=ttyS0,115200`
+/// carries the serial capture; `panic=0` is deliberately fail-closed — a
+/// panicked BARE kernel halts rather than silently rebooting into a second,
+/// evidence-polluting PXE attempt. `imgfree` discards any image a prior boot
+/// of the same BVE left registered before loading this boot's payload. Pure
+/// — writes nothing.
+pub fn bare_boot_ipxe_script() -> String {
+    let base = winpe_http_base_url();
+    format!(
+        "#!ipxe\n\
+         echo Bamep BVE Issue 73 BARE UEFI-PXE proof\n\
+         imgfree\n\
+         kernel {base}/{BARE_PXE_KERNEL_NAME} console=ttyS0,115200 panic=0\n\
+         initrd {base}/{BARE_PXE_INITRD_NAME}\n\
+         boot\n"
+    )
+}
+
 /// The exact `dnsmasq` argv for the WinPE fixture (Issue #71). Pure.
 ///
 /// Adds to the #70 DHCP fixture: TFTP serving from [`winpe_tftp_root`], an
@@ -1514,6 +1555,35 @@ mod tests {
         assert!(s.trim_end().ends_with("boot"));
         // The Secure-Boot wrapper is out of scope: no shim anywhere.
         assert!(!s.contains("shim"));
+    }
+
+    // ---- Issue #73 BARE UEFI-PXE fixture (reuses the #71 TFTP/HTTP roots and
+    // dnsmasq argv unchanged; only the served boot.ipxe payload differs) -----
+
+    #[test]
+    fn bare_boot_ipxe_script_is_the_kernel_initrd_chain_over_http() {
+        let s = bare_boot_ipxe_script();
+        assert!(s.starts_with("#!ipxe\n"));
+        // Clears any image a previous chain (or a previous boot of the same
+        // BVE) left loaded — never boot a stale payload.
+        assert!(s.contains("imgfree\n"));
+        assert!(s.contains(&format!(
+            "kernel http://192.0.2.1:8080/{BARE_PXE_KERNEL_NAME} console=ttyS0,115200 panic=0"
+        )));
+        assert!(s.contains(&format!(
+            "initrd http://192.0.2.1:8080/{BARE_PXE_INITRD_NAME}"
+        )));
+        assert!(s.trim_end().ends_with("boot"));
+        // Never the WinPE payload.
+        assert!(!s.contains("wimboot"));
+        assert!(!s.contains(".wim"));
+    }
+
+    #[test]
+    fn bare_pxe_kernel_and_initrd_names_are_stable_and_distinct() {
+        assert_eq!(BARE_PXE_KERNEL_NAME, "bzImage");
+        assert_eq!(BARE_PXE_INITRD_NAME, "rootfs.cpio.gz");
+        assert_ne!(BARE_PXE_KERNEL_NAME, BARE_PXE_INITRD_NAME);
     }
 
     #[test]

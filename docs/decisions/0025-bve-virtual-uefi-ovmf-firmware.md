@@ -152,3 +152,6 @@ Boot**:
 - `docs/specifications/m0-bamep-virtual-endpoint-contract.md` — backend- and
   firmware-independent BVE responsibility, lifecycle, and fidelity boundary.
 - Issue #71 — Work Package that produced this decision.
+- Issue #73 — confirms this ADR's own prediction: BARE's UEFI BVE uses
+  `NicModel::VirtioNetPci` (OVMF's native `VirtioNetDxe`), not #71's `E1000`.
+  See `docs/reference/bve-bare-uefi-pxe-host-proof.md`.

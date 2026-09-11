@@ -322,8 +322,36 @@ parsed per boot by `scripts/lib/bare-serial-evidence.sh` (`bare_ready_in_range` 
 `crates/ve/tests/bare_direct_host.rs` (`BAMEP_BVE_BARE_HOST_TEST=1` +
 `BAMEP_BVE_BARE_KERNEL`/`BAMEP_BVE_BARE_INITRD`) is the in-crate regression anchor. Empirical
 result and fidelity limits: `docs/reference/bve-bare-direct-boot-host-proof.md`. #72 does not
-implement PXE/DHCP/TFTP/HTTP/iPXE/Secure Boot for BARE (that boundary is #73) or a visual
+implement PXE/DHCP/TFTP/HTTP/iPXE/Secure Boot for BARE (#73, below) or a visual
 console (#74); the production Agent is future work.
+
+**BARE UEFI-PXE delivery (Issue #73)** loads the same `bzImage` + `rootfs.cpio.gz` — never
+rebuilt — over the isolated #70 network through the exact Issue #71 UEFI/iPXE bootstrap
+mechanism, unchanged: `Firmware::Uefi` + `NicModel::VirtioNetPci` (OVMF's native
+`VirtioNetDxe` UEFI PXE driver; kept at `VirtioNetPci`, not #71's `E1000`, since BARE's
+kernel has no `e1000` driver built in) + `BootMode::NetworkFirst`, with
+`BveRuntime::with_serial_capture` added on top of the isolated-network runtime. The only new
+Rust surface is `bamep_ve::bare_boot_ipxe_script` (`crates/ve/src/network.rs`) — a `boot.ipxe`
+that fetches `bzImage` as an EFI-stub kernel and `rootfs.cpio.gz` as its initrd over HTTP,
+reusing #71's TFTP/HTTP fixture roots and dnsmasq argv unchanged — and the new
+`crates/ve/examples/bve_bare_pxe.rs` (`plan`/`env`/`check`/`check-artifacts`/`verify-clean`/
+`setup`/`start-fixture`/`run-bve`/`teardown`), which boots the SAME `BveRuntime`/definition/
+storage/OVMF VARS twice and emits **two** independent per-boot line-range pairs — one over the
+host-side fixture log (dnsmasq + `python3 -m http.server`, captured together the same way #71
+already captures its HTTP evidence), one over the guest-side serial log — because BARE
+readiness (`BARE_READY`/`BARE_NET_READY`, unchanged from #72) and host-side PXE/HTTP delivery
+are separate evidence authorities that must each be proven independently per boot.
+`scripts/bve-bare-pxe-proof.sh` orchestrates the full cycle (never rebuilds BARE, never
+downloads `snponly.efi` — it reuses the exact Issue #71 artifact and reads its hash from
+`scripts/winpe-pxe-fixture.sha256`, the one authoritative source, rather than a second
+manifest); `scripts/lib/bare-pxe-evidence.sh` parses the fixture-log stages
+(`uefi_pxe_attempt_in_range`/`dhcp_ack_in_range`/`snponly_tftp_in_range`/
+`ipxe_boot_script_selected_in_range`/`http_get_200_in_range`), unit-tested by
+`scripts/bve-bare-pxe-proof-parser-test.sh`; `scripts/lib/bare-serial-evidence.sh` (#72) is
+reused unchanged for the guest-side markers. A pre-implementation spike found BARE's kernel
+already builds `CONFIG_EFI`/`CONFIG_EFI_STUB` (part of the arch-default kernel config), so no
+`linux.fragment`/defconfig/Buildroot change was needed. Empirical result and fidelity limits:
+`docs/reference/bve-bare-uefi-pxe-host-proof.md` (owner-run evidence PENDING).
 
 BVE never proves physical firmware, option-ROM, NIC, switch/VLAN, storage-controller,
 Secure Boot, or physical WinPE/PXE behavior, and host-internal virtual-network evidence is
