@@ -170,7 +170,13 @@ Implemented across Issues #67, #69, #70, #71 and #72:
   bootloader and no optical device. The serial line is `-serial none` by default (every path
   before #72 is byte-identical) or, when the runtime enables capture, `-chardev
   file,id=char0,path=<serial.log>,append=on` + `-serial chardev:char0` — a headless
-  machine-readable log, never a display/VNC/SPICE path (Issue #74).
+  machine-readable log. `-display none` is always present; when the runtime opts a BVE into
+  an optional visual display (Issue #74), exactly one additional `-vnc 127.0.0.1:<display>`
+  is emitted — never SPICE, never a GTK/SDL window. The display number is deterministic
+  (`VncEndpoint::deterministic_for`, `fnv1a_64(BveId)` modulo the number of available
+  displays — a different derivation than the network module's hashed resource names, which
+  format the hash's low 32 bits as hex), loopback-only, and independent of every other
+  argument here; connecting/disconnecting a VNC client never touches lifecycle.
 - `network` (ADR-0024) — the optional isolated provisioning network.
   `BveNetworkPlan::for_bve` derives deterministic, `IFNAMSIZ`-safe host-resource names
   (`bvbr<h>`, `bvtap<h>`, `bvh<h>`/`bvp<h>`, netns `bve-<h>`, where `<h>` is the low 32
@@ -227,7 +233,12 @@ Implemented across Issues #67, #69, #70, #71 and #72:
   self-consistent) for a `DirectKernelBoot` BVE. `with_serial_capture` (Issue #72) opts one
   BVE into an append-mode `<control-dir>/serial.log` (`SERIAL_LOG_FILENAME`) so a
   `stop`/`start` cycle accumulates both boots' serial output for per-boot line-range
-  evidence; `destroy` removes it (control state, like the VARS copy). `create_with_isolated_network`
+  evidence; `destroy` removes it (control state, like the VARS copy). `with_visual_display`
+  (Issue #74) opts one BVE into its deterministic `VncEndpoint`; off by default, it creates
+  no file under the control directory (nothing extra for `destroy` to remove), and `start`
+  validates the derived loopback port is free (`check_vnc_endpoint_available`) before
+  spawning QEMU, failing closed with `VncEndpointUnavailable` on a collision rather than
+  silently landing a client on another BVE's console. `create_with_isolated_network`
   additionally cross-checks the definition's `NetworkAttachment` against a
   `PreparedBveNetwork` (same consistency lesson as ADR-0023) and performs no privileged
   network operation — QEMU opens the already-prepared, user-owned TAP unprivileged.
