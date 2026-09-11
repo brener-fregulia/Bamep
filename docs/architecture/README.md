@@ -350,8 +350,9 @@ manifest); `scripts/lib/bare-pxe-evidence.sh` parses the fixture-log stages
 `scripts/bve-bare-pxe-proof-parser-test.sh`; `scripts/lib/bare-serial-evidence.sh` (#72) is
 reused unchanged for the guest-side markers. A pre-implementation spike found BARE's kernel
 already builds `CONFIG_EFI`/`CONFIG_EFI_STUB` (part of the arch-default kernel config), so no
-`linux.fragment`/defconfig/Buildroot change was needed. Empirical result and fidelity limits:
-`docs/reference/bve-bare-uefi-pxe-host-proof.md` (owner-run evidence PENDING).
+`linux.fragment`/defconfig/Buildroot change was needed. Owner-run validated (2026-09-11, two
+boots, host clean); empirical result and fidelity limits:
+`docs/reference/bve-bare-uefi-pxe-host-proof.md`.
 
 BVE never proves physical firmware, option-ROM, NIC, switch/VLAN, storage-controller,
 Secure Boot, or physical WinPE/PXE behavior, and host-internal virtual-network evidence is

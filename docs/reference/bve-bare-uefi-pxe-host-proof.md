@@ -1,13 +1,13 @@
 # BVE BARE UEFI-PXE — Host-Proof Reference (Issue #73)
 
-Status: **Design/wiring reference — empirical transcript of the two-boot proof
-PENDING the owner-run `scripts/bve-bare-pxe-proof.sh`.**
+Status: **Validated — owner-run two-boot UEFI-PXE proof passed
+(2026-09-11, WSL2).**
 
 This document describes the implemented Issue #73 host-proof wiring and what a
-successful run establishes and does not establish. The pass/fail transcript,
-observed provisioning/serial evidence, and any host-specific findings are
-filled in **after** `scripts/bve-bare-pxe-proof.sh` is actually executed by
-the owner — only executed validation produces validation evidence
+successful run establishes and does not establish. The owner executed
+`scripts/bve-bare-pxe-proof.sh` on 2026-09-11; both boots passed every required
+provisioning and guest-readiness stage, and teardown left the host clean.
+Only executed validation produces validation evidence
 (`docs/development/testing.md`).
 
 Normative ownership is unchanged: `docs/specifications/m0-bamep-virtual-endpoint-contract.md`
@@ -251,11 +251,63 @@ its defined readiness state** — nothing more.
 
 ## Evidence
 
-**PENDING** — to be filled from the owner's `scripts/bve-bare-pxe-proof.sh`
-run: environment confirmation, the per-boot per-stage PASS/FAIL/N-A table
-(both authorities), the observed DHCP/TFTP/HTTP/serial transcript excerpts,
-whether the NIC's firmware entered iPXE directly (TFTP stage N/A) or via
-`snponly.efi` over TFTP, and the clean-teardown / reproducibility result.
+Owner-run validation completed on **2026-09-11** in the reference WSL2
+environment documented above.
+
+The proof used the retained Issue #71 `snponly.efi` 2.0.0 through the explicit
+TFTP bootstrap path in **both** boots; the TFTP stage was therefore proven and
+was not the option-ROM `N/A` case.
+
+Observed result:
+
+```text
+host + artifacts ..... ok
+host clean ........... ok
+isolated network ..... ok
+PXE fixture .......... ok
+BVE x2 (UEFI PXE) .... ok
+
+boot #1
+  UEFI PXE attempt ........ PASS
+  DHCP/bootstrap .......... PASS
+  snponly.efi (TFTP) ...... PASS
+  iPXE / boot.ipxe select . PASS
+  boot.ipxe (HTTP 200) .... PASS
+  bzImage (HTTP 200) ...... PASS
+  rootfs.cpio.gz (HTTP 200) PASS
+  BARE_READY .............. PASS
+  BARE_NET_READY .......... PASS
+
+boot #2
+  UEFI PXE attempt ........ PASS
+  DHCP/bootstrap .......... PASS
+  snponly.efi (TFTP) ...... PASS
+  iPXE / boot.ipxe select . PASS
+  boot.ipxe (HTTP 200) .... PASS
+  bzImage (HTTP 200) ...... PASS
+  rootfs.cpio.gz (HTTP 200) PASS
+  BARE_READY .............. PASS
+  BARE_NET_READY .......... PASS
+
+repeat PXE path (BVE reboot) . PASS
+fixture stop ................. ok
+teardown ..................... ok
+host clean ................... yes
+```
+
+The host-side fixture evidence independently contained successful HTTP 200
+requests for `boot.ipxe`, `bzImage`, and `rootfs.cpio.gz` inside each boot's
+fixture range. The guest-side serial evidence independently contained
+`BARE_READY` and `BARE_NET_READY` inside each corresponding serial range.
+
+The second boot reused the same BVE runtime/definition, prepared storage,
+per-BVE OVMF VARS, BARE artifacts, isolated provisioning network, and staged
+PXE fixture. No VM, storage, firmware state, or BARE artifact was reconstructed
+between boots.
+
+After the second boot the fixture stopped successfully, network teardown
+completed, `verify-clean` passed, and no BVE-scoped residual FORWARD rule
+remained.
 
 ## Related
 
